@@ -511,7 +511,7 @@ class _Evidence:
 # these only say the value is the kind of thing its type claims.
 _CTRL = re.compile(r"[\x00-\x1f\x7f]")
 _REG_RELATIVE = re.compile(r"(?:software|system|control panel|environment)\\\S", re.I)
-_FILE_NAME = re.compile(r"[\w.$~{}-]+\.[A-Za-z][A-Za-z0-9]{1,3}")
+_FILE_NAME = re.compile(r"[\w.$~{}-]+(?: [\w.$~{}-]+)*\.[A-Za-z][A-Za-z0-9]{1,3}")
 _MUTEX_NAME = re.compile(r"[\w.{}#@$!-]{6,128}")
 _POSIX_PATH = re.compile(r"/[^\s/]+(?:/[^\s/]*)*")
 

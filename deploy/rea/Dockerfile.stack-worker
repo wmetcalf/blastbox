@@ -18,7 +18,7 @@
 # is that image's local id, which the containerd image store also lists as a repo digest:
 #   docker image inspect blastbox-rea:dev --format '{{index .RepoDigests 0}}'
 # Update it after every rebuild of Dockerfile.rea-cold-worker (or pass --build-arg BASE_IMAGE=...).
-ARG BASE_IMAGE=blastbox-rea@sha256:fa7eb15a99c163835ae77bb2f172117b00d828792d5aa5c919fa79e17d27a4ff
+ARG BASE_IMAGE=blastbox-rea@sha256:145bcbd61123eda164560c79e20a08fdfc95a78161472e29026694dcbd85b1a0
 FROM ${BASE_IMAGE}
 
 ARG ENGINE_CLASS=blastbox.engines.rea:ReaSweepEngine

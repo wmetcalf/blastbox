@@ -42,9 +42,10 @@ either the system bundle or `ca.crt` changes.
 
 ```text
 image                         from                                                     toolz2 id
-blastbox-rea:dev              Dockerfile.rea-cold-worker @ feat/rea-engine 66deffb      fa7eb15a99c1 (prev: blastbox-rea:dev-9854db3 @ 31b56e2)
-blastbox-rea-sweep:fa7eb15    Dockerfile.stack-worker ENGINE_CLASS=ReaSweepEngine        84ddcfd3f453
-blastbox-rea-agent:fa7eb15    Dockerfile.stack-worker ENGINE_CLASS=ReaAgentEngine        5ca4dcd738b8
+blastbox-rea:dev              Dockerfile.rea-cold-worker @ feat/rea-engine 80308c5      145bcbd61123 (prev: blastbox-rea:dev-d0e82b8 @ d0e82b8)
+blastbox-rea-sweep:or2        Dockerfile.stack-worker ENGINE_CLASS=ReaSweepEngine        3ca526ecad09
+blastbox-rea-agent:or2        Dockerfile.stack-worker ENGINE_CLASS=ReaAgentEngine        1b80e0eaac97
+                              (both with the OpenRouter build args, see "Hosted model")
 blastbox-rea-host:0def6b2     Dockerfile.host @ deploy/rea-toolz2 0def6b2                8f6eab0bb0eb
 rea-model-proxy               kalaksi/tinyproxy@sha256:fafafc7079ca29c6704564de1353f61d038f2166f09b01d4e460e8e499bf6b57 (tinyproxy 1.11.3)
 ```
@@ -61,11 +62,13 @@ fbbbaaf, merge commit 0def6b2). It is not pushed. The host image needs it for th
 # worker (context = repo root at feat/rea-engine)
 docker tag blastbox-rea:dev blastbox-rea:dev-prev
 docker build -f deploy/docker/Dockerfile.rea-cold-worker -t blastbox-rea:dev .
+# toolz2 runs the hosted model: add the three OpenRouter --build-arg lines from "Hosted model"
+# to both stack-worker builds below.
 # A digest BASE_IMAGE for a freshly built local image failed to resolve on toolz2 (buildkit tried
 # docker.io). After checking that blastbox-rea:dev has the pinned id, pass the tag instead:
-docker build -f deploy/rea/Dockerfile.stack-worker -t blastbox-rea-sweep:fa7eb15 --build-arg BASE_IMAGE=blastbox-rea:dev \
+docker build -f deploy/rea/Dockerfile.stack-worker -t blastbox-rea-sweep:or2 --build-arg BASE_IMAGE=blastbox-rea:dev \
   --build-arg ENGINE_CLASS=blastbox.engines.rea:ReaSweepEngine --build-arg ENGINE_NAME=rea .
-docker build -f deploy/rea/Dockerfile.stack-worker -t blastbox-rea-agent:fa7eb15 --build-arg BASE_IMAGE=blastbox-rea:dev \
+docker build -f deploy/rea/Dockerfile.stack-worker -t blastbox-rea-agent:or2 --build-arg BASE_IMAGE=blastbox-rea:dev \
   --build-arg ENGINE_CLASS=blastbox.engines.rea:ReaAgentEngine --build-arg ENGINE_NAME=rea-agent .
 # host (context = repo root at deploy/rea-toolz2)
 docker build -f deploy/rea/Dockerfile.host -t blastbox-rea-host:0def6b2 .
