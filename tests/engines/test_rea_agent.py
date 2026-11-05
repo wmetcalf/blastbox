@@ -1135,6 +1135,36 @@ def test_ioc_shape_is_checked_before_the_byte_search(tmp_path):
     assert got["45.33.2.17"] == (True, "")  # a real, well-formed IP literal in the sample stays verifiable
 
 
+@pytest.mark.parametrize("typ,value,ok", [
+    # in-binary forms a real worm used (live 2026-11-04), all refused as "shape" before
+    ("registry", "Software\\Microsoft\\Windows\\CurrentVersion\\Run\\", True),
+    ("registry", "SYSTEM\\CurrentControlSet\\Services\\x", True),
+    ("registry", "HKLM\\Software\\x", True),
+    ("path", "%APPDATA%\\winsec.exe", True),
+    ("path", "%s\\tbtnds.dat", True),
+    ("path", "sysdreblov.exe", True),
+    ("path", "/etc/rc.local", True),
+    ("path", "C:\\Users\\x\\a.pdb", True),
+    ("mutex", "6464834774", True),
+    ("mutex", "Global\\abc", True),
+    # still not the kind of thing the type claims
+    ("registry", "Wavesoft", False),
+    ("registry", "X-CAB-Key: b244f0p", False),
+    ("path", "Wavesoft", False),
+    ("path", "%APPDATA%", False),
+    ("path", ".png", False),
+    ("path", "1.0.0.0", False),
+    ("path", "a b", False),
+    ("mutex", "Rich", False),
+    ("mutex", "Windows Settings", False),
+    ("path", "C:\\x\n\\y.exe", False),
+    ("domain", "cabagent/1.0", False),
+])
+def test_ioc_shape_accepts_host_artifacts_in_their_in_binary_form(typ, value, ok):
+    from blastbox.engines.rea.agent import ioc_shape_ok
+    assert ioc_shape_ok(typ, value) is ok
+
+
 def test_ioc_reasons(tmp_path):
     cont = make_continuation(tmp_path)
     model = FakeModel([_final(iocs=[

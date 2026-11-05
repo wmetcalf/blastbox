@@ -503,13 +503,39 @@ class _Evidence:
                     dest.add(a)
 
 
+# Host-artifact shapes as they sit in a binary, which iocs.py's free-text rules (built to find
+# IOCs in arbitrary strings, so hive-, drive- or Global\-anchored) reject: RegOpenKeyEx takes
+# the hive as a handle, so the string is "Software\...\Run"; paths are "%APPDATA%\x.exe",
+# "%s\cmds.dat", "/etc/rc.local" or a bare "dropper.exe"; a mutex is any name. Live 2026-11-04 every such IOC
+# from a real worm was refused as "shape" before the byte check. The byte check is the gate:
+# these only say the value is the kind of thing its type claims.
+_CTRL = re.compile(r"[\x00-\x1f\x7f]")
+_REG_RELATIVE = re.compile(r"(?:software|system|control panel|environment)\\\S", re.I)
+_FILE_NAME = re.compile(r"[\w.$~{}-]+\.[A-Za-z][A-Za-z0-9]{1,3}")
+_MUTEX_NAME = re.compile(r"[\w.{}#@$!-]{6,128}")
+_POSIX_PATH = re.compile(r"/[^\s/]+(?:/[^\s/]*)*")
+
+
 def ioc_shape_ok(typ: str, value: str) -> bool:
     """Ruling V: ``value`` alone must be exactly one IOC of ``typ`` under iocs.py's own rules.
 
     ``extract_iocs`` on the bare value must report this very ``(type, value)``, so "Rich" is no
-    mutex, ".dll" no domain (a dot plus an allowlisted TLD is required), "This" no URL.
+    mutex, ".dll" no domain (a dot plus an allowlisted TLD is required), "This" no URL. A
+    registry key, path or mutex may instead take its in-binary form (``_REG_RELATIVE``; a path
+    with a backslash, an absolute POSIX path or a bare file name; ``_MUTEX_NAME``); none may hold a control character.
     """
-    return any(i.type == typ and i.value == value for i in extract_iocs([("shape", value)], limit=16))
+    if any(i.type == typ and i.value == value for i in extract_iocs([("shape", value)], limit=16)):
+        return True
+    if _CTRL.search(value):
+        return False
+    if typ == "registry":
+        return _REG_RELATIVE.match(value) is not None
+    if typ == "path":
+        return ("\\" in value.strip("\\") or _POSIX_PATH.fullmatch(value) is not None
+                or _FILE_NAME.fullmatch(value) is not None)
+    if typ == "mutex":
+        return _MUTEX_NAME.fullmatch(value) is not None
+    return False
 
 
 def verify_iocs_in_sample(sample: Path, iocs: list[tuple[str, str]], time_left: Callable[[], float], *,
