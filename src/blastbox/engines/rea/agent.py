@@ -31,8 +31,8 @@ dir in ``BLASTBOX_WORK_DIR``:
    a skipped / failed / invalid report (``report_skipped_deadline`` / ``report_failed`` /
    ``report_invalid``) leaves the rest of the pass unchanged;
 8. the deepening bar (``sufficiency.py``, ``_deepen``): an accepted pass with the report call on is
-   checked against evidence the engine can verify (verdict strength, observed behaviour, IOCs found
-   in the sample, dropped claims, capa leads the report left not analysed). Another pass follows
+   checked against evidence the engine can verify (verdict strength, observed behaviour, capa
+   leads the report left not analysed). Another pass follows
    only while the bar is unmet, the pass added a fact the chain did not have (else ``stalled``) and
    ``REA_MAX_PASSES`` (4) is not reached; the model's ``done`` flag is recorded but decides
    nothing. The gaps go to the next pass (``State.gaps``, ``open_gaps`` in its first message) and
@@ -60,7 +60,7 @@ the model is cut to ``TOOL_RESULT_CHARS`` (head + tail around a truncation marke
 ``iocs`` (columns ``type``/``value``/``source``/``verified``/``reason``), ``summary``,
 ``todo_count``, ``explored_count``, ``done``, ``more_pending``; when the bar was applied,
 ``bar_met`` (bool), ``gaps`` (gap codes: ``no_report``, ``verdict_unknown``, ``verdict_low``,
-``no_behaviour``, ``iocs_unverified``, ``claims_dropped``, ``lead:<section>``) and ``stop_reason``
+``no_behaviour``, ``lead:<section>``) and ``stop_reason``
 (``bar_met``/``stalled``/``pass_cap``, ``""`` while the chain continues); and, only when this pass wrote a
 valid report, ``analysis_report``: the ``rea.analysis/1`` object as compact JSON text (a Record
 cannot hold lists of objects), at most ``MAX_REPORT_JSON`` chars:
@@ -567,6 +567,55 @@ def ioc_shape_ok(typ: str, value: str) -> bool:
     return False
 
 
+# DeepSeek drops or garbles backslashes when it copies a Windows path into its answer (live
+# 2026-11-05: "C:2 Usersdevsource..." for C:\Users\dev\source..., "SoftwareMicrosoftWindows..."),
+# and the IOC fails its shape check. A host-artifact IOC whose letters-only form equals exactly one
+# string a tool returned this pass takes that string. The byte check still decides: a snapped
+# value is verified only if it occurs in the sample.
+SNAP_TYPES = frozenset({"path", "registry", "mutex"})
+MIN_SNAP_KEY = 10
+MAX_SNAP_LEAVES = 200_000
+_NOT_LETTER = re.compile(r"[^a-z]")
+
+
+def _snap_key(value: str) -> str:
+    return _NOT_LETTER.sub("", value.lower())
+
+
+def snap_iocs(iocs: list[dict[str, Any]], texts: list[str]) -> int:
+    """Replace each mangled host-artifact IOC value with the tool-result string it matches.
+
+    Matching is on :func:`_snap_key` (letters only, case-folded), at least ``MIN_SNAP_KEY``
+    letters, against the string leaves of the tool results' ``normalized_result``. Only a unique
+    match is taken.
+    Returns how many values changed.
+    """
+    wanted = {_snap_key(i["value"]) for i in iocs if i["type"] in SNAP_TYPES}
+    wanted = {k for k in wanted if len(k) >= MIN_SNAP_KEY}
+    if not wanted:
+        return 0
+    found: dict[str, set[str]] = {}
+    seen = 0
+    for text in texts:
+        obj = _parse_json(text)
+        # normalized_result only: a search tool echoes the model's own (mangled) query beside it.
+        body = obj.get("normalized_result") if isinstance(obj, dict) else None
+        for leaf in _string_leaves(body) if body is not None else ():
+            seen += 1
+            if seen > MAX_SNAP_LEAVES:
+                break
+            leaf = leaf.strip()
+            if MIN_IOC_CHARS <= len(leaf) <= MAX_IOC_VALUE and (k := _snap_key(leaf)) in wanted:
+                found.setdefault(k, set()).add(leaf)
+    changed = 0
+    for i in iocs:
+        hits = found.get(_snap_key(i["value"])) if i["type"] in SNAP_TYPES else None
+        if hits is not None and len(hits) == 1 and i["value"] not in hits:
+            i["value"] = next(iter(hits))
+            changed += 1
+    return changed
+
+
 def verify_iocs_in_sample(sample: Path, iocs: list[tuple[str, str]], time_left: Callable[[], float], *,
                           chunk_size: int = VERIFY_CHUNK) -> tuple[list[bool], bool]:
     """Ruling R/W: which IOC values occur in the sample's own bytes; (found flags, ran out of time).
@@ -661,7 +710,6 @@ class _Pass:
     model_tokens: int = 0  # completion tokens of the calls that reported usage ...
     model_seconds: float = 0.0  # ... and the seconds those calls took (the measured rate)
     accepted: bool = False  # _accept finished: functions/iocs/summary are one consistent answer
-    claims_dropped: int = 0  # function claims _accept dropped (uncitable address)
     # The deepening bar (sufficiency.py), set only when an accepted pass was assessed.
     assessed: bool = False
     bar_met: bool = False
@@ -1337,10 +1385,10 @@ class ReaAgentEngine:
                 continue
             fn["evidence"] = _dedup([e for e in fn["evidence"] if e in ev.results])
             p.functions.append(fn)
-        p.claims_dropped = dropped
         if dropped:
             p.warnings.append(Warning(code="claims_dropped",
                                       message=f"{dropped} function claim(s) cited an address no tool result contained"))
+        snapped = snap_iocs(answer.iocs, list(ev.results.values()))
         seen: set[tuple[str, str]] = set()
         unique = []
         for ioc in answer.iocs:
@@ -1393,7 +1441,8 @@ class ReaAgentEngine:
         p.done = answer.done
         p.accepted = True
         tw.write({"event": "final", "summary": p.summary[:TRANSCRIPT_TEXT], "functions": p.functions,
-                  "iocs": p.iocs, "todo": p.todo, "done": p.done, "claims_dropped": dropped})
+                  "iocs": p.iocs, "todo": p.todo, "done": p.done, "claims_dropped": dropped,
+                  "iocs_snapped": snapped})
 
     @staticmethod
     def _deepen(p: _Pass, state: State, tw: TranscriptWriter) -> list[str]:
@@ -1403,8 +1452,7 @@ class ReaAgentEngine:
         front of the todo list. The model's ``done`` flag is recorded but decides nothing.
         """
         report = p.report if p.report is not None else p.prior_report
-        suff = assess(report=report, functions_kept=len(p.functions), claims_dropped=p.claims_dropped,
-                      iocs=p.iocs, sweep=p.sweep, explored=p.explored)
+        suff = assess(report=report, sweep=p.sweep, explored=p.explored)
         known = set(state.facts)
         new = [f for f in _dedup(facts_of(report, p.functions, p.iocs)) if f not in known]
         max_passes = _env_int("REA_MAX_PASSES", DEFAULT_MAX_PASSES, 1, MAX_STEPS_CEILING)

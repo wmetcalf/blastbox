@@ -17,15 +17,13 @@ def _ioc(v, ok):
 
 
 def _codes(**kw):
-    base = {"report": _rep(), "functions_kept": 1, "claims_dropped": 0, "iocs": [], "sweep": {},
-            "explored": []}
+    base = {"report": _rep(), "sweep": {}, "explored": []}
     base.update(kw)
     return [g.code for g in assess(**base).gaps]
 
 
 def test_a_confident_report_with_observed_behaviour_meets_the_bar():
-    s = assess(report=_rep(), functions_kept=3, claims_dropped=0, iocs=[_ioc("a.example", True)], sweep={},
-               explored=[])
+    s = assess(report=_rep(), sweep={}, explored=[])
     assert s.met and s.gaps == []
 
 
@@ -41,17 +39,6 @@ def test_no_observed_behaviour_is_a_gap_even_with_an_observed_overview():
     assert _codes(report=_rep(execution_flow="not_observed", network="observed")) == []
 
 
-def test_ioc_precision_needs_enough_iocs_to_judge():
-    assert _codes(iocs=[_ioc(f"{i}.example", i == 0) for i in range(4)]) == ["iocs_unverified"]
-    assert _codes(iocs=[_ioc(f"{i}.example", i < 2) for i in range(4)]) == []
-    assert _codes(iocs=[_ioc(f"{i}.example", False) for i in range(3)]) == []
-
-
-def test_claims_dropped_only_when_they_outnumber_the_kept_ones():
-    assert _codes(functions_kept=1, claims_dropped=2) == ["claims_dropped"]
-    assert _codes(functions_kept=2, claims_dropped=2) == []
-
-
 def test_capa_leads_point_at_sections_left_not_analysed():
     caps = [
         {"rule": "connect TCP", "namespace": "communication/socket/tcp", "attack": ["T1071"],
@@ -63,8 +50,7 @@ def test_capa_leads_point_at_sections_left_not_analysed():
         {"rule": "contain loop", "namespace": "internal", "attack": ["T0000"], "functions": ["0x50"]},
         "junk",
     ]
-    s = assess(report=_rep(), functions_kept=1, claims_dropped=0, iocs=[], sweep={"capabilities": caps},
-               explored=["0x20"])
+    s = assess(report=_rep(), sweep={"capabilities": caps}, explored=["0x20"])
     assert [g.code for g in s.gaps] == ["lead:network"]
     g = s.gaps[0]
     assert g.targets == ["0x10", "0x30"]  # explored and token entries left out, each once

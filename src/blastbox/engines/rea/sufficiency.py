@@ -7,12 +7,14 @@ verify itself, and lists what is still missing (``gaps``):
 - ``no_report``: no valid ``rea.analysis/1`` report exists yet;
 - ``verdict_unknown`` / ``verdict_low``: the verdict is ``unknown``, or its confidence is ``low``;
 - ``no_behaviour``: no behaviour section (``BEHAVIOUR_KEYS``) is ``observed``;
-- ``iocs_unverified``: at least ``MIN_IOCS_FOR_RATIO`` IOCs were proposed and fewer than
-  ``MIN_VERIFIED_RATIO`` of them occur in the sample's bytes;
-- ``claims_dropped``: more function claims were dropped (uncitable address) than kept;
 - ``lead:<section>``: a capa rule with an ATT&CK id points at a report section
   (``LEAD_SECTIONS``) that the report left ``not_analysed``. Its unexplored functions are the
   gap's ``targets``, which go to the front of the next pass's todo list.
+
+IOC precision and dropped claims are not gaps: they measure the model's care, not what is left
+to analyse, and live they did not improve with another pass (a DLL's pass 2 verified 0 of 6
+IOCs) while a pass could clear them by proposing nothing. Both stay visible in the payload (IOC
+``verified`` column, the ``claims_dropped`` warning).
 
 The bar is met when there are no gaps. Otherwise the chain continues unless a stop rule fires:
 ``stalled`` (a later pass added no fact the chain did not already have) or ``pass_cap``
@@ -29,8 +31,6 @@ from typing import Any
 
 __all__ = ["BEHAVIOUR_KEYS", "LEAD_SECTIONS", "Gap", "Sufficiency", "assess", "facts_of"]
 
-MIN_IOCS_FOR_RATIO = 4
-MIN_VERIFIED_RATIO = 0.5
 MAX_TARGETS = 16  # per lead gap
 MAX_GAPS = 16
 MAX_FACTS = 4096
@@ -89,8 +89,7 @@ def facts_of(report: dict[str, Any] | None, functions: list[dict[str, Any]],
     return out
 
 
-def assess(*, report: dict[str, Any] | None, functions_kept: int, claims_dropped: int,
-           iocs: list[dict[str, Any]], sweep: dict[str, Any], explored: list[str]) -> Sufficiency:
+def assess(*, report: dict[str, Any] | None, sweep: dict[str, Any], explored: list[str]) -> Sufficiency:
     gaps: list[Gap] = []
     if not isinstance(report, dict):
         gaps.append(Gap("no_report", "no valid analysis report has been written yet"))
@@ -107,14 +106,6 @@ def assess(*, report: dict[str, Any] | None, functions_kept: int, claims_dropped
         statuses = _statuses(report)
         if not any(statuses.get(k) == "observed" for k in BEHAVIOUR_KEYS):
             gaps.append(Gap("no_behaviour", "no behaviour section is backed by observed evidence"))
-    proposed = len(iocs)
-    verified = sum(1 for i in iocs if i.get("verified"))
-    if proposed >= MIN_IOCS_FOR_RATIO and verified < MIN_VERIFIED_RATIO * proposed:
-        gaps.append(Gap("iocs_unverified", f"only {verified} of {proposed} proposed IOCs occur in the "
-                                           "sample's bytes: report only values read from the sample"))
-    if claims_dropped > functions_kept:
-        gaps.append(Gap("claims_dropped", f"{claims_dropped} function claims cited addresses no tool "
-                                          "result contained"))
     if isinstance(report, dict):
         done = set(explored)
         leads: dict[str, Gap] = {}

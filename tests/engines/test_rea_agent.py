@@ -2055,3 +2055,44 @@ def _restate(tmp_path, out):
     dest.write_bytes((out / "continuation.tar.gz").read_bytes())
     (tmp_path / "p2").mkdir(exist_ok=True)
     return dest
+
+
+# ---------------------------------------------------------------- IOC snapping
+def _nr(*strings):
+    return json.dumps({"parameters": {"pattern": "SoftwareMicrosoftWindowsRun"},
+                       "normalized_result": [{"address": "0x1", "value": s} for s in strings]})
+
+
+def test_snap_restores_a_backslash_mangled_host_artifact():
+    real = "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+    iocs = [{"type": "registry", "value": "Software2 Microsoft2 Windows2 CurrentVersion2 Run"},
+            {"type": "path", "value": "C:Usersdevx64Releasea.pdb"},
+            {"type": "domain", "value": "softwaremicrosoftwindowscurrentversionrun.example"},
+            {"type": "mutex", "value": "Short-1"}]
+    n = ag.snap_iocs(iocs, [_nr(real, "C:\\Users\\dev\\x64\\Release\\a.pdb", "Short_1"), "not json"])
+    assert n == 2
+    assert [i["value"] for i in iocs] == [real, "C:\\Users\\dev\\x64\\Release\\a.pdb",
+                                          "softwaremicrosoftwindowscurrentversionrun.example", "Short-1"]
+
+
+def test_snap_takes_only_a_unique_match_from_the_results_not_the_echoed_query():
+    iocs = [{"type": "registry", "value": "SoftwareMicrosoftWindowsRun"}]
+    # The echoed query sits outside normalized_result; two distinct matches inside are ambiguous.
+    assert ag.snap_iocs(iocs, [_nr()]) == 0
+    assert ag.snap_iocs(iocs, [_nr("Software\\Microsoft\\Windows\\Run", "Software/Microsoft/Windows/Run")]) == 0
+    assert iocs[0]["value"] == "SoftwareMicrosoftWindowsRun"
+
+
+def test_a_snapped_ioc_is_verified_from_the_sample_bytes(tmp_path):
+    cont = make_continuation(tmp_path, todo=["0x140001420"])
+    rig = McpRig(tmp_path, {"list_strings": {"text": _nr("HKLM\\Software\\Evil\\Run",
+                                                          "HKLM\\Software\\Gone\\RunOnce")}})
+    model = FakeModel([tc(("list_strings", {}, "a")),
+                       answer({"summary": "s", "functions": [], "todo": [], "done": True,
+                               "iocs": [{"type": "registry", "value": "HKLMSoftwareEvilRun", "source": "a"},
+                                        {"type": "registry", "value": "HKLM Software Gone RunOnce", "source": "a"}]})])
+    res, _ = run(tmp_path, cont, model, rig)
+    io = cols(res.payload, "iocs")
+    # Both snap; only the one in the sample's bytes is verified.
+    assert io["value"] == ["HKLM\\Software\\Evil\\Run", "HKLM\\Software\\Gone\\RunOnce"]
+    assert io["verified"] == [True, False] and io["reason"] == ["", "not_in_sample"]
