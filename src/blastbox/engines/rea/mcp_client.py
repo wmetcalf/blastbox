@@ -2,7 +2,7 @@
 
 Only what the rea-agent engine needs: ``initialize``, ``tools/list`` and ``tools/call``, one
 request in flight at a time. Every response line is capped while reading (``max_response``,
-1 MiB by default; ``tools/list`` gets a larger cap because REA's catalog with output schemas
+8 MiB by default; ``tools/list`` gets a larger cap because REA's catalog with output schemas
 is ~3.9 MB). An oversized line is drained and dropped, and the waiting call fails with
 ``response_too_large``; the session stays usable. Requests from the server are answered with
 "method not found"; notifications are ignored. stderr is discarded. The child runs in its
@@ -22,8 +22,10 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import IO, Any
 
-MAX_RESPONSE = 1024 * 1024
-MAX_LIST_RESPONSE = 8 * 1024 * 1024
+# list_procedures(detail=complete) over a 2167-function Go binary is ~500 KB of text; its response
+# line passed 1 MiB live (2026-11-05), was dropped, and left the agent's todo seed empty.
+MAX_RESPONSE = 8 * 1024 * 1024
+MAX_LIST_RESPONSE = 16 * 1024 * 1024
 MAX_LIST_PAGES = 16
 PROTOCOL_VERSION = "2025-06-18"
 _QUEUE_DEPTH = 64

@@ -30,7 +30,15 @@ dir in ``BLASTBOX_WORK_DIR``:
    drops evidence addresses the analysis never saw and downgrades a section left without evidence;
    a skipped / failed / invalid report (``report_skipped_deadline`` / ``report_failed`` /
    ``report_invalid``) leaves the rest of the pass unchanged;
-8. the next continuation (same project, updated ``State``) and a capped JSONL transcript are
+8. the deepening bar (``sufficiency.py``, ``_deepen``): an accepted pass with the report call on is
+   checked against evidence the engine can verify (verdict strength, observed behaviour, IOCs found
+   in the sample, dropped claims, capa leads the report left not analysed). Another pass follows
+   only while the bar is unmet, the pass added a fact the chain did not have (else ``stalled``) and
+   ``REA_MAX_PASSES`` (4) is not reached; the model's ``done`` flag is recorded but decides
+   nothing. The gaps go to the next pass (``State.gaps``, ``open_gaps`` in its first message) and
+   their capa target functions to the front of its todo list. With the report call off, ``done``
+   and the todo list decide as before;
+9. the next continuation (same project, updated ``State``) and a capped JSONL transcript are
    declared, and a ``rea.pass/1`` Record is sealed. The continuation is packed only when another
    pass can follow (``more_pending``); a final pass seals the transcript alone.
 
@@ -50,7 +58,10 @@ the model is cut to ``TOOL_RESULT_CHARS`` (head + tail around a truncation marke
 ``rea.pass/1`` payload fields: ``schema``, ``pass_no``, ``model``, ``model_status``, ``steps``,
 ``refused_calls``, ``tool_calls``, ``functions`` (columns ``address``/``name``/``claim``/``evidence``),
 ``iocs`` (columns ``type``/``value``/``source``/``verified``/``reason``), ``summary``,
-``todo_count``, ``explored_count``, ``done``, ``more_pending`` and, only when this pass wrote a
+``todo_count``, ``explored_count``, ``done``, ``more_pending``; when the bar was applied,
+``bar_met`` (bool), ``gaps`` (gap codes: ``no_report``, ``verdict_unknown``, ``verdict_low``,
+``no_behaviour``, ``iocs_unverified``, ``claims_dropped``, ``lead:<section>``) and ``stop_reason``
+(``bar_met``/``stalled``/``pass_cap``, ``""`` while the chain continues); and, only when this pass wrote a
 valid report, ``analysis_report``: the ``rea.analysis/1`` object as compact JSON text (a Record
 cannot hold lists of objects), at most ``MAX_REPORT_JSON`` chars:
 
@@ -103,6 +114,7 @@ from blastbox.engines.rea.policy import ADDRESS_RE, TOOL_ALLOWLIST, CallRefused,
 from blastbox.engines.rea.prompts import IOC_TYPES, Framer, final_response_format, report_response_format
 from blastbox.engines.rea.report import ReportInvalid, complete_sections, report_addresses, validate_report
 from blastbox.engines.rea.runner import rea_env, run_ghidra_analysis
+from blastbox.engines.rea.sufficiency import MAX_FACTS, assess, facts_of
 from blastbox.engines.rea.sweep import _env_seconds, _sha256, _string_leaves
 from blastbox.limits import Limits
 from blastbox.worker.engine import DetonationResult
@@ -116,6 +128,7 @@ SCHEMA = "rea.pass/1"
 DEFAULT_MODEL_ID = "deepseek-v4-flash"
 DEFAULT_PASS_WALL_S = 540.0
 DEFAULT_MAX_STEPS = 16  # Ruling O; 12 -> 16 in G3 (the bounded final answer freed the time)
+DEFAULT_MAX_PASSES = 4  # REA_MAX_PASSES: the deepening bar's own pass cap (Loadout's chain cap also applies)
 DEFAULT_MAX_TOKENS = 4096  # the final answer
 DEFAULT_TURN_MAX_TOKENS = 2048  # each tool-choice turn
 DEFAULT_TOKENS_PER_S = 30.0  # sizes the final-answer reserve (deepseek-v4-flash on vLLM, 1 sequence)
@@ -163,6 +176,19 @@ MIN_RETRY_TOKENS = 512  # a final-answer retry shorter than this cannot hold a u
 _MAIN_NAMES = ("main", "wmain", "_main", "WinMain", "wWinMain", "DllMain", "DllEntryPoint", "_start",
                "start", "entry")
 _NAMED_SOURCES = frozenset({"imported", "user_defined", "user-defined", "user"})
+
+
+def go_user_function(name: str) -> bool:
+    """A Go function of the program's own packages, as Ghidra names it (``pkg::pkg.Func``).
+
+    ``main`` is the program; an import path whose first element holds a dot (``github.com/...``)
+    is a third-party module. Everything else is the standard library or the runtime. Compiler
+    generated type helpers (``type:.eq.``) are not user code.
+    """
+    ns, sep, rest = name.partition("::")
+    if not sep or rest.startswith("type:"):
+        return False
+    return ns == "main" or "." in ns.split("/", 1)[0]
 # Ruling S: a citable address is 0x-prefixed hex in a content tool's normalized_result.
 _ADDR_TOKEN = re.compile(r"(?<![0-9A-Za-z])0x([0-9a-fA-F]{1,16})(?![0-9A-Za-z])")
 # Anything address-like the model typed (with or without 0x), anywhere in its arguments.
@@ -635,6 +661,12 @@ class _Pass:
     model_tokens: int = 0  # completion tokens of the calls that reported usage ...
     model_seconds: float = 0.0  # ... and the seconds those calls took (the measured rate)
     accepted: bool = False  # _accept finished: functions/iocs/summary are one consistent answer
+    claims_dropped: int = 0  # function claims _accept dropped (uncitable address)
+    # The deepening bar (sufficiency.py), set only when an accepted pass was assessed.
+    assessed: bool = False
+    bar_met: bool = False
+    gaps: list[dict[str, str]] = field(default_factory=list)
+    stop_reason: str = ""  # bar_met | stalled | pass_cap; "" when the chain continues
     warnings: list[Warning] = field(default_factory=list)
 
 
@@ -745,6 +777,12 @@ class ReaAgentEngine:
             # else: the final answer was fully accepted before the failure (e.g. MCP close):
             # it is sealed as the ok pass it is.
 
+        facts = list(state.facts)
+        if p.model_status == "ok" and p.accepted and p.report_tokens > 0:
+            # With the report call off (REA_REPORT_MAX_TOKENS=0) there is no verdict to measure,
+            # and the model's done flag decides as before.
+            facts = self._deepen(p, state, tw)
+
         # 7. continuation, transcript, payload
         next_state = State(
             pass_no=p.pass_no,
@@ -759,9 +797,13 @@ class ReaAgentEngine:
             # Pass N+1 rewrites the latest valid report, this pass's or the one it was given.
             analysis_report=p.report if p.report is not None else p.prior_report,
             sweep=p.sweep,
+            facts=facts,
+            gaps=p.gaps if p.assessed else list(state.gaps),
         )
         transcript_reserve = min(MAX_TRANSCRIPT_BYTES, limits.max_artifact_bytes)
-        if p.model_status == "ok":
+        if p.model_status == "ok" and p.assessed:
+            more = not p.stop_reason
+        elif p.model_status == "ok":
             more = (not p.done) and bool(p.todo)
         elif p.model_status == "budget":
             more = True
@@ -884,8 +926,9 @@ class ReaAgentEngine:
               remaining: Callable[[], float], capa_functions: list[str] | None = None) -> list[dict[str, str]]:
         """Todo seed from ``procedure_info(entry)`` + ``list_procedures(detail=complete)``.
 
-        Order: the entry point, well-known main names, functions capa matched (``capa_functions``,
-        in the sweep's rule order; only those that are procedure entries here), functions named by
+        Order: the entry point, well-known main names (and Go's ``main.main``), functions capa
+        matched (``capa_functions``, in the sweep's rule order; only those that are procedure entries
+        here), the Go program's own functions (:func:`go_user_function`), functions named by
         the binary's own symbols (exports / symbol table, ``symbol.source == imported``), then the
         rest by address. Externals and thunks are skipped. At most ``SEED_TODO`` entries.
         """
@@ -907,7 +950,7 @@ class ReaAgentEngine:
         if not err:
             obj = _parse_json(list_text)
             rows = obj.get("normalized_result", obj) if isinstance(obj, dict) else obj
-        main, named, rest = [], [], []
+        main, go_main, go_user, named, rest = [], [], [], [], []
         by_addr: dict[str, dict[str, str]] = {}
         for row in rows if isinstance(rows, list) else []:
             if not isinstance(row, dict):
@@ -922,6 +965,10 @@ class ReaAgentEngine:
             by_addr.setdefault(a, entry)
             if entry["name"] in _MAIN_NAMES:
                 main.append(entry)
+            elif entry["name"] == "main::main.main":
+                go_main.append(entry)
+            elif go_user_function(entry["name"]):
+                go_user.append(entry)
             elif sym.get("source") in _NAMED_SOURCES:
                 named.append(entry)
             else:
@@ -930,7 +977,9 @@ class ReaAgentEngine:
         rest.sort(key=lambda e: int(e["address"], 16))
         matched = [by_addr[a] for a in (norm_addr(x) for x in capa_functions or []) if a in by_addr]
         seen = {s["address"] for s in seeds}
-        for e in main + matched + named + rest:
+        # Go: the runtime and standard library are most of the symbols (1347 of 2167 runtime.* in
+        # one live sample); the program's own packages come right after the entry points.
+        for e in main + go_main + matched + go_user + named + rest:
             if len(seeds) >= SEED_TODO:
                 break
             if e["address"] not in seen:
@@ -1288,6 +1337,7 @@ class ReaAgentEngine:
                 continue
             fn["evidence"] = _dedup([e for e in fn["evidence"] if e in ev.results])
             p.functions.append(fn)
+        p.claims_dropped = dropped
         if dropped:
             p.warnings.append(Warning(code="claims_dropped",
                                       message=f"{dropped} function claim(s) cited an address no tool result contained"))
@@ -1346,6 +1396,38 @@ class ReaAgentEngine:
                   "iocs": p.iocs, "todo": p.todo, "done": p.done, "claims_dropped": dropped})
 
     @staticmethod
+    def _deepen(p: _Pass, state: State, tw: TranscriptWriter) -> list[str]:
+        """Apply the deepening bar to an accepted pass; returns the chain's facts so far.
+
+        Sets ``p.bar_met``/``p.gaps``/``p.stop_reason`` and puts the gaps' target functions at the
+        front of the todo list. The model's ``done`` flag is recorded but decides nothing.
+        """
+        report = p.report if p.report is not None else p.prior_report
+        suff = assess(report=report, functions_kept=len(p.functions), claims_dropped=p.claims_dropped,
+                      iocs=p.iocs, sweep=p.sweep, explored=p.explored)
+        known = set(state.facts)
+        new = [f for f in _dedup(facts_of(report, p.functions, p.iocs)) if f not in known]
+        max_passes = _env_int("REA_MAX_PASSES", DEFAULT_MAX_PASSES, 1, MAX_STEPS_CEILING)
+        done = set(p.explored)
+        targets = [t for g in suff.gaps for t in g.targets if t not in done]
+        todo = _dedup(targets + p.todo)[:MAX_TODO]
+        if suff.met:
+            stop = "bar_met"
+        elif p.pass_no >= 2 and not new:
+            stop = "stalled"
+        elif p.pass_no >= max_passes:
+            stop = "pass_cap"
+        else:  # an open gap is work even with an empty todo list: stalled ends a pass that finds nothing
+            stop = ""
+        if not stop:
+            p.todo = todo
+        p.assessed, p.bar_met, p.stop_reason = True, suff.met, stop
+        p.gaps = [{"code": g.code, "detail": g.detail} for g in suff.gaps]
+        tw.write({"event": "deepen", "bar_met": suff.met, "gaps": p.gaps, "targets": targets,
+                  "new_facts": len(new), "stop_reason": stop, "model_done": p.done})
+        return (state.facts + new)[-MAX_FACTS:]
+
+    @staticmethod
     def _continuation(outdir: Path, sample: Path, project: Path | None, state: State, limits: Limits,
                       transcript_reserve: int, p: _Pass) -> Path | None:
         dest = outdir / "continuation.tar.gz"
@@ -1373,6 +1455,8 @@ class ReaAgentEngine:
 
         def build() -> Record:
             extra: dict[str, Any] = {"analysis_report": report} if report is not None else {}
+            deepen: dict[str, Any] = ({"bar_met": p.bar_met, "gaps": [g["code"] for g in p.gaps],
+                                       "stop_reason": p.stop_reason} if p.assessed else {})
             return Record(fields={
                 "schema": SCHEMA,
                 "pass_no": p.pass_no,
@@ -1401,6 +1485,7 @@ class ReaAgentEngine:
                 "explored_count": len(p.explored),
                 "done": p.done,
                 "more_pending": more_pending,
+                **deepen,
                 **extra,
             })
 

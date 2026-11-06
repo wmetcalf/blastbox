@@ -22,7 +22,8 @@ from blastbox.engines.rea import ReaAgentEngine
 from blastbox.engines.rea import agent as ag
 from blastbox.engines.rea import policy, prompts
 from blastbox.engines.rea.continuation import State, pack, unpack
-from blastbox.engines.rea.mcp_client import McpError, McpStdioClient
+from blastbox.engines.rea.mcp_client import MAX_RESPONSE, McpError, McpStdioClient
+from blastbox.engines.rea.sufficiency import Gap, Sufficiency
 from blastbox.engines.rea.model import MAX_RESPONSE_BYTES, ModelClient, ModelError
 from blastbox.limits import Limits
 
@@ -53,7 +54,7 @@ def _env(tmp_path, monkeypatch):
     monkeypatch.setenv("REA_BIN", REA_BIN)
     monkeypatch.setenv("REA_MODEL_URL", "http://model.invalid:8888/v1")
     monkeypatch.setenv("REA_MODEL_ID", "deepseek-v4-flash")
-    for k in ("REA_PASS_WALL_S", "REA_MAX_STEPS", "REA_MAX_COMPLETION_TOKENS", "REA_RESERVE_TOKENS"):
+    for k in ("REA_PASS_WALL_S", "REA_MAX_STEPS", "REA_MAX_COMPLETION_TOKENS", "REA_RESERVE_TOKENS", "REA_MAX_PASSES"):
         monkeypatch.delenv(k, raising=False)
     # The analysis-report call (G3) is off unless a test turns it on: the scripted models below
     # end at the final answer.
@@ -308,7 +309,7 @@ def test_mcp_client_lists_and_calls(tmp_path):
 
 
 def test_mcp_client_caps_each_response_and_recovers(tmp_path):
-    rig, c = _client(tmp_path, {"read_bytes": {"huge": 2 * 1024 * 1024}})
+    rig, c = _client(tmp_path, {"read_bytes": {"huge": MAX_RESPONSE + 1024 * 1024}})
     try:
         with pytest.raises(McpError) as ei:
             c.call("read_bytes", {"address": "0x1"}, timeout_s=10)
@@ -526,7 +527,8 @@ def test_happy_path(tmp_path, monkeypatch):
     assert all(isinstance(e.get("t"), (int, float)) for e in tr)  # seconds since pass start
 
 
-def test_done_flag_ends_the_chain(tmp_path):
+def test_without_reports_the_done_flag_ends_the_chain(tmp_path):
+    # The autouse fixture turns the report call off: no verdict to measure, the bar is not applied.
     cont = make_continuation(tmp_path)
     rig = McpRig(tmp_path, {"procedure_pseudo_code": {"text": DECOMP}})
     model = FakeModel([
@@ -547,6 +549,7 @@ def test_payload_field_set(tmp_path):
     assert set(cols(res.payload, "functions")) == {"address", "name", "claim", "evidence"}
     assert set(cols(res.payload, "iocs")) == {"type", "value", "source", "verified", "reason"}
     assert f["more_pending"] is False  # todo empty after the pass
+    assert not {"bar_met", "gaps", "stop_reason"} & set(f)  # only an assessed pass carries them
 
 
 def test_non_allowlisted_tool_is_refused_and_not_forwarded(tmp_path):
@@ -1372,7 +1375,7 @@ def test_analyze_function_complete_is_rewritten_to_summary(tmp_path, monkeypatch
 def test_response_too_large_is_explained_to_the_model(tmp_path, monkeypatch):
     monkeypatch.setenv("REA_MAX_STEPS", "1")
     cont = make_continuation(tmp_path)
-    rig = McpRig(tmp_path, {"procedure_pseudo_code": {"huge": 2 * 1024 * 1024}})
+    rig = McpRig(tmp_path, {"procedure_pseudo_code": {"huge": MAX_RESPONSE + 1024 * 1024}})
     model = FakeModel([tc(("procedure_pseudo_code", {"procedure": "0x140001420"}, "a")), _final()])
     res, _ = run(tmp_path, cont, model, rig)
     assert res.payload.fields["model_status"] == "ok"
@@ -1725,6 +1728,9 @@ def test_report_schema_is_the_interface_shape_and_fits_the_token_budget():
 
 
 def test_report_is_written_validated_and_carried_to_the_next_pass(tmp_path, monkeypatch):
+    # This report meets the deepening bar, which would end the chain; keep it open so the carried
+    # state can be read (the bar has its own tests).
+    monkeypatch.setattr(ag, "assess", lambda **_: Sufficiency(False, [Gap("verdict_low", "x")]))
     res, out, model = _report_run(tmp_path, monkeypatch, answer(_report()), prior=PRIOR_REPORT)
     f = res.payload.fields
     assert f["model_status"] == "ok" and cols(res.payload, "functions")["address"] == [FN_MAIN]
@@ -1942,3 +1948,110 @@ def test_capa_functions_keeps_addresses_once_in_rule_order():
     sweep = {"capabilities": [{"functions": ["0x2", "0x1"]}, {"functions": ["0x1", "token:0x6", 5]}, "junk"]}
     assert ag.capa_functions(sweep) == ["0x2", "0x1"]
     assert ag.capa_functions({}) == []
+
+
+@pytest.mark.parametrize("name,user", [
+    ("main::main.main", True), ("main::main.(*AOTcAtpla1ol33).aebIPEct", True),
+    ("github.com/x/y::github.com/x/y.Dial", True), ("runtime::runtime.mallocgc", False),
+    ("internal/poll::internal/poll.(*FD).Read", False), ("main::type:.eq.main.HiBryYMv", False),
+    ("main", False), ("FUN_00401000", False)])
+def test_go_user_function(name, user):
+    assert ag.go_user_function(name) is user
+
+
+def test_go_program_functions_are_seeded_before_the_runtime(tmp_path):
+    cont = make_continuation(tmp_path, todo=[], explored=[], sweep={"kind": "pe"})
+    rows = [{"address": a, "value": n, "symbol": {"external": False, "source": "imported"},
+             "procedure": {"external": False, "thunk": False}}
+            for a, n in [("0x401000", "runtime::runtime.mallocgc"), ("0x402000", "fmt::fmt.Println"),
+                         ("0x4d0000", "main::main.helper"), ("0x4d2180", "main::main.main"),
+                         ("0x4d3000", "main::type:.eq.main.T")]]
+    rig = McpRig(tmp_path, {
+        "procedure_info": {"text": json.dumps({"normalized_result": {"name": "_rt0_amd64_windows",
+                                                                     "entrypoint": "0x46eca0"}})},
+        "list_procedures": {"text": json.dumps({"normalized_result": rows})},
+    })
+    model = FakeModel([answer({"summary": "s", "functions": [], "iocs": [], "todo": [], "done": False})])
+    _res, out = run(tmp_path, cont, model, rig)
+    assert next_state(out).todo[:5] == ["0x46eca0", "0x4d2180", "0x4d0000", "0x401000", "0x402000"]
+
+
+# ---------------------------------------------------------------- the deepening bar
+
+_LOW = {"verdict": {"label": "suspicious", "confidence": "low", "rationale": "unclear"}}
+
+
+def _bar_run(tmp_path, monkeypatch, report, *, final=None, **cont_kw):
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    cont_kw.setdefault("sweep", {"kind": "pe"})
+    cont = make_continuation(tmp_path, **cont_kw)
+    model = FakeModel([tc(("procedure_pseudo_code", {"procedure": FN_MAIN}, "a")), answer(final or FINAL_OK),
+                       answer(report)])
+    res, out = run(tmp_path, cont, model, McpRig(tmp_path, {"procedure_pseudo_code": {"text": DECOMP}}))
+    return res, out, model
+
+
+def test_bar_met_ends_the_chain_even_when_the_model_wants_more(tmp_path, monkeypatch):
+    res, out, _m = _bar_run(tmp_path, monkeypatch, _report())  # FINAL_OK: done False, todo left
+    f = res.payload.fields
+    assert f["done"] is False and f["bar_met"] is True and f["gaps"] == [] and f["stop_reason"] == "bar_met"
+    assert f["more_pending"] is False and not (out / "continuation.tar.gz").exists()
+
+
+def test_bar_unmet_continues_even_when_the_model_says_done(tmp_path, monkeypatch):
+    caps = [{"rule": "connect TCP socket", "namespace": "communication/socket/tcp", "attack": ["T1071"],
+             "mbc": [], "functions": ["0x140001700", FN_MAIN]},
+            {"rule": "get file size", "namespace": "host-interaction/file-system/meta", "attack": [],
+             "mbc": [], "functions": ["0x140001800"]}]
+    res, out, model = _bar_run(tmp_path, monkeypatch, _report(**_LOW), final={**FINAL_OK, "done": True},
+                               sweep={"kind": "pe", "capabilities": caps})
+    f = res.payload.fields
+    assert f["done"] is True and f["bar_met"] is False and f["stop_reason"] == ""
+    # network is not_observed in _report(), so the communication lead is closed; persistence etc.
+    # have no ATT&CK-bearing capa rule. Only the low verdict is open.
+    assert f["gaps"] == ["verdict_low"] and f["more_pending"] is True
+    st = next_state(out)
+    assert [g["code"] for g in st.gaps] == ["verdict_low"]
+    assert f"fn:{FN_MAIN}" in st.facts and "sec:execution_flow" in st.facts
+    # The next pass is told what is missing.
+    model2 = FakeModel([_final()])
+    run(tmp_path / "p2", st_cont := _restate(tmp_path, out), model2, McpRig(tmp_path))
+    assert "open_gaps" in model2.calls[0]["messages"][1]["content"] and st_cont.exists()
+
+
+def test_capa_lead_targets_lead_the_next_todo(tmp_path, monkeypatch):
+    caps = [{"rule": "persist via Run key", "namespace": "persistence/registry/run", "attack": ["T1547.001"],
+             "mbc": [], "functions": ["0x140001900", FN_MAIN]}]
+    res, out, _m = _bar_run(tmp_path, monkeypatch, _report(), sweep={"kind": "pe", "capabilities": caps})
+    f = res.payload.fields
+    assert f["gaps"] == ["lead:persistence"] and f["more_pending"] is True
+    # FN_MAIN was explored this pass; only the unexplored target is queued, ahead of the model's todo.
+    assert next_state(out).todo[:2] == ["0x140001900", "0x140001500"]
+
+
+def test_a_pass_that_adds_no_fact_stalls_the_chain(tmp_path, monkeypatch):
+    known = [f"fn:{FN_MAIN}", "sec:execution_flow", "ioc:url:http://evil.example/a.php"]
+    res, _o, _m = _bar_run(tmp_path, monkeypatch, _report(**_LOW), pass_no=1, facts=known)
+    f = res.payload.fields
+    assert f["pass_no"] == 2 and f["stop_reason"] == "stalled" and f["more_pending"] is False
+
+
+def test_the_pass_cap_ends_an_unmet_chain(tmp_path, monkeypatch):
+    monkeypatch.setenv("REA_MAX_PASSES", "2")
+    res, _o, _m = _bar_run(tmp_path, monkeypatch, _report(**_LOW), pass_no=1)
+    f = res.payload.fields
+    assert f["pass_no"] == 2 and f["stop_reason"] == "pass_cap" and f["more_pending"] is False
+
+
+def test_a_failed_report_keeps_the_chain_open_for_a_report(tmp_path, monkeypatch):
+    res, _o, _m = _bar_run(tmp_path, monkeypatch, "not json at all")
+    f = res.payload.fields
+    assert f["gaps"][0] == "no_report" and f["more_pending"] is True
+
+
+def _restate(tmp_path, out):
+    """Copy a sealed continuation to a fresh input path for the next pass."""
+    dest = tmp_path / "p2-in.tar.gz"
+    dest.write_bytes((out / "continuation.tar.gz").read_bytes())
+    (tmp_path / "p2").mkdir(exist_ok=True)
+    return dest

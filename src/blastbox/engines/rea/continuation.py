@@ -73,6 +73,11 @@ class State:
     # from older continuations and default to empty.
     analysis_report: dict[str, Any] | None = None
     sweep: dict[str, Any] = field(default_factory=dict)
+    # The deepening bar (sufficiency.py): every fact the chain has established so far, and the
+    # gaps the last pass left (``[{"code", "detail"}]``) for the next pass to work on. Both are
+    # absent from older continuations and default to empty.
+    facts: list[str] = field(default_factory=list)
+    gaps: list[dict[str, str]] = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), sort_keys=True)
@@ -93,6 +98,8 @@ class State:
                 started_at=float(d["started_at"]),
                 analysis_report=_opt_dict(d.get("analysis_report")),
                 sweep=_opt_dict(d.get("sweep")) or {},
+                facts=[str(x) for x in d.get("facts") or []],
+                gaps=[{"code": str(g["code"]), "detail": str(g["detail"])} for g in d.get("gaps") or []],
             )
         except (ValueError, KeyError, TypeError) as exc:
             raise ContinuationError(f"bad state.json: {exc}") from exc
