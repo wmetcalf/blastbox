@@ -7,6 +7,11 @@ verify itself, and lists what is still missing (``gaps``):
 - ``no_report``: no valid ``rea.analysis/1`` report exists yet;
 - ``verdict_unknown`` / ``verdict_low``: the verdict is ``unknown``, or its confidence is ``low``;
 - ``no_behaviour``: no behaviour section (``BEHAVIOUR_KEYS``) is ``observed``;
+- ``benign_unexplored``: the verdict is ``benign`` while some of the program's own functions
+  (``program_functions``: for Go, ``main.*`` and third-party modules) are unexplored. A benign
+  call is a claim about everything the program does; live, a Go sample whose ``main`` is a
+  board-game decoy was called benign/medium with part of its own code unread. Its targets are
+  those functions;
 - ``lead:<section>``: a capa rule with an ATT&CK id points at a report section
   (``LEAD_SECTIONS``) that the report left ``not_analysed``. Its unexplored functions are the
   gap's ``targets``, which go to the front of the next pass's todo list; a lead with no target
@@ -90,7 +95,8 @@ def facts_of(report: dict[str, Any] | None, functions: list[dict[str, Any]],
     return out
 
 
-def assess(*, report: dict[str, Any] | None, sweep: dict[str, Any], explored: list[str]) -> Sufficiency:
+def assess(*, report: dict[str, Any] | None, sweep: dict[str, Any], explored: list[str],
+           program_functions: list[str] | None = None) -> Sufficiency:
     gaps: list[Gap] = []
     if not isinstance(report, dict):
         gaps.append(Gap("no_report", "no valid analysis report has been written yet"))
@@ -107,6 +113,14 @@ def assess(*, report: dict[str, Any] | None, sweep: dict[str, Any], explored: li
         statuses = _statuses(report)
         if not any(statuses.get(k) == "observed" for k in BEHAVIOUR_KEYS):
             gaps.append(Gap("no_behaviour", "no behaviour section is backed by observed evidence"))
+        if label == "benign":
+            seen = set(explored)
+            left = [f for f in program_functions or [] if f not in seen]
+            if left:
+                gaps.append(Gap("benign_unexplored",
+                                f"the verdict is benign but {len(left)} of the program's own "
+                                f"{len(program_functions or [])} functions are unexplored: read them "
+                                "before ruling out hostile behaviour", left[:MAX_TARGETS]))
     if isinstance(report, dict):
         done = set(explored)
         leads: dict[str, Gap] = {}

@@ -168,6 +168,7 @@ MAX_SOURCE = 256
 MAX_TODO = 256
 MAX_EXPLORED = 4096
 SEED_TODO = 32
+MAX_PROGRAM_FUNCTIONS = 512
 MAX_FINAL_CHARS = 1024 * 1024
 MAX_SALVAGE_CHARS = 256 * 1024
 MAX_SALVAGE_DEPTH = 64
@@ -722,6 +723,7 @@ class _Pass:
     report: dict[str, Any] | None = None  # this pass's validated rea.analysis/1 report
     prior_report: dict[str, Any] | None = None  # the continuation's (last valid) report
     sweep: dict[str, Any] = field(default_factory=dict)
+    program_functions: list[str] = field(default_factory=list)
     model_tokens: int = 0  # completion tokens of the calls that reported usage ...
     model_seconds: float = 0.0  # ... and the seconds those calls took (the measured rate)
     accepted: bool = False  # _accept finished: functions/iocs/summary are one consistent answer
@@ -800,7 +802,7 @@ class ReaAgentEngine:
                   final_thinking=os.environ.get("REA_FINAL_THINKING", "").strip().lower()
                   in ("1", "true", "yes", "on"),
                   report_tokens=report_tokens, prior_report=_sealed_report(state.analysis_report),
-                  sweep=dict(state.sweep))
+                  sweep=dict(state.sweep), program_functions=list(state.program_functions))
         transcript_path = outdir / "transcript.jsonl"
         tw = TranscriptWriter(transcript_path, min(MAX_TRANSCRIPT_BYTES, limits.max_artifact_bytes), self._clock)
         tw.write({"event": "start", "pass_no": p.pass_no, "model": model_id, "wall_budget_s": round(wall, 1),
@@ -862,6 +864,7 @@ class ReaAgentEngine:
             sweep=p.sweep,
             facts=facts,
             gaps=p.gaps if p.assessed else list(state.gaps),
+            program_functions=p.program_functions[:MAX_PROGRAM_FUNCTIONS],
         )
         transcript_reserve = min(MAX_TRANSCRIPT_BYTES, limits.max_artifact_bytes)
         if p.model_status == "ok" and p.assessed:
@@ -987,7 +990,7 @@ class ReaAgentEngine:
 
     def _seed(self, mcp: Any, ev: _Evidence, tw: TranscriptWriter,
               remaining: Callable[[], float], capa_functions: list[str] | None = None,
-              hash_sites: list[int] | None = None) -> list[dict[str, str]]:
+              hash_sites: list[int] | None = None, program: list[str] | None = None) -> list[dict[str, str]]:
         """Todo seed from ``procedure_info(entry)`` + ``list_procedures(detail=complete)``.
 
         Order: the entry point, well-known main names (and Go's ``main.main``), functions capa
@@ -1057,6 +1060,8 @@ class ReaAgentEngine:
             if e["address"] not in seen:
                 seen.add(e["address"])
                 seeds.append(e)
+        if program is not None:
+            program.extend(e["address"] for e in (go_main + go_user)[:MAX_PROGRAM_FUNCTIONS])
         tw.write({"event": "seed", "todo": seeds, "capa_functions": len(capa_functions or []),
                   "capa_matched": len(matched), "hash_functions": len(hashed)})
         return seeds
@@ -1089,7 +1094,7 @@ class ReaAgentEngine:
         seed_note = ""
         if not p.todo and not p.explored:
             seeds = self._seed(mcp, ev, tw, explore_left, capa_functions=capa_functions(state.sweep),
-                               hash_sites=hash_sites(state.sweep))
+                               hash_sites=hash_sites(state.sweep), program=p.program_functions)
             p.todo = [s["address"] for s in seeds]
             todo_view = seeds
             seed_note = "The todo list was seeded by the engine from the entry point and the procedure list."
@@ -1477,7 +1482,7 @@ class ReaAgentEngine:
         front of the todo list. The model's ``done`` flag is recorded but decides nothing.
         """
         report = p.report if p.report is not None else p.prior_report
-        suff = assess(report=report, sweep=p.sweep, explored=p.explored)
+        suff = assess(report=report, sweep=p.sweep, explored=p.explored, program_functions=p.program_functions)
         known = set(state.facts)
         new = [f for f in _dedup(facts_of(report, p.functions, p.iocs)) if f not in known]
         max_passes = _env_int("REA_MAX_PASSES", DEFAULT_MAX_PASSES, 1, MAX_STEPS_CEILING)

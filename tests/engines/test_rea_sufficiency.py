@@ -69,3 +69,14 @@ def test_facts_are_verified_iocs_kept_claims_and_observed_behaviour():
                      [_ioc("a.example", True), _ioc("b.example", False)])
     assert sorted(facts) == ["fn:0x10", "ioc:domain:a.example", "sec:execution_flow"]
     assert facts_of(None, [], []) == []
+
+
+def test_a_benign_verdict_needs_the_programs_own_code_read():
+    own = ["0x10", "0x20", "0x30"]
+    s = assess(report=_rep("benign", "medium"), sweep={}, explored=["0x10"], program_functions=own)
+    assert [g.code for g in s.gaps] == ["benign_unexplored"] and s.gaps[0].targets == ["0x20", "0x30"]
+    assert "2 of the program's own 3" in s.gaps[0].detail
+    assert assess(report=_rep("benign", "medium"), sweep={}, explored=own, program_functions=own).met
+    # Only a benign call carries that burden; and with no program list there is nothing to check.
+    assert assess(report=_rep("malicious", "high"), sweep={}, explored=[], program_functions=own).met
+    assert assess(report=_rep("benign", "medium"), sweep={}, explored=[]).met

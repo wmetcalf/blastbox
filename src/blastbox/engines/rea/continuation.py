@@ -78,6 +78,9 @@ class State:
     # absent from older continuations and default to empty.
     facts: list[str] = field(default_factory=list)
     gaps: list[dict[str, str]] = field(default_factory=list)
+    # The program's own functions as the pass-1 seed found them (Go: main.* and third-party
+    # modules), which a benign verdict must have read.
+    program_functions: list[str] = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), sort_keys=True)
@@ -100,6 +103,7 @@ class State:
                 sweep=_opt_dict(d.get("sweep")) or {},
                 facts=[str(x) for x in d.get("facts") or []],
                 gaps=[{"code": str(g["code"]), "detail": str(g["detail"])} for g in d.get("gaps") or []],
+                program_functions=[str(x) for x in d.get("program_functions") or []],
             )
         except (ValueError, KeyError, TypeError) as exc:
             raise ContinuationError(f"bad state.json: {exc}") from exc

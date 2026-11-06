@@ -1973,7 +1973,9 @@ def test_go_program_functions_are_seeded_before_the_runtime(tmp_path):
     })
     model = FakeModel([answer({"summary": "s", "functions": [], "iocs": [], "todo": [], "done": False})])
     _res, out = run(tmp_path, cont, model, rig)
-    assert next_state(out).todo[:5] == ["0x46eca0", "0x4d2180", "0x4d0000", "0x401000", "0x402000"]
+    st = next_state(out)
+    assert st.todo[:5] == ["0x46eca0", "0x4d2180", "0x4d0000", "0x401000", "0x402000"]
+    assert st.program_functions == ["0x4d2180", "0x4d0000"]  # main.main, then the program's own
 
 
 # ---------------------------------------------------------------- the deepening bar
