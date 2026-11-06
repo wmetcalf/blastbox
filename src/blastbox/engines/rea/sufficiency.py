@@ -9,7 +9,8 @@ verify itself, and lists what is still missing (``gaps``):
 - ``no_behaviour``: no behaviour section (``BEHAVIOUR_KEYS``) is ``observed``;
 - ``lead:<section>``: a capa rule with an ATT&CK id points at a report section
   (``LEAD_SECTIONS``) that the report left ``not_analysed``. Its unexplored functions are the
-  gap's ``targets``, which go to the front of the next pass's todo list.
+  gap's ``targets``, which go to the front of the next pass's todo list; a lead with no target
+  left is not a gap.
 
 IOC precision and dropped claims are not gaps: they measure the model's care, not what is left
 to analyse, and live they did not improve with another pass (a DLL's pass 2 verified 0 of 6
@@ -130,6 +131,9 @@ def assess(*, report: dict[str, Any] | None, sweep: dict[str, Any], explored: li
                     gap.targets.append(f)
         for gap in leads.values():
             gap.detail = gap.detail.rstrip(";")
-        gaps.extend(leads.values())
+        # A lead with nothing left to open (every function explored, or .NET tokens only, which the
+        # agent cannot address) is closed: live, such leads kept a .NET chain running to the cap
+        # with the same malicious/high verdict on every pass.
+        gaps.extend(g for g in leads.values() if g.targets)
     gaps = gaps[:MAX_GAPS]
     return Sufficiency(met=not gaps, gaps=gaps)

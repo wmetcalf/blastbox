@@ -57,6 +57,11 @@ def test_capa_leads_point_at_sections_left_not_analysed():
     assert "connect TCP" in g.detail and "send HTTP" in g.detail and not g.detail.endswith(";")
     # A section the model looked at and found nothing in closes the lead.
     assert _codes(report=_rep(network="not_observed"), sweep={"capabilities": caps}) == []
+    # So does having nothing left to open: all explored, or .NET tokens only.
+    assert _codes(sweep={"capabilities": caps}, explored=["0x10", "0x20", "0x30"]) == []
+    dotnet = [{"rule": "connect TCP", "namespace": "communication/socket/tcp", "attack": ["T1071"],
+               "functions": ["token:0x6000001"]}]
+    assert _codes(sweep={"capabilities": dotnet}) == []
 
 
 def test_facts_are_verified_iocs_kept_claims_and_observed_behaviour():
