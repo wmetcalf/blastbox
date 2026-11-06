@@ -91,6 +91,7 @@ model was not consulted because no Ghidra project or MCP session could be had.
 
 from __future__ import annotations
 
+import bisect
 import json
 import logging
 import mmap
@@ -681,6 +682,20 @@ def capa_functions(sweep: dict[str, Any]) -> list[str]:
     return out
 
 
+def hash_sites(sweep: dict[str, Any]) -> list[int]:
+    """The VAs where the sweep found hashed API constants (``api_hashes``), each once."""
+    hashes = sweep.get("api_hashes")
+    hits = hashes.get("hits") if isinstance(hashes, dict) else None
+    out: list[int] = []
+    for h in hits if isinstance(hits, list) else []:
+        sites = h.get("sites") if isinstance(h, dict) else None
+        for site in sites if isinstance(sites, list) else []:
+            a = norm_addr(site)
+            if a is not None and int(a, 16) not in out:
+                out.append(int(a, 16))
+    return out
+
+
 @dataclass
 class _Pass:
     """Mutable state of one pass, gathered for the payload."""
@@ -971,7 +986,8 @@ class ReaAgentEngine:
         return text, is_error
 
     def _seed(self, mcp: Any, ev: _Evidence, tw: TranscriptWriter,
-              remaining: Callable[[], float], capa_functions: list[str] | None = None) -> list[dict[str, str]]:
+              remaining: Callable[[], float], capa_functions: list[str] | None = None,
+              hash_sites: list[int] | None = None) -> list[dict[str, str]]:
         """Todo seed from ``procedure_info(entry)`` + ``list_procedures(detail=complete)``.
 
         Order: the entry point, well-known main names (and Go's ``main.main``), functions capa
@@ -1024,17 +1040,25 @@ class ReaAgentEngine:
         main.sort(key=lambda e: _MAIN_NAMES.index(e["name"]))
         rest.sort(key=lambda e: int(e["address"], 16))
         matched = [by_addr[a] for a in (norm_addr(x) for x in capa_functions or []) if a in by_addr]
+        # A hashed-API site is an instruction: its function is the nearest procedure entry at or
+        # below it (an approximation that can name a neighbour for code between functions).
+        starts = sorted(int(a, 16) for a in by_addr)
+        hashed: list[dict[str, str]] = []
+        for site in hash_sites or []:
+            i = bisect.bisect_right(starts, site) - 1
+            if i >= 0 and (e := by_addr[f"{starts[i]:#x}"]) not in hashed:
+                hashed.append(e)
         seen = {s["address"] for s in seeds}
         # Go: the runtime and standard library are most of the symbols (1347 of 2167 runtime.* in
         # one live sample); the program's own packages come right after the entry points.
-        for e in main + go_main + matched + go_user + named + rest:
+        for e in main + go_main + matched + hashed + go_user + named + rest:
             if len(seeds) >= SEED_TODO:
                 break
             if e["address"] not in seen:
                 seen.add(e["address"])
                 seeds.append(e)
         tw.write({"event": "seed", "todo": seeds, "capa_functions": len(capa_functions or []),
-                  "capa_matched": len(matched)})
+                  "capa_matched": len(matched), "hash_functions": len(hashed)})
         return seeds
 
     def _loop(self, mcp: Any, listed: dict[str, str], sample: Path, state: State, p: _Pass,
@@ -1064,7 +1088,8 @@ class ReaAgentEngine:
         todo_view = [{"address": a, "name": ""} for a in p.todo[:SEED_TODO * 2]]
         seed_note = ""
         if not p.todo and not p.explored:
-            seeds = self._seed(mcp, ev, tw, explore_left, capa_functions=capa_functions(state.sweep))
+            seeds = self._seed(mcp, ev, tw, explore_left, capa_functions=capa_functions(state.sweep),
+                               hash_sites=hash_sites(state.sweep))
             p.todo = [s["address"] for s in seeds]
             todo_view = seeds
             seed_note = "The todo list was seeded by the engine from the entry point and the procedure list."

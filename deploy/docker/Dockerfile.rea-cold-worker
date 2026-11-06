@@ -171,7 +171,8 @@ COPY pyproject.toml README.md /src/blastbox/
 COPY src /src/blastbox/src
 RUN python3 -m venv /opt/blastbox \
     && /opt/blastbox/bin/pip install --no-cache-dir "/src/blastbox[rea]" \
-    && rm -rf /src
+    && rm -rf /src \
+    && /opt/blastbox/bin/python -c "from blastbox.engines.rea import apihash; assert len(apihash._names()) > 10000"
 
 # Operator-fixed engine, never job-derived. `rea-agent` images override BLASTBOX_ENGINE
 # with blastbox.engines.rea:ReaAgentEngine.

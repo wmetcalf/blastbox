@@ -2096,3 +2096,29 @@ def test_a_snapped_ioc_is_verified_from_the_sample_bytes(tmp_path):
     # Both snap; only the one in the sample's bytes is verified.
     assert io["value"] == ["HKLM\\Software\\Evil\\Run", "HKLM\\Software\\Gone\\RunOnce"]
     assert io["verified"] == [True, False] and io["reason"] == ["", "not_in_sample"]
+
+
+def test_functions_holding_hashed_api_sites_are_seeded_after_capa(tmp_path):
+    hashes = {"algorithm": "ror13", "hits": [
+        {"hash": "0xec0e4e8e", "api": "kernel32!LoadLibraryA", "sites": ["0x140001610", "0x140001790"]},
+        {"hash": "0x7c0dfcaa", "api": "kernel32!GetProcAddress", "sites": ["0x140001612", "junk"]}]}
+    cont = make_continuation(tmp_path, todo=[], explored=[], sweep={"kind": "pe", "api_hashes": hashes})
+    rows = [{"address": a, "value": n, "symbol": {"external": False, "source": "default"},
+             "procedure": {"external": False, "thunk": False}}
+            for a, n in [("0x140001500", "FUN_140001500"), ("0x140001600", "FUN_140001600"),
+                         ("0x140001700", "FUN_140001700")]]
+    rig = McpRig(tmp_path, {
+        "procedure_info": {"text": json.dumps({"normalized_result": {"name": "entry", "entrypoint": "0x140001420"}})},
+        "list_procedures": {"text": json.dumps({"normalized_result": rows})},
+    })
+    model = FakeModel([answer({"summary": "s", "functions": [], "iocs": [], "todo": [], "done": False})])
+    _res, out = run(tmp_path, cont, model, rig)
+    # sites 0x...610/612 fall in FUN_140001600, 0x...790 in FUN_140001700; then the rest by address
+    assert next_state(out).todo[:4] == ["0x140001420", "0x140001600", "0x140001700", "0x140001500"]
+    first_user = model.calls[0]["messages"][1]["content"]
+    assert "api_hashes" in first_user and "LoadLibraryA" in first_user
+
+
+def test_hash_sites_tolerates_junk():
+    assert ag.hash_sites({"api_hashes": {"hits": [{"sites": ["0x10", "0x10", 5, "zz"]}, "x"]}}) == [0x10]
+    assert ag.hash_sites({"api_hashes": "nope"}) == [] and ag.hash_sites({}) == []

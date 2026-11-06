@@ -706,3 +706,26 @@ def test_capa_skips_go_binaries(tmp_path, monkeypatch):
     res, _out, _g = _run(FIXTURES / "sample.exe", tmp_path, capa=fc)
     assert fc.calls == [] and _fields(res)["capa_status"] == "skipped"
     assert any(w.message == "capa skipped: go binary" for w in res.warnings)
+
+
+def test_hashed_api_imports_reach_the_report_and_continuation_not_the_payload(tmp_path):
+    from test_rea_apihash import BASE, LOADER, TEXT_VA, _movs, _pe
+    sample = tmp_path / "loader.exe"
+    sample.write_bytes(_pe(_movs("ror13", LOADER)))
+    ghidra = FakeGhidra(strings=[{"function_count": 40, "image_base": f"{BASE:#x}"}])
+    res, out, _g = _run(sample, tmp_path, ghidra=ghidra)
+    f = _fields(res)
+    assert "api_hashes" not in f
+    report = json.loads((out / "report.json").read_text())
+    assert report["api_hashes"]["algorithm"] == "ror13"
+    assert {h["api"] for h in report["api_hashes"]["hits"]} == {f"kernel32!{n}" for n in LOADER}
+    sites = {h["api"]: h["sites"] for h in report["api_hashes"]["hits"]}
+    # each (nop, mov ecx) pair is 6 bytes; the mov of the n-th name is at 6n + 1
+    assert sites["kernel32!CreateThread"] == [f"{BASE + TEXT_VA + 6 * LOADER.index('CreateThread') + 1:#x}"]
+    _s, _p, state = unpack(out / "continuation.tar.gz", tmp_path / "cont", max_bytes=1 << 30)
+    assert state.sweep["api_hashes"] == report["api_hashes"]
+
+
+def test_no_hashed_imports_is_null_in_the_report(tmp_path):
+    res, out, _g = _run(FIXTURES / "sample.exe", tmp_path)
+    assert json.loads((out / "report.json").read_text())["api_hashes"] is None

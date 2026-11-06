@@ -17,6 +17,9 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
    ``State.sweep["capabilities"]``, where the agent seeds its todo with those functions. A capa
    failure or timeout is a warning; ``unsupported`` (capa's architecture/format refusal) is not;
    Go binaries and images over ``CAPA_MAX_INPUT_BYTES`` are ``skipped`` (``capa_skipped``);
+5b. for a PE, hashed API imports (``apihash.py``, at most ``API_HASH_S``): the hashing algorithm
+   and the APIs whose hashes sit in the code or data, with their sites. They go to the report
+   (``api_hashes``) and ``State.sweep["api_hashes"]``, never to the payload;
 6. deterministic IOCs over the inspect JSON string leaves, the Ghidra strings and, for native
    code, UTF-16LE URL strings in the sample bytes (a .NET ``#US`` heap has no Ghidra string)
    and, for Go binaries, the exact string literals named by Go string headers
@@ -73,7 +76,7 @@ from pathlib import Path
 from typing import Any
 
 from blastbox.contract import DeclaredArtifact, Detection, Record, Warning
-from blastbox.engines.rea import capa
+from blastbox.engines.rea import apihash, capa
 from blastbox.engines.rea.continuation import GhidraStatus, State, pack
 from blastbox.engines.rea.gostrings import clip_overruns, exact_iocs, go_strings
 from blastbox.engines.rea.icons import extract_icons
@@ -128,6 +131,7 @@ MAX_UTF16_SCAN_BYTES = 256 * 1024 * 1024
 MAX_UTF16_URLS = 1024
 STATE_IOCS = 64  # sweep IOCs carried in the continuation for the agent's analysis report
 GO_SCAN_S = 30.0  # wall-clock cap on the Go string-header scan
+API_HASH_S = 30.0  # wall-clock cap on the hashed-import scan (apihash.py)
 MAX_ICONS = 8
 MAX_REPORT_BYTES = 16 * 1024 * 1024
 MAX_LEAVES = 200_000
@@ -398,6 +402,14 @@ class ReaSweepEngine:
             else:
                 capa_status, capabilities = self._capa(analysed, kind, job, image_base, remaining(), warnings)
 
+        # 4c. hashed API imports (PE only; .NET resolves by metadata, not by hash).
+        api_hashes: apihash.ApiHashes | None = None
+        if kind == "pe":
+            try:
+                api_hashes = apihash.resolve(analysed, deadline=time.monotonic() + max(0.0, min(API_HASH_S, remaining())))
+            except (OSError, ValueError) as exc:
+                warnings.append(Warning(code="api_hash_failed", message=f"exception:{type(exc).__name__}"))
+
         iocs = extract_iocs(sources(), limit=MAX_IOCS)
         if go_lits:
             iocs = clip_overruns(iocs, exact_iocs(go_lits), key=lambda i: (i.type, i.value),
@@ -416,6 +428,8 @@ class ReaSweepEngine:
             sweep_evidence["unpacked"] = {"packer": "upx", "packed_sha256": _sha256(input)}
         if capabilities:
             sweep_evidence["capabilities"] = capabilities[:STATE_CAPABILITIES]
+        if api_hashes is not None:
+            sweep_evidence["api_hashes"] = {"algorithm": api_hashes.algorithm, "hits": api_hashes.hits}
         cont = (self._continuation(analysed, outdir, project, ghidra_status, limits, warnings, sweep_evidence)
                 if chainable else None)
 
@@ -447,7 +461,7 @@ class ReaSweepEngine:
 
         # 8. report artifact, then the payload
         report_path = outdir / "report.json"
-        self._write_report(report_path, summary, iocs, inspect, report_cap, warnings, capabilities)
+        self._write_report(report_path, summary, iocs, inspect, report_cap, warnings, capabilities, api_hashes)
         payload = self._payload(summary, iocs, limits, warnings, capabilities)
 
         artifacts = [DeclaredArtifact(id=f"member-{i}", path=p.relative_to(outdir).as_posix(), kind="extracted")
@@ -639,13 +653,16 @@ class ReaSweepEngine:
     @staticmethod
     def _write_report(path: Path, summary: dict[str, Any], iocs: list[Ioc],
                       inspect: dict[str, dict[str, Any]], cap: int, warnings: list[Warning],
-                      capabilities: list[dict[str, Any]] | None = None) -> None:
+                      capabilities: list[dict[str, Any]] | None = None,
+                      api_hashes: apihash.ApiHashes | None = None) -> None:
         results = dict(inspect)
+        hashes = ({"algorithm": api_hashes.algorithm, "hits": api_hashes.hits}
+                  if api_hashes is not None else None)
         ioc_rows = [{"type": i.type, "value": i.value, "source": i.source} for i in iocs]
         caps = list(capabilities or [])
 
         def encode() -> bytes:
-            return json.dumps({**summary, "iocs": ioc_rows, "capabilities": caps,
+            return json.dumps({**summary, "iocs": ioc_rows, "capabilities": caps, "api_hashes": hashes,
                                "inspect_results": results}).encode()
 
         data = encode()

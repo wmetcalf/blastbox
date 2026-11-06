@@ -269,6 +269,8 @@ class Framer:
             data["unpacked_from"] = state.sweep["unpacked"]
         if state.sweep.get("capabilities"):
             data["capa_capabilities"] = state.sweep["capabilities"]
+        if state.sweep.get("api_hashes"):
+            data["api_hashes"] = state.sweep["api_hashes"]
         if state.gaps:
             data["open_gaps"] = state.gaps
         context = {"call_id": "context", "data": data}
@@ -279,6 +281,10 @@ class Framer:
             lead += (" capa_capabilities lists capa rule matches (rule, ATT&CK/MBC ids, the functions "
                      "they matched in). A rule match is a pattern over the code, not proof: decompile a "
                      "function before claiming what it does.")
+        if state.sweep.get("api_hashes"):
+            lead += (" api_hashes lists Windows APIs whose name hashes (algorithm named) the engine "
+                     "found as constants at the listed sites: the sample likely resolves those imports "
+                     "at run time. Use them to read the resolver and the calls it feeds.")
         if state.gaps:
             lead += (" open_gaps lists what the engine found missing when it checked the previous "
                      "pass's report against the evidence; close those first (the functions they point "
