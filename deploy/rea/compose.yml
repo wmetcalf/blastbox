@@ -79,6 +79,8 @@ services:
     volumes:
       # The entrypoint renders haproxy.cfg at start; read_only needs this one writable dir.
       - proxy-haproxy-cfg:/usr/local/etc/haproxy
+      # Longer client/server timeouts than the image's 10m (see the file's header).
+      - ./docker-socket-proxy/haproxy.cfg.template:/usr/local/etc/haproxy/haproxy.cfg.template:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks: [backend]
 
