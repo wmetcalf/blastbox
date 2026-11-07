@@ -729,3 +729,58 @@ def test_hashed_api_imports_reach_the_report_and_continuation_not_the_payload(tm
 def test_no_hashed_imports_is_null_in_the_report(tmp_path):
     res, out, _g = _run(FIXTURES / "sample.exe", tmp_path)
     assert json.loads((out / "report.json").read_text())["api_hashes"] is None
+
+
+def _dump_pe(path: Path, *, vsize: int, size_of_image: int = 0x4000, rdata_raw: int = 0x200) -> Path:
+    """A PE32 shaped like CAPE's rebuilt dumps: .text, then .rdata (``rdata_raw=0``: never captured)."""
+    import struct
+    e = 0x40
+    hdr = bytearray(0x400)
+    hdr[0:2] = b"MZ"
+    struct.pack_into("<I", hdr, 60, e)
+    hdr[e:e + 4] = b"PE\0\0"
+    struct.pack_into("<HH", hdr, e + 4, 0x14C, 2)
+    struct.pack_into("<H", hdr, e + 20, 0xE0)
+    struct.pack_into("<H", hdr, e + 24, 0x10B)
+    struct.pack_into("<I", hdr, e + 24 + 56, size_of_image)
+    first = e + 24 + 0xE0
+    struct.pack_into("<8sIIII", hdr, first, b".text", vsize, 0x1000, 0x200, 0x400)
+    struct.pack_into("<I", hdr, first + 36, 0x60000020)
+    struct.pack_into("<8sIIII", hdr, first + 40, b".rdata", 0x1800, 0x2000, rdata_raw, 0x600)
+    struct.pack_into("<I", hdr, first + 40 + 36, 0x40000040)
+    path.write_bytes(bytes(hdr) + b"\xcc" * 0x200 + b"\x00" * rdata_raw)
+    return path
+
+
+def test_dump_with_corrupt_virtual_sizes_is_analysed_repaired(tmp_path):
+    import hashlib
+    p = _dump_pe(tmp_path / "dump.dll", vsize=0x69C81000)
+    original = p.read_bytes()
+    res, out, g = _run(p, tmp_path)
+    runner = FakeRunner.instances[-1]
+    seen = g.calls[0]["sample"]
+    assert seen != p and seen.name == "dump.dll"  # Ghidra reads the repaired copy
+    assert all(c[1] == seen for c in runner.inspect_calls)  # so does inspect
+    assert p.read_bytes() == original
+    assert "pe_header_repaired" in _codes(res) and "pe_sections_missing" not in _codes(res)
+    sample, _proj, state = unpack(out / "continuation.tar.gz", tmp_path / "cont", max_bytes=1 << 30)
+    assert sample.read_bytes() != original and len(sample.read_bytes()) == len(original)
+    assert state.sweep["dump_headers"] == {"repaired_sections": [".text"],
+                                           "original_sha256": hashlib.sha256(original).hexdigest()}
+
+
+def test_dump_missing_sections_is_a_warning_and_the_original_is_analysed(tmp_path):
+    p = _dump_pe(tmp_path / "trunc.exe", vsize=0x200, rdata_raw=0)
+    res, out, g = _run(p, tmp_path)
+    assert g.calls[0]["sample"] == p
+    assert "pe_sections_missing" in _codes(res) and "pe_header_repaired" not in _codes(res)
+    _s, _p, state = unpack(out / "continuation.tar.gz", tmp_path / "cont", max_bytes=1 << 30)
+    assert state.sweep["dump_headers"] == {"missing_sections": [".rdata"]}
+
+
+def test_ordinary_samples_carry_no_dump_headers(tmp_path):
+    res, out, g = _run(FIXTURES / "sample.exe", tmp_path)
+    assert g.calls[0]["sample"] == FIXTURES / "sample.exe"
+    assert not {"pe_header_repaired", "pe_sections_missing"} & set(_codes(res))
+    _s, _p, state = unpack(out / "continuation.tar.gz", tmp_path / "cont", max_bytes=1 << 30)
+    assert "dump_headers" not in state.sweep

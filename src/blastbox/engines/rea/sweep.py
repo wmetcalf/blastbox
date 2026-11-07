@@ -2,7 +2,10 @@
 
 One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``:
 
-1. classify the sample by magic bytes;
+1. classify the sample by magic bytes; a PE goes through ``dumpfix`` (headers only): a
+   VirtualSize past SizeOfImage (seen in CAPE's rebuilt dumps) is rewritten and every later
+   step reads the repaired copy (``pe_header_repaired``); code/data sections the dump never
+   captured are a ``pe_sections_missing`` warning. Both go to ``State.sweep["dump_headers"]``;
 2. run the fixed ``INSPECT_MAP[kind]`` REA inspect commands (no caller arguments);
 3. ``extract-artifact`` for containers (archive/apk/asar/firmware) -> ``member-<n>``;
 4. icons -> ``icon-<n>``;
@@ -76,7 +79,7 @@ from pathlib import Path
 from typing import Any
 
 from blastbox.contract import DeclaredArtifact, Detection, Record, Warning
-from blastbox.engines.rea import apihash, capa
+from blastbox.engines.rea import apihash, capa, dumpfix
 from blastbox.engines.rea.continuation import GhidraStatus, State, pack
 from blastbox.engines.rea.gostrings import clip_overruns, exact_iocs, go_strings
 from blastbox.engines.rea.icons import extract_icons
@@ -302,6 +305,7 @@ class ReaSweepEngine:
 
         warnings: list[Warning] = []
         kind = classify(input)
+        dump, input = self._dumpfix(input, kind, job, warnings)
         runner = self._runner_factory(os.environ.get("REA_BIN") or "rea", os.environ, job / "rea")
 
         # 1. inspect
@@ -426,6 +430,8 @@ class ReaSweepEngine:
                                                  for i in iocs[:STATE_IOCS]]}
         if unpacked:
             sweep_evidence["unpacked"] = {"packer": "upx", "packed_sha256": _sha256(input)}
+        if dump is not None:
+            sweep_evidence["dump_headers"] = dump
         if capabilities:
             sweep_evidence["capabilities"] = capabilities[:STATE_CAPABILITIES]
         if api_hashes is not None:
@@ -530,6 +536,36 @@ class ReaSweepEngine:
             delta = image_base - capa_base
             rebase = lambda va: va + delta  # noqa: E731
         return "ok", capa.summarize(doc, rebase=rebase)
+
+    @staticmethod
+    def _dumpfix(sample: Path, kind: str, job: Path,
+                 warnings: list[Warning]) -> tuple[dict[str, Any] | None, Path]:
+        """``(State.sweep["dump_headers"] or None, the image every later step reads)``: a PE whose
+        rebuilt headers ``dumpfix`` repaired is analysed as the repaired copy (same file name)."""
+        if kind not in ("pe", "dotnet"):
+            return None, sample
+        dest = job / "repaired" / sample.name
+        try:
+            fix = dumpfix.repair(sample, dest)
+        except (OSError, ValueError) as exc:
+            warnings.append(Warning(code="dumpfix_failed", message=f"exception:{type(exc).__name__}"))
+            return None, sample
+        if fix is None:
+            return None, sample
+        evidence: dict[str, Any] = {}
+        if fix.missing:
+            evidence["missing_sections"] = fix.missing
+            warnings.append(Warning(code="pe_sections_missing",
+                                    message=_short("sections with no bytes in the file (a dump that never "
+                                                   "captured them): " + ", ".join(fix.missing), 1000)))
+        if fix.repaired:
+            evidence["repaired_sections"] = fix.repaired
+            evidence["original_sha256"] = _sha256(sample)
+            warnings.append(Warning(code="pe_header_repaired",
+                                    message=_short("VirtualSize past SizeOfImage rewritten to the section "
+                                                   "span: " + ", ".join(fix.repaired), 1000)))
+            return evidence, dest
+        return evidence, sample
 
     def _unpack(self, sample: Path, job: Path, timeout_s: float, warnings: list[Warning]) -> Path:
         """The ``upx -d`` image of ``sample`` (same file name, so the agent sees the same name), or
