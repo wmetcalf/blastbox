@@ -6,6 +6,16 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
    VirtualSize past SizeOfImage (seen in CAPE's rebuilt dumps) is rewritten and every later
    step reads the repaired copy (``pe_header_repaired``); code/data sections the dump never
    captured are a ``pe_sections_missing`` warning. Both go to ``State.sweep["dump_headers"]``;
+1b. an installer PE (``installer.UNWRAPPERS``: NSIS via ``7z x -tNsis``, Inno Setup via
+   ``innoextract``; static decompressors, the installer never runs) is unwrapped: every extracted
+   file becomes a ``member-<n>`` and the PE the install script runs (NSIS: named under a directory
+   in the script's string table) or else the largest PE member replaces the sample for every later
+   step, inspect included, with ``kind`` re-classified (a .NET payload is ``dotnet``). The payload
+   is offered to the registry again, up to ``installer.MAX_DEPTH_UNWRAP`` layers. Evidence:
+   ``State.sweep["unpacked"] = {"packer", "packed_sha256", "payload_member", "payload_sha256",
+   "payload_reason"[, "script_strings"][, "inner": [layer, ...]]}``. A failed extraction
+   (``installer_unpack_failed``) or one with no PE (``installer_no_payload``) is a warning and the
+   stub is analysed as before;
 2. run the fixed ``INSPECT_MAP[kind]`` REA inspect commands (no caller arguments);
 3. ``extract-artifact`` for containers (archive/apk/asar/firmware) -> ``member-<n>``;
 4. icons -> ``icon-<n>``;
@@ -37,7 +47,8 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
 ``rea.report/1`` payload fields: ``schema``, ``kind``, ``inspect`` (``{cmd: {ok[, error]}}``),
 ``ghidra_status`` (ok | timeout | failed | skipped), ``members``, ``icons``, ``more_pending``,
 ``iocs_total``, ``iocs`` (parallel columns ``type``/``value``/``source``), the optional
-``unpacked`` (``"upx"``, with ``unpacked_sha256``), the optional ``capa_status`` /
+``unpacked`` (``"upx"``, ``"nsis"`` or ``"inno"``: the outermost layer, with ``unpacked_sha256``
+of the image finally analysed), the optional ``capa_status`` /
 ``capabilities_total`` / ``capabilities`` (parallel columns ``rule``/``namespace``/``attack``) and
 the optional ``chain_stop``.
 ``chain_stop`` is absent while the chain can continue; otherwise it is exactly one of, checked
@@ -79,7 +90,7 @@ from pathlib import Path
 from typing import Any
 
 from blastbox.contract import DeclaredArtifact, Detection, Record, Warning
-from blastbox.engines.rea import apihash, capa, dumpfix
+from blastbox.engines.rea import apihash, capa, dumpfix, installer
 from blastbox.engines.rea.continuation import GhidraStatus, State, pack
 from blastbox.engines.rea.gostrings import clip_overruns, exact_iocs, go_strings
 from blastbox.engines.rea.icons import extract_icons
@@ -91,6 +102,8 @@ from blastbox.engines.rea.runner import (
     classify,
     CAPA_BACKENDS,
     CapaStatus,
+    MAX_MEMBER_BYTES,
+    MAX_MEMBERS,
     rea_env,
     run_capa,
     run_ghidra_analysis,
@@ -111,6 +124,11 @@ DEFAULT_GHIDRA_SWEEP_S = 420.0
 DEFAULT_INSPECT_TIMEOUT_S = 60.0
 EXTRACT_TIMEOUT_S = 120.0
 UNPACK_TIMEOUT_S = 60.0
+INSTALLER_TIMEOUT_S = 120.0
+# The installer's whole extracted tree (bytes, entries), before the members caps apply.
+MAX_INSTALLER_BYTES = 512 * 1024 * 1024
+MAX_INSTALLER_FILES = 4096
+_SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
 MAX_UNPACKED_BYTES = 256 * 1024 * 1024
 DEFAULT_CAPA_S = 300.0
 # Address-space cap on capa (KiB). vivisect on an 876 KB PE64 peaked at 2.8 GB RSS (MemoryError
@@ -150,6 +168,7 @@ _MIME = {
 
 GhidraFn = Callable[..., str]
 UnpackFn = Callable[..., str]
+InstallerFn = Callable[..., str]
 CapaFn = Callable[..., tuple[CapaStatus, bytes]]
 RunnerFactory = Callable[..., Any]
 
@@ -279,11 +298,13 @@ class ReaSweepEngine:
         ghidra_fn: GhidraFn = run_ghidra_analysis,
         unpack_fn: UnpackFn = upx_unpack,
         capa_fn: CapaFn = run_capa,
+        installer_fn: InstallerFn = installer.extract,
     ) -> None:
         self._runner_factory = runner_factory
         self._ghidra_fn = ghidra_fn
         self._unpack_fn = unpack_fn
         self._capa_fn = capa_fn
+        self._installer_fn = installer_fn
 
     def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
         base = Path(os.environ.get("BLASTBOX_WORK_DIR") or "/work")
@@ -306,6 +327,26 @@ class ReaSweepEngine:
         warnings: list[Warning] = []
         kind = classify(input)
         dump, input = self._dumpfix(input, kind, job, warnings)
+
+        # 0b. an installer (installer.UNWRAPPERS: NSIS, Inno Setup): everything from here on
+        # (inspect included) analyses the PE it installs and runs, up to MAX_DEPTH_UNWRAP layers,
+        # and every extracted file goes out as a member.
+        analysed = input
+        members: list[Path] = []
+        layers: list[dict[str, Any]] = []
+        for depth in range(installer.MAX_DEPTH_UNWRAP):
+            packer = installer.detect(analysed) if kind == "pe" else None
+            if packer is None:
+                break
+            inner, layer, found = self._installer(analysed, packer, job / f"installer-{depth}",
+                                                    outdir / "members", len(members),
+                                                    min(INSTALLER_TIMEOUT_S, remaining()), warnings)
+            members += found
+            if inner is None or layer is None:
+                break
+            layers.append(layer)
+            analysed = inner
+            kind = classify(inner)
         runner = self._runner_factory(os.environ.get("REA_BIN") or "rea", os.environ, job / "rea")
 
         # 1. inspect
@@ -317,7 +358,7 @@ class ReaSweepEngine:
                 inspect[cmd] = {"ok": False, "error": "budget_exhausted"}
             else:
                 try:
-                    inspect[cmd] = runner.inspect(cmd, input, budget)
+                    inspect[cmd] = runner.inspect(cmd, analysed, budget)
                 except Exception as exc:  # an inspect failure never fails the job
                     inspect[cmd] = {"ok": False, "error": f"exception:{type(exc).__name__}"}
             if not inspect[cmd].get("ok"):
@@ -327,7 +368,6 @@ class ReaSweepEngine:
                                         context=cmd))
 
         # 2. extraction (containers only)
-        members: list[Path] = []
         if kind in EXTRACT_KINDS:
             members = self._extract(runner, input, outdir / "members", min(EXTRACT_TIMEOUT_S, remaining()),
                                     warnings)
@@ -338,11 +378,11 @@ class ReaSweepEngine:
         icons = extract_icons(input, icons_dir, max_icons=MAX_ICONS)
 
         # 4a. UPX: everything from here on analyses the unpacked image when there is one.
-        analysed = input
         unpacked = False
-        if kind in ("pe", "elf") and upx_marked(input):
-            analysed = self._unpack(input, job, min(UNPACK_TIMEOUT_S, remaining()), warnings)
-            unpacked = analysed != input
+        if kind in ("pe", "elf") and upx_marked(analysed):
+            upx = self._unpack(analysed, job, min(UNPACK_TIMEOUT_S, remaining()), warnings)
+            unpacked = upx != analysed
+            analysed = upx
 
         # 4. Ghidra
         ghidra_status: GhidraStatus = "skipped"
@@ -428,7 +468,10 @@ class ReaSweepEngine:
         chainable = chain_stop is None
         sweep_evidence: dict[str, Any] = {"kind": kind, "iocs": [{"type": i.type, "value": i.value, "source": i.source}
                                                  for i in iocs[:STATE_IOCS]]}
-        if unpacked:
+        if layers:
+            nested = layers[1:] + ([{"packer": "upx"}] if unpacked else [])
+            sweep_evidence["unpacked"] = {**layers[0], **({"inner": nested} if nested else {})}
+        elif unpacked:
             sweep_evidence["unpacked"] = {"packer": "upx", "packed_sha256": _sha256(input)}
         if dump is not None:
             sweep_evidence["dump_headers"] = dump
@@ -456,8 +499,8 @@ class ReaSweepEngine:
             "more_pending": more_pending,
             "iocs_total": len(iocs),
         }
-        if unpacked:
-            summary["unpacked"] = "upx"
+        if layers or unpacked:
+            summary["unpacked"] = layers[0]["packer"] if layers else "upx"
             summary["unpacked_sha256"] = _sha256(analysed)
         if capa_status is not None:
             summary["capa_status"] = capa_status
@@ -566,6 +609,59 @@ class ReaSweepEngine:
                                                    "span: " + ", ".join(fix.repaired), 1000)))
             return evidence, dest
         return evidence, sample
+
+    def _installer(self, sample: Path, packer: str, job: Path, members_dir: Path, have: int, timeout_s: float,
+                   warnings: list[Warning]) -> tuple[Path | None, dict[str, Any] | None, list[Path]]:
+        """Unwrap one installer layer: ``(payload copy or None, its evidence or None, member
+        artifacts)``; ``have`` members already exist. Every failure is a warning and the wrapper
+        itself is analysed as before."""
+        if timeout_s < 1:
+            warnings.append(Warning(code="installer_unpack_failed", message=f"{packer}: no time left"))
+            return None, None, []
+        tree = job / "tree"
+        try:
+            status = self._installer_fn(sample, tree, timeout_s, packer=packer, env=rea_env(job / "env", os.environ),
+                                        max_bytes=MAX_INSTALLER_BYTES, max_files=MAX_INSTALLER_FILES)
+        except Exception as exc:
+            warnings.append(Warning(code="installer_unpack_failed",
+                                    message=f"{packer}: exception:{type(exc).__name__}"))
+            return None, None, []
+        if status not in ("ok", "partial"):
+            warnings.append(Warning(code="installer_unpack_failed",
+                                    message=f"{packer}: {_short(str(status), 64)}; analysing the installer stub"))
+            shutil.rmtree(tree, ignore_errors=True)
+            return None, None, []
+        if status == "partial":
+            warnings.append(Warning(code="installer_partial",
+                                    message=f"{packer}: the extractor reported errors; some members may be missing"))
+        try:
+            found, dropped = installer.collect(tree, members_dir, max_members=max(0, MAX_MEMBERS - have),
+                                               max_member_bytes=MAX_MEMBER_BYTES, start=have)
+        finally:
+            shutil.rmtree(tree, ignore_errors=True)
+        capped = sum(1 for _rel, why in dropped if why == "member_cap")
+        if capped:
+            warnings.append(Warning(code="members_capped",
+                                    message=f"{capped} member(s) beyond the {MAX_MEMBERS}-member cap dropped"))
+        others = [(rel, why) for rel, why in dropped if why != "member_cap"]
+        for rel, why in others[:MAX_DROP_WARNINGS]:
+            warnings.append(Warning(code="member_dropped", message=f"member dropped: {_short(why, 64)}",
+                                    context=_short(rel, 255)))
+        paths = [m.path for m in found]
+        choice = installer.choose(packer, found, sample)
+        if choice is None:
+            warnings.append(Warning(code="installer_no_payload",
+                                    message=f"{packer}: no PE among {len(found)} extracted member(s); "
+                                            "analysing the installer stub"))
+            return None, None, paths
+        member, reason, extra = choice
+        name = _SAFE_NAME.sub("_", member.rel.rsplit("/", 1)[-1])[-64:].lstrip(".-") or "payload.exe"
+        dest = job / "payload" / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(member.path, dest)
+        evidence: dict[str, Any] = {"packer": packer, "packed_sha256": _sha256(sample), "payload_member": member.rel,
+                                    "payload_sha256": _sha256(dest), "payload_reason": reason, **extra}
+        return dest, evidence, paths
 
     def _unpack(self, sample: Path, job: Path, timeout_s: float, warnings: list[Warning]) -> Path:
         """The ``upx -d`` image of ``sample`` (same file name, so the agent sees the same name), or

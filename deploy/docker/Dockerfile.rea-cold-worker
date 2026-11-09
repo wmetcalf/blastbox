@@ -129,9 +129,10 @@ RUN curl -fsSL -o rules.tgz "https://codeload.github.com/mandiant/capa-rules/tar
 
 # ------------------------------------------- fixtures (regeneration only; not in image)
 FROM ${JDK_IMAGE} AS rea-fixtures-build
+ARG NSIS_VERSION=3.10-2ubuntu2
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-       gcc libc6-dev gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 python3 \
+       gcc libc6-dev gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 python3 "nsis=${NSIS_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 COPY deploy/rea/fixtures /src/fixtures
 RUN sh /src/fixtures/build.sh /out
@@ -145,6 +146,10 @@ FROM ${JDK_IMAGE}
 ARG REA_TOOLS_SHA256=c819d694c65bd1482a0e780ff1848542f2046fe50a6b68fc366066b593d7e58f
 # The sweep upx -d-s UPX-marked samples (a static decompressor; the sample never runs).
 ARG UPX_VERSION=4.2.4-1.1build1
+# The sweep unwraps NSIS installers with 7-Zip (7z x -tNsis) and Inno Setup installers with
+# innoextract (static decompressors; the installer never runs). See installer.UNWRAPPERS.
+ARG SEVENZIP_VERSION=26.00+dfsg-1
+ARG INNOEXTRACT_VERSION=1.9-3
 # Address-space cap (KiB) on each Ghidra decompiler process. Auto-analysis runs one per
 # analysis thread; on a .NET assembly each grew past 1 GiB until the 6 GiB slot was
 # OOM-killed with no output. Capped, a runaway function fails alone and analysis goes on.
@@ -153,8 +158,11 @@ ARG DECOMPILE_MAX_KB=786432
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
        procps python3 python3-venv "upx-ucl=${UPX_VERSION}" \
+       "7zip=${SEVENZIP_VERSION}" "innoextract=${INNOEXTRACT_VERSION}" \
     && rm -rf /var/lib/apt/lists/* \
     && upx --version | head -1 \
+    && 7z i | grep -q ' Nsis ' \
+    && innoextract --version | head -1 \
     && useradd -u 10001 -m worker
 
 COPY --from=node /opt/node /opt/node
@@ -226,6 +234,9 @@ RUN --mount=type=bind,source=deploy/rea,target=/mnt/rea \
         > "$w/capa.json"; \
     python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('capa rules matched:', len(d['rules']))" \
         "$w/capa.json"; \
+    echo '== NSIS fixture unwrapped by 7z'; \
+    7z x -tNsis -y -bd -bso0 -bsp0 -o"$w/nsis" -- /mnt/rea/fixtures/installer.exe; \
+    cmp "$w/nsis/payload.exe" /mnt/rea/fixtures/sample.exe; \
     echo '== import blastbox.engines.rea'; \
     python -c "import blastbox.worker.cold, blastbox.engines.rea, pefile, PIL; print('blastbox rea worker ready')"; \
     echo '== nothing written outside HOME/TMPDIR'; \
@@ -239,5 +250,5 @@ WORKDIR /home/worker
 ENTRYPOINT ["python", "-m", "blastbox.worker.cold"]
 
 LABEL org.opencontainers.image.title="blastbox-rea-cold-worker" \
-      org.opencontainers.image.description="REA reverse-engineering worker (REA source build cd878ad, Ghidra 12.1.4 headless, Temurin JDK 21, Node 22.23.4)" \
+      org.opencontainers.image.description="REA reverse-engineering worker (REA source build cd878ad, Ghidra 12.1.4 headless, Temurin JDK 21, Node 22.23.4, 7-Zip 26.00, innoextract 1.9)" \
       org.opencontainers.image.version="0.1.0"

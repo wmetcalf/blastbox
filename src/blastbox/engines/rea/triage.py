@@ -13,11 +13,17 @@ a chain that could have produced findings.
   ("needs 32R2"); MIPS32 r1 (5), MIPS64 (6), R2 and R6 are left alone until verified live.
 - .NET assemblies (``dotnet=True`` or a CLR header) are exempt from the entropy rule: their
   ``.text`` carries compressed resources and Ghidra sees few native procedures.
+- :func:`nsis_marked` / :func:`inno_marked` -- a PE that is an NSIS installer (the first-header signature
+  ``\xEF\xBE\xAD\xDE NullsoftInst`` or the stub's ``Nullsoft.NSIS`` manifest) or an Inno Setup
+  installer (the setup loader's ``rDlPtS`` offset table or the ``Inno Setup Setup Data (``
+  header), read from the first ``MAX_INSTALLER_SCAN`` bytes. ``installer.UNWRAPPERS`` uses them
+  and the sweep unpacks those installers statically.
 """
 
 from __future__ import annotations
 
 import math
+import mmap
 import os
 from collections import Counter
 import struct
@@ -29,6 +35,10 @@ MIN_ENTROPY_BYTES = 4096
 MAX_ENTROPY_BYTES = 4 * 1024 * 1024  # the first 4 MiB of a region decide
 MAX_SECTIONS = 96
 HEAD_BYTES = 64 * 1024
+
+MAX_INSTALLER_SCAN = 256 * 1024 * 1024
+_NSIS_MARKERS = (b"\xef\xbe\xad\xdeNullsoftInst", b"Nullsoft.NSIS")
+_INNO_MARKERS = (b"rDlPtS", b"Inno Setup Setup Data (")
 
 _UPX_SECTIONS = frozenset({b"UPX0", b"UPX1", b"UPX2"})
 _SCN_MEM_EXECUTE = 0x20000000
@@ -196,3 +206,33 @@ def unsupported_arch(path: Path) -> bool:
         return False
     cls, _e, machine, flags, _o, _p = hdr
     return cls == 1 and machine == _EM_MIPS and (flags >> _EF_MIPS_ARCH_SHIFT) & 0xF in _MIPS_UNSUPPORTED
+
+
+def _scan_for(path: Path, markers: tuple[bytes, ...]) -> bool:
+    """True when the PE ``path`` holds any of ``markers`` in its first ``MAX_INSTALLER_SCAN`` bytes."""
+    if not _pe_sections(_read(path, 0, HEAD_BYTES)):
+        return False
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        size = os.fstat(fd).st_size
+        if size == 0:
+            return False
+        with mmap.mmap(fd, min(size, MAX_INSTALLER_SCAN), access=mmap.ACCESS_READ) as m:
+            return any(m.find(marker) >= 0 for marker in markers)
+    except (OSError, ValueError):
+        return False
+    finally:
+        os.close(fd)
+
+
+def nsis_marked(path: Path) -> bool:
+    """An NSIS installer: the first-header signature or the exehead manifest; never raises."""
+    return _scan_for(path, _NSIS_MARKERS)
+
+
+def inno_marked(path: Path) -> bool:
+    """An Inno Setup installer: the setup loader's offset table or the setup-data header."""
+    return _scan_for(path, _INNO_MARKERS)

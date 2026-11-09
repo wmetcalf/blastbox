@@ -17,6 +17,7 @@ import stat
 import struct
 import subprocess
 import threading
+import time
 import zipfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -523,6 +524,78 @@ def upx_unpack(
         dest.unlink(missing_ok=True)
         return "failed"
     return "ok"
+
+
+WatchStatus = Literal["ok", "failed", "timeout", "too_large"]
+WatchFn = Callable[..., WatchStatus]
+"""``watch_fn(argv, *, env, cwd, timeout_s, watch, max_bytes, max_files) -> WatchStatus``."""
+
+
+def _tree_usage(root: Path, max_files: int) -> tuple[int, int]:
+    """``(bytes, entries)`` under ``root`` by lstat (links are never followed); stops past ``max_files``."""
+    total = n = 0
+    stack = [root]
+    while stack and n <= max_files:
+        try:
+            with os.scandir(stack.pop()) as it:
+                for e in it:
+                    n += 1
+                    try:
+                        st = e.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISDIR(st.st_mode):
+                        stack.append(Path(e.path))
+                    else:
+                        total += st.st_size
+        except OSError:
+            continue
+    return total, n
+
+
+def watched_run(
+    argv: list[str],
+    *,
+    env: Mapping[str, str],
+    cwd: Path | None,
+    timeout_s: float,
+    watch: Path,
+    max_bytes: int,
+    max_files: int,
+    poll_s: float = 0.1,
+) -> WatchStatus:
+    """Run an extractor in its own process group while watching what it writes under ``watch``.
+
+    An archive's sizes are attacker-chosen and a solid NSIS block lists none, so the bound is
+    enforced on the output itself: the whole group is killed (``too_large``) as soon as the bytes
+    or entries under ``watch`` pass ``max_bytes`` / ``max_files``, and on ``timeout``. Output
+    written between two polls is also bounded by the caller's ``ulimit -f``. stdout and stderr
+    are discarded. A non-zero exit is ``failed`` (the caller decides what a partial tree is worth).
+    """
+    proc = subprocess.Popen(argv, env=dict(env), cwd=cwd, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    deadline = time.monotonic() + timeout_s
+    status: WatchStatus = "failed"
+    try:
+        while True:
+            try:
+                rc = proc.wait(timeout=poll_s)
+            except subprocess.TimeoutExpired:
+                rc = None
+            used, entries = _tree_usage(watch, max_files)
+            if used > max_bytes or entries > max_files:
+                status = "too_large"
+                break
+            if rc is not None:
+                status = "ok" if rc == 0 else "failed"
+                break
+            if time.monotonic() >= deadline:
+                status = "timeout"
+                break
+    finally:
+        _kill_group(proc)
+        proc.wait()
+    return status
 
 
 CAPA_BACKENDS = {"pe": ("pe", "vivisect"), "elf": ("elf", "vivisect"), "dotnet": ("dotnet", "dotnet")}

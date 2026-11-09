@@ -27,6 +27,16 @@ JDK_IMAGE=eclipse-temurin:21-jdk@sha256:ebfbb18d11ff163ee83b21258acf12248af48d22
 # upx-ucl from the base image's Ubuntu archive (the sweep upx -d-s UPX-marked samples).
 UPX_VERSION=4.2.4-1.1build1
 
+# Installer unwrapping (installer.py). The base image's archive is Ubuntu 26.04 "resolute"
+# (not noble): versions read with `apt-cache policy` inside JDK_IMAGE on 2026-11-09.
+# 7-Zip's NSIS handler extracts files only (no [NSIS].nsi since 15.05); the sweep decodes the
+# script's string table itself. innoextract 1.9 (the latest release) reads Inno Setup up to
+# 6.0.5; newer installers are attempted and fail as a warning.
+SEVENZIP_VERSION=26.00+dfsg-1
+INNOEXTRACT_VERSION=1.9-3
+# Fixture regeneration only (rea-fixtures stage builds deploy/rea/fixtures/installer.exe).
+NSIS_VERSION=3.10-2ubuntu2
+
 # capa 10.0.0 (flare-capa wheel + deps, hash-locked in capa-requirements.txt), with the
 # same release's rules (capa-rules tag) and FLIRT signatures (capa tag, sigs/ only).
 CAPA_VERSION=10.0.0
