@@ -22,6 +22,19 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
 4a. a UPX-marked PE/ELF is ``upx -d``-ed (a static decompressor; the sample never runs) and
    every later step analyses the unpacked image instead (``unpacked: "upx"``); a failed unpack
    is a warning and the packed original goes on, to stop at ``chain_stop: packed``;
+4a'. a native x86/x64 PE (not .NET) whose static signals say it hides its next stage
+   (``emulate.triggers``: high-entropy section, few or loader-only imports, TLS callbacks, W+X
+   section, entry outside code, hashed API names, a UPX header upx refused) is emulated in Speakeasy
+   (``emulate_runner.py`` under the Speakeasy venv's python, out of process, wall-clock / API /
+   memory / file-size capped; unicorn interprets the code, nothing runs natively). PEs it wrote
+   into memory and executable allocations become ``member-<n>``; the most plausible PE
+   (``emulate.choose``) replaces the stub for every later step (layer ``{"packer": "emulated",
+   "packed_sha256", "payload_sha256", "payload_reason", "region": {"base", "size", "protect"}}``,
+   summary ``unpacked: "emulated"`` when outermost) and may be ``upx -d``-ed in turn. What the stub
+   did goes to ``State.sweep["emulation"]`` and the report (``emulate.py`` documents the shape); the
+   strings in its API arguments go to the IOC extractor as ``emulation:<api>``. Summary
+   ``emulation`` (``ok`` | ``budget`` | ``failed``) and ``emulation_captures``. A crash or missing
+   emulator is ``emulation_failed``, a budget stop ``emulation_budget``; the stub is analysed as before;
 4b. a .NET assembly's ManifestResources (``dotnet_resources.py``, run under the capa venv's python
    as a bounded subprocess): name/size/entropy per resource and ``.resources`` entry, the loader APIs
    the code references, and hidden payloads (large + high-entropy, or decoding to a PE), which become
@@ -54,9 +67,9 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
 ``rea.report/1`` payload fields: ``schema``, ``kind``, ``inspect`` (``{cmd: {ok[, error]}}``),
 ``ghidra_status`` (ok | timeout | failed | skipped), ``members``, ``icons``, ``more_pending``,
 ``iocs_total``, ``iocs`` (parallel columns ``type``/``value``/``source``), the optional
-``unpacked`` (``"upx"``, ``"nsis"`` or ``"inno"``: the outermost layer, with ``unpacked_sha256``
+``unpacked`` (``"upx"``, ``"nsis"``, ``"inno"`` or ``"emulated"``: the outermost layer, with ``unpacked_sha256``
 of the image finally analysed), the optional ``hidden_payloads`` (int, .NET only: how many hidden payloads the resource scan
-flagged), the optional ``capa_status`` /
+flagged), the optional ``emulation`` / ``emulation_captures`` (step 4a'), the optional ``capa_status`` /
 ``capabilities_total`` / ``capabilities`` (parallel columns ``rule``/``namespace``/``attack``) and
 the optional ``chain_stop``.
 ``chain_stop`` is absent while the chain can continue; otherwise it is exactly one of, checked
@@ -98,7 +111,7 @@ from pathlib import Path
 from typing import Any
 
 from blastbox.contract import DeclaredArtifact, Detection, Record, Warning
-from blastbox.engines.rea import apihash, capa, dotnet_resources, dumpfix, installer
+from blastbox.engines.rea import apihash, capa, dotnet_resources, dumpfix, emulate, installer
 from blastbox.engines.rea.continuation import GhidraStatus, State, pack
 from blastbox.engines.rea.gostrings import clip_overruns, exact_iocs, go_strings
 from blastbox.engines.rea.icons import extract_icons
@@ -115,6 +128,7 @@ from blastbox.engines.rea.runner import (
     rea_env,
     run_capa,
     run_dotnet_resources,
+    run_emulation,
     run_ghidra_analysis,
     upx_unpack,
 )
@@ -187,6 +201,7 @@ GhidraFn = Callable[..., str]
 UnpackFn = Callable[..., str]
 InstallerFn = Callable[..., str]
 DotnetFn = Callable[..., tuple[str, bytes]]
+EmulateFn = Callable[..., tuple[str, bytes]]
 CapaFn = Callable[..., tuple[CapaStatus, bytes]]
 RunnerFactory = Callable[..., Any]
 
@@ -318,6 +333,7 @@ class ReaSweepEngine:
         capa_fn: CapaFn = run_capa,
         installer_fn: InstallerFn = installer.extract,
         dotnet_fn: DotnetFn = run_dotnet_resources,
+        emulate_fn: EmulateFn = run_emulation,
     ) -> None:
         self._runner_factory = runner_factory
         self._ghidra_fn = ghidra_fn
@@ -325,6 +341,7 @@ class ReaSweepEngine:
         self._capa_fn = capa_fn
         self._installer_fn = installer_fn
         self._dotnet_fn = dotnet_fn
+        self._emulate_fn = emulate_fn
 
     def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
         base = Path(os.environ.get("BLASTBOX_WORK_DIR") or "/work")
@@ -353,6 +370,7 @@ class ReaSweepEngine:
         # and every extracted file goes out as a member.
         analysed = input
         members: list[Path] = []
+        # Every unwrapped layer, outermost first: installers, upx -d, the emulated stage.
         layers: list[dict[str, Any]] = []
         for depth in range(installer.MAX_DEPTH_UNWRAP):
             packer = installer.detect(analysed) if kind == "pe" else None
@@ -398,11 +416,30 @@ class ReaSweepEngine:
         icons = extract_icons(input, icons_dir, max_icons=MAX_ICONS)
 
         # 4a. UPX: everything from here on analyses the unpacked image when there is one.
-        unpacked = False
         if kind in ("pe", "elf") and upx_marked(analysed):
-            upx = self._unpack(analysed, job, min(UNPACK_TIMEOUT_S, remaining()), warnings)
-            unpacked = upx != analysed
-            analysed = upx
+            analysed = self._upx_layer(analysed, job / "upx-0", remaining(), layers, warnings)
+
+        # 4a'. emulated unpacking (emulate.py): a native PE that conceals its next stage runs under
+        # Speakeasy (interpreted by unicorn, out of process); a captured stage replaces it for every
+        # later step, and may itself be upx -d-ed.
+        emulation: dict[str, Any] | None = None
+        emulation_strings: list[tuple[str, str]] = []
+        api_hashes: apihash.ApiHashes | None = None
+        hashed: Path | None = None  # the image api_hashes describes
+        if kind == "pe" and len(layers) < installer.MAX_DEPTH_UNWRAP and emulate.emulatable(analysed):
+            api_hashes, hashed = self._api_hashes(analysed, remaining(), warnings), analysed
+            reasons = emulate.triggers(analysed, api_hashes=len(api_hashes.hits) if api_hashes else 0,
+                                       upx_failed=upx_marked(analysed))
+            if reasons:
+                emulation, emulation_strings, stage, layer, found = self._emulate(
+                    analysed, job, outdir / "members", len(members), remaining(), reasons, warnings)
+                members += found
+                if stage is not None and layer is not None:
+                    layers.append(layer)
+                    analysed = stage
+                    kind = classify(stage)
+                    if kind in ("pe", "elf") and upx_marked(analysed) and len(layers) <= installer.MAX_DEPTH_UNWRAP:
+                        analysed = self._upx_layer(analysed, job / "upx-1", remaining(), layers, warnings)
 
         # 4b. .NET: embedded resources (hidden payloads behind a decoy UI), out of process.
         resources: dict[str, Any] | None = None
@@ -460,6 +497,7 @@ class ReaSweepEngine:
             for addr, value in gstrings:
                 yield f"ghidra:{addr}", value
             yield from wide_urls
+            yield from emulation_strings
 
         # 4b. capa, after Ghidra (see CAPA_MAX_KB), moved into Ghidra's image base.
         capa_status: CapaStatus | None = None
@@ -473,13 +511,12 @@ class ReaSweepEngine:
             else:
                 capa_status, capabilities = self._capa(analysed, kind, job, image_base, remaining(), warnings)
 
-        # 4c. hashed API imports (PE only; .NET resolves by metadata, not by hash).
-        api_hashes: apihash.ApiHashes | None = None
-        if kind == "pe":
-            try:
-                api_hashes = apihash.resolve(analysed, deadline=time.monotonic() + max(0.0, min(API_HASH_S, remaining())))
-            except (OSError, ValueError) as exc:
-                warnings.append(Warning(code="api_hash_failed", message=f"exception:{type(exc).__name__}"))
+        # 4c. hashed API imports (PE only; .NET resolves by metadata, not by hash). Already computed
+        # for the emulation trigger when the image did not change since.
+        if kind != "pe":
+            api_hashes = None
+        elif hashed != analysed:
+            api_hashes = self._api_hashes(analysed, remaining(), warnings)
 
         iocs = extract_iocs(sources(), limit=MAX_IOCS)
         if go_lits:
@@ -496,10 +533,11 @@ class ReaSweepEngine:
         sweep_evidence: dict[str, Any] = {"kind": kind, "iocs": [{"type": i.type, "value": i.value, "source": i.source}
                                                  for i in iocs[:STATE_IOCS]]}
         if layers:
-            nested = layers[1:] + ([{"packer": "upx"}] if unpacked else [])
+            # An inner upx layer is recorded as {"packer": "upx"} (the outer layer names the input).
+            nested = [{"packer": "upx"} if layer["packer"] == "upx" else layer for layer in layers[1:]]
             sweep_evidence["unpacked"] = {**layers[0], **({"inner": nested} if nested else {})}
-        elif unpacked:
-            sweep_evidence["unpacked"] = {"packer": "upx", "packed_sha256": _sha256(input)}
+        if emulation is not None:
+            sweep_evidence["emulation"] = emulation
         if dump is not None:
             sweep_evidence["dump_headers"] = dump
         if resources is not None:
@@ -528,9 +566,12 @@ class ReaSweepEngine:
             "more_pending": more_pending,
             "iocs_total": len(iocs),
         }
-        if layers or unpacked:
-            summary["unpacked"] = layers[0]["packer"] if layers else "upx"
+        if layers:
+            summary["unpacked"] = layers[0]["packer"]
             summary["unpacked_sha256"] = _sha256(analysed)
+        if emulation is not None:
+            summary["emulation"] = emulation["status"]
+            summary["emulation_captures"] = len(emulation.get("captures", []))
         if resources is not None:
             summary["hidden_payloads"] = len(resources["hidden_payloads"])
         if capa_status is not None:
@@ -542,7 +583,7 @@ class ReaSweepEngine:
         # 8. report artifact, then the payload
         report_path = outdir / "report.json"
         self._write_report(report_path, summary, iocs, inspect, report_cap, warnings, capabilities, api_hashes,
-                           resources)
+                           resources, emulation)
         payload = self._payload(summary, iocs, limits, warnings, capabilities)
 
         artifacts = [DeclaredArtifact(id=f"member-{i}", path=p.relative_to(outdir).as_posix(), kind="extracted")
@@ -791,6 +832,99 @@ class ReaSweepEngine:
                     "loader_refs": [text(r) for r in refs[:32] if isinstance(r, str)], "hidden_payloads": hidden}
         return evidence, paths
 
+    def _upx_layer(self, sample: Path, job: Path, remaining_s: float, layers: list[dict[str, Any]],
+                   warnings: list[Warning]) -> Path:
+        """``upx -d`` one layer: the unpacked image (a layer is appended) or ``sample``."""
+        upx = self._unpack(sample, job, min(UNPACK_TIMEOUT_S, remaining_s), warnings)
+        if upx != sample:
+            layers.append({"packer": "upx", "packed_sha256": _sha256(sample)})
+        return upx
+
+    @staticmethod
+    def _api_hashes(sample: Path, remaining_s: float, warnings: list[Warning]) -> apihash.ApiHashes | None:
+        try:
+            return apihash.resolve(sample, deadline=time.monotonic() + max(0.0, min(API_HASH_S, remaining_s)))
+        except (OSError, ValueError) as exc:
+            warnings.append(Warning(code="api_hash_failed", message=f"exception:{type(exc).__name__}"))
+            return None
+
+    def _emulate(self, sample: Path, job: Path, members_dir: Path, have: int, remaining_s: float,
+                 reasons: list[str], warnings: list[Warning]
+                 ) -> tuple[dict[str, Any], list[tuple[str, str]], Path | None, dict[str, Any] | None, list[Path]]:
+        """Emulate one stub: ``(State.sweep["emulation"], IOC strings, the captured stage to analyse
+        instead or None, its unpack layer or None, member artifacts)``; ``have`` members already
+        exist. A crash or a missing emulator is ``emulation_failed``, a budget stop
+        ``emulation_budget``; both are warnings and the stub is analysed as before."""
+        evidence: dict[str, Any] = {"status": "failed", "triggers": list(reasons)}
+        budget = min(emulate.env_number("REA_EMULATE_TIMEOUT_S", emulate.DEFAULT_TIMEOUT_S),
+                     remaining_s - emulate.OVERHEAD_S)
+        if budget < 5:
+            warnings.append(Warning(code="emulation_budget", message="no time left to emulate the stub"))
+            return {**evidence, "status": "budget"}, [], None, None, []
+        scan = job / "emulate"
+        try:
+            status, out = self._emulate_fn(
+                sample, scan, budget + emulate.OVERHEAD_S, env=rea_env(job / "emulate-env", os.environ),
+                python=emulate.DEFAULT_PYTHON, budget_s=budget,
+                max_api=int(emulate.env_number("REA_EMULATE_MAX_API", emulate.DEFAULT_MAX_API, integer=True)),
+                max_insn=int(emulate.env_number("REA_EMULATE_MAX_INSTRUCTIONS", emulate.DEFAULT_MAX_INSN,
+                                                integer=True, allow_negative_one=True)),
+                max_kb=emulate.MAX_KB, max_stdout=emulate.MAX_JSON, max_write_bytes=emulate.MAX_WRITE)
+        except Exception as exc:
+            status, out = f"exception:{type(exc).__name__}", b""
+        doc = emulate.parse(out) if status == "ok" else None
+        if status == "timeout":
+            shutil.rmtree(scan, ignore_errors=True)
+            warnings.append(Warning(code="emulation_budget",
+                                    message=f"emulation exceeded its {budget + emulate.OVERHEAD_S:.0f}s wall clock "
+                                            "and was killed; analysing the stub"))
+            return {**evidence, "status": "budget"}, [], None, None, []
+        if doc is None:
+            shutil.rmtree(scan, ignore_errors=True)
+            why = "Speakeasy is not installed" if status == "unavailable" else (
+                "malformed output" if status == "ok" else _short(str(status), 64))
+            warnings.append(Warning(code="emulation_failed", message=f"emulation: {why}; analysing the stub"))
+            return {**evidence, "stop_detail": why}, [], None, None, []
+        try:
+            em = emulate.shape(doc, scan, job / "captures", input_sha256=_sha256(sample), triggers=reasons,
+                               imported=emulate.imports(sample))
+        finally:
+            shutil.rmtree(scan, ignore_errors=True)
+        evidence = em.evidence
+        if isinstance(doc.get("error"), str):
+            warnings.append(Warning(code="emulation_failed",
+                                    message=_short(f"Speakeasy raised: {doc['error']}; partial results kept", 1000)))
+        if evidence.get("stop") == "budget":
+            warnings.append(Warning(code="emulation_budget",
+                                    message=f"emulation stopped at its {budget:.0f}s / instruction budget; a "
+                                            "stage decrypted later was not reached"))
+        members_dir.mkdir(parents=True, exist_ok=True)
+        paths: list[Path] = []
+        capped = 0
+        for cap in em.captures:
+            if have + len(paths) >= MAX_MEMBERS:
+                capped += 1
+                continue
+            dest = members_dir / f"member-{have + len(paths)}"
+            if installer.copy_member(str(cap.path), dest, MAX_MEMBER_BYTES) is None:
+                cap.member = dest.name
+                paths.append(dest)
+        if capped:
+            warnings.append(Warning(code="members_capped",
+                                    message=f"{capped} emulation capture(s) beyond the {MAX_MEMBERS}-member cap dropped"))
+        evidence["captures"] = [c.row() for c in em.captures]
+        choice = emulate.choose(em.captures)
+        if choice is None:
+            return evidence, em.strings, None, None, paths
+        cap, reason = choice
+        dest = job / "emulated" / f"stage-{cap.sha256[:12]}.{'dll' if cap.dll else 'exe'}"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(cap.path, dest)
+        evidence["payload_sha256"] = cap.sha256
+        layer = {"packer": "emulated", "packed_sha256": _sha256(sample), "payload_sha256": cap.sha256,
+                 "payload_reason": reason, "region": dict(cap.region)}
+        return evidence, em.strings, dest, layer, paths
+
     def _unpack(self, sample: Path, job: Path, timeout_s: float, warnings: list[Warning]) -> Path:
         """The ``upx -d`` image of ``sample`` (same file name, so the agent sees the same name), or
         ``sample`` itself with an ``unpack_failed`` warning."""
@@ -915,7 +1049,8 @@ class ReaSweepEngine:
                       inspect: dict[str, dict[str, Any]], cap: int, warnings: list[Warning],
                       capabilities: list[dict[str, Any]] | None = None,
                       api_hashes: apihash.ApiHashes | None = None,
-                      resources: dict[str, Any] | None = None) -> None:
+                      resources: dict[str, Any] | None = None,
+                      emulation: dict[str, Any] | None = None) -> None:
         results = dict(inspect)
         hashes = ({"algorithm": api_hashes.algorithm, "hits": api_hashes.hits}
                   if api_hashes is not None else None)
@@ -924,7 +1059,8 @@ class ReaSweepEngine:
 
         def encode() -> bytes:
             return json.dumps({**summary, "iocs": ioc_rows, "capabilities": caps, "api_hashes": hashes,
-                               "dotnet_resources": resources, "inspect_results": results}).encode()
+                               "dotnet_resources": resources, "emulation": emulation,
+                               "inspect_results": results}).encode()
 
         data = encode()
         if len(data) > cap:

@@ -130,6 +130,37 @@ RUN curl -fsSL -o rules.tgz "https://codeload.github.com/mandiant/capa-rules/tar
     && tar -xzf capa.tgz --strip-components=1 "capa-${CAPA_VERSION}/sigs" \
     && mv sigs /opt/capa/sigs && rm -rf /build/*
 
+# ------------------------------- speakeasy (hash-locked wheels + one pinned pure-Python sdist)
+# The sweep's emulated unpacking (src/blastbox/engines/rea/emulate.py) runs emulate_runner.py under
+# /opt/speakeasy/bin/python as a bounded subprocess: unicorn interprets the stub, nothing runs
+# natively. Wheels as for capa (speakeasy-requirements.txt). lznt1 (a Speakeasy dependency) ships
+# only as a pure-Python sdist: it is sha256-checked and turned into a wheel here with a hash-locked
+# setuptools, offline and without build isolation; the build venv stays in this stage.
+FROM ${JDK_IMAGE} AS speakeasy
+ARG SPEAKEASY_VERSION=2.0.0b9
+ARG LZNT1_SDIST_URL=https://files.pythonhosted.org/packages/72/c2/087cd4845836f0eddd17cb4e99f92f4ef2087074de6e0ca8253f47e83524/lznt1-0.2.tar.gz
+ARG LZNT1_SDIST_SHA256=fdc59b57d462003038d572b17e165aa3c8f91a33df68948a344969a2896bc2ea
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       ca-certificates curl python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+COPY deploy/rea/speakeasy-requirements.txt deploy/rea/speakeasy-build-requirements.txt /build/
+WORKDIR /build
+RUN python3 -m venv /build/bv \
+    && /build/bv/bin/pip install --no-cache-dir --require-hashes --no-deps --only-binary :all: \
+       -r /build/speakeasy-build-requirements.txt \
+    && curl -fsSL -o lznt1-0.2.tar.gz "${LZNT1_SDIST_URL}" \
+    && echo "${LZNT1_SDIST_SHA256}  lznt1-0.2.tar.gz" | sha256sum -c - \
+    && /build/bv/bin/pip wheel --no-cache-dir --no-deps --no-build-isolation --no-index -w /build/wheels \
+       ./lznt1-0.2.tar.gz \
+    && python3 -m venv /opt/speakeasy \
+    && /opt/speakeasy/bin/pip install --no-cache-dir --require-hashes --no-deps --only-binary :all: \
+       -r /build/speakeasy-requirements.txt \
+    && /opt/speakeasy/bin/pip install --no-cache-dir --no-deps --no-index /build/wheels/lznt1-0.2-py3-none-any.whl \
+    && /opt/speakeasy/bin/pip check \
+    && /opt/speakeasy/bin/python -I -c "import importlib.metadata as m, speakeasy, unicorn; assert m.version('speakeasy-emulator') == '${SPEAKEASY_VERSION}'; print('speakeasy', m.version('speakeasy-emulator'), 'unicorn', unicorn.__version__)" \
+    && rm -rf /build
+
 # ------------------------------------------- fixtures (regeneration only; not in image)
 FROM ${JDK_IMAGE} AS rea-fixtures-build
 ARG NSIS_VERSION=3.10-2ubuntu2
@@ -176,6 +207,7 @@ RUN d=/opt/ghidra/Ghidra/Features/Decompiler/os/linux_x86_64 \
     && chmod 755 "$d/decompile"
 COPY --from=rea-build /opt/rea /opt/rea
 COPY --from=capa /opt/capa /opt/capa
+COPY --from=speakeasy /opt/speakeasy /opt/speakeasy
 COPY deploy/rea/ghidra_scripts /opt/rea/ghidra_scripts
 
 COPY pyproject.toml README.md /src/blastbox/
@@ -245,6 +277,13 @@ RUN --mount=type=bind,source=deploy/rea,target=/mnt/rea \
     /opt/capa/bin/python -I "$scanner" /mnt/rea/fixtures/dotnet.dll "$w/dres" > "$w/dres.json"; \
     python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['resources_total'] == 6 and len(d['hidden']) == 5, d; print('hidden payloads:', len(d['hidden']))" \
         "$w/dres.json"; \
+    echo '== emulated unpacking (speakeasy venv, unicorn only) of the loader fixture under its ulimits'; \
+    runner=$(python -c 'import blastbox.engines.rea.emulate_runner as m; print(m.__file__)'); \
+    mkdir "$w/emu"; \
+    sh -c 'ulimit -v 3145728 && ulimit -f 655360 && exec /opt/speakeasy/bin/python -I "$@"' sh \
+        "$runner" /mnt/rea/fixtures/unpack.exe "$w/emu" 60 20000 -1 > "$w/emu.json"; \
+    python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert not d.get('error') and len(d['regions']) == 3 and d['dynamic_code'], d; print('emulation regions:', len(d['regions']), 'apis:', d['apis_total'])" \
+        "$w/emu.json"; \
     echo '== import blastbox.engines.rea'; \
     python -c "import blastbox.worker.cold, blastbox.engines.rea, pefile, PIL; print('blastbox rea worker ready')"; \
     echo '== nothing written outside HOME/TMPDIR'; \
@@ -258,5 +297,5 @@ WORKDIR /home/worker
 ENTRYPOINT ["python", "-m", "blastbox.worker.cold"]
 
 LABEL org.opencontainers.image.title="blastbox-rea-cold-worker" \
-      org.opencontainers.image.description="REA reverse-engineering worker (REA source build cd878ad, Ghidra 12.1.4 headless, Temurin JDK 21, Node 22.23.4, 7-Zip 26.00, innoextract 1.9)" \
+      org.opencontainers.image.description="REA reverse-engineering worker (REA source build cd878ad, Ghidra 12.1.4 headless, Temurin JDK 21, Node 22.23.4, 7-Zip 26.00, innoextract 1.9, Speakeasy 2.0.0b9)" \
       org.opencontainers.image.version="0.1.0"

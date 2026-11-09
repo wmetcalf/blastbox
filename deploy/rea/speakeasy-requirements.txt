@@ -1,0 +1,38 @@
+# Speakeasy (speakeasy-emulator 2.0.0b9, Mandiant's Windows emulator on unicorn 2.1.4) and every
+# runtime dependency, wheels only, each pinned by sha256. The REA cold-worker image installs it with
+# pip --require-hashes --no-deps --only-binary :all: into its own venv (/opt/speakeasy) on the
+# image's python3 (3.14); the sweep's emulate_runner.py runs under that venv's python.
+# Shared packages use the same versions and hashes as capa-requirements.txt.
+# 2.0.0b9 is a pre-release, chosen because the last stable release (1.5.11, 2022) pins
+# unicorn==1.0.2 and has no Python 3.14 support. pycryptodome stays on the mature 3.x line (the 4.x
+# series is weeks old). lznt1 (pure Python, sdist only) is NOT here: the image builds its wheel from
+# a sha256-pinned sdist with the setuptools wheel in speakeasy-build-requirements.txt.
+# Regenerate in the base image: pip download --only-binary :all: --no-deps -d w <name>==<ver> ...
+annotated-types==0.8.0 \
+    --hash=sha256:f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0
+capstone==5.0.9 \
+    --hash=sha256:273fd8d747d2e35c88f91450be51a603ecfaafb00d96d9f315dcb8689c86193e
+markdown-it-py==4.2.0 \
+    --hash=sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a
+mdurl==0.1.2 \
+    --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8
+pefile==2024.8.26 \
+    --hash=sha256:76f8b485dcd3b1bb8166f1128d395fa3d87af26360c2358fb75b80019b957c6f
+pycryptodome==3.24.1 \
+    --hash=sha256:93619c3117a8f14ea1267b427e465d152a66c89c3d3c643262070c05b2855aae
+pydantic==2.14.3 \
+    --hash=sha256:3f7b347782ab7e4cf4c798496ae3a82787d9f21ec12676a9c564355eeef8daa8
+pydantic-core==2.50.4 \
+    --hash=sha256:f1d62fb172db35c6478c9323da34ff37d1f3d37d7d44337a9d94ba8c583e5730
+pygments==2.21.0 \
+    --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9
+rich==15.0.0 \
+    --hash=sha256:33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb
+speakeasy-emulator==2.0.0b9 \
+    --hash=sha256:cfec1403da9537922eeaea09d912bb5f8bda5b4bdc9cf7a4d53ee440b2a1dccf
+typing-extensions==4.16.0 \
+    --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8
+typing-inspection==0.4.5 \
+    --hash=sha256:bc210535442b39e1bf2805e0c7a17dfd6a4ace760c84c7f7d16245d23a6b1c39
+unicorn==2.1.4 \
+    --hash=sha256:9d6e6dea140560de4ebd8446661f7ef84a357d428c14a3ef09dacd306ec8c239

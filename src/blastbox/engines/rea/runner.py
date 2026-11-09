@@ -637,6 +637,56 @@ def run_dotnet_resources(
     return "ok", out.stdout
 
 
+EmulateStatus = Literal["ok", "timeout", "failed", "too_large", "unavailable"]
+
+
+def run_emulation(
+    sample: Path,
+    outdir: Path,
+    timeout_s: float,
+    *,
+    env: Mapping[str, str],
+    python: str,
+    budget_s: float,
+    max_api: int,
+    max_insn: int,
+    max_kb: int,
+    max_stdout: int,
+    max_write_bytes: int,
+    run_fn: RunFn = bounded_run,
+) -> tuple[EmulateStatus, bytes]:
+    """``emulate_runner.py`` over ``sample`` under ``python`` (the Speakeasy venv's).
+
+    The sample's code is interpreted by unicorn inside that process, so it is bounded like any
+    hostile parser and more: ``ulimit -v`` caps memory, ``ulimit -f`` each region file it writes
+    into ``outdir``, ``ulimit -t`` its CPU seconds, ``max_stdout`` its JSON and ``timeout_s`` its
+    wall clock (Speakeasy's own ``budget_s`` stops emulation first, so the dumps still happen).
+    ``-I`` keeps the script's own directory and the environment out of ``sys.path``. A missing
+    interpreter (no Speakeasy in this image) is ``unavailable``.
+    """
+    from blastbox.engines.rea import emulate_runner
+
+    if not Path(python).is_file():
+        return "unavailable", b""
+    outdir = outdir.resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+    blocks = max(1, max_write_bytes // 512)
+    cpu = max(1, int(timeout_s) + 1)
+    argv = ["sh", "-c",
+            'ulimit -v "$1" || exit 1; ulimit -f "$2" || exit 1; ulimit -t "$3" || exit 1; '
+            'exec "$4" -I "$5" "$6" "$7" "$8" "$9" "${10}"',
+            "sh", str(max_kb), str(blocks), str(cpu), python, str(Path(emulate_runner.__file__).resolve()),
+            str(sample.resolve()), str(outdir), f"{budget_s:g}", str(max_api), str(max_insn)]
+    out = run_fn(argv, env=env, cwd=outdir, timeout_s=timeout_s, max_stdout=max_stdout)
+    if out.timed_out:
+        return "timeout", b""
+    if out.capped:
+        return "too_large", b""
+    if out.rc != 0 or not out.stdout:
+        return "failed", b""
+    return "ok", out.stdout
+
+
 CAPA_BACKENDS = {"pe": ("pe", "vivisect"), "elf": ("elf", "vivisect"), "dotnet": ("dotnet", "dotnet")}
 # capa's exit codes for a file it does not handle (main.py E_INVALID_FILE_TYPE/_ARCH/_OS).
 _CAPA_UNSUPPORTED = frozenset({16, 17, 18})

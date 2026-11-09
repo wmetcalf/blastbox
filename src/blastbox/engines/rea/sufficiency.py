@@ -18,6 +18,12 @@ verify itself, and lists what is still missing (``gaps``):
   described by their decoy UI and called benign with the encrypted payload unread. The code that
   loads it is not addressable (CIL tokens), so the gap has no targets; it holds until the verdict
   stops being benign or the chain stops (stalled, pass cap);
+- ``benign_emulated_stage``: the verdict is ``benign`` while emulating the stub showed it hiding
+  a stage (``sweep["emulation"]["concealment"]``: executable allocations, code run outside its
+  image, a PE written into memory, its own code rewritten, injection APIs) and no captured stage
+  replaced it (``sweep["emulation"]["payload_sha256"]`` absent; when one did, the report is about
+  that stage and the usual bar applies). Live, obfuscated loaders were described by their stub. No
+  targets; it holds until the verdict stops being benign or the chain stops;
 - ``lead:<section>``: a capa rule with an ATT&CK id points at a report section
   (``LEAD_SECTIONS``) that the report left ``not_analysed``. Its unexplored functions are the
   gap's ``targets``, which go to the front of the next pass's todo list; a lead with no target
@@ -103,6 +109,14 @@ def _hidden_payloads(sweep: dict[str, Any]) -> list[str]:
     return out
 
 
+def _concealment(sweep: dict[str, Any]) -> list[str]:
+    em = sweep.get("emulation")
+    if not isinstance(em, dict) or em.get("payload_sha256"):
+        return []
+    items = em.get("concealment")
+    return [str(c)[:40] for c in items if isinstance(c, str)][:8] if isinstance(items, list) else []
+
+
 def facts_of(report: dict[str, Any] | None, functions: list[dict[str, Any]],
              iocs: list[dict[str, Any]]) -> list[str]:
     """What a pass established that a later pass can be compared against."""
@@ -144,6 +158,12 @@ def assess(*, report: dict[str, Any] | None, sweep: dict[str, Any], explored: li
                                 ("the verdict is benign but the assembly carries a hidden payload the analysis "
                                  "has not explained (" + "; ".join(hidden) + "): the visible program may be a "
                                  "decoy; find the code that loads it")[:MAX_DETAIL]))
+            concealed = _concealment(sweep)
+            if concealed:
+                gaps.append(Gap("benign_emulated_stage",
+                                ("the verdict is benign but emulating the stub showed it concealing a stage ("
+                                 + ", ".join(concealed) + "): the analysed code is a loader; explain what it "
+                                 "decrypts and runs")[:MAX_DETAIL]))
     if isinstance(report, dict):
         done = set(explored)
         leads: dict[str, Gap] = {}

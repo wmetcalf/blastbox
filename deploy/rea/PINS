@@ -48,3 +48,25 @@ CAPA_RULES_URL=https://codeload.github.com/mandiant/capa-rules/tar.gz/refs/tags/
 CAPA_RULES_SHA256=3d14dbdaf5b71731e42395ed5fa4d287418e6a2e5d6b0a348c7fd9fbe1699611
 CAPA_SRC_URL=https://codeload.github.com/mandiant/capa/tar.gz/refs/tags/v10.0.0
 CAPA_SRC_SHA256=d3f6006ad61e6591896f524566c191eca89c6220611969e1bd485bd9a1098180
+
+# Emulated unpacking (emulate.py / emulate_runner.py): Speakeasy in its own hash-locked venv
+# (/opt/speakeasy, the Dockerfile's speakeasy stage). Wheels + sha256 in speakeasy-requirements.txt.
+# 2.0.0b9 (2026-10-11) is a pre-release: the last stable 1.5.11 (2022) pins unicorn==1.0.2 and does
+# not support Python 3.14 (the base image's python). Its unicorn pin is >=2.1.4; 2.1.4 is used.
+# pycryptodome 3.24.1 (mature 3.x line; 4.x was weeks old). pydantic/rich/pefile and their
+# dependencies are the same versions and hashes as capa-requirements.txt.
+SPEAKEASY_VERSION=2.0.0b9
+SPEAKEASY_WHEEL_SHA256=cfec1403da9537922eeaea09d912bb5f8bda5b4bdc9cf7a4d53ee440b2a1dccf
+UNICORN_VERSION=2.1.4
+UNICORN_WHEEL_SHA256=9d6e6dea140560de4ebd8446661f7ef84a357d428c14a3ef09dacd306ec8c239
+CAPSTONE_VERSION=5.0.9
+PYCRYPTODOME_VERSION=3.24.1
+# lznt1 (Speakeasy dependency, pure Python, sdist only on PyPI): built into a wheel in the speakeasy
+# stage from this sdist with the hash-locked setuptools in speakeasy-build-requirements.txt
+# (setuptools 84.2.1, build stage only).
+LZNT1_SDIST_URL=https://files.pythonhosted.org/packages/72/c2/087cd4845836f0eddd17cb4e99f92f4ef2087074de6e0ca8253f47e83524/lznt1-0.2.tar.gz
+LZNT1_SDIST_SHA256=fdc59b57d462003038d572b17e165aa3c8f91a33df68948a344969a2896bc2ea
+SETUPTOOLS_BUILD_VERSION=84.2.1
+# Fixtures (rea-fixtures stage, gcc-mingw-w64-x86-64 as before): unpack.exe / unpack.dll (decrypt the
+# benign sample.exe into VirtualAlloc'd memory, map it, make it RX, run 54 bytes of shellcode, call
+# WinINet with run-time-decrypted strings) and peb.exe (no imports; PEB walk + ror13 hashes).
