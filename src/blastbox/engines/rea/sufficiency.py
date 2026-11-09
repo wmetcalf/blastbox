@@ -12,6 +12,12 @@ verify itself, and lists what is still missing (``gaps``):
   call is a claim about everything the program does; live, a Go sample whose ``main`` is a
   board-game decoy was called benign/medium with part of its own code unread. Its targets are
   those functions;
+- ``benign_hidden_payload``: the verdict is ``benign`` while the sweep found a hidden payload in
+  a .NET assembly's resources (``sweep["dotnet_resources"]["hidden_payloads"]``: a large
+  high-entropy resource, or one that decodes to a PE). Live, Formbook and NanoCore carriers were
+  described by their decoy UI and called benign with the encrypted payload unread. The code that
+  loads it is not addressable (CIL tokens), so the gap has no targets; it holds until the verdict
+  stops being benign or the chain stops (stalled, pass cap);
 - ``lead:<section>``: a capa rule with an ATT&CK id points at a report section
   (``LEAD_SECTIONS``) that the report left ``not_analysed``. Its unexplored functions are the
   gap's ``targets``, which go to the front of the next pass's todo list; a lead with no target
@@ -86,6 +92,17 @@ def _statuses(report: dict[str, Any] | None) -> dict[str, str]:
     return out
 
 
+def _hidden_payloads(sweep: dict[str, Any]) -> list[str]:
+    res = sweep.get("dotnet_resources")
+    items = res.get("hidden_payloads") if isinstance(res, dict) else None
+    out = []
+    for h in items if isinstance(items, list) else []:
+        if isinstance(h, dict):
+            where = str(h.get("resource") or "?")[:80] + (f"/{str(h['entry'])[:40]}" if h.get("entry") else "")
+            out.append(f"{where}: {h.get('size')} bytes, entropy {h.get('entropy')}")
+    return out
+
+
 def facts_of(report: dict[str, Any] | None, functions: list[dict[str, Any]],
              iocs: list[dict[str, Any]]) -> list[str]:
     """What a pass established that a later pass can be compared against."""
@@ -121,6 +138,12 @@ def assess(*, report: dict[str, Any] | None, sweep: dict[str, Any], explored: li
                                 f"the verdict is benign but {len(left)} of the program's own "
                                 f"{len(program_functions or [])} functions are unexplored: read them "
                                 "before ruling out hostile behaviour", left[:MAX_TARGETS]))
+            hidden = _hidden_payloads(sweep)
+            if hidden:
+                gaps.append(Gap("benign_hidden_payload",
+                                ("the verdict is benign but the assembly carries a hidden payload the analysis "
+                                 "has not explained (" + "; ".join(hidden) + "): the visible program may be a "
+                                 "decoy; find the code that loads it")[:MAX_DETAIL]))
     if isinstance(report, dict):
         done = set(explored)
         leads: dict[str, Gap] = {}

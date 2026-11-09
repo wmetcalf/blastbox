@@ -334,7 +334,7 @@ def _rel_text(rel: str) -> str:
     return "".join(ch if ch.isprintable() else "?" for ch in rel)[:255]
 
 
-def _copy(src_path: str, dest: Path, cap: int) -> str | None:
+def copy_member(src_path: str, dest: Path, cap: int) -> str | None:
     """Copy one file without following links; the drop reason, or None when copied."""
     try:
         fd = os.open(src_path, os.O_RDONLY | os.O_NOFOLLOW)
@@ -397,7 +397,7 @@ def collect(root: Path, dest: Path, *, max_members: int, max_member_bytes: int,
                 dropped.append((rel, "member_cap"))
                 continue
             target = dest / f"member-{start + len(members)}"
-            why = _copy(e.path, target, max_member_bytes)
+            why = copy_member(e.path, target, max_member_bytes)
             if why is not None:
                 dropped.append((rel, why))
                 continue

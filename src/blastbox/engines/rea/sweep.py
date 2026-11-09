@@ -22,6 +22,13 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
 4a. a UPX-marked PE/ELF is ``upx -d``-ed (a static decompressor; the sample never runs) and
    every later step analyses the unpacked image instead (``unpacked: "upx"``); a failed unpack
    is a warning and the packed original goes on, to stop at ``chain_stop: packed``;
+4b. a .NET assembly's ManifestResources (``dotnet_resources.py``, run under the capa venv's python
+   as a bounded subprocess): name/size/entropy per resource and ``.resources`` entry, the loader APIs
+   the code references, and hidden payloads (large + high-entropy, or decoding to a PE), which become
+   members and ``hidden_payload`` warnings. Evidence ``State.sweep["dotnet_resources"] =
+   {"resources_total", "resources", "loader_refs", "hidden_payloads": [{"resource"[, "entry"], "size",
+   "entropy"[, "member"][, "decoded"[, "decoded_member", "decoded_sha256"]]}]}``; a failed scan is a
+   ``dotnet_resources_failed`` warning;
 5. native code (pe/elf/macho/dotnet): ``analyzeHeadless`` import + auto-analysis with the
    bundled ``ListStrings.java`` post-script dumping defined strings and the image base;
 5a. after it, ``capa`` (pe/elf/dotnet; ``capa.py``): rule matches with ATT&CK/MBC
@@ -48,7 +55,8 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
 ``ghidra_status`` (ok | timeout | failed | skipped), ``members``, ``icons``, ``more_pending``,
 ``iocs_total``, ``iocs`` (parallel columns ``type``/``value``/``source``), the optional
 ``unpacked`` (``"upx"``, ``"nsis"`` or ``"inno"``: the outermost layer, with ``unpacked_sha256``
-of the image finally analysed), the optional ``capa_status`` /
+of the image finally analysed), the optional ``hidden_payloads`` (int, .NET only: how many hidden payloads the resource scan
+flagged), the optional ``capa_status`` /
 ``capabilities_total`` / ``capabilities`` (parallel columns ``rule``/``namespace``/``attack``) and
 the optional ``chain_stop``.
 ``chain_stop`` is absent while the chain can continue; otherwise it is exactly one of, checked
@@ -90,7 +98,7 @@ from pathlib import Path
 from typing import Any
 
 from blastbox.contract import DeclaredArtifact, Detection, Record, Warning
-from blastbox.engines.rea import apihash, capa, dumpfix, installer
+from blastbox.engines.rea import apihash, capa, dotnet_resources, dumpfix, installer
 from blastbox.engines.rea.continuation import GhidraStatus, State, pack
 from blastbox.engines.rea.gostrings import clip_overruns, exact_iocs, go_strings
 from blastbox.engines.rea.icons import extract_icons
@@ -106,6 +114,7 @@ from blastbox.engines.rea.runner import (
     MAX_MEMBERS,
     rea_env,
     run_capa,
+    run_dotnet_resources,
     run_ghidra_analysis,
     upx_unpack,
 )
@@ -125,6 +134,14 @@ DEFAULT_INSPECT_TIMEOUT_S = 60.0
 EXTRACT_TIMEOUT_S = 120.0
 UNPACK_TIMEOUT_S = 60.0
 INSTALLER_TIMEOUT_S = 120.0
+DOTNET_RESOURCES_S = 90.0
+DEFAULT_DOTNET_PYTHON = "/opt/capa/bin/python"  # the capa venv carries the hash-locked dnfile
+DOTNET_MAX_KB = 2 * 1024 * 1024
+MAX_DOTNET_JSON = 4 * 1024 * 1024
+MAX_DOTNET_WRITE = 256 * 1024 * 1024
+STATE_RESOURCES = 32  # resources (and entries per container) carried in the continuation
+_SCAN_FILE = re.compile(r"(?:hidden|decoded)-[0-9]{1,4}\.bin")
+_DECODED = re.compile(r"plain|gzip|zlib|deflate|base64|xor:0x[0-9a-f]{2}")
 # The installer's whole extracted tree (bytes, entries), before the members caps apply.
 MAX_INSTALLER_BYTES = 512 * 1024 * 1024
 MAX_INSTALLER_FILES = 4096
@@ -169,6 +186,7 @@ _MIME = {
 GhidraFn = Callable[..., str]
 UnpackFn = Callable[..., str]
 InstallerFn = Callable[..., str]
+DotnetFn = Callable[..., tuple[str, bytes]]
 CapaFn = Callable[..., tuple[CapaStatus, bytes]]
 RunnerFactory = Callable[..., Any]
 
@@ -299,12 +317,14 @@ class ReaSweepEngine:
         unpack_fn: UnpackFn = upx_unpack,
         capa_fn: CapaFn = run_capa,
         installer_fn: InstallerFn = installer.extract,
+        dotnet_fn: DotnetFn = run_dotnet_resources,
     ) -> None:
         self._runner_factory = runner_factory
         self._ghidra_fn = ghidra_fn
         self._unpack_fn = unpack_fn
         self._capa_fn = capa_fn
         self._installer_fn = installer_fn
+        self._dotnet_fn = dotnet_fn
 
     def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
         base = Path(os.environ.get("BLASTBOX_WORK_DIR") or "/work")
@@ -383,6 +403,13 @@ class ReaSweepEngine:
             upx = self._unpack(analysed, job, min(UNPACK_TIMEOUT_S, remaining()), warnings)
             unpacked = upx != analysed
             analysed = upx
+
+        # 4b. .NET: embedded resources (hidden payloads behind a decoy UI), out of process.
+        resources: dict[str, Any] | None = None
+        if kind == "dotnet":
+            resources, found = self._dotnet(analysed, job, outdir / "members", len(members),
+                                            min(DOTNET_RESOURCES_S, remaining()), warnings)
+            members += found
 
         # 4. Ghidra
         ghidra_status: GhidraStatus = "skipped"
@@ -475,6 +502,8 @@ class ReaSweepEngine:
             sweep_evidence["unpacked"] = {"packer": "upx", "packed_sha256": _sha256(input)}
         if dump is not None:
             sweep_evidence["dump_headers"] = dump
+        if resources is not None:
+            sweep_evidence["dotnet_resources"] = resources
         if capabilities:
             sweep_evidence["capabilities"] = capabilities[:STATE_CAPABILITIES]
         if api_hashes is not None:
@@ -502,6 +531,8 @@ class ReaSweepEngine:
         if layers or unpacked:
             summary["unpacked"] = layers[0]["packer"] if layers else "upx"
             summary["unpacked_sha256"] = _sha256(analysed)
+        if resources is not None:
+            summary["hidden_payloads"] = len(resources["hidden_payloads"])
         if capa_status is not None:
             summary["capa_status"] = capa_status
             summary["capabilities_total"] = len(capabilities)
@@ -510,7 +541,8 @@ class ReaSweepEngine:
 
         # 8. report artifact, then the payload
         report_path = outdir / "report.json"
-        self._write_report(report_path, summary, iocs, inspect, report_cap, warnings, capabilities, api_hashes)
+        self._write_report(report_path, summary, iocs, inspect, report_cap, warnings, capabilities, api_hashes,
+                           resources)
         payload = self._payload(summary, iocs, limits, warnings, capabilities)
 
         artifacts = [DeclaredArtifact(id=f"member-{i}", path=p.relative_to(outdir).as_posix(), kind="extracted")
@@ -663,6 +695,102 @@ class ReaSweepEngine:
                                     "payload_sha256": _sha256(dest), "payload_reason": reason, **extra}
         return dest, evidence, paths
 
+    def _dotnet(self, sample: Path, job: Path, members_dir: Path, have: int, timeout_s: float,
+                warnings: list[Warning]) -> tuple[dict[str, Any] | None, list[Path]]:
+        """``(State.sweep["dotnet_resources"] or None, member artifacts)`` from the resource scan
+        (``dotnet_resources.py``). Hidden payloads, and the PEs they decode to, become members and
+        ``hidden_payload`` warnings; a failed scan is a ``dotnet_resources_failed`` warning."""
+        if timeout_s < 1:
+            warnings.append(Warning(code="dotnet_resources_failed", message="no time left for the resource scan"))
+            return None, []
+        scan_dir = job / "dotnet-res"
+        python = DEFAULT_DOTNET_PYTHON
+        try:
+            status, out = self._dotnet_fn(sample, scan_dir, timeout_s, env=rea_env(job / "dotnet", os.environ),
+                                          python=python, max_kb=DOTNET_MAX_KB, max_stdout=MAX_DOTNET_JSON,
+                                          max_write_bytes=MAX_DOTNET_WRITE)
+        except Exception as exc:
+            warnings.append(Warning(code="dotnet_resources_failed", message=f"exception:{type(exc).__name__}"))
+            return None, []
+        try:
+            doc = json.loads(out) if status == "ok" else None
+        except (ValueError, RecursionError):
+            doc = None
+        doc_rows = doc.get("resources") if isinstance(doc, dict) else None
+        doc_hidden = doc.get("hidden") if isinstance(doc, dict) else None
+        if not isinstance(doc, dict) or not isinstance(doc_rows, list) or not isinstance(doc_hidden, list):
+            warnings.append(Warning(code="dotnet_resources_failed",
+                                    message=f"resource scan: {status if status != 'ok' else 'malformed output'}"))
+            return None, []
+        if isinstance(doc.get("error"), str):
+            warnings.append(Warning(code="dotnet_resources_failed", message=f"resource scan: {_short(doc['error'], 64)}"))
+
+        def num(v: Any, kind: type | tuple[type, ...]) -> Any:
+            return v if isinstance(v, (int, float)) and not isinstance(v, bool) and isinstance(v, kind) else 0
+
+        def text(v: Any) -> str:
+            return _short(v, 200) if isinstance(v, str) else ""
+
+        rows: list[dict[str, Any]] = []
+        for r in doc_rows[:STATE_RESOURCES]:
+            if not isinstance(r, dict):
+                continue
+            row: dict[str, Any] = {"name": text(r.get("name")), "size": num(r.get("size"), int),
+                                   "entropy": float(num(r.get("entropy"), (int, float))),
+                                   "container": r.get("container") is True}
+            if isinstance(r.get("format"), str):
+                row["format"] = text(r["format"])
+            if row["container"]:
+                row["entries_total"] = num(r.get("entries_total"), int)
+                raw_ents = r.get("entries")
+                ents: list[Any] = raw_ents if isinstance(raw_ents, list) else []
+                row["entries"] = [{"name": text(e.get("name")), "size": num(e.get("size"), int),
+                                   "entropy": float(num(e.get("entropy"), (int, float))), "type": text(e.get("type"))}
+                                  for e in ents[:STATE_RESOURCES] if isinstance(e, dict)]
+            rows.append(row)
+        raw_refs = doc.get("loader_refs")
+        refs: list[Any] = raw_refs if isinstance(raw_refs, list) else []
+        hidden: list[dict[str, Any]] = []
+        paths: list[Path] = []
+
+        def take(name: Any) -> Path | None:
+            if not isinstance(name, str) or not _SCAN_FILE.fullmatch(name) or have + len(paths) >= MAX_MEMBERS:
+                return None
+            dest = members_dir / f"member-{have + len(paths)}"
+            if installer.copy_member(str(scan_dir / name), dest, MAX_MEMBER_BYTES) is not None:
+                return None
+            paths.append(dest)
+            return dest
+
+        members_dir.mkdir(parents=True, exist_ok=True)
+        for h in doc_hidden[:dotnet_resources.MAX_HIDDEN]:
+            if not isinstance(h, dict):
+                continue
+            item: dict[str, Any] = {"resource": text(h.get("resource")), "size": num(h.get("size"), int),
+                                    "entropy": float(num(h.get("entropy"), (int, float)))}
+            if isinstance(h.get("entry"), str):
+                item["entry"] = text(h["entry"])
+            raw = take(h.get("file"))
+            if raw is not None:
+                item["member"] = raw.name
+            decoded = h.get("decoded")
+            if isinstance(decoded, str) and _DECODED.fullmatch(decoded):
+                item["decoded"] = decoded
+                pe = raw if decoded == "plain" else take(h.get("decoded_file"))
+                if pe is not None:
+                    item["decoded_member"] = pe.name
+                    item["decoded_sha256"] = _sha256(pe)
+            hidden.append(item)
+            where = item["resource"] + (f"/{item['entry']}" if "entry" in item else "")
+            how = f", decodes ({item['decoded']}) to a PE" if "decoded" in item else ""
+            warnings.append(Warning(code="hidden_payload",
+                                    message=_short(f"embedded resource {where}: {item['size']} bytes, entropy "
+                                                   f"{item['entropy']:.2f}{how}", 1000)))
+        shutil.rmtree(scan_dir, ignore_errors=True)
+        evidence = {"resources_total": num(doc.get("resources_total"), int), "resources": rows,
+                    "loader_refs": [text(r) for r in refs[:32] if isinstance(r, str)], "hidden_payloads": hidden}
+        return evidence, paths
+
     def _unpack(self, sample: Path, job: Path, timeout_s: float, warnings: list[Warning]) -> Path:
         """The ``upx -d`` image of ``sample`` (same file name, so the agent sees the same name), or
         ``sample`` itself with an ``unpack_failed`` warning."""
@@ -786,7 +914,8 @@ class ReaSweepEngine:
     def _write_report(path: Path, summary: dict[str, Any], iocs: list[Ioc],
                       inspect: dict[str, dict[str, Any]], cap: int, warnings: list[Warning],
                       capabilities: list[dict[str, Any]] | None = None,
-                      api_hashes: apihash.ApiHashes | None = None) -> None:
+                      api_hashes: apihash.ApiHashes | None = None,
+                      resources: dict[str, Any] | None = None) -> None:
         results = dict(inspect)
         hashes = ({"algorithm": api_hashes.algorithm, "hits": api_hashes.hits}
                   if api_hashes is not None else None)
@@ -795,7 +924,7 @@ class ReaSweepEngine:
 
         def encode() -> bytes:
             return json.dumps({**summary, "iocs": ioc_rows, "capabilities": caps, "api_hashes": hashes,
-                               "inspect_results": results}).encode()
+                               "dotnet_resources": resources, "inspect_results": results}).encode()
 
         data = encode()
         if len(data) > cap:

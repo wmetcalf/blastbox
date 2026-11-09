@@ -598,6 +598,45 @@ def watched_run(
     return status
 
 
+DotnetStatus = Literal["ok", "timeout", "failed", "too_large"]
+
+
+def run_dotnet_resources(
+    sample: Path,
+    outdir: Path,
+    timeout_s: float,
+    *,
+    env: Mapping[str, str],
+    python: str,
+    max_kb: int,
+    max_stdout: int,
+    max_write_bytes: int,
+    run_fn: RunFn = bounded_run,
+) -> tuple[DotnetStatus, bytes]:
+    """``dotnet_resources.py`` over ``sample`` under ``python`` (the capa venv's, which has dnfile).
+
+    dnfile parses hostile metadata, so it runs out of process: ``ulimit -v`` caps memory,
+    ``ulimit -f`` each file it writes into ``outdir``, ``max_stdout`` its JSON, ``timeout_s`` its
+    time. ``-I`` keeps the script's own directory and the environment out of ``sys.path``.
+    """
+    from blastbox.engines.rea import dotnet_resources
+
+    outdir = outdir.resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+    blocks = max(1, max_write_bytes // 512)
+    argv = ["sh", "-c", 'ulimit -v "$1" || exit 1; ulimit -f "$2" || exit 1; exec "$3" -I "$4" "$5" "$6"',
+            "sh", str(max_kb), str(blocks), python, str(Path(dotnet_resources.__file__).resolve()),
+            str(sample.resolve()), str(outdir)]
+    out = run_fn(argv, env=env, cwd=outdir, timeout_s=timeout_s, max_stdout=max_stdout)
+    if out.timed_out:
+        return "timeout", b""
+    if out.capped:
+        return "too_large", b""
+    if out.rc != 0 or not out.stdout:
+        return "failed", b""
+    return "ok", out.stdout
+
+
 CAPA_BACKENDS = {"pe": ("pe", "vivisect"), "elf": ("elf", "vivisect"), "dotnet": ("dotnet", "dotnet")}
 # capa's exit codes for a file it does not handle (main.py E_INVALID_FILE_TYPE/_ARCH/_OS).
 _CAPA_UNSUPPORTED = frozenset({16, 17, 18})

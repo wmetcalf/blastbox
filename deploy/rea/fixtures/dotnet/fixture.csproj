@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <AssemblyName>fixture</AssemblyName>
+    <RootNamespace>Fixture</RootNamespace>
+    <Deterministic>true</Deterministic>
+    <DebugType>none</DebugType>
+    <UseAppHost>false</UseAppHost>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="gen/blob.bin" LogicalName="Fixture.blob.bin" />
+    <EmbeddedResource Include="gen/payload.gz" LogicalName="Fixture.payload.gz" />
+    <EmbeddedResource Include="gen/x.dat" LogicalName="Fixture.x.dat" />
+    <EmbeddedResource Include="gen/b64.txt" LogicalName="Fixture.b64.txt" />
+    <EmbeddedResource Include="gen/logo.png" LogicalName="Fixture.logo.png" />
+    <EmbeddedResource Include="gen/Resources.resources" LogicalName="Fixture.Properties.Resources.resources" />
+  </ItemGroup>
+</Project>

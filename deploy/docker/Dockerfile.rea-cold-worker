@@ -101,6 +101,9 @@ RUN curl -fsSL -o ghidra.zip "${GHIDRA_URL}" \
     && mv /build/x/ghidra_* /opt/ghidra && rm -rf /build/x
 
 # --------------------------------------------- capa (hash-locked wheels + pinned rules)
+# The capa venv's python also runs the sweep's .NET resource scan
+# (src/blastbox/engines/rea/dotnet_resources.py), which needs only the stdlib and the hash-locked
+# dnfile pinned here for capa; no second copy of dnfile is installed.
 # The sweep runs capa after Ghidra. Not the standalone release binary: that is a PyInstaller
 # one-file build, which unpacks itself to $TMPDIR and runs from there, and the slot's only
 # writable dir (/tmp) is noexec. Rules and FLIRT signatures are the same release's, by sha256.
@@ -237,6 +240,11 @@ RUN --mount=type=bind,source=deploy/rea,target=/mnt/rea \
     echo '== NSIS fixture unwrapped by 7z'; \
     7z x -tNsis -y -bd -bso0 -bsp0 -o"$w/nsis" -- /mnt/rea/fixtures/installer.exe; \
     cmp "$w/nsis/payload.exe" /mnt/rea/fixtures/sample.exe; \
+    echo '== .NET resource scan (capa venv python, hash-locked dnfile) over the dotnet fixture'; \
+    scanner=$(python -c 'import blastbox.engines.rea.dotnet_resources as m; print(m.__file__)'); \
+    /opt/capa/bin/python -I "$scanner" /mnt/rea/fixtures/dotnet.dll "$w/dres" > "$w/dres.json"; \
+    python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['resources_total'] == 6 and len(d['hidden']) == 5, d; print('hidden payloads:', len(d['hidden']))" \
+        "$w/dres.json"; \
     echo '== import blastbox.engines.rea'; \
     python -c "import blastbox.worker.cold, blastbox.engines.rea, pefile, PIL; print('blastbox rea worker ready')"; \
     echo '== nothing written outside HOME/TMPDIR'; \
