@@ -171,6 +171,23 @@ Three things in the plan's Step 2 cannot work as written. Each was found live:
    CAPE's rules target unpacked payloads; most of the 20 still end in an encrypted stage the sweep
    does not recover, and 11 of the families have no CAPE rule. Needs the Loadout companion (the
    three summary fields) or the sweep is refused.
+   **.NET code is read with a decompiler, not Ghidra.** A .NET assembly is decompiled to C# with
+   ILSpy's command-line front end (`dotnet_decompile.py`: `/opt/dotnet/dotnet
+   /opt/ilspycmd/ilspycmd.dll`, at most 120 s, bounded like every other tool; it reads IL and
+   metadata, the assembly never runs), and so are up to 3 .NET executables the resource scan
+   recovered from it. The sweep keeps a digest per image (type outline plus the methods ranked most
+   telling: entry point, module initialiser, loaders, network, persistence) in
+   `State.sweep["decompiled"]` and the report (`decompiled`), feeds the C# string literals to IOC
+   extraction (source `decompiled:sample` / `decompiled:member-N`) and reports `decompile_status` /
+   `decompiled_images` in the summary. When the assembly's own code was read this way Ghidra is
+   skipped (`ghidra_status: skipped`) and the agent writes its report in one call from the sweep's
+   evidence (`basis: evidence`, citing `source: decompiled`); the `code_unread` gap is not raised,
+   because the code was read. If ILSpy fails or finds no method bodies the assembly goes to Ghidra
+   as before, and recovered stages are still decompiled for the agent to read. Measured on the 12
+   .NET images of the 20 labelled samples (cape5, 2026-11-10): all decompile in 5-21 s; an
+   unprotected RAT is readable whole (C2, command dispatcher, keylogger, persistence), a loader
+   shows its loader, and a payload behind a commercial protector stays unreadable: no deobfuscator
+   is run. Needs the Loadout companion (the two summary fields) or the sweep is refused.
    **Go string literals.** Go packs literals with no terminator, so a defined-string scan reads
    one literal into the next (live 2026-11-03: `http://loadout-go-fixture.example.org/ping`
    sealed with the strconv digits `1734723475976807094411` glued on, and the agent's byte check

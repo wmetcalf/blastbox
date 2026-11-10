@@ -229,6 +229,43 @@ RUN python3 -m venv /opt/yara \
     /opt/yara/bin/python -I -c "import json; d=json.load(open('/opt/yara/cape-compile.json')); print('CAPE rules compiled:', d['rules'], 'from', d['compiled_files'], 'of', d['files'], 'files; skipped:', [s['file'] for s in d['skipped']])" \
     && chmod -R a+rX /opt/yara && rm -rf /build
 
+# ------------------------------------ ilspy (pinned .NET runtime + ilspycmd nupkg)
+# The sweep decompiles .NET assemblies (the sample and the .NET stages dotnet_resources recovers)
+# to C# with ILSpy's command-line front end (src/blastbox/engines/rea/dotnet_decompile.py, run as a
+# bounded subprocess: ulimit -v/-f, timeout, stdout cap, process-group kill). Decompiling reads IL
+# and metadata; the assembly never runs.
+# No SDK and no `dotnet tool install`: the ilspycmd .nupkg is a zip, sha512-checked against the pin
+# (= nuget.org's packageHash) and its tools/net10.0/any tree unpacked to /opt/ilspycmd; it runs as
+# `/opt/dotnet/dotnet /opt/ilspycmd/ilspycmd.dll`. The runtime is Microsoft's linux-x64 tarball,
+# sha512-checked against the pin (= the hash in Microsoft's 10.0 releases.json). The runtime needs
+# only libc/libstdc++/libgcc_s/zlib (in the base image); ICU is not needed (invariant
+# globalization, set in ilspycmd.runtimeconfig.json and again by the engine). Dropped from the
+# nupkg tree: the 1.2 MB XML API docs, the .pdb and the Windows-only runtimes/win assets.
+FROM ${JDK_IMAGE} AS ilspy
+ARG DOTNET_RUNTIME_VERSION=10.0.14
+ARG DOTNET_RUNTIME_SHA512=634326028645f38731c8c4e71a68356e4ca0d6b6607139a234ab760687f742063edaf33a1f20dda615742d2dc8300ca2ff857619d51fbb38090383b71334af89
+ARG ILSPYCMD_VERSION=11.1.0.9782
+ARG ILSPYCMD_SHA512=17b0a5bbfad858fb7d7c29432f3660597234376fd1b78e2de6d3ae90e61466dd6d23c930653098f3311956022bede4e425086e645256e9127c1f34429709c842
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       ca-certificates curl unzip \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+RUN curl -fsSL -o runtime.tgz \
+       "https://builds.dotnet.microsoft.com/dotnet/Runtime/${DOTNET_RUNTIME_VERSION}/dotnet-runtime-${DOTNET_RUNTIME_VERSION}-linux-x64.tar.gz" \
+    && echo "${DOTNET_RUNTIME_SHA512}  runtime.tgz" | sha512sum -c - \
+    && mkdir /opt/dotnet && tar -xzf runtime.tgz -C /opt/dotnet --no-same-owner \
+    && curl -fsSL -o ilspycmd.nupkg \
+       "https://api.nuget.org/v3-flatcontainer/ilspycmd/${ILSPYCMD_VERSION}/ilspycmd.${ILSPYCMD_VERSION}.nupkg" \
+    && echo "${ILSPYCMD_SHA512}  ilspycmd.nupkg" | sha512sum -c - \
+    && unzip -q ilspycmd.nupkg 'tools/net10.0/any/*' -d /build/x \
+    && mv /build/x/tools/net10.0/any /opt/ilspycmd \
+    && rm -rf /opt/ilspycmd/runtimes /opt/ilspycmd/ICSharpCode.Decompiler.xml /opt/ilspycmd/ilspycmd.pdb \
+    && chmod -R a+rX,go-w /opt/dotnet /opt/ilspycmd \
+    && DOTNET_CLI_TELEMETRY_OPTOUT=1 /opt/dotnet/dotnet /opt/ilspycmd/ilspycmd.dll --version \
+       | grep -q "ICSharpCode.Decompiler: ${ILSPYCMD_VERSION}" \
+    && rm -rf /build
+
 # ------------------------------------------- fixtures (regeneration only; not in image)
 FROM ${JDK_IMAGE} AS rea-fixtures-build
 ARG NSIS_VERSION=3.10-2ubuntu2
@@ -276,6 +313,10 @@ COPY --from=capa /opt/capa /opt/capa
 COPY --from=speakeasy /opt/speakeasy /opt/speakeasy
 COPY --from=refinery /opt/refinery /opt/refinery
 COPY --from=yara /opt/yara /opt/yara
+# dotnet_decompile.py calls /opt/dotnet/dotnet by absolute path and sets every DOTNET_* variable
+# itself; nothing else in the image runs .NET, so no PATH change.
+COPY --from=ilspy /opt/dotnet /opt/dotnet
+COPY --from=ilspy /opt/ilspycmd /opt/ilspycmd
 COPY deploy/rea/ghidra_scripts /opt/rea/ghidra_scripts
 
 COPY pyproject.toml README.md /src/blastbox/
@@ -369,6 +410,12 @@ RUN --mount=type=bind,source=deploy/rea,target=/mnt/rea \
     /opt/yara/bin/python -I "$sigrunner" compile "$w/yr" "$w/benign.yarx" 1 | grep -q '"rules": 1'; \
     sh -c 'ulimit -d 2097152 && ulimit -f 0 && exec /opt/yara/bin/python -I "$@"' sh \
         "$sigrunner" scan "$w/benign.yarx" 67108864 30 /mnt/rea/fixtures/sample.exe | grep -q '"rule": "BenignFixture"'; \
+    echo '== ilspycmd (.NET runtime) decompiles the dotnet fixture'; \
+    python -I -c "import sys, json; from pathlib import Path; from blastbox.engines.rea import dotnet_decompile as d; \
+r = d.decompile(Path('/mnt/rea/fixtures/dotnet.dll'), Path(sys.argv[1]), timeout_s=120); \
+assert r.status == 'ok', (r.status, r.reason); g = d.digest(r, label='fixture', budget_chars=30000); \
+assert g and g['entry_point'] == 'Fixture.Program.Main' and g['excerpts'][1]['member'] == 'LoadHidden', g; \
+print('ilspy', r.tool, 'types', r.types_total, 'methods', r.methods_total, 'chars', r.source_chars)" "$w/il"; \
     echo '== import blastbox.engines.rea'; \
     python -c "import blastbox.worker.cold, blastbox.engines.rea, pefile, PIL; print('blastbox rea worker ready')"; \
     echo '== nothing written outside HOME/TMPDIR'; \
@@ -382,5 +429,5 @@ WORKDIR /home/worker
 ENTRYPOINT ["python", "-m", "blastbox.worker.cold"]
 
 LABEL org.opencontainers.image.title="blastbox-rea-cold-worker" \
-      org.opencontainers.image.description="REA reverse-engineering worker (REA source build cd878ad, Ghidra 12.1.4 headless, Temurin JDK 21, Node 22.23.4, 7-Zip 26.00, Binary Refinery 0.11.3, Speakeasy 2.0.0b9, YARA-X 1.22.1 + CAPEv2 rules 5ee1155)" \
+      org.opencontainers.image.description="REA reverse-engineering worker (REA source build cd878ad, Ghidra 12.1.4 headless, Temurin JDK 21, Node 22.23.4, 7-Zip 26.00, Binary Refinery 0.11.3, Speakeasy 2.0.0b9, YARA-X 1.22.1 + CAPEv2 rules 5ee1155, ILSpy 11.1.0.9782 on .NET runtime 10.0.14)" \
       org.opencontainers.image.version="0.1.0"

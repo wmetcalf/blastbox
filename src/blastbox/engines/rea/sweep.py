@@ -50,6 +50,19 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
    "entropy"[, "image"[, "noise"]][, "member"][, "decoded"[, "decoded_member", "decoded_sha256"]
    [, "stage": {"dotnet"[, "module", "types", "methods", "loader_refs"]}]]}]}``; a failed scan is a
    ``dotnet_resources_failed`` warning;
+4b'. .NET only: the assembly to C# (``dotnet_decompile.py``: ILSpy's command-line decompiler, at
+   most ``DECOMPILE_S`` a run), then up to ``MAX_DECOMPILE_STAGES`` .NET stages recovered from its
+   resources (``DECOMPILE_STAGES_S`` together). Evidence ``State.sweep["decompiled"] = {"images":
+   [digest]}`` and the report's ``decompiled`` (``dotnet_decompile.digest`` documents one digest:
+   label ``sample`` or ``stage <module> (<member>)``, counts, entry point, an outline and the ranked
+   method excerpts, ``DECOMPILE_CHARS`` / ``DECOMPILE_STAGE_CHARS`` characters each); whole string
+   literals feed IOC extraction (source ``decompiled:sample`` / ``decompiled:<member>``); summary
+   ``decompile_status`` (the assembly's run: ``ok`` | ``timeout`` | ``failed`` | ``too_large``) and
+   ``decompiled_images`` (digests kept). When the assembly's code was read this way (``ok``, or a
+   run cut short that still left excerpts) Ghidra is NOT run: ``ghidra_status`` is ``skipped`` and
+   the chain goes on from the evidence alone, as it does after a Ghidra timeout. A run that fails
+   is a ``decompile_failed`` / ``decompile_timeout`` / ``decompile_too_large`` warning and the
+   assembly goes to Ghidra as before; an image without the decompiler adds nothing;
 4c. signatures (``signatures.py``, at most ``SIGNATURES_S``, before Ghidra so a disassembly that eats
    the budget still leaves them): YARA-X with CAPEv2's family rules over the submitted file, the
    image analysed when that is another file (``unpacked``) and every member recovered so far
@@ -108,7 +121,9 @@ packed            UPX sections / UPX! magic, or <= 16 procedures plus a high-ent
 ```
 
 ``ghidra_failed`` and ``ghidra_timeout`` are sealed only when the sweep has no evidence to report
-from, or the evidence-only continuation could not be packed (a warning says which).
+from, or the evidence-only continuation could not be packed (a warning says which). A .NET assembly
+read by the decompiler (``ghidra_status`` ``skipped``) seals ``ghidra_failed`` in that second case
+only.
 
 ``more_pending=false`` without ``chain_stop`` means the continuation itself could not be packed
 or exceeded the artifact limits (a warning says which).
@@ -137,7 +152,16 @@ from pathlib import Path
 from typing import Any
 
 from blastbox.contract import DeclaredArtifact, Detection, Record, Warning
-from blastbox.engines.rea import apihash, capa, dotnet_resources, dumpfix, emulate, installer, signatures
+from blastbox.engines.rea import (
+    apihash,
+    capa,
+    dotnet_decompile,
+    dotnet_resources,
+    dumpfix,
+    emulate,
+    installer,
+    signatures,
+)
 from blastbox.engines.rea.continuation import GhidraStatus, State, pack
 from blastbox.engines.rea.gostrings import clip_overruns, exact_iocs, go_strings
 from blastbox.engines.rea.icons import extract_icons
@@ -179,6 +203,13 @@ UNPACK_TIMEOUT_S = 60.0
 INSTALLER_TIMEOUT_S = 120.0
 DOTNET_RESOURCES_S = 90.0
 SIGNATURES_S = 60.0  # wall-clock cap on the YARA scan of the sample and its stages (signatures.py)
+DECOMPILE_S = 120.0  # wall-clock cap on one ILSpy run (dotnet_decompile.py); the cape5 set took 6-21 s
+DECOMPILE_STAGES_S = 120.0  # ... on the recovered .NET stages together
+MAX_DECOMPILE_STAGES = 3
+DECOMPILE_CHARS = 30_000  # the assembly's C# digest in the model's evidence, in JSON characters
+DECOMPILE_STAGE_CHARS = 10_000  # ... each recovered stage's
+# The assembly's code counts as read (and Ghidra is skipped) on these statuses, given excerpts.
+DECOMPILE_READ = ("ok", "timeout", "too_large")
 DEFAULT_DOTNET_PYTHON = "/opt/capa/bin/python"  # the capa venv carries the hash-locked dnfile
 DOTNET_MAX_KB = 2 * 1024 * 1024
 MAX_DOTNET_JSON = 4 * 1024 * 1024
@@ -235,6 +266,7 @@ InstallerFn = Callable[..., str]
 DotnetFn = Callable[..., tuple[str, bytes]]
 EmulateFn = Callable[..., tuple[str, bytes]]
 SignaturesFn = Callable[..., signatures.SigResult]
+DecompileFn = Callable[..., dotnet_decompile.Decompiled]
 CapaFn = Callable[..., tuple[CapaStatus, bytes]]
 RunnerFactory = Callable[..., Any]
 
@@ -368,6 +400,7 @@ class ReaSweepEngine:
         dotnet_fn: DotnetFn = run_dotnet_resources,
         emulate_fn: EmulateFn = run_emulation,
         signatures_fn: SignaturesFn = signatures.scan,
+        decompile_fn: DecompileFn = dotnet_decompile.decompile,
     ) -> None:
         self._runner_factory = runner_factory
         self._ghidra_fn = ghidra_fn
@@ -377,6 +410,7 @@ class ReaSweepEngine:
         self._dotnet_fn = dotnet_fn
         self._emulate_fn = emulate_fn
         self._signatures_fn = signatures_fn
+        self._decompile_fn = decompile_fn
 
     def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
         base = Path(os.environ.get("BLASTBOX_WORK_DIR") or "/work")
@@ -487,6 +521,16 @@ class ReaSweepEngine:
                                             min(DOTNET_RESOURCES_S, remaining()), warnings)
             members += found
 
+        # 4b'. .NET: C# from ILSpy for the assembly and the .NET stages recovered from its resources.
+        # Code read this way replaces the Ghidra run: CIL is not what a disassembler reads well.
+        decompiled: dict[str, Any] | None = None
+        decompile_status: str | None = None
+        code_read = False
+        decompiled_strings: list[tuple[str, str]] = []
+        if kind == "dotnet":
+            decompiled, decompile_status, code_read, decompiled_strings = self._decompile(
+                analysed, resources, outdir / "members", job, remaining, warnings)
+
         # 4c. signatures (signatures.py): YARA over the submitted file and every stage recovered so
         # far. Before Ghidra: a disassembly that eats the budget still leaves the family name.
         sigs = self._signatures(input, analysed, members, job, min(SIGNATURES_S, remaining()), warnings)
@@ -495,7 +539,7 @@ class ReaSweepEngine:
         ghidra_status: GhidraStatus = "skipped"
         project = job / "proj"
         strings_path = job / "strings.jsonl"
-        if kind in NATIVE_KINDS:
+        if kind in NATIVE_KINDS and not code_read:
             ghidra_status = self._ghidra(analysed, project, strings_path, job, remaining(), warnings)
 
         # 5. IOCs
@@ -541,6 +585,7 @@ class ReaSweepEngine:
                 yield f"ghidra:{addr}", value
             yield from wide_urls
             yield from emulation_strings
+            yield from decompiled_strings
 
         # 4b. capa, after Ghidra (see CAPA_MAX_KB), moved into Ghidra's image base.
         capa_status: CapaStatus | None = None
@@ -586,6 +631,8 @@ class ReaSweepEngine:
             sweep_evidence["dump_headers"] = dump
         if resources is not None:
             sweep_evidence["dotnet_resources"] = resources
+        if decompiled is not None:
+            sweep_evidence["decompiled"] = decompiled
         if capabilities:
             sweep_evidence["capabilities"] = capabilities[:STATE_CAPABILITIES]
         if api_hashes is not None:
@@ -626,6 +673,9 @@ class ReaSweepEngine:
             summary["emulation_captures"] = len(emulation.get("captures", []))
         if resources is not None:
             summary["hidden_payloads"] = len(resources["hidden_payloads"])
+        if decompile_status is not None:
+            summary["decompile_status"] = decompile_status
+            summary["decompiled_images"] = len(decompiled["images"]) if decompiled is not None else 0
         if capa_status is not None:
             summary["capa_status"] = capa_status
             summary["capabilities_total"] = len(capabilities)
@@ -637,7 +687,7 @@ class ReaSweepEngine:
         # 8. report artifact, then the payload
         report_path = outdir / "report.json"
         self._write_report(report_path, summary, iocs, inspect, report_cap, warnings, capabilities, api_hashes,
-                           resources, emulation, sig_evidence)
+                           resources, emulation, sig_evidence, decompiled)
         payload = self._payload(summary, iocs, limits, warnings, capabilities)
 
         artifacts = [DeclaredArtifact(id=f"member-{i}", path=p.relative_to(outdir).as_posix(), kind="extracted")
@@ -915,6 +965,61 @@ class ReaSweepEngine:
                     "loader_refs": [text(r) for r in refs[:32] if isinstance(r, str)], "hidden_payloads": hidden}
         return evidence, paths
 
+    def _decompile(self, sample: Path, resources: dict[str, Any] | None, members_dir: Path, job: Path,
+                   remaining: Callable[[], float], warnings: list[Warning]
+                   ) -> tuple[dict[str, Any] | None, str | None, bool, list[tuple[str, str]]]:
+        """A .NET assembly and its recovered .NET stages to C#: ``(State.sweep["decompiled"] or None,
+        the assembly's decompile status or None where the image has no decompiler, whether the
+        assembly's code was read, IOC strings)``. Nothing here fails the job: a run that fails, times
+        out or overflows is a warning, and what it produced before that is kept."""
+        images: list[dict[str, Any]] = []
+        strings: list[tuple[str, str]] = []
+        runs = 0
+
+        def one(path: Path, label: str, source: str, timeout_s: float, chars: int
+                ) -> tuple[dotnet_decompile.Decompiled, dict[str, Any] | None]:
+            nonlocal runs
+            runs += 1
+            if timeout_s < 5:
+                d = dotnet_decompile.Decompiled("timeout", "no time left to decompile")
+            else:
+                try:
+                    d = self._decompile_fn(path, job / f"decompile-{runs}", timeout_s=timeout_s)
+                except Exception as exc:  # a decompiler failure never fails the job
+                    d = dotnet_decompile.Decompiled("failed", f"exception:{type(exc).__name__}")
+            if d.status == "unavailable":
+                return d, None
+            if d.status != "ok":
+                warnings.append(Warning(code=f"decompile_{d.status}",
+                                        message=_short(f"{label}: {d.reason or d.status}", 1000)))
+            digest = dotnet_decompile.digest(d, label=label, budget_chars=chars)
+            if digest is not None:
+                images.append(digest)
+                strings.extend((source, s) for s in d.literals)
+            return d, digest
+
+        first, digest = one(sample, "sample", "decompiled:sample", min(DECOMPILE_S, remaining()), DECOMPILE_CHARS)
+        if first.status == "unavailable":
+            return None, None, False, []
+        code_read = digest is not None and bool(digest["excerpts"]) and first.status in DECOMPILE_READ
+
+        # Stages: a .NET PE the resource scan recovered (decoded_member), each distinct one once. An
+        # assembly that still needs Ghidra keeps Ghidra's budget.
+        stages_end = time.monotonic() + DECOMPILE_STAGES_S
+        reserve = 0.0 if code_read else DEFAULT_GHIDRA_SWEEP_S
+        seen: set[str] = set()
+        for item in (resources or {}).get("hidden_payloads", []):
+            name, sha = item.get("decoded_member"), item.get("decoded_sha256")
+            if not item.get("stage", {}).get("dotnet") or not name or not sha or sha in seen:
+                continue
+            if len(seen) >= MAX_DECOMPILE_STAGES:
+                break
+            seen.add(sha)
+            module = item["stage"].get("module") or item["resource"]
+            left = min(DECOMPILE_S, stages_end - time.monotonic(), remaining() - reserve)
+            one(members_dir / name, f"stage {module} ({name})", f"decompiled:{name}", left, DECOMPILE_STAGE_CHARS)
+        return ({"images": images} if images else None), first.status, code_read, strings
+
     def _upx_layer(self, sample: Path, job: Path, remaining_s: float, layers: list[dict[str, Any]],
                    warnings: list[Warning]) -> Path:
         """``upx -d`` one layer: the unpacked image (a layer is appended) or ``sample``."""
@@ -1154,7 +1259,8 @@ class ReaSweepEngine:
                       api_hashes: apihash.ApiHashes | None = None,
                       resources: dict[str, Any] | None = None,
                       emulation: dict[str, Any] | None = None,
-                      sigs: dict[str, Any] | None = None) -> None:
+                      sigs: dict[str, Any] | None = None,
+                      decompiled: dict[str, Any] | None = None) -> None:
         results = dict(inspect)
         hashes = ({"algorithm": api_hashes.algorithm, "hits": api_hashes.hits}
                   if api_hashes is not None else None)
@@ -1164,7 +1270,8 @@ class ReaSweepEngine:
         def encode() -> bytes:
             return json.dumps({**summary, "iocs": ioc_rows, "capabilities": caps, "api_hashes": hashes,
                                "dotnet_resources": resources, "emulation": emulation,
-                               "signature_matches": sigs, "inspect_results": results}).encode()
+                               "signature_matches": sigs, "decompiled": decompiled,
+                               "inspect_results": results}).encode()
 
         data = encode()
         if len(data) > cap:

@@ -121,5 +121,10 @@ def test_an_evidence_only_report_leaves_the_code_unread():
               "sections": [{"key": "network", "status": "observed"}]}
     assert [g.code for g in assess(report=report, sweep={}, explored=[]).gaps] == ["code_unread"]
     # Decompiler output stands in for the disassembly: the usual bar applies.
-    assert assess(report=report, sweep={"decompiled": {"tool": "ilspycmd"}}, explored=[]).met
+    image = {"label": "sample", "excerpts": [{"type": "Stub", "member": "Main", "why": [], "code": "x"}]}
+    assert assess(report=report, sweep={"decompiled": {"images": [image]}}, explored=[]).met
+    # ... but only for the assembly itself: a recovered stage's code, or an outline alone, does not.
+    for images in ([{**image, "label": "stage Inner.dll (member-2)"}], [{**image, "excerpts": []}], "x", [None]):
+        got = assess(report=report, sweep={"decompiled": {"images": images}}, explored=[])
+        assert [g.code for g in got.gaps] == ["code_unread"], images
     assert assess(report={**report, "basis": None}, sweep={}, explored=[]).met

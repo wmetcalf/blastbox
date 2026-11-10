@@ -105,3 +105,25 @@ YARA_X_WHEEL_SHA256=5dcb9db77784f0ad62460506923031673e0aadc525c1a5d25e53965a7f91
 CAPE_COMMIT=5ee1155a30c46e50c0f1cb6272c724979a1d61bf
 CAPE_TARBALL_SHA256=680ecbf561c4d5326082a52159d054e5aeec5917833f357e3beadbe5b7631219
 CAPE_RULES_MIN=135
+
+# .NET decompile (dotnet_decompile.py): ILSpy's command-line front end on the .NET runtime, in the
+# Dockerfile's ilspy stage, copied to /opt/dotnet and /opt/ilspycmd. Run as
+# `/opt/dotnet/dotnet /opt/ilspycmd/ilspycmd.dll` (no SDK, no `dotnet tool install`, no network at run
+# time; ilspycmd's own update check is turned off with --disable-updatecheck on every call).
+# ilspycmd 11.1.0.9782 (nuget.org, published 2026-09-23; ICSharpCode.Decompiler 11.1.0.9782): the
+# release before 11.2.0.10050, which was 14 days old on 2026-11-10. Targets net10.0. The .nupkg is a
+# zip; its tools/net10.0/any tree is unpacked as-is (XML API docs, .pdb and Windows-only runtimes/win
+# dropped). ILSPYCMD_SHA512 is nuget.org's packageHash for the package (catalog entry
+# 2026.09.23.06.00.50), checked with sha512sum.
+ILSPYCMD_VERSION=11.1.0.9782
+ILSPYCMD_URL=https://api.nuget.org/v3-flatcontainer/ilspycmd/11.1.0.9782/ilspycmd.11.1.0.9782.nupkg
+ILSPYCMD_SHA512=17b0a5bbfad858fb7d7c29432f3660597234376fd1b78e2de6d3ae90e61466dd6d23c930653098f3311956022bede4e425086e645256e9127c1f34429709c842
+# .NET runtime 10.0.14 (Microsoft.NETCore.App only, linux-x64; 2026-10-25, a security release, 16 days
+# old on 2026-11-10). DOTNET_RUNTIME_SHA512 is the hash Microsoft publishes for the file in
+# https://dotnetcli.blob.core.windows.net/dotnet/release-metadata/10.0/releases.json. Needs only libc,
+# libstdc++, libgcc_s and zlib (all in the base image); no ICU (invariant globalization).
+DOTNET_RUNTIME_VERSION=10.0.14
+DOTNET_RUNTIME_URL=https://builds.dotnet.microsoft.com/dotnet/Runtime/10.0.14/dotnet-runtime-10.0.14-linux-x64.tar.gz
+DOTNET_RUNTIME_SHA512=634326028645f38731c8c4e71a68356e4ca0d6b6607139a234ab760687f742063edaf33a1f20dda615742d2dc8300ca2ff857619d51fbb38090383b71334af89
+# Image size added: /opt/dotnet 80 MB + /opt/ilspycmd 9.1 MB (lab image blastbox-rea:lab-il vs
+# blastbox-rea:dev-f5ee252: 3.54 GB vs 3.41 GB on disk as reported by `docker images`).

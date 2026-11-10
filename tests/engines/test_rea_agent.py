@@ -2202,7 +2202,10 @@ def test_evidence_only_pass_never_meets_the_bar_without_code(tmp_path, monkeypat
 
 
 def test_evidence_only_pass_over_decompiled_code_can_meet_the_bar(tmp_path, monkeypatch):
-    sweep = {**EV_SWEEP, "kind": "dotnet", "decompiled": {"tool": "ilspycmd", "outline": ["Stub.Main"]}}
+    sweep = {**EV_SWEEP, "kind": "dotnet", "decompiled": {"images": [
+        {"label": "sample", "tool": "ilspy", "status": "ok", "outline": ["Stub (class): Main"],
+         "excerpts": [{"type": "Stub", "member": "Main", "why": ["entry_point"],
+                       "code": "Assembly.Load(Decrypt(res)).EntryPoint.Invoke(null, null);"}]}]}}
     rep = _ev_report()
     rep["sections"]["execution_flow"] = _section("observed", "Main decrypts a resource and loads it.", [
         {"source": "decompiled", "item": "Stub.Main", "note": "Assembly.Load on the decrypted bytes"}])

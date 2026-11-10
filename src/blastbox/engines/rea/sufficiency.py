@@ -9,7 +9,8 @@ verify itself, and lists what is still missing (``gaps``):
 - ``no_behaviour``: no behaviour section (``BEHAVIOUR_KEYS``) is ``observed``;
 - ``code_unread``: the report was written from the sweep's evidence alone (``basis``
   ``evidence``: the disassembler timed out or failed) and no decompiler output stood in for it
-  (``sweep["decompiled"]``). Whatever the sample does beyond that evidence is unknown, so the bar
+  (``sweep["decompiled"]`` holding excerpts of the analysed assembly itself, label ``sample``; a
+  recovered stage's code does not cover the sample). Whatever the sample does beyond that evidence is unknown, so the bar
   is never met; no pass can close the gap, and the chain stops with ``evidence_only``;
 - ``benign_unexplored``: the verdict is ``benign`` while some of the program's own functions
   (``program_functions``: for Go, ``main.*`` and third-party modules) are unexplored. A benign
@@ -146,6 +147,14 @@ def _installer_concealment(sweep: dict[str, Any]) -> str:
 _STALLING = frozenset({"delay_loop"})
 
 
+def sample_decompiled(sweep: dict[str, Any]) -> bool:
+    """Whether the sweep's decompiler read the analysed assembly itself (label ``sample``)."""
+    decompiled = sweep.get("decompiled")
+    images = decompiled.get("images") if isinstance(decompiled, dict) else None
+    return isinstance(images, list) and any(
+        isinstance(i, dict) and i.get("label") == "sample" and bool(i.get("excerpts")) for i in images)
+
+
 def _concealment(sweep: dict[str, Any]) -> list[str]:
     em = sweep.get("emulation")
     if not isinstance(em, dict) or em.get("payload_sha256"):
@@ -183,7 +192,7 @@ def assess(*, report: dict[str, Any] | None, sweep: dict[str, Any], explored: li
         statuses = _statuses(report)
         if not any(statuses.get(k) == "observed" for k in BEHAVIOUR_KEYS):
             gaps.append(Gap("no_behaviour", "no behaviour section is backed by observed evidence"))
-        if report.get("basis") == "evidence" and not isinstance(sweep.get("decompiled"), dict):
+        if report.get("basis") == "evidence" and not sample_decompiled(sweep):
             gaps.append(Gap("code_unread", "the report rests on the sweep's evidence alone: the disassembler "
                                            "produced no code to read, so what the sample does beyond that "
                                            "evidence is unknown"))
