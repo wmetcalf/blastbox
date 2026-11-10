@@ -24,6 +24,13 @@ verify itself, and lists what is still missing (``gaps``):
   replaced it (``sweep["emulation"]["payload_sha256"]`` absent; when one did, the report is about
   that stage and the usual bar applies). Live, obfuscated loaders were described by their stub. No
   targets; it holds until the verdict stops being benign or the chain stops;
+- ``benign_installer_concealment``: the verdict is ``benign`` while the sweep's installer
+  evidence says the installer hides what it runs: its archive signature was altered
+  (``"signature": "altered"`` in ``sweep["unpacked"]`` or ``sweep["installer_stub"]``), or it
+  carries no program of its own, only the ``System.dll`` plugin beside data files of
+  ``OPAQUE_MEMBER_BYTES`` or more (``sweep["installer_stub"]``: the script-driven shellcode
+  loader). Live, a GuLoader-style NSIS installer was called a standard installer on its stub's
+  code. No targets; it holds until the verdict stops being benign or the chain stops;
 - ``lead:<section>``: a capa rule with an ATT&CK id points at a report section
   (``LEAD_SECTIONS``) that the report left ``not_analysed``. Its unexplored functions are the
   gap's ``targets``, which go to the front of the next pass's todo list; a lead with no target
@@ -53,6 +60,7 @@ MAX_TARGETS = 16  # per lead gap
 MAX_GAPS = 16
 MAX_FACTS = 4096
 MAX_DETAIL = 300
+OPAQUE_MEMBER_BYTES = 64 * 1024  # a data file this large in a program-less installer needs explaining
 
 BEHAVIOUR_KEYS = ("execution_flow", "capabilities", "network", "persistence", "host_activity",
                   "anti_analysis")
@@ -114,6 +122,23 @@ def _hidden_payloads(sweep: dict[str, Any]) -> list[str]:
     return out
 
 
+def _installer_concealment(sweep: dict[str, Any]) -> str:
+    """Why the installer evidence rules out a benign call ("" when it does not)."""
+    unpacked, stub = sweep.get("unpacked"), sweep.get("installer_stub")
+    layers = [unpacked, *(unpacked.get("inner") or [])] if isinstance(unpacked, dict) else []
+    why = []
+    if any(isinstance(layer, dict) and layer.get("signature") == "altered" for layer in [*layers, stub]):
+        why.append("its archive signature was altered to defeat extraction tools")
+    if isinstance(stub, dict):
+        plugins = [str(p)[:40] for p in stub.get("plugins") or [] if isinstance(p, str)]
+        data = [d for d in stub.get("data_members") or [] if isinstance(d, dict)
+                and isinstance(d.get("size"), int) and d["size"] >= OPAQUE_MEMBER_BYTES]
+        if data and any(p.lower() == "system.dll" for p in plugins):
+            names = ", ".join(f"{str(d.get('name'))[-40:]} {d['size']} bytes" for d in data[:2])
+            why.append(f"it carries no program, only System.dll and {len(data)} opaque data file(s) ({names})")
+    return "; ".join(why)
+
+
 def _concealment(sweep: dict[str, Any]) -> list[str]:
     em = sweep.get("emulation")
     if not isinstance(em, dict) or em.get("payload_sha256"):
@@ -163,6 +188,11 @@ def assess(*, report: dict[str, Any] | None, sweep: dict[str, Any], explored: li
                                 ("the verdict is benign but the assembly carries a hidden payload the analysis "
                                  "has not explained (" + "; ".join(hidden) + "): the visible program may be a "
                                  "decoy; find the code that loads it")[:MAX_DETAIL]))
+            installer = _installer_concealment(sweep)
+            if installer:
+                gaps.append(Gap("benign_installer_concealment",
+                                ("the verdict is benign but the installer hides what it runs: " + installer
+                                 + "; explain what its script loads")[:MAX_DETAIL]))
             concealed = _concealment(sweep)
             if concealed:
                 gaps.append(Gap("benign_emulated_stage",

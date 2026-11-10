@@ -185,7 +185,9 @@ verdict: benign, suspicious, malicious or unknown, with a confidence and a short
 
 If sweep.dotnet_resources.hidden_payloads is non-empty, the assembly carries an embedded payload (large and high-entropy, or decoding to a PE) and the visible application may be a decoy. The overview must say so (name the resource, its size and entropy) and must not describe the sample by its decoy UI alone; the verdict is never benign while that payload is unexplained, and it is at least suspicious when the code loads or decrypts it (sweep.dotnet_resources.loader_refs). An item with "image" is a picture resource (PNG or BMP) whose pixels carry the payload: "decoded" beginning "image:" means the pixel bytes, read in the named order (col- or row-major, channel order, "+len" a 4-byte length prefix, then plain or the named XOR key or compression), ARE a Windows executable, recovered by the engine as decoded_member; "noise" means the pixels are random-looking data rather than a picture, an encrypted payload the engine could not decode. "stage" describes a recovered executable (for .NET: module name, type and method counts, and the loader APIs it references); a resource named "<module>!<name>" was found inside that recovered stage, one level further down. A program that hides an executable in image pixels is a loader built to conceal it, and that has no benign use: describe the chain in order (visible application, each recovered stage by module name and what its loader_refs show it does, and where the chain ends), say plainly when the last stage's payload is encrypted and was not recovered, and never describe the sample as the application its forms and class names imitate. The verdict for such a chain is at least suspicious, and malicious when a recovered stage itself decrypts and loads a further hidden payload (decryptor and Assembly.Load or Invoke references with a high-entropy resource inside it): that is a multi-stage crypter, whatever the final payload is. The final payload's family and capabilities are not_analysed unless evidence shows them.
 
-If sweep.unpacked names an installer (nsis, inno), the submitted file was an installer and the analysed binary is the payload the engine extracted from it statically (unpacked.payload_member). Describe the payload's behaviour and, in the overview, say it was delivered by that installer; unpacked.script_strings are operands of the install script (commands it runs, registry values it writes, paths it drops files to) and may be cited in the text as installer behaviour.
+If sweep.unpacked names an installer (nsis, inno), the submitted file was an installer and the analysed binary is the payload the engine extracted from it statically (unpacked.payload_member). Describe the payload's behaviour and, in the overview, say it was delivered by that installer; unpacked.script_strings are operands of the install script (commands it runs, registry values it writes, paths it drops files to; for inno also the string literals of its compiled [Code] script: URLs, COM objects, registry and startup paths) and unpacked.script_imports are the functions that [Code] script calls (Exec, ShellExec, DownloadTemporaryFile, CreateOleObject, registry writes). Both may be cited in the text as installer behaviour, and what the script does (downloads, reports to a server, writes startup entries, probes installed browsers) is the sample's behaviour even when the payload binary does none of it. payload_reason "unsigned_import" means the installer's program (unpacked.loader_member) carries an Authenticode signature and imports the analysed DLL, which is unsigned and shipped beside it: the DLL side-loading layout, where a legitimate signed program is only the loader. Say so, describe the DLL, and do not judge the sample by the signed program. unpacked.signature "altered" means the installer's archive signature was overwritten so that standard tools cannot list or extract it (the engine found the archive by its structure and carved the members, which therefore have positions, not names). Legitimate installers do not do this: say it in the overview and count it as concealment.
+
+If sweep.installer_stub is present, the submitted file is an installer (installer_stub.packer) that the engine unpacked statically and found to carry NO program of its own: the analysed binary is only the generic installer runtime, and its code is not the sample's behaviour. Never describe such a sample as a standard or ordinary installer, and never call it benign on the stub's code. What it does is in its script and data: installer_stub.script_strings (paths it writes, registry keys, files it reads), installer_stub.plugins (the DLLs the script calls; System.dll is the NSIS plugin that lets a script call any Windows API function) and installer_stub.data_members (its largest non-executable files, with size and the entropy of their first megabyte). An installer whose only executable content is System.dll, beside large data files of no recognisable format (constant-byte padding near entropy 0, or encrypted content near 8), is the script-driven shellcode-loader pattern: the script reads a data file into memory and calls it through System.dll. Say that in the overview, name the files, say the payload was not recovered, and give a verdict of at least suspicious; the payload's family and capabilities are not_analysed.
 
 If sweep.emulation is present, the engine ran the stub (the analysed binary, or the outer layer when unpacked names "emulated") in the Speakeasy emulator. Its apis, strings, events, dynamic_code and concealment are OBSERVED run-time behaviour of that stub and may be cited as such, with the caveat that an emulator is not Windows: an unsupported API or an anti-emulation check may have stopped it early (sweep.emulation.stop says why it stopped), so behaviour missing from it is not evidence of absence. If unpacked (or one of its inner layers) names "emulated", the analysed binary is the stage the emulated stub decrypted and wrote to memory (payload_reason says how it was chosen, region where it was): say so in the overview, describe the stage's own behaviour, and describe the stub as its loader. If sweep.emulation.concealment is non-empty and no stage replaced the stub, the overview must say what the stub hides (executable allocations, code run from them, a PE in memory) and name the captures; such a stub is never benign.
 
@@ -275,6 +277,9 @@ class Framer:
             # The sweep unpacked the sample (upx -d, or an installer's payload): this is the
             # unpacked image, not the file submitted.
             data["unpacked_from"] = unpacked
+        stub = state.sweep.get("installer_stub")
+        if stub:
+            data["installer_stub"] = stub
         if state.sweep.get("dump_headers"):
             data["dump_headers"] = state.sweep["dump_headers"]
         if state.sweep.get("capabilities"):
@@ -299,8 +304,25 @@ class Framer:
                      "(payload_member; payload_reason says how it was chosen), not the installer stub. "
                      "The installer's own behaviour is in unpacked_from: script_strings are operands of the "
                      "install script (command lines it executes, registry keys and values it writes, paths "
-                     "it drops files to) and count as observed behaviour of the sample; any inner layers "
-                     "were unwrapped the same way.")
+                     "it drops files to; for inno also the literals of its compiled [Code] script, whose "
+                     "imported functions are script_imports) and count as observed behaviour of the sample; "
+                     "any inner layers were unwrapped the same way.")
+            if unpacked.get("payload_reason") == "unsigned_import":
+                lead += (" payload_reason unsigned_import: the installer's program (loader_member) is signed and "
+                         "imports this unsigned DLL shipped beside it, the DLL side-loading layout. This DLL, not "
+                         "the signed program, is what to explain: start from its entry point and exports.")
+            if unpacked.get("signature") == "altered":
+                lead += (" signature altered: the installer's archive signature was overwritten to stop standard "
+                         "tools extracting it; the engine carved the members by structure.")
+        if isinstance(stub, dict):
+            lead += (f" installer_stub says the submitted file is a {stub.get('packer')} installer that carries no "
+                     "program of its own: this binary is only the generic installer runtime, so its code is not "
+                     "the sample's behaviour and reading it will not explain the sample. What the sample does is "
+                     "in installer_stub: script_strings (the install script's operands), plugins (DLLs the script "
+                     "calls; System.dll lets a script call any Windows API) and data_members (its largest "
+                     "non-executable files with entropy). Only System.dll beside large opaque data files is the "
+                     "script-driven shellcode-loader pattern. Record that in your summary and do not call the "
+                     "sample a standard installer.")
         layers = ([unpacked] + list(unpacked.get("inner") or [])) if isinstance(unpacked, dict) else []
         if any(isinstance(layer, dict) and layer.get("packer") == "emulated" for layer in layers):
             lead += (" unpacked_from includes an \"emulated\" layer: the submitted stub was run in the Speakeasy "

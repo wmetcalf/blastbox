@@ -6,16 +6,21 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
    VirtualSize past SizeOfImage (seen in CAPE's rebuilt dumps) is rewritten and every later
    step reads the repaired copy (``pe_header_repaired``); code/data sections the dump never
    captured are a ``pe_sections_missing`` warning. Both go to ``State.sweep["dump_headers"]``;
-1b. an installer PE (``installer.UNWRAPPERS``: NSIS via ``7z x -tNsis``, Inno Setup via
-   ``innoextract``; static decompressors, the installer never runs) is unwrapped: every extracted
-   file becomes a ``member-<n>`` and the PE the install script runs (NSIS: named under a directory
-   in the script's string table) or else the largest PE member replaces the sample for every later
-   step, inspect included, with ``kind`` re-classified (a .NET payload is ``dotnet``). The payload
-   is offered to the registry again, up to ``installer.MAX_DEPTH_UNWRAP`` layers. Evidence:
-   ``State.sweep["unpacked"] = {"packer", "packed_sha256", "payload_member", "payload_sha256",
-   "payload_reason"[, "script_strings"][, "inner": [layer, ...]]}``. A failed extraction
-   (``installer_unpack_failed``) or one with no PE (``installer_no_payload``) is a warning and the
-   stub is analysed as before;
+1b. an installer PE (``installer.UNWRAPPERS``: NSIS via ``7z x -tNsis``, else an in-process carve
+   of its archive when 7-Zip lists nothing; Inno Setup via Binary Refinery's parser,
+   ``inno_unwrap.py``; static decompressors, the installer never runs) is unwrapped: every
+   extracted file becomes a ``member-<n>`` and the PE the install script runs (NSIS: named under a
+   directory in the script's string table) or else the largest PE member replaces the sample for
+   every later step, inspect included, with ``kind`` re-classified (a .NET payload is ``dotnet``).
+   NSIS's own plugin DLLs are never the payload. The payload is offered to the registry again, up
+   to ``installer.MAX_DEPTH_UNWRAP`` layers. Evidence: ``State.sweep["unpacked"] = {"packer",
+   "packed_sha256", "payload_member", "payload_sha256", "payload_reason"[, "script_strings"]
+   [, "script_imports"][, "signature": "altered"][, "inner": [layer, ...]]}``. A failed extraction
+   (``installer_unpack_failed``) is a warning and the stub is analysed as before. So is one that
+   carries no program of its own (``installer_no_payload``: a script-driven loader), and then
+   ``State.sweep["installer_stub"] = {"packer", "member_count"[, "plugins"][, "data_members":
+   [{"name", "size", "entropy"}]][, "script_strings"][, "script_imports"][, "signature"]}`` says
+   what it does carry;
 2. run the fixed ``INSPECT_MAP[kind]`` REA inspect commands (no caller arguments);
 3. ``extract-artifact`` for containers (archive/apk/asar/firmware) -> ``member-<n>``;
 4. icons -> ``icon-<n>``;
@@ -377,6 +382,7 @@ class ReaSweepEngine:
         members: list[Path] = []
         # Every unwrapped layer, outermost first: installers, upx -d, the emulated stage.
         layers: list[dict[str, Any]] = []
+        installer_stub: dict[str, Any] | None = None
         for depth in range(installer.MAX_DEPTH_UNWRAP):
             packer = installer.detect(analysed) if kind == "pe" else None
             if packer is None:
@@ -385,7 +391,10 @@ class ReaSweepEngine:
                                                     outdir / "members", len(members),
                                                     min(INSTALLER_TIMEOUT_S, remaining()), warnings)
             members += found
-            if inner is None or layer is None:
+            if inner is None:
+                installer_stub = layer  # unwrapped, but it carries no program: the stub is analysed
+                break
+            if layer is None:
                 break
             layers.append(layer)
             analysed = inner
@@ -541,6 +550,8 @@ class ReaSweepEngine:
             # An inner upx layer is recorded as {"packer": "upx"} (the outer layer names the input).
             nested = [{"packer": "upx"} if layer["packer"] == "upx" else layer for layer in layers[1:]]
             sweep_evidence["unpacked"] = {**layers[0], **({"inner": nested} if nested else {})}
+        if installer_stub is not None:
+            sweep_evidence["installer_stub"] = installer_stub
         if emulation is not None:
             sweep_evidence["emulation"] = emulation
         if dump is not None:
@@ -690,9 +701,10 @@ class ReaSweepEngine:
 
     def _installer(self, sample: Path, packer: str, job: Path, members_dir: Path, have: int, timeout_s: float,
                    warnings: list[Warning]) -> tuple[Path | None, dict[str, Any] | None, list[Path]]:
-        """Unwrap one installer layer: ``(payload copy or None, its evidence or None, member
+        """Unwrap one installer layer: ``(payload copy or None, evidence or None, member
         artifacts)``; ``have`` members already exist. Every failure is a warning and the wrapper
-        itself is analysed as before."""
+        itself is analysed as before. An installer that unwrapped but carries no program of its
+        own returns no payload and its ``installer_stub`` evidence (what it does carry)."""
         if timeout_s < 1:
             warnings.append(Warning(code="installer_unpack_failed", message=f"{packer}: no time left"))
             return None, None, []
@@ -727,18 +739,19 @@ class ReaSweepEngine:
                                     context=_short(rel, 255)))
         paths = [m.path for m in found]
         choice = installer.choose(packer, found, sample)
-        if choice is None:
+        member = choice.payload
+        if member is None:
             warnings.append(Warning(code="installer_no_payload",
-                                    message=f"{packer}: no PE among {len(found)} extracted member(s); "
+                                    message=f"{packer}: no program among {len(found)} extracted member(s); "
                                             "analysing the installer stub"))
-            return None, None, paths
-        member, reason, extra = choice
+            return None, {"packer": packer, **choice.extra}, paths
         name = _SAFE_NAME.sub("_", member.rel.rsplit("/", 1)[-1])[-64:].lstrip(".-") or "payload.exe"
         dest = job / "payload" / name
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(member.path, dest)
         evidence: dict[str, Any] = {"packer": packer, "packed_sha256": _sha256(sample), "payload_member": member.rel,
-                                    "payload_sha256": _sha256(dest), "payload_reason": reason, **extra}
+                                    "payload_sha256": _sha256(dest), "payload_reason": choice.reason,
+                                    **choice.extra}
         return dest, evidence, paths
 
     def _dotnet(self, sample: Path, job: Path, members_dir: Path, have: int, timeout_s: float,

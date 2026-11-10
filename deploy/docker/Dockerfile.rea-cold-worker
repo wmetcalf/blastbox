@@ -161,6 +161,38 @@ RUN python3 -m venv /build/bv \
     && /opt/speakeasy/bin/python -I -c "import importlib.metadata as m, speakeasy, unicorn; assert m.version('speakeasy-emulator') == '${SPEAKEASY_VERSION}'; print('speakeasy', m.version('speakeasy-emulator'), 'unicorn', unicorn.__version__)" \
     && rm -rf /build
 
+# ------------------------- refinery (hash-locked wheels + one pinned pure-Python sdist, unpacked)
+# The sweep unwraps Inno Setup installers with Binary Refinery's xtinno parser
+# (src/blastbox/engines/rea/inno_unwrap.py, run under /opt/refinery/bin/python as a bounded
+# subprocess; a parser, nothing runs). PyPI has only an sdist, and its setup.py imports the package
+# and every optional dependency to build; none of that is needed: the package is pure Python (its
+# Cython extensions are optional accelerators with pure-Python twins), so the sha256-checked sdist's
+# refinery/ tree is unpacked into the venv as-is and no build runs. Only the three packages xtinno
+# imports are installed (refinery-requirements.txt). Refinery declares more (lief, msgpack,
+# colorama, toml...) for units the sweep never loads, so there is no `pip check` here, and no
+# console scripts.
+FROM ${JDK_IMAGE} AS refinery
+ARG REFINERY_VERSION=0.11.3
+ARG REFINERY_SDIST_URL=https://files.pythonhosted.org/packages/3d/4a/0bd600f4f86f33bdf7bdc60d332a5cc33a2f9b8411a0eedec26ce8203164/binary_refinery-0.11.3.tar.gz
+ARG REFINERY_SDIST_SHA256=8b5bf2113939cb1e2b8ca234ba40bef07aff87a33685dfcbdc7105d59675a520
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       ca-certificates curl python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+COPY deploy/rea/refinery-requirements.txt /build/
+WORKDIR /build
+RUN python3 -m venv /opt/refinery \
+    && /opt/refinery/bin/pip install --no-cache-dir --require-hashes --no-deps --only-binary :all: \
+       -r /build/refinery-requirements.txt \
+    && curl -fsSL -o refinery.tar.gz "${REFINERY_SDIST_URL}" \
+    && echo "${REFINERY_SDIST_SHA256}  refinery.tar.gz" | sha256sum -c - \
+    && site=$(/opt/refinery/bin/python -I -c "import sysconfig; print(sysconfig.get_path('purelib'))") \
+    && tar -xzf refinery.tar.gz -C "$site" --strip-components=1 --no-same-owner --no-same-permissions \
+       "binary_refinery-${REFINERY_VERSION}/refinery" \
+    && /opt/refinery/bin/python -I -m compileall -q "$site/refinery" \
+    && /opt/refinery/bin/python -I -c "import refinery; assert refinery.__version__ == '${REFINERY_VERSION}', refinery.__version__; from refinery.units.formats.archive.xtinno import xtinno; print('refinery', refinery.__version__, xtinno.__name__)" \
+    && rm -rf /build
+
 # ------------------------------------------- fixtures (regeneration only; not in image)
 FROM ${JDK_IMAGE} AS rea-fixtures-build
 ARG NSIS_VERSION=3.10-2ubuntu2
@@ -180,10 +212,9 @@ FROM ${JDK_IMAGE}
 ARG REA_TOOLS_SHA256=c819d694c65bd1482a0e780ff1848542f2046fe50a6b68fc366066b593d7e58f
 # The sweep upx -d-s UPX-marked samples (a static decompressor; the sample never runs).
 ARG UPX_VERSION=4.2.4-1.1build1
-# The sweep unwraps NSIS installers with 7-Zip (7z x -tNsis) and Inno Setup installers with
-# innoextract (static decompressors; the installer never runs). See installer.UNWRAPPERS.
+# The sweep unwraps NSIS installers with 7-Zip (7z x -tNsis; a static decompressor, the installer
+# never runs). Inno Setup goes through the refinery venv above. See installer.UNWRAPPERS.
 ARG SEVENZIP_VERSION=26.00+dfsg-1
-ARG INNOEXTRACT_VERSION=1.9-3
 # Address-space cap (KiB) on each Ghidra decompiler process. Auto-analysis runs one per
 # analysis thread; on a .NET assembly each grew past 1 GiB until the 6 GiB slot was
 # OOM-killed with no output. Capped, a runaway function fails alone and analysis goes on.
@@ -192,11 +223,10 @@ ARG DECOMPILE_MAX_KB=786432
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
        procps python3 python3-venv "upx-ucl=${UPX_VERSION}" \
-       "7zip=${SEVENZIP_VERSION}" "innoextract=${INNOEXTRACT_VERSION}" \
+       "7zip=${SEVENZIP_VERSION}" \
     && rm -rf /var/lib/apt/lists/* \
     && upx --version | head -1 \
     && 7z i | grep -q ' Nsis ' \
-    && innoextract --version | head -1 \
     && useradd -u 10001 -m worker
 
 COPY --from=node /opt/node /opt/node
@@ -208,6 +238,7 @@ RUN d=/opt/ghidra/Ghidra/Features/Decompiler/os/linux_x86_64 \
 COPY --from=rea-build /opt/rea /opt/rea
 COPY --from=capa /opt/capa /opt/capa
 COPY --from=speakeasy /opt/speakeasy /opt/speakeasy
+COPY --from=refinery /opt/refinery /opt/refinery
 COPY deploy/rea/ghidra_scripts /opt/rea/ghidra_scripts
 
 COPY pyproject.toml README.md /src/blastbox/
@@ -272,6 +303,11 @@ RUN --mount=type=bind,source=deploy/rea,target=/mnt/rea \
     echo '== NSIS fixture unwrapped by 7z'; \
     7z x -tNsis -y -bd -bso0 -bsp0 -o"$w/nsis" -- /mnt/rea/fixtures/installer.exe; \
     cmp "$w/nsis/payload.exe" /mnt/rea/fixtures/sample.exe; \
+    echo '== Inno unwrapper (refinery venv) loads its parser and refuses the NSIS fixture with status 1'; \
+    unwrapper=$(python -c 'import blastbox.engines.rea.inno_unwrap as m; print(m.__file__)'); \
+    /opt/refinery/bin/python -I -c 'from refinery.units.formats.archive.xtinno import xtinno'; \
+    rc=0; /opt/refinery/bin/python -I "$unwrapper" /mnt/rea/fixtures/installer.exe "$w/inno" 1048576 || rc=$?; \
+    [ "$rc" = 1 ] && [ -z "$(ls -A "$w/inno")" ]; \
     echo '== .NET resource scan (capa venv python, hash-locked dnfile) over the dotnet fixture'; \
     scanner=$(python -c 'import blastbox.engines.rea.dotnet_resources as m; print(m.__file__)'); \
     /opt/capa/bin/python -I "$scanner" /mnt/rea/fixtures/dotnet.dll "$w/dres" > "$w/dres.json"; \
@@ -297,5 +333,5 @@ WORKDIR /home/worker
 ENTRYPOINT ["python", "-m", "blastbox.worker.cold"]
 
 LABEL org.opencontainers.image.title="blastbox-rea-cold-worker" \
-      org.opencontainers.image.description="REA reverse-engineering worker (REA source build cd878ad, Ghidra 12.1.4 headless, Temurin JDK 21, Node 22.23.4, 7-Zip 26.00, innoextract 1.9, Speakeasy 2.0.0b9)" \
+      org.opencontainers.image.description="REA reverse-engineering worker (REA source build cd878ad, Ghidra 12.1.4 headless, Temurin JDK 21, Node 22.23.4, 7-Zip 26.00, Binary Refinery 0.11.3, Speakeasy 2.0.0b9)" \
       org.opencontainers.image.version="0.1.0"

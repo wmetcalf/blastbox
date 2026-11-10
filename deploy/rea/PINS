@@ -30,10 +30,26 @@ UPX_VERSION=4.2.4-1.1build1
 # Installer unwrapping (installer.py). The base image's archive is Ubuntu 26.04 "resolute"
 # (not noble): versions read with `apt-cache policy` inside JDK_IMAGE on 2026-11-09.
 # 7-Zip's NSIS handler extracts files only (no [NSIS].nsi since 15.05); the sweep decodes the
-# script's string table itself. innoextract 1.9 (the latest release) reads Inno Setup up to
-# 6.0.5; newer installers are attempted and fail as a warning.
+# script's string table itself, and carves the archive itself when its signature was altered so
+# that 7-Zip lists nothing (installer.nsis_carve).
 SEVENZIP_VERSION=26.00+dfsg-1
-INNOEXTRACT_VERSION=1.9-3
+# Inno Setup: Binary Refinery's xtinno parser in its own venv (/opt/refinery, the Dockerfile's
+# refinery stage), run by inno_unwrap.py. It replaced innoextract 1.9 (the latest release), which
+# rejects current Inno Setup and returned nothing for a live 6.7.0 installer; xtinno reads through 7.x
+# and also disassembles the compiled [Code] script. 0.11.3 (2026-10-26) is sdist-only on PyPI; its
+# setup.py imports the package and every optional dependency, so nothing is built: the
+# sha256-checked sdist's pure-Python refinery/ tree is unpacked into the venv (the Cython
+# accelerators are optional and left out). Only what xtinno imports is installed, hash-locked in
+# refinery-requirements.txt: defusedxml 0.7.1, pure-magic-rs 0.5.1 and pycryptodomex 3.24.1 (the
+# releases before the current 0.6.0 / 3.24.2, which were days old on 2026-11-10). The rest of
+# Refinery's declared dependencies (lief, msgpack, colorama, toml...) serve units the sweep never
+# loads and are absent on purpose, so the stage has no `pip check`.
+# There is NO benign Inno Setup fixture (the compiler is Windows-only): the build smoke proves the
+# parser imports and that a non-Inno file is refused; extraction was verified in the sandboxed lab
+# on a live Inno 6.7.0 installer, and the tests feed inno_unwrap synthetic member lists.
+REFINERY_VERSION=0.11.3
+REFINERY_SDIST_URL=https://files.pythonhosted.org/packages/3d/4a/0bd600f4f86f33bdf7bdc60d332a5cc33a2f9b8411a0eedec26ce8203164/binary_refinery-0.11.3.tar.gz
+REFINERY_SDIST_SHA256=8b5bf2113939cb1e2b8ca234ba40bef07aff87a33685dfcbdc7105d59675a520
 # Fixture regeneration only (rea-fixtures stage builds deploy/rea/fixtures/installer.exe).
 NSIS_VERSION=3.10-2ubuntu2
 

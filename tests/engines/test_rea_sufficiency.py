@@ -80,3 +80,36 @@ def test_a_benign_verdict_needs_the_programs_own_code_read():
     # Only a benign call carries that burden; and with no program list there is nothing to check.
     assert assess(report=_rep("malicious", "high"), sweep={}, explored=[], program_functions=own).met
     assert assess(report=_rep("benign", "medium"), sweep={}, explored=[]).met
+
+
+def test_a_benign_verdict_does_not_stand_on_an_installer_that_hides_what_it_runs():
+    big = {"name": "heteroalbumose.ube", "size": 904637, "entropy": 0.16}
+    stub = {"packer": "nsis", "member_count": 15, "plugins": ["System.dll"], "data_members": [big]}
+    s = assess(report=_rep("benign", "medium"), sweep={"installer_stub": stub}, explored=[])
+    assert [g.code for g in s.gaps] == ["benign_installer_concealment"] and s.gaps[0].targets == []
+    assert "System.dll" in s.gaps[0].detail and "heteroalbumose.ube 904637 bytes" in s.gaps[0].detail
+    assert len(s.gaps[0].detail) <= 300
+    # Only a benign call carries the burden.
+    assert _codes(report=_rep("suspicious", "medium"), sweep={"installer_stub": stub}) == []
+    # An altered archive signature, on the payload's installer or a nested one, or on a stub.
+    altered = {"packer": "nsis", "payload_member": "carved/item-2.bin", "signature": "altered"}
+    assert _codes(report=_rep("benign", "high"), sweep={"unpacked": altered}) == ["benign_installer_concealment"]
+    nested = {"packer": "inno", "inner": [{"packer": "nsis", "signature": "altered"}]}
+    assert _codes(report=_rep("benign", "high"), sweep={"unpacked": nested}) == ["benign_installer_concealment"]
+    s = assess(report=_rep("benign", "high"), sweep={"installer_stub": {**stub, "signature": "altered"}},
+               explored=[])
+    assert "signature was altered" in s.gaps[0].detail and "no program" in s.gaps[0].detail
+
+
+def test_ordinary_installers_and_program_less_ones_without_a_loader_shape_are_not_concealment():
+    benign = _rep("benign", "medium")
+    small = {"name": "license.txt", "size": 4096, "entropy": 4.2}
+    big = {"name": "data.bin", "size": 1 << 20, "entropy": 7.9}
+    for sweep in ({"unpacked": {"packer": "nsis", "payload_member": "app.exe"}},
+                  {"unpacked": {"packer": "upx"}},
+                  {"installer_stub": {"packer": "nsis", "plugins": ["System.dll"], "data_members": [small]}},
+                  {"installer_stub": {"packer": "nsis", "plugins": ["nsDialogs.dll"], "data_members": [big]}},
+                  {"installer_stub": {"packer": "inno", "member_count": 3, "data_members": [big]}},
+                  {"installer_stub": {"packer": "nsis", "plugins": "System.dll", "data_members": [None, 7]}},
+                  {"installer_stub": "nsis", "unpacked": ["x"]}):
+        assert _codes(report=benign, sweep=sweep) == [], sweep

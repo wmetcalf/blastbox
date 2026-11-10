@@ -1,0 +1,10 @@
+# Hash-locked wheels for the image's /opt/refinery venv (Dockerfile.rea-cold-worker, refinery
+# stage): the three packages Binary Refinery's Inno Setup parser (xtinno) imports. Binary Refinery
+# itself is not here: PyPI has only its sdist, which is sha256-checked and unpacked as-is by the
+# stage. Linux x86_64, CPython 3.14. See deploy/rea/PINS.
+defusedxml==0.7.1 \
+    --hash=sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61
+pure-magic-rs==0.5.1 \
+    --hash=sha256:6f64908c538784340616c798cb98f9f4768f63c660176d16d3b8e304cad6c428
+pycryptodomex==3.24.1 \
+    --hash=sha256:9b94a8c647c1f80b4c82c7ac9642dda94a71abbb4efa29ad652c410ad7a39879
