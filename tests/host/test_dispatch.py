@@ -1163,6 +1163,76 @@ def test_requeue_grace_window(tmp_path):
     assert store.get(fresh.job_id).status == JobStatus.RUNNING
 
 
+def test_requeue_skips_cold_job_this_dispatcher_is_still_finishing(tmp_path):
+    """The maintenance sweep must not requeue a cold job one of THIS dispatcher's own threads is
+    still working on.
+
+    `docker ps` lists RUNNING containers only, so from the moment a worker exits until its owner
+    thread writes the terminal status -- container auto-removal, output size cap, trust
+    validation, sealing, upload -- the job is RUNNING in the store and absent from `docker ps`.
+    Past the grace window the sweep called that "worker container disappeared" and requeued it out
+    from under its live owner: the re-claim wipes output/ and either collides on the container
+    name (job FAILED on a missing metadata.json) or runs the same untrusted sample a second time.
+    Seen on a live stack as 3 of ~45 jobs, each requeued 94-142 s after launch.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    swept: list[int] = []
+    holder: dict[str, Dispatcher] = {}
+
+    def fake_runner(argv, **kw):
+        if "ps" in argv:
+            # The worker has exited: no running container carries this job's label.
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if "run" in argv:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+            # A long-running worker: the grace window is well behind us when it exits...
+            store.update(job.job_id, started_at=time.time() - 600)
+            # ...and the maintenance tick lands before the owner thread has finished the job.
+            swept.append(holder["d"].requeue_orphaned_jobs())
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    holder["d"] = dispatcher
+    assert dispatcher.dispatch_once() is True
+
+    assert swept == [0], "the sweep must have run mid-dispatch and requeued nothing"
+    final_job = store.get(job.job_id)
+    assert final_job is not None
+    assert final_job.status == JobStatus.DONE
+    assert "requeued: worker container disappeared" not in final_job.security_warnings
+
+
+def test_requeue_still_recovers_a_cold_job_once_its_dispatch_has_returned(tmp_path):
+    """The in-flight exclusion ends with the dispatch: a job left RUNNING after its owner thread
+    has returned (or by a dispatcher that is gone) is still an orphan and is still requeued."""
+    store = InMemoryJobStore()
+    done = _make_job()
+    done.input_sha256 = _INPUT_SHA
+    store.create(done)
+    _setup_job_dirs(tmp_path, done)
+    output_dir = tmp_path / done.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        if "run" in argv:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    assert dispatcher.dispatch_once() is True
+    assert store.get(done.job_id).status == JobStatus.DONE
+
+    # Same job id, RUNNING again with no live owner: nothing may remember it as in flight.
+    store.update(done.job_id, status=JobStatus.RUNNING, started_at=time.time() - 600)
+    assert dispatcher.requeue_orphaned_jobs() == 1
+    assert store.get(done.job_id).status == JobStatus.QUEUED
+
+
 def test_cold_enrichment_claim_fenced_aborts_on_reclaim(tmp_path):
     """If a peer requeues+reclaims a cold job while _runtime_selector blocks (e.g. on `docker
     info`), the claim-fenced enrichment write aborts THIS stale owner before it launches a worker,
