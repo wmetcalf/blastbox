@@ -159,6 +159,18 @@ Three things in the plan's Step 2 cannot work as written. Each was found live:
    produce is dropped like an unknown address. The pass seals `stop_reason: evidence_only` and the
    gap `code_unread`: no code was read, so the bar is never met on evidence alone. Needs the
    Loadout companion (`evidence_only`, `code_unread`, source rows) or the pass is refused.
+   **Signatures.** Before Ghidra the sweep matches the submitted file, the unpacked image and
+   every recovered member (installer payloads, emulation captures, hidden .NET payloads) against
+   CAPEv2's family rules with YARA-X (`signatures.py`, at most 60 s, out of process under
+   `/opt/yara/bin/python -I` with `ulimit -d/-t/-f`; rules compiled at image build into
+   `/opt/yara/cape.yarx`, see `PINS`). Matches go to `State.sweep["signatures"]`, the report
+   (`signature_matches`) and the summary (`signatures_status`, `signatures_total`, `signatures`);
+   the agent is told to treat a family match as a lead to confirm, and the evidence-only report can
+   cite it (`source: signatures`). Measured on the 20 labelled samples (cape5, 2026-11-10): the
+   rules name 1 of 20 (SalatStealer), 0 wrong, no match on ~680 benign files, under 1 s a sample.
+   CAPE's rules target unpacked payloads; most of the 20 still end in an encrypted stage the sweep
+   does not recover, and 11 of the families have no CAPE rule. Needs the Loadout companion (the
+   three summary fields) or the sweep is refused.
    **Go string literals.** Go packs literals with no terminator, so a defined-string scan reads
    one literal into the next (live 2026-11-03: `http://loadout-go-fixture.example.org/ping`
    sealed with the strconv digits `1734723475976807094411` glued on, and the agent's byte check

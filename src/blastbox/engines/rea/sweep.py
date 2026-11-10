@@ -50,6 +50,15 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
    "entropy"[, "image"[, "noise"]][, "member"][, "decoded"[, "decoded_member", "decoded_sha256"]
    [, "stage": {"dotnet"[, "module", "types", "methods", "loader_refs"]}]]}]}``; a failed scan is a
    ``dotnet_resources_failed`` warning;
+4c. signatures (``signatures.py``, at most ``SIGNATURES_S``, before Ghidra so a disassembly that eats
+   the budget still leaves them): YARA-X with CAPEv2's family rules over the submitted file, the
+   image analysed when that is another file (``unpacked``) and every member recovered so far
+   (``member:<file name>``). Evidence ``State.sweep["signatures"]`` and the report's
+   ``signature_matches`` (``signatures.py`` documents the shape); summary ``signatures_status``
+   (``ok`` | ``timeout`` | ``failed``), ``signatures_total`` (distinct rules matched) and
+   ``signatures`` (their names). An image without the scanner or its rules adds nothing; a scan that
+   fails or times out is a ``signatures_failed`` / ``signatures_timeout`` warning and keeps what it
+   matched before that;
 5. native code (pe/elf/macho/dotnet): ``analyzeHeadless`` import + auto-analysis with the
    bundled ``ListStrings.java`` post-script dumping defined strings and the image base;
 5a. after it, ``capa`` (pe/elf/dotnet; ``capa.py``): rule matches with ATT&CK/MBC
@@ -128,7 +137,7 @@ from pathlib import Path
 from typing import Any
 
 from blastbox.contract import DeclaredArtifact, Detection, Record, Warning
-from blastbox.engines.rea import apihash, capa, dotnet_resources, dumpfix, emulate, installer
+from blastbox.engines.rea import apihash, capa, dotnet_resources, dumpfix, emulate, installer, signatures
 from blastbox.engines.rea.continuation import GhidraStatus, State, pack
 from blastbox.engines.rea.gostrings import clip_overruns, exact_iocs, go_strings
 from blastbox.engines.rea.icons import extract_icons
@@ -169,6 +178,7 @@ EXTRACT_TIMEOUT_S = 120.0
 UNPACK_TIMEOUT_S = 60.0
 INSTALLER_TIMEOUT_S = 120.0
 DOTNET_RESOURCES_S = 90.0
+SIGNATURES_S = 60.0  # wall-clock cap on the YARA scan of the sample and its stages (signatures.py)
 DEFAULT_DOTNET_PYTHON = "/opt/capa/bin/python"  # the capa venv carries the hash-locked dnfile
 DOTNET_MAX_KB = 2 * 1024 * 1024
 MAX_DOTNET_JSON = 4 * 1024 * 1024
@@ -224,6 +234,7 @@ UnpackFn = Callable[..., str]
 InstallerFn = Callable[..., str]
 DotnetFn = Callable[..., tuple[str, bytes]]
 EmulateFn = Callable[..., tuple[str, bytes]]
+SignaturesFn = Callable[..., signatures.SigResult]
 CapaFn = Callable[..., tuple[CapaStatus, bytes]]
 RunnerFactory = Callable[..., Any]
 
@@ -356,6 +367,7 @@ class ReaSweepEngine:
         installer_fn: InstallerFn = installer.extract,
         dotnet_fn: DotnetFn = run_dotnet_resources,
         emulate_fn: EmulateFn = run_emulation,
+        signatures_fn: SignaturesFn = signatures.scan,
     ) -> None:
         self._runner_factory = runner_factory
         self._ghidra_fn = ghidra_fn
@@ -364,6 +376,7 @@ class ReaSweepEngine:
         self._installer_fn = installer_fn
         self._dotnet_fn = dotnet_fn
         self._emulate_fn = emulate_fn
+        self._signatures_fn = signatures_fn
 
     def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
         base = Path(os.environ.get("BLASTBOX_WORK_DIR") or "/work")
@@ -474,6 +487,10 @@ class ReaSweepEngine:
                                             min(DOTNET_RESOURCES_S, remaining()), warnings)
             members += found
 
+        # 4c. signatures (signatures.py): YARA over the submitted file and every stage recovered so
+        # far. Before Ghidra: a disassembly that eats the budget still leaves the family name.
+        sigs = self._signatures(input, analysed, members, job, min(SIGNATURES_S, remaining()), warnings)
+
         # 4. Ghidra
         ghidra_status: GhidraStatus = "skipped"
         project = job / "proj"
@@ -573,6 +590,9 @@ class ReaSweepEngine:
             sweep_evidence["capabilities"] = capabilities[:STATE_CAPABILITIES]
         if api_hashes is not None:
             sweep_evidence["api_hashes"] = {"algorithm": api_hashes.algorithm, "hits": api_hashes.hits}
+        sig_evidence = signatures.evidence(sigs)
+        if sig_evidence is not None:
+            sweep_evidence["signatures"] = sig_evidence
         # No disassembly, but evidence a report can be written from: the chain goes on without a
         # project (the agent's evidence-only pass).
         evidence_only = chain_stop in EVIDENCE_STOPS and bool(evidence_sources(sweep_evidence))
@@ -609,13 +629,15 @@ class ReaSweepEngine:
         if capa_status is not None:
             summary["capa_status"] = capa_status
             summary["capabilities_total"] = len(capabilities)
+        if sig_evidence is not None:
+            summary.update(signatures.summary_fields(sigs))
         if chain_stop is not None:
             summary["chain_stop"] = chain_stop
 
         # 8. report artifact, then the payload
         report_path = outdir / "report.json"
         self._write_report(report_path, summary, iocs, inspect, report_cap, warnings, capabilities, api_hashes,
-                           resources, emulation)
+                           resources, emulation, sig_evidence)
         payload = self._payload(summary, iocs, limits, warnings, capabilities)
 
         artifacts = [DeclaredArtifact(id=f"member-{i}", path=p.relative_to(outdir).as_posix(), kind="extracted")
@@ -909,6 +931,26 @@ class ReaSweepEngine:
             warnings.append(Warning(code="api_hash_failed", message=f"exception:{type(exc).__name__}"))
             return None
 
+    def _signatures(self, sample: Path, analysed: Path, members: list[Path], job: Path, timeout_s: float,
+                    warnings: list[Warning]) -> signatures.SigResult:
+        """YARA over the submitted file, the image the sweep analyses when that is another file, and
+        every member recovered so far. A scan that fails or runs out of time is a warning; what it
+        matched before that is kept."""
+        targets = [signatures.SigTarget("sample", sample)]
+        if analysed != sample:
+            targets.append(signatures.SigTarget("unpacked", analysed))
+        targets += [signatures.SigTarget(f"member:{m.name}", m) for m in members]
+        cwd = job / "signatures"
+        try:
+            cwd.mkdir(parents=True, exist_ok=True)
+            result = self._signatures_fn(targets, timeout_s=timeout_s, cwd=cwd)
+        except Exception as exc:  # a signature failure never fails the job
+            result = signatures.SigResult("failed", f"exception:{type(exc).__name__}")
+        if result.status in ("timeout", "failed"):
+            warnings.append(Warning(code=f"signatures_{result.status}",
+                                    message=_short(result.reason or result.status, 1000)))
+        return result
+
     def _emulate(self, sample: Path, job: Path, members_dir: Path, have: int, remaining_s: float,
                  reasons: list[str], warnings: list[Warning]
                  ) -> tuple[dict[str, Any], list[tuple[str, str]], Path | None, dict[str, Any] | None, list[Path]]:
@@ -1111,7 +1153,8 @@ class ReaSweepEngine:
                       capabilities: list[dict[str, Any]] | None = None,
                       api_hashes: apihash.ApiHashes | None = None,
                       resources: dict[str, Any] | None = None,
-                      emulation: dict[str, Any] | None = None) -> None:
+                      emulation: dict[str, Any] | None = None,
+                      sigs: dict[str, Any] | None = None) -> None:
         results = dict(inspect)
         hashes = ({"algorithm": api_hashes.algorithm, "hits": api_hashes.hits}
                   if api_hashes is not None else None)
@@ -1121,7 +1164,7 @@ class ReaSweepEngine:
         def encode() -> bytes:
             return json.dumps({**summary, "iocs": ioc_rows, "capabilities": caps, "api_hashes": hashes,
                                "dotnet_resources": resources, "emulation": emulation,
-                               "inspect_results": results}).encode()
+                               "signature_matches": sigs, "inspect_results": results}).encode()
 
         data = encode()
         if len(data) > cap:

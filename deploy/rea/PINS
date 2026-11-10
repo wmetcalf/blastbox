@@ -86,3 +86,22 @@ SETUPTOOLS_BUILD_VERSION=84.2.1
 # Fixtures (rea-fixtures stage, gcc-mingw-w64-x86-64 as before): unpack.exe / unpack.dll (decrypt the
 # benign sample.exe into VirtualAlloc'd memory, map it, make it RX, run 54 bytes of shellcode, call
 # WinINet with run-time-decrypted strings) and peb.exe (no imports; PEB walk + ror13 hashes).
+
+# Signatures (signatures.py / signatures_runner.py): YARA-X in its own hash-locked venv (/opt/yara,
+# the Dockerfile's yara stage). Wheel + sha256 in yara-requirements.txt (one abi3 manylinux_2_28
+# x86_64 wheel, no runtime dependencies). yara-x, not yara-python: yara-python's newest release
+# (4.5.4, 2025-05) has no CPython 3.14 or abi3 wheel. 1.22.1 (2026-10-26) is the newest yara-x
+# release at least two weeks old (1.23.0 was 5 days old when chosen).
+YARA_X_VERSION=1.22.1
+YARA_X_WHEEL_SHA256=5dcb9db77784f0ad62460506923031673e0aadc525c1a5d25e53965a7f91587f
+# Rules: CAPEv2's family rules, data/yara/CAPE (114 files, 143 rules at this commit), fetched at
+# image build from the codeload tarball of this commit (the newest commit touching data/yara/CAPE,
+# 2026-09-22, "Defendnot yara") and sha256-checked; NOT vendored in this repository. Licence:
+# CAPEv2 is GPL-3.0 (its LICENSE file, kept in the image as /opt/yara/CAPE-LICENSE); the rules are
+# used unmodified, compiled at build into /opt/yara/cape.yarx (YARA-X serialized rules, loaded per
+# job; tied to the YARA-X version that wrote them). Each file is compiled alone first and skipped
+# if it fails; the build fails under CAPE_RULES_MIN rules. At this commit all 114 files / 143
+# rules compile under YARA-X 1.22.1 (relaxed_re_syntax); /opt/yara/cape-compile.json records it.
+CAPE_COMMIT=5ee1155a30c46e50c0f1cb6272c724979a1d61bf
+CAPE_TARBALL_SHA256=680ecbf561c4d5326082a52159d054e5aeec5917833f357e3beadbe5b7631219
+CAPE_RULES_MIN=135

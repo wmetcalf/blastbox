@@ -6,6 +6,7 @@ import pytest
 
 from blastbox.contract import Record
 from blastbox.engines.rea import ReaSweepEngine
+from blastbox.engines.rea import signatures as sig
 from blastbox.engines.rea import sweep as sw
 from blastbox.engines.rea.continuation import unpack
 from blastbox.engines.rea.runner import INSPECT_MAP, MAX_MEMBERS, ExtractResult
@@ -111,12 +112,35 @@ class FakeCapa:
         return (self.status, json.dumps(self.doc).encode() if self.status == "ok" else b"")
 
 
-def _run(sample: Path, tmp_path: Path, *, runner=None, ghidra=None, limits=None, unpack=None, capa=None):
+class FakeSignatures:
+    """Stands in for signatures.scan: every target gets a slot, ``rules`` match in the first one."""
+
+    def __init__(self, status="ok", rules=(), reason="", raises=None):
+        self.status, self.rules, self.reason, self.raises = status, rules, reason, raises
+        self.calls: list[dict] = []
+
+    def __call__(self, targets, *, timeout_s, cwd):
+        self.calls.append(dict(labels=[t.label for t in targets], paths=[t.path for t in targets],
+                               timeout_s=timeout_s, cwd=cwd))
+        if self.raises is not None:
+            raise self.raises
+        if self.status == "unavailable":
+            return sig.SigResult("unavailable", "no yara interpreter in this image")
+        slots = [{"label": t.label, "sha256": f"{i:064x}", "size": t.path.stat().st_size}
+                 for i, t in enumerate(targets)]
+        matches = [{"rule": r, "family": fam, "target": slots[0]["label"], "sha256": slots[0]["sha256"],
+                    "meta": {"cape_type": f"{fam} Payload"}} for r, fam in self.rules]
+        return sig.SigResult(self.status, self.reason, rules_total=135, targets=slots, matches=matches,
+                             matches_total=len(matches))
+
+
+def _run(sample: Path, tmp_path: Path, *, runner=None, ghidra=None, limits=None, unpack=None, capa=None,
+         signatures=None):
     out = tmp_path / "out"
     out.mkdir(exist_ok=True)
     ghidra = ghidra or FakeGhidra()
     eng = ReaSweepEngine(runner_factory=runner or factory(), ghidra_fn=ghidra, unpack_fn=unpack or FakeUnpack("failed"),
-                         capa_fn=capa or FakeCapa())
+                         capa_fn=capa or FakeCapa(), signatures_fn=signatures or FakeSignatures("unavailable"))
     res = eng.detonate(sample, out, limits or Limits(timeout_s=600))
     return res, out, ghidra
 
@@ -802,3 +826,75 @@ def test_ordinary_samples_carry_no_dump_headers(tmp_path):
     assert not {"pe_header_repaired", "pe_sections_missing"} & set(_codes(res))
     _s, _p, state = unpack(out / "continuation.tar.gz", tmp_path / "cont", max_bytes=1 << 30)
     assert "dump_headers" not in state.sweep
+
+
+def test_signature_matches_reach_payload_report_and_continuation(tmp_path):
+    scan = FakeSignatures(rules=[("AgentTeslaV4", "AgentTesla"), ("AgentTeslaV4JIT", "AgentTesla")])
+    res, out, ghidra = _run(FIXTURES / "sample.exe", tmp_path, signatures=scan)
+    f = _fields(res)
+    assert (f["signatures_status"], f["signatures_total"]) == ("ok", 2)
+    assert f["signatures"] == ["AgentTeslaV4", "AgentTeslaV4JIT"]
+    assert scan.calls[0]["labels"] == ["sample"] and 0 < scan.calls[0]["timeout_s"] <= sw.SIGNATURES_S
+    assert scan.calls[0]["cwd"].name == "signatures" and ghidra.calls
+    report = json.loads((out / "report.json").read_text())
+    assert report["signature_matches"]["families"] == ["AgentTesla"]
+    assert report["signature_matches"]["rules_total"] == 135 and report["signatures"] == f["signatures"]
+    _s, _p, state = unpack(out / "continuation.tar.gz", tmp_path / "cont", max_bytes=1 << 30)
+    assert state.sweep["signatures"] == report["signature_matches"]
+    assert not [c for c in _codes(res) if c.startswith("signatures_")]
+
+
+def test_a_clean_scan_is_recorded_as_a_scan_that_matched_nothing(tmp_path):
+    res, out, _g = _run(FIXTURES / "sample.exe", tmp_path, signatures=FakeSignatures())
+    f = _fields(res)
+    assert (f["signatures_status"], f["signatures_total"], f["signatures"]) == ("ok", 0, [])
+    assert json.loads((out / "report.json").read_text())["signature_matches"]["matches"] == []
+
+
+def test_an_image_without_the_scanner_adds_no_signature_fields(tmp_path):
+    res, out, _g = _run(FIXTURES / "sample.exe", tmp_path)
+    assert not [k for k in _fields(res) if k.startswith("signatures")]
+    assert json.loads((out / "report.json").read_text())["signature_matches"] is None
+    _s, _p, state = unpack(out / "continuation.tar.gz", tmp_path / "cont", max_bytes=1 << 30)
+    assert "signatures" not in state.sweep
+
+
+@pytest.mark.parametrize("scan,status,code", [
+    (FakeSignatures("timeout", rules=[("Salat", "Salat")], reason="scanner killed"), "timeout", "signatures_timeout"),
+    (FakeSignatures("failed", reason="scanner exited with status 1"), "failed", "signatures_failed"),
+])
+def test_signature_failures_are_warnings_and_keep_what_matched(tmp_path, scan, status, code):
+    res, _out, _g = _run(FIXTURES / "sample.exe", tmp_path, signatures=scan)
+    f = _fields(res)
+    assert res.status == "ok" and code in _codes(res)
+    assert f["signatures_status"] == status and f["signatures"] == [r for r, _f in scan.rules]
+    assert f["more_pending"] is True
+
+
+def test_a_signature_exception_never_fails_the_sweep(tmp_path):
+    res, out, _g = _run(FIXTURES / "sample.exe", tmp_path, signatures=FakeSignatures(raises=RuntimeError("boom")))
+    assert res.status == "ok" and "signatures_failed" in _codes(res)
+    assert not [k for k in _fields(res) if k.startswith("signatures")]
+    assert json.loads((out / "report.json").read_text())["signature_matches"] is None
+
+
+def test_signatures_scan_the_unpacked_image_and_every_member(tmp_path):
+    # A UPX-marked sample: the scan sees the submitted file and the image upx -d produced.
+    p = make_pe(tmp_path / "upx.exe", [(b"UPX0", X, b""), (b"UPX1", X, b"\x90" * 4096)])
+    up, scan = FakeUnpack("ok"), FakeSignatures()
+    _run(p, tmp_path, unpack=up, signatures=scan)
+    assert scan.calls[0]["labels"] == ["sample", "unpacked"]
+    assert scan.calls[0]["paths"] == [p, up.calls[0]["dest"]]
+
+
+def test_signatures_scan_extracted_members(tmp_path):
+    def extract(outdir: Path) -> ExtractResult:
+        outdir.mkdir(parents=True, exist_ok=True)
+        files = [outdir / f"member-{n}" for n in range(3)]
+        for f in files:
+            f.write_bytes(f.name.encode())
+        return ExtractResult(files=files)
+
+    scan = FakeSignatures()
+    _run(_zip(tmp_path / "a.zip"), tmp_path, runner=factory(extract_fn=extract), signatures=scan)
+    assert scan.calls[0]["labels"] == ["sample", "member:member-0", "member:member-1", "member:member-2"]
