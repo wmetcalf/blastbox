@@ -5,17 +5,24 @@ section, decoded in order). :func:`validate_report` turns that, or an already-se
 wire shape (``sections`` as a list, as carried in the continuation), into the wire object:
 
 ```text
-{"schema": "rea.analysis/1", "pass": N,
+{"schema": "rea.analysis/1", "pass": N, "basis"?: "evidence",
  "verdict": {"label", "confidence", "rationale"},
- "sections": [{"key", "title", "status", "text", "evidence": [{"address", "function"?, "note"?}]}]}
+ "sections": [{"key", "title", "status", "text",
+               "evidence": [{"address", "function"?, "note"?} | {"source", "item"?, "note"?}]}]}
 ```
+
+An evidence row cites either a function address or, in a report written without a disassembly
+(``basis: "evidence"``: Ghidra timed out or failed, or a .NET assembly was decompiled to C#
+instead), a piece of the sweep's evidence: ``source`` is one of ``prompts.EVIDENCE_SOURCES`` and
+``item`` names what is cited inside it.
 
 Rules (the interface, docs/.../g3-interface.md in Loadout):
 
 - A shape violation (unknown enum, over-long string, more than ``REPORT_EVIDENCE`` entries, a
   malformed address, a missing field, a repeated or unknown key) rejects the whole report.
 - Every key appears once, in ``REPORT_KEYS`` order; a missing one is filled as ``not_analysed``.
-- An evidence address the pass has not seen (``known``) is dropped, not fatal. A section left
+- An evidence address the pass has not seen (``known``) is dropped, not fatal, and so is a row
+  citing a source the sweep evidence does not hold (``sources``). A section left
   ``observed`` with no evidence (other than overview/unknowns) is downgraded to ``not_analysed``
   and its unsupported text replaced. ``not_observed``/``not_analysed`` sections carry no evidence.
 - An empty title, or one that only repeats the key, becomes the section's default title.
@@ -24,13 +31,17 @@ Rules (the interface, docs/.../g3-interface.md in Loadout):
 from __future__ import annotations
 
 import re
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
 from blastbox.engines.rea.prompts import (
+    EVIDENCE_SOURCES,
+    REPORT_BASIS,
     REPORT_CONFIDENCES,
     REPORT_EVIDENCE,
     REPORT_FUNCTION,
+    REPORT_ITEM,
     REPORT_KEYS,
     REPORT_LABELS,
     REPORT_NO_EVIDENCE_OK,
@@ -49,6 +60,8 @@ _ADDR = re.compile(r"^0x[0-9a-fA-F]{1,16}$")
 MISSING_TEXT = "Not covered by this report."
 DOWNGRADED_TEXT = ("The report cited no address the analysis has seen for this section, so it is "
                    "marked not analysed.")
+DOWNGRADED_EVIDENCE_TEXT = ("The report cited no evidence the sweep recorded for this section, so it is "
+                            "marked not analysed.")
 _FIELDS = ("title", "status", "text", "evidence")
 
 
@@ -59,7 +72,7 @@ class ReportInvalid(ValueError):
 @dataclass
 class Validated:
     report: dict[str, Any]
-    dropped: int  # evidence entries citing an address the pass has not seen
+    dropped: int  # evidence entries citing an address the pass has not seen, or an absent source
     downgraded: list[str]  # observed sections left without evidence
 
 
@@ -81,10 +94,21 @@ def complete_sections(raw: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in raw.items() if isinstance(v, dict) and all(f in v for f in _FIELDS)}
 
 
-def validate_report(obj: Any, pass_no: int, known: set[str] | None) -> Validated:
-    """The wire report for ``obj``; ``known=None`` skips the seen-address check (a sealed report)."""
+def validate_report(obj: Any, pass_no: int, known: set[str] | None, *,
+                    sources: Collection[str] | None = None, basis: str | None = None) -> Validated:
+    """The wire report for ``obj``.
+
+    ``known=None`` skips the seen-address check and ``sources=None`` the present-source check (a
+    sealed report); a pass that read functions passes ``sources=()``, so only addresses count.
+    ``basis`` marks the report being written (``REPORT_BASIS`` for an evidence-only one); a
+    sealed report keeps its own.
+    """
     if not isinstance(obj, dict):
         raise ReportInvalid("not an object")
+    if basis is None:
+        basis = obj.get("basis")
+    if basis not in (None, REPORT_BASIS):
+        raise ReportInvalid("basis outside the enum")
     verdict = obj.get("verdict")
     if not isinstance(verdict, dict):
         raise ReportInvalid("verdict missing")
@@ -132,30 +156,48 @@ def validate_report(obj: Any, pass_no: int, known: set[str] | None) -> Validated
         if not isinstance(raw_ev, list) or len(raw_ev) > REPORT_EVIDENCE:
             raise ReportInvalid(f"{key}: evidence is not a list of at most {REPORT_EVIDENCE}")
         evidence: list[dict[str, str]] = []
-        seen: set[str] = set()
+        seen: set[tuple[str, ...]] = set()
         for e in raw_ev:
-            if not isinstance(e, dict) or not isinstance(e.get("address"), str) or not _ADDR.fullmatch(e["address"]):
-                raise ReportInvalid(f"{key}: malformed evidence address")
-            row = {"address": _norm(e["address"])}
-            for name, cap in (("function", REPORT_FUNCTION), ("note", REPORT_NOTE)):
+            if not isinstance(e, dict):
+                raise ReportInvalid(f"{key}: malformed evidence row")
+            by_source = "address" not in e and "source" in e
+            if by_source:
+                if e["source"] not in EVIDENCE_SOURCES:
+                    raise ReportInvalid(f"{key}: evidence source outside the enum")
+                row = {"source": e["source"]}
+                extra = (("item", REPORT_ITEM), ("note", REPORT_NOTE))
+            else:
+                if not isinstance(e.get("address"), str) or not _ADDR.fullmatch(e["address"]):
+                    raise ReportInvalid(f"{key}: malformed evidence address")
+                row = {"address": _norm(e["address"])}
+                extra = (("function", REPORT_FUNCTION), ("note", REPORT_NOTE))
+            for name, cap in extra:
                 if e.get(name) is not None:
                     v = _str(e[name], cap, f"{key}.evidence.{name}")
                     if v:
                         row[name] = v
-            if known is not None and row["address"] not in known:
-                dropped += 1
-                continue
-            if row["address"] not in seen:
-                seen.add(row["address"])
+            if by_source:
+                if sources is not None and row["source"] not in sources:
+                    dropped += 1
+                    continue
+                ident: tuple[str, ...] = ("source", row["source"], row.get("item", ""))
+            else:
+                if known is not None and row["address"] not in known:
+                    dropped += 1
+                    continue
+                ident = ("address", row["address"])
+            if ident not in seen:
+                seen.add(ident)
                 evidence.append(row)
         if status != "observed":
             evidence = []
         elif not evidence and key not in REPORT_NO_EVIDENCE_OK:
-            status, text = "not_analysed", DOWNGRADED_TEXT
+            status, text = "not_analysed", DOWNGRADED_EVIDENCE_TEXT if basis else DOWNGRADED_TEXT
             downgraded.append(key)
         sections.append({"key": key, "title": title, "status": status, "text": text, "evidence": evidence})
 
     report: dict[str, Any] = {"schema": REPORT_SCHEMA, "pass": pass_no,
+                              **({"basis": basis} if basis else {}),
                               "verdict": {"label": label, "confidence": confidence, "rationale": rationale},
                               "sections": sections}
     return Validated(report=report, dropped=dropped, downgraded=downgraded)
@@ -166,5 +208,6 @@ def report_addresses(report: dict[str, Any] | None) -> set[str]:
     out: set[str] = set()
     for sec in (report or {}).get("sections", []):
         for e in sec.get("evidence", []):
-            out.add(e["address"])
+            if "address" in e:
+                out.add(e["address"])
     return out

@@ -150,6 +150,15 @@ Three things in the plan's Step 2 cannot work as written. Each was found live:
    `ghidra_timeout`, `unsupported_arch`, `packed`; see `sweep.py`). When it is set the sweep seals
    `more_pending=false` with no continuation (Ruling AL). `packed` needs the `function_count` line
    that `ghidra_scripts/ListStrings.java` now writes first, so rebuild the base image too.
+   **A Ghidra timeout or failure no longer ends the chain** when the sweep collected anything else
+   (IOCs, unpacking, emulation, .NET resources, capa, API hashes): the sweep seals `more_pending`
+   with a continuation that has no project and no `chain_stop`, and the agent runs ONE pass with no
+   MCP session: a single report call over the sweep's evidence. That report is `rea.analysis/1`
+   with `basis: evidence` (set by the engine, never taken from the model) and cites sweep sources
+   (`{source, item?, note?}`) in place of addresses; a row citing a source the sweep did not
+   produce is dropped like an unknown address. The pass seals `stop_reason: evidence_only` and the
+   gap `code_unread`: no code was read, so the bar is never met on evidence alone. Needs the
+   Loadout companion (`evidence_only`, `code_unread`, source rows) or the pass is refused.
    **Go string literals.** Go packs literals with no terminator, so a defined-string scan reads
    one literal into the next (live 2026-11-03: `http://loadout-go-fixture.example.org/ping`
    sealed with the strconv digits `1734723475976807094411` glued on, and the agent's byte check

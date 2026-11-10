@@ -69,7 +69,13 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
 7. a continuation archive (sample + Ghidra project + ``State``, whose ``sweep`` holds the kind and
    the first ``STATE_IOCS`` IOCs for the agent's analysis report), only when a model pass can
    follow. Otherwise the payload names why in ``chain_stop`` (Ruling AL, superseding "a Ghidra
-   timeout still continues"), seals ``more_pending=false`` and packs no continuation;
+   timeout still continues"), seals ``more_pending=false`` and packs no continuation. A Ghidra
+   timeout or failure (``EVIDENCE_STOPS``) no longer ends the chain when the sweep has evidence
+   to report from (``prompts.evidence_sources``: IOCs, an unwrapped installer, emulation, .NET
+   resources, capa matches, hashed imports): the continuation is packed without a project,
+   ``chain_stop`` is omitted, and the agent writes one report from that evidence, marked as
+   not decompiled. Live, 5 of 20 labelled samples had no report at all for a Ghidra timeout
+   while their sweeps held an unpacked installer, an emulated stage or hidden .NET payloads;
 8. a ``rea.report/1`` Record payload plus a full JSON ``report`` artifact.
 
 ``rea.report/1`` payload fields: ``schema``, ``kind``, ``inspect`` (``{cmd: {ok[, error]}}``),
@@ -91,6 +97,9 @@ unsupported_arch  REA's Ghidra lane rejects the architecture (32-bit MIPS I-V)
 packed            UPX sections / UPX! magic, or <= 16 procedures plus a high-entropy code section
                   (the entropy rule never applies to .NET)
 ```
+
+``ghidra_failed`` and ``ghidra_timeout`` are sealed only when the sweep has no evidence to report
+from, or the evidence-only continuation could not be packed (a warning says which).
 
 ``more_pending=false`` without ``chain_stop`` means the continuation itself could not be packed
 or exceeded the artifact limits (a warning says which).
@@ -124,6 +133,7 @@ from blastbox.engines.rea.continuation import GhidraStatus, State, pack
 from blastbox.engines.rea.gostrings import clip_overruns, exact_iocs, go_strings
 from blastbox.engines.rea.icons import extract_icons
 from blastbox.engines.rea.iocs import Ioc, extract_iocs, utf16le_urls
+from blastbox.engines.rea.prompts import evidence_sources
 from blastbox.engines.rea.triage import packed, unsupported_arch, upx_marked
 from blastbox.engines.rea.runner import (
     INSPECT_MAP,
@@ -148,6 +158,8 @@ _HEX_ADDR = re.compile(r"0x[0-9a-fA-F]{1,16}")
 
 SCHEMA = "rea.report/1"
 CHAIN_STOPS = ("ghidra_timeout", "ghidra_failed", "packed", "unsupported_arch", "not_native")
+# Stops that still get a report when the sweep has evidence (the agent's evidence-only pass).
+EVIDENCE_STOPS = ("ghidra_timeout", "ghidra_failed")
 NATIVE_KINDS = frozenset({"pe", "elf", "macho", "dotnet"})
 EXTRACT_KINDS = frozenset({"archive", "apk", "asar", "firmware"})
 
@@ -543,7 +555,6 @@ class ReaSweepEngine:
         # Ghidra run would only repeat in the agent; non-native inputs, architectures REA's lane
         # rejects and packed stubs give the model nothing to analyse.
         chain_stop = self._chain_stop(analysed, kind, ghidra_status, function_count)
-        chainable = chain_stop is None
         sweep_evidence: dict[str, Any] = {"kind": kind, "iocs": [{"type": i.type, "value": i.value, "source": i.source}
                                                  for i in iocs[:STATE_IOCS]]}
         if layers:
@@ -562,14 +573,19 @@ class ReaSweepEngine:
             sweep_evidence["capabilities"] = capabilities[:STATE_CAPABILITIES]
         if api_hashes is not None:
             sweep_evidence["api_hashes"] = {"algorithm": api_hashes.algorithm, "hits": api_hashes.hits}
+        # No disassembly, but evidence a report can be written from: the chain goes on without a
+        # project (the agent's evidence-only pass).
+        evidence_only = chain_stop in EVIDENCE_STOPS and bool(evidence_sources(sweep_evidence))
         cont = (self._continuation(analysed, outdir, project, ghidra_status, limits, warnings, sweep_evidence)
-                if chainable else None)
+                if chain_stop is None or evidence_only else None)
+        if evidence_only and cont is not None:
+            chain_stop = None
 
         # 7. artifact budget (report + continuation reserved first)
         report_cap = min(MAX_REPORT_BYTES, limits.max_artifact_bytes)
         icons, members = self._budget(icons, members, cont, report_cap, limits, warnings)
 
-        more_pending = chainable and cont is not None
+        more_pending = cont is not None
 
         summary: dict[str, Any] = {
             "schema": SCHEMA,

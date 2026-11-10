@@ -23,6 +23,7 @@ from blastbox.engines.rea import agent as ag
 from blastbox.engines.rea import policy, prompts
 from blastbox.engines.rea.continuation import State, pack, unpack
 from blastbox.engines.rea.mcp_client import MAX_RESPONSE, McpError, McpStdioClient
+from blastbox.engines.rea.report import ReportInvalid, report_addresses, validate_report
 from blastbox.engines.rea.sufficiency import Gap, Sufficiency
 from blastbox.engines.rea.model import MAX_RESPONSE_BYTES, ModelClient, ModelError
 from blastbox.limits import Limits
@@ -2124,3 +2125,166 @@ def test_functions_holding_hashed_api_sites_are_seeded_after_capa(tmp_path):
 def test_hash_sites_tolerates_junk():
     assert ag.hash_sites({"api_hashes": {"hits": [{"sites": ["0x10", "0x10", 5, "zz"]}, "x"]}}) == [0x10]
     assert ag.hash_sites({"api_hashes": "nope"}) == [] and ag.hash_sites({}) == []
+
+
+# ------------------------------------------------- the evidence-only pass (no disassembly)
+EV_SWEEP = {"kind": "pe",
+            "iocs": [{"type": "url", "value": "http://evil.example/a.php", "source": "inspect:strings"}],
+            "unpacked": {"packer": "inno", "members": 3},
+            "emulation": {"status": "failed", "triggers": ["few_imports"]}}
+
+
+def _ev_report(**over):
+    sections = {k: _section() for k in prompts.REPORT_KEYS}
+    sections["overview"] = _section("observed", "An Inno Setup installer that carries a download URL.", [], "Overview")
+    sections["network"] = _section("observed", "Contains a download URL.", [
+        {"source": "iocs", "item": "http://evil.example/a.php", "note": "embedded URL"},
+        {"source": "iocs", "item": "http://evil.example/a.php", "note": "again"},
+        {"source": "emulation", "item": "VirtualAlloc", "note": "this sweep's emulation found nothing"},
+        {"address": FN_MAIN, "function": "entry", "note": "no function was read"}])
+    sections["persistence"] = _section("observed", "Adds a Run key.", [
+        {"source": "capabilities", "item": "persist via Run key", "note": "capa did not run"}])
+    obj = {"verdict": {"label": "suspicious", "confidence": "medium", "rationale": "an installer with a URL"},
+           "sections": sections}
+    obj.update(over)
+    return obj
+
+
+def _ev_run(tmp_path, monkeypatch, resp, *, status="timeout", sweep=None, **cont_kw):
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    cont = make_continuation(tmp_path, project=False, ghidra_status=status, todo=[],
+                             sweep=EV_SWEEP if sweep is None else sweep, **cont_kw)
+
+    def no_ghidra(*a, **kw):
+        raise AssertionError("Ghidra must not run again")
+
+    model = FakeModel([] if resp is None else [resp])
+    rig = McpRig(tmp_path)
+    res, out = run(tmp_path, cont, model, rig, ghidra_fn=no_ghidra)
+    return res, out, model, rig
+
+
+def test_evidence_only_pass_writes_the_report_from_the_sweep(tmp_path, monkeypatch):
+    res, out, model, rig = _ev_run(tmp_path, monkeypatch, answer(_ev_report()))
+    f = res.payload.fields
+    assert f["model_status"] == "ok" and f["steps"] == 0 and f["tool_calls"] == 0
+    assert cols(res.payload, "functions")["address"] == [] and not rig.requests  # no MCP session
+    assert f["summary"] == "An Inno Setup installer that carries a download URL."
+    rep = json.loads(f["analysis_report"])
+    assert rep["schema"] == "rea.analysis/1" and rep["basis"] == "evidence" and rep["pass"] == 1
+    secs = {s["key"]: s for s in rep["sections"]}
+    # Cited by source; a source the sweep holds nothing under and an address are dropped.
+    assert secs["network"]["evidence"] == [
+        {"source": "iocs", "item": "http://evil.example/a.php", "note": "embedded URL"}]
+    assert secs["persistence"]["status"] == "not_analysed" and secs["persistence"]["evidence"] == []
+    assert "Run key" not in secs["persistence"]["text"]
+    assert {"evidence_only", "report_evidence_dropped"} <= set(_codes(res))
+    # One report, then the chain ends: no tool can add to the sweep's evidence.
+    assert f["stop_reason"] == "evidence_only" and f["bar_met"] is False and f["more_pending"] is False
+    assert f["gaps"] == ["code_unread"] and not (out / "continuation.tar.gz").exists()
+    # The call: one schema-bound request whose rows may only cite what the sweep holds.
+    assert len(model.calls) == 1
+    call = model.calls[0]
+    assert call["tools"] == [] and call["response_format"]["json_schema"]["name"] == "rea_analysis"
+    row = (call["response_format"]["json_schema"]["schema"]["properties"]["sections"]["properties"]["network"]
+           ["properties"]["evidence"]["items"])
+    assert row["properties"]["source"]["enum"] == ["iocs", "unpacked"] and "address" not in row["properties"]
+    body = json.dumps(call["messages"])
+    assert "http://evil.example/a.php" in body and "did not finish" in body and "inno" in body
+
+
+def test_evidence_only_pass_never_meets_the_bar_without_code(tmp_path, monkeypatch):
+    rep = _ev_report(verdict={"label": "malicious", "confidence": "high", "rationale": "known C2 URL"})
+    res, _o, _m, _r = _ev_run(tmp_path, monkeypatch, answer(rep), status="failed")
+    f = res.payload.fields
+    assert f["stop_reason"] == "evidence_only" and f["bar_met"] is False and f["gaps"] == ["code_unread"]
+    assert "failed" in next(w.message for w in res.warnings if w.code == "evidence_only")
+
+
+def test_evidence_only_pass_over_decompiled_code_can_meet_the_bar(tmp_path, monkeypatch):
+    sweep = {**EV_SWEEP, "kind": "dotnet", "decompiled": {"tool": "ilspycmd", "outline": ["Stub.Main"]}}
+    rep = _ev_report()
+    rep["sections"]["execution_flow"] = _section("observed", "Main decrypts a resource and loads it.", [
+        {"source": "decompiled", "item": "Stub.Main", "note": "Assembly.Load on the decrypted bytes"}])
+    res, _o, model, _r = _ev_run(tmp_path, monkeypatch, answer(rep), status="skipped", sweep=sweep)
+    f = res.payload.fields
+    assert f["stop_reason"] == "bar_met" and f["bar_met"] is True and f["more_pending"] is False
+    secs = {s["key"]: s for s in json.loads(f["analysis_report"])["sections"]}
+    assert secs["execution_flow"]["evidence"][0]["source"] == "decompiled"
+    assert "decompiled it to C#" in model.calls[0]["messages"][0]["content"]
+
+
+@pytest.mark.parametrize("resp, status, code", [
+    (answer("not json at all"), "malformed", "report_invalid"),
+    (answer(_ev_report(verdict={"label": "evil", "confidence": "high", "rationale": "x"})), "malformed",
+     "report_invalid"),
+    (RuntimeError("model down"), "unavailable", "report_failed"),
+])
+def test_evidence_only_pass_without_a_report_seals_no_findings(tmp_path, monkeypatch, resp, status, code):
+    res, out, _m, _r = _ev_run(tmp_path, monkeypatch, resp)
+    f = res.payload.fields
+    assert f["model_status"] == status and code in _codes(res) and "evidence_only" not in _codes(res)
+    assert f["summary"] == "prior summary" and "analysis_report" not in f
+    assert f["more_pending"] is False and not (out / "continuation.tar.gz").exists()
+
+
+def test_evidence_only_pass_needs_the_report_call(tmp_path, monkeypatch):
+    monkeypatch.setenv("REA_REPORT_MAX_TOKENS", "0")
+    cont = make_continuation(tmp_path, project=False, ghidra_status="timeout", todo=[], sweep=EV_SWEEP)
+    model = FakeModel([])
+    res, _o = run(tmp_path, cont, model, McpRig(tmp_path), ghidra_fn=lambda *a, **kw: "timeout")
+    assert res.payload.fields["model_status"] == "skipped" and model.calls == []
+
+
+def test_a_pass_that_read_functions_cannot_claim_the_evidence_basis(tmp_path, monkeypatch):
+    sections = {"network": _section("observed", "Talks to a C2.", [
+        {"source": "iocs", "item": "sweep.example", "note": "embedded"}])}
+    res, _o, _m = _report_run(tmp_path, monkeypatch, answer(_report(sections=sections, basis="evidence")))
+    rep = json.loads(res.payload.fields["analysis_report"])
+    secs = {s["key"]: s for s in rep["sections"]}
+    assert "basis" not in rep
+    assert secs["network"]["status"] == "not_analysed" and secs["network"]["evidence"] == []
+
+
+def test_sealed_evidence_report_round_trips_and_rejects_what_it_should():
+    v = validate_report(_ev_report(), 1, set(), sources=["iocs", "unpacked"], basis="evidence")
+    assert v.dropped == 3 and v.downgraded == ["persistence"]
+    again = validate_report(v.report, 1, None)  # a sealed report: its own basis, nothing re-checked
+    assert again.report == v.report and again.dropped == 0
+    assert report_addresses(v.report) == set()
+    bad = _ev_report()
+    bad["sections"]["network"]["evidence"] = [{"source": "the model's memory", "item": "x"}]
+    with pytest.raises(ReportInvalid):
+        validate_report(bad, 1, set(), sources=["iocs"], basis="evidence")
+    with pytest.raises(ReportInvalid):
+        validate_report({**_ev_report(), "basis": "vibes"}, 1, None)
+    with pytest.raises(ReportInvalid):
+        validate_report(_ev_report(), 1, None, basis="vibes")
+
+
+def test_evidence_sources_ignore_scans_that_found_nothing():
+    assert prompts.evidence_sources({}) == []
+    assert prompts.evidence_sources({
+        "kind": "pe", "iocs": [], "capabilities": [],
+        "emulation": {"status": "failed", "triggers": ["few_imports"], "stop_detail": "x", "arch": "x86"},
+        "dotnet_resources": {"resources_total": 0, "resources": [], "loader_refs": [], "hidden_payloads": []},
+        "api_hashes": {"algorithm": "ror13", "hits": []},
+        "signatures": {"status": "ok", "matches": []}, "unpacked": "inno"}) == []
+    assert prompts.evidence_sources({
+        "iocs": [{"type": "url", "value": "http://a.example", "source": "x"}],
+        "emulation": {"status": "ok", "triggers": [], "apis": [{"api": "VirtualAlloc"}]},
+        "dotnet_resources": {"resources": [], "hidden_payloads": [{"resource": "r"}]},
+        "api_hashes": {"algorithm": "ror13", "hits": [{"api": "kernel32!VirtualAlloc"}]},
+        "signatures": {"matches": [{"rule": "r"}]}, "unpacked": {"packer": "nsis"},
+        "decompiled": {"tool": "ilspycmd"},
+    }) == ["iocs", "unpacked", "emulation", "dotnet_resources", "api_hashes", "signatures", "decompiled"]
+
+
+def test_evidence_prompt_says_why_no_code_was_read():
+    fr = prompts.Framer()
+    kw = dict(pass_no=1, sample_name="s.exe", sweep={"kind": "pe"})
+    failed = fr.evidence_report_messages(sources=["iocs"], ghidra_status="failed", **kw)[0]["content"]
+    timeout = fr.evidence_report_messages(sources=["iocs"], ghidra_status="timeout", **kw)[0]["content"]
+    assert "did not finish" in timeout and "did not finish" not in failed and "could not import" in failed
+    for text in (failed, timeout):
+        assert "sweep.unpacked" in text and "SECURITY" in text and "source" in text

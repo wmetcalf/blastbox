@@ -113,3 +113,13 @@ def test_ordinary_installers_and_program_less_ones_without_a_loader_shape_are_no
                   {"installer_stub": {"packer": "nsis", "plugins": "System.dll", "data_members": [None, 7]}},
                   {"installer_stub": "nsis", "unpacked": ["x"]}):
         assert _codes(report=benign, sweep=sweep) == [], sweep
+
+
+def test_an_evidence_only_report_leaves_the_code_unread():
+    from blastbox.engines.rea.sufficiency import assess
+    report = {"basis": "evidence", "verdict": {"label": "malicious", "confidence": "high"},
+              "sections": [{"key": "network", "status": "observed"}]}
+    assert [g.code for g in assess(report=report, sweep={}, explored=[]).gaps] == ["code_unread"]
+    # Decompiler output stands in for the disassembly: the usual bar applies.
+    assert assess(report=report, sweep={"decompiled": {"tool": "ilspycmd"}}, explored=[]).met
+    assert assess(report={**report, "basis": None}, sweep={}, explored=[]).met

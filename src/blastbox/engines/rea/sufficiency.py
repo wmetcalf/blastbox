@@ -7,6 +7,10 @@ verify itself, and lists what is still missing (``gaps``):
 - ``no_report``: no valid ``rea.analysis/1`` report exists yet;
 - ``verdict_unknown`` / ``verdict_low``: the verdict is ``unknown``, or its confidence is ``low``;
 - ``no_behaviour``: no behaviour section (``BEHAVIOUR_KEYS``) is ``observed``;
+- ``code_unread``: the report was written from the sweep's evidence alone (``basis``
+  ``evidence``: the disassembler timed out or failed) and no decompiler output stood in for it
+  (``sweep["decompiled"]``). Whatever the sample does beyond that evidence is unknown, so the bar
+  is never met; no pass can close the gap, and the chain stops with ``evidence_only``;
 - ``benign_unexplored``: the verdict is ``benign`` while some of the program's own functions
   (``program_functions``: for Go, ``main.*`` and third-party modules) are unexplored. A benign
   call is a claim about everything the program does; live, a Go sample whose ``main`` is a
@@ -42,8 +46,8 @@ IOCs) while a pass could clear them by proposing nothing. Both stay visible in t
 ``verified`` column, the ``claims_dropped`` warning).
 
 The bar is met when there are no gaps. Otherwise the chain continues unless a stop rule fires:
-``stalled`` (a later pass added no fact the chain did not already have) or ``pass_cap``
-(``REA_MAX_PASSES``). Facts are verified IOCs,
+``stalled`` (a later pass added no fact the chain did not already have), ``pass_cap``
+(``REA_MAX_PASSES``) or ``evidence_only`` (the pass had no disassembly: one report, then stop). Facts are verified IOCs,
 the addresses of kept function claims and the report sections marked ``observed``.
 
 Thresholds are first guesses, to be calibrated on a labeled scoring set.
@@ -179,6 +183,10 @@ def assess(*, report: dict[str, Any] | None, sweep: dict[str, Any], explored: li
         statuses = _statuses(report)
         if not any(statuses.get(k) == "observed" for k in BEHAVIOUR_KEYS):
             gaps.append(Gap("no_behaviour", "no behaviour section is backed by observed evidence"))
+        if report.get("basis") == "evidence" and not isinstance(sweep.get("decompiled"), dict):
+            gaps.append(Gap("code_unread", "the report rests on the sweep's evidence alone: the disassembler "
+                                           "produced no code to read, so what the sample does beyond that "
+                                           "evidence is unknown"))
         if label == "benign":
             seen = set(explored)
             left = [f for f in program_functions or [] if f not in seen]

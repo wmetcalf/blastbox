@@ -38,6 +38,15 @@ dir in ``BLASTBOX_WORK_DIR``:
    nothing. The gaps go to the next pass (``State.gaps``, ``open_gaps`` in its first message) and
    their capa target functions to the front of its todo list. With the report call off, ``done``
    and the todo list decide as before;
+8a. the evidence-only pass (``_evidence_pass``): a continuation the sweep packed without a
+   project because it had no disassembly to hand on (``State.ghidra_status`` timeout or failed,
+   or skipped for a .NET assembly decompiled to C# instead) is not sent to Ghidra again. There
+   is no MCP session and no tool turn: one report call writes ``rea.analysis/1`` from the
+   sweep's evidence alone (``Framer.evidence_report_messages``), citing it by source
+   (``basis: "evidence"``, rows ``{source, item, note}``), and the chain ends there with
+   ``stop_reason`` ``evidence_only`` (or ``bar_met``). The pass seals ``model_status`` ok with no
+   function claims and the ``evidence_only`` warning; a failed report call seals
+   ``unavailable``, an invalid report ``malformed``;
 9. the next continuation (same project, updated ``State``) and a capped JSONL transcript are
    declared, and a ``rea.pass/1`` Record is sealed. The continuation is packed only when another
    pass can follow (``more_pending``); a final pass seals the transcript alone.
@@ -61,7 +70,7 @@ the model is cut to ``TOOL_RESULT_CHARS`` (head + tail around a truncation marke
 ``todo_count``, ``explored_count``, ``done``, ``more_pending``; when the bar was applied,
 ``bar_met`` (bool), ``gaps`` (gap codes: ``no_report``, ``verdict_unknown``, ``verdict_low``,
 ``no_behaviour``, ``lead:<section>``) and ``stop_reason``
-(``bar_met``/``stalled``/``pass_cap``, ``""`` while the chain continues); and, only when this pass wrote a
+(``bar_met``/``stalled``/``pass_cap``/``evidence_only``, ``""`` while the chain continues); and, only when this pass wrote a
 valid report, ``analysis_report``: the ``rea.analysis/1`` object as compact JSON text (a Record
 cannot hold lists of objects), at most ``MAX_REPORT_JSON`` chars:
 
@@ -112,7 +121,14 @@ from blastbox.engines.rea.gostrings import clip_overruns, exact_iocs, go_strings
 from blastbox.engines.rea.mcp_client import McpError, McpStdioClient
 from blastbox.engines.rea.model import ModelClient, ModelError
 from blastbox.engines.rea.policy import ADDRESS_RE, TOOL_ALLOWLIST, CallRefused, check_call, model_tool_specs, safe_name
-from blastbox.engines.rea.prompts import IOC_TYPES, Framer, final_response_format, report_response_format
+from blastbox.engines.rea.prompts import (
+    IOC_TYPES,
+    REPORT_BASIS,
+    Framer,
+    evidence_sources,
+    final_response_format,
+    report_response_format,
+)
 from blastbox.engines.rea.report import ReportInvalid, complete_sections, report_addresses, validate_report
 from blastbox.engines.rea.runner import rea_env, run_ghidra_analysis
 from blastbox.engines.rea.sufficiency import MAX_FACTS, assess, facts_of
@@ -731,7 +747,8 @@ class _Pass:
     assessed: bool = False
     bar_met: bool = False
     gaps: list[dict[str, str]] = field(default_factory=list)
-    stop_reason: str = ""  # bar_met | stalled | pass_cap; "" when the chain continues
+    stop_reason: str = ""  # bar_met | stalled | pass_cap | evidence_only; "" when the chain continues
+    evidence_only: bool = False  # no disassembly: the report was written from the sweep's evidence
     warnings: list[Warning] = field(default_factory=list)
 
 
@@ -814,7 +831,13 @@ class ReaAgentEngine:
         gpr = project / "sample.gpr" if project is not None else None
         try:
             # 2. a project to work on
-            if gpr is None or not gpr.is_file() or program_name is None:
+            no_project = gpr is None or not gpr.is_file() or program_name is None
+            if no_project and state.ghidra_status != "ok" and evidence_sources(p.sweep):
+                # The sweep had no disassembly to hand on, and a second Ghidra run would only
+                # repeat: write the report from the sweep's evidence instead.
+                project = None
+                self._evidence_pass(state, p, tw, remaining)
+            elif no_project:
                 project = job / "u" / "project"
                 ghidra_status = self._ghidra(sample, project, job, remaining() - MIN_MCP_S, p)
                 if ghidra_status == "ok":
@@ -828,7 +851,7 @@ class ReaAgentEngine:
                 else:
                     self._session(sample, project, program_name, state, p, tw, remaining, job,
                                   max_steps, max_tokens)
-            elif p.model_status == "ok":
+            elif p.model_status == "ok" and not p.evidence_only:
                 p.model_status = "skipped"
         except Exception as exc:  # an engine bug never fails the job or seals a refused shape
             _log.exception("rea-agent pass failed")
@@ -839,6 +862,7 @@ class ReaAgentEngine:
                 p.model_status = "skipped"
                 p.functions, p.iocs = [], []
                 p.summary, p.done = state.summary, False
+                p.report, p.accepted = None, False
             # else: the final answer was fully accepted before the failure (e.g. MCP close):
             # it is sealed as the ok pass it is.
 
@@ -935,6 +959,47 @@ class ReaAgentEngine:
             return "timeout"
         p.warnings.append(Warning(code="ghidra_failed", message="Ghidra analysis failed"))
         return "failed"
+
+    def _model(self, p: _Pass) -> Any | None:
+        """The model client, or None with ``model_status`` unavailable."""
+        url = os.environ.get("REA_MODEL_URL")
+        if not url:
+            p.model_status = "unavailable"
+            p.warnings.append(Warning(code="model_unavailable", message="REA_MODEL_URL is not set"))
+            return None
+        try:
+            # No fixed per-request ceiling unless REA_MODEL_TIMEOUT_S is set: each request gets the
+            # time left in its phase (a full answer at ~30 tok/s outlasts any fixed 240 s).
+            return self._model_factory(url, p.model_id, _env_seconds("REA_MODEL_TIMEOUT_S", max(1.0, p.wall_s)))
+        except ValueError as exc:
+            p.model_status = "unavailable"
+            p.warnings.append(Warning(code="model_unavailable", message=str(exc)[:2000]))
+            return None
+
+    def _evidence_pass(self, state: State, p: _Pass, tw: TranscriptWriter,
+                       remaining: Callable[[], float]) -> None:
+        """The report from the sweep's evidence alone (module docstring, step 8a)."""
+        p.evidence_only = True
+        sources = evidence_sources(p.sweep)
+        tw.write({"event": "evidence_only", "ghidra_status": state.ghidra_status, "sources": sources})
+        if p.report_tokens <= 0:  # the report call is switched off: nothing else can run
+            p.model_status = "skipped"
+            return
+        model = self._model(p)
+        if model is None:
+            return
+        outcome = self._report(model, p, tw, remaining, Framer(), state.sample_name, set(), sources=sources,
+                               ghidra_status=state.ghidra_status)
+        if outcome == "ok" and p.report is not None:
+            overview = next((sec["text"] for sec in p.report["sections"] if sec["key"] == "overview"), "")
+            p.summary = _cap(overview, MAX_SUMMARY)
+            p.done, p.accepted = True, True
+            p.warnings.append(Warning(
+                code="evidence_only",
+                message=f"no disassembly (Ghidra {state.ghidra_status}): the report was written from the "
+                        f"sweep's evidence ({', '.join(sources)})"))
+        else:
+            p.model_status = {"invalid": "malformed", "failed": "unavailable"}.get(outcome, "skipped")
 
     def _session(self, sample: Path, project: Path, program_name: str, state: State, p: _Pass,
                  tw: TranscriptWriter, remaining: Callable[[], float], job: Path, max_steps: int,
@@ -1107,19 +1172,8 @@ class ReaAgentEngine:
             framer.initial_user_message(state, p.pass_no, todo=todo_view, explored=p.explored[-200:],
                                         seed_note=seed_note),
         ]
-        url = os.environ.get("REA_MODEL_URL")
-        if not url:
-            p.model_status = "unavailable"
-            p.warnings.append(Warning(code="model_unavailable", message="REA_MODEL_URL is not set"))
-            return
-        try:
-            # No fixed per-request ceiling unless REA_MODEL_TIMEOUT_S is set: each request gets the
-            # time left in its phase (a full answer at ~30 tok/s outlasts any fixed 240 s).
-            model = self._model_factory(url, p.model_id,
-                                        _env_seconds("REA_MODEL_TIMEOUT_S", max(1.0, p.wall_s)))
-        except ValueError as exc:
-            p.model_status = "unavailable"
-            p.warnings.append(Warning(code="model_unavailable", message=str(exc)[:2000]))
+        model = self._model(p)
+        if model is None:
             return
 
         counter = 0
@@ -1313,8 +1367,11 @@ class ReaAgentEngine:
         return max(1.0, min(4 * p.tokens_per_s, p.model_tokens / p.model_seconds))
 
     def _report(self, model: Any, p: _Pass, tw: TranscriptWriter, remaining: Callable[[], float],
-                framer: Framer, sample_name: str, known: set[str]) -> None:
-        """The analysis report (rea.analysis/1): one schema-bound call after the accepted answer.
+                framer: Framer, sample_name: str, known: set[str], *, sources: list[str] | None = None,
+                ghidra_status: str = "ok") -> str:
+        """The analysis report (rea.analysis/1): one schema-bound call after the accepted answer,
+        or, with ``sources`` (an evidence-only pass), the pass's only call. Returns ``ok``,
+        ``skipped``, ``failed`` or ``invalid``.
 
         Skipped (``report_skipped_deadline``) when the time left cannot hold ``MIN_REPORT_TOKENS``
         at the measured rate; otherwise asks for ``min(REA_REPORT_MAX_TOKENS, what fits)``. A model
@@ -1331,12 +1388,17 @@ class ReaAgentEngine:
                     message=f"{remaining():.0f}s left at {tps:.1f} tok/s holds {fit} tokens, "
                             f"under the report's {MIN_REPORT_TOKENS}"))
                 tw.write({"event": "report_skipped", "fit_tokens": fit, "tokens_per_s": round(tps, 2)})
-                return
+                return "skipped"
             tokens = min(p.report_tokens, fit)
-            messages = framer.report_messages(pass_no=p.pass_no, sample_name=sample_name, summary=p.summary,
-                                              functions=p.functions, iocs=p.iocs, sweep=p.sweep,
-                                              prior_report=p.prior_report)
-            kw: dict[str, Any] = {"response_format": report_response_format()}
+            if sources:
+                messages = framer.evidence_report_messages(pass_no=p.pass_no, sample_name=sample_name,
+                                                           sweep=p.sweep, sources=sources,
+                                                           ghidra_status=ghidra_status)
+            else:
+                messages = framer.report_messages(pass_no=p.pass_no, sample_name=sample_name, summary=p.summary,
+                                                  functions=p.functions, iocs=p.iocs, sweep=p.sweep,
+                                                  prior_report=p.prior_report)
+            kw: dict[str, Any] = {"response_format": report_response_format(sources)}
             if not p.final_thinking:
                 kw["chat_template_kwargs"] = {"thinking": False}
             try:
@@ -1344,7 +1406,7 @@ class ReaAgentEngine:
             except ModelError as exc:
                 p.warnings.append(Warning(code="report_failed", message=f"report call failed: {exc}"[:2000]))
                 tw.write({"event": "report_failed", "message": str(exc)[:2000]})
-                return
+                return "failed"
             parsed = _parse_message(resp)
             content = parsed[0] if parsed is not None else None
             tw.write({"event": "report_turn", "max_tokens": tokens, "content": (content or "")[:TRANSCRIPT_TEXT],
@@ -1356,30 +1418,35 @@ class ReaAgentEngine:
                 salvaged = isinstance(obj, dict)
                 if salvaged and isinstance(obj.get("sections"), dict):
                     obj["sections"] = complete_sections(obj["sections"])
+            if isinstance(obj, dict):
+                obj.pop("basis", None)  # the engine, not the model, says what the report rests on
             try:
-                v = validate_report(obj, p.pass_no, known)
+                v = validate_report(obj, p.pass_no, known, sources=sources or (),
+                                    basis=REPORT_BASIS if sources else None)
             except ReportInvalid as exc:
                 p.warnings.append(Warning(code="report_invalid", message=f"analysis report dropped: {exc}"[:2000]))
                 tw.write({"event": "report_invalid", "reason": str(exc)[:2000]})
-                return
+                return "invalid"
             text = json.dumps(v.report, ensure_ascii=False, separators=(",", ":"))
             if len(text) > MAX_REPORT_JSON:
                 p.warnings.append(Warning(code="report_invalid",
                                           message=f"analysis report is {len(text)} chars, over {MAX_REPORT_JSON}"))
-                return
+                return "invalid"
             if salvaged:
                 p.warnings.append(Warning(code="report_salvaged",
                                           message="analysis report was cut off; its complete sections were kept"))
             if v.dropped:
                 p.warnings.append(Warning(
                     code="report_evidence_dropped",
-                    message=f"{v.dropped} report evidence address(es) the analysis never saw were dropped"
+                    message=f"{v.dropped} report evidence row(s) citing what the analysis never saw were dropped"
                             + (f"; downgraded to not_analysed: {', '.join(v.downgraded)}" if v.downgraded else "")))
             p.report = v.report
             tw.write({"event": "report", "report": v.report, "evidence_dropped": v.dropped})
+            return "ok"
         except Exception as exc:  # the report never costs the pass its findings
             _log.exception("rea-agent report failed")
             p.warnings.append(Warning(code="report_failed", message=f"exception:{type(exc).__name__}"))
+            return "failed"
 
     @staticmethod
     def _turn_failed(p: _Pass, tw: TranscriptWriter, message: str) -> None:
@@ -1491,6 +1558,8 @@ class ReaAgentEngine:
         todo = _dedup(targets + p.todo)[:MAX_TODO]
         if suff.met:
             stop = "bar_met"
+        elif p.evidence_only:  # no tool can add to the sweep's evidence: one report, then stop
+            stop = "evidence_only"
         elif p.pass_no >= 2 and not new:
             stop = "stalled"
         elif p.pass_no >= max_passes:

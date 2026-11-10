@@ -237,21 +237,38 @@ def test_extract_error_is_warning(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------- ghidra timeout
-def test_ghidra_timeout_still_ok(tmp_path: Path) -> None:
-    # Ruling AL: a Ghidra timeout still seals ok with the inspect evidence, but no longer chains.
-    res, out, _g = _run(FIXTURES / "sample.exe", tmp_path, ghidra=FakeGhidra(status="timeout"))
+def _bare():
+    """A runner whose inspect commands find nothing: a sweep with no evidence to report from."""
+    return factory(inspect_fn=lambda cmd: {"ok": True, "result": {}})
+
+
+@pytest.mark.parametrize("status", ["timeout", "failed"])
+def test_ghidra_stop_with_evidence_chains_without_a_project(tmp_path: Path, status: str) -> None:
+    # Live (cape7): 5 of 20 samples sealed no report for a Ghidra timeout while the sweep held
+    # IOCs, an unwrapped installer or emulation captures. The chain goes on from that evidence.
+    res, out, _g = _run(FIXTURES / "sample.exe", tmp_path, ghidra=FakeGhidra(status=status))
     f = _fields(res)
     assert res.status == "ok"
-    assert f["ghidra_status"] == "timeout" and f["more_pending"] is False
-    assert f["chain_stop"] == "ghidra_timeout"
+    assert f["ghidra_status"] == status and f["more_pending"] is True and "chain_stop" not in f
     assert set(f["inspect"].fields) == set(INSPECT_MAP["pe"])
     assert any(s.startswith("inspect:") for _t, _v, s in _iocs(f))
-    assert "continuation" not in _by_id(res) and not (out / "continuation.tar.gz").exists()
-    assert "ghidra_timeout" in _codes(res)
+    assert f"ghidra_{status}" in _codes(res)
+    assert _by_id(res)["continuation"].kind == "rea_continuation"
+    _s, project, st = unpack(out / "continuation.tar.gz", tmp_path / "chk", max_bytes=1 << 26)
+    assert project is None and st.program_name is None and st.ghidra_status == status
+    assert st.sweep["iocs"] and "chain_stop" not in json.loads((out / "report.json").read_text())
+
+
+def test_ghidra_stop_keeps_its_chain_stop_when_the_evidence_cannot_be_packed(tmp_path: Path) -> None:
+    res, out, _g = _run(FIXTURES / "sample.exe", tmp_path, ghidra=FakeGhidra(status="timeout"),
+                        limits=Limits(timeout_s=600, max_artifact_bytes=600))
+    f = _fields(res)
+    assert f["more_pending"] is False and f["chain_stop"] == "ghidra_timeout"
+    assert "continuation" not in _by_id(res) and "continuation_too_large" in _codes(res)
 
 
 def test_ghidra_failed_not_pending(tmp_path: Path) -> None:
-    res, _out, _g = _run(FIXTURES / "sample.elf", tmp_path, ghidra=FakeGhidra(status="failed"))
+    res, _out, _g = _run(FIXTURES / "sample.elf", tmp_path, ghidra=FakeGhidra(status="failed"), runner=_bare())
     f = _fields(res)
     assert f["kind"] == "elf" and f["ghidra_status"] == "failed" and f["more_pending"] is False
     assert res.status == "ok"
@@ -479,13 +496,14 @@ def test_chain_stop_absent_when_chaining(tmp_path):
 
 
 def test_chain_stop_ghidra_timeout_packs_no_continuation(tmp_path):
-    res, out, _g = _run(FIXTURES / "sample.exe", tmp_path, ghidra=FakeGhidra(status="timeout"))
+    # Nothing to report from: the timeout ends the chain, as before.
+    res, out, _g = _run(FIXTURES / "sample.exe", tmp_path, ghidra=FakeGhidra(status="timeout"), runner=_bare())
     _not_pending(res, out, "ghidra_timeout")
     assert json.loads((out / "report.json").read_text())["chain_stop"] == "ghidra_timeout"
 
 
 def test_chain_stop_ghidra_failed(tmp_path):
-    res, out, _g = _run(FIXTURES / "sample.elf", tmp_path, ghidra=FakeGhidra(status="failed"))
+    res, out, _g = _run(FIXTURES / "sample.elf", tmp_path, ghidra=FakeGhidra(status="failed"), runner=_bare())
     _not_pending(res, out, "ghidra_failed")
 
 
@@ -569,16 +587,16 @@ def test_chain_stop_unsupported_arch_mips1(tmp_path):
 
 def test_chain_stop_priority_with_combined_conditions(tmp_path):
     mips = make_elf32(tmp_path / "m.elf", machine=8, flags=0x1007, segments=[(5, b"\x00" * 16 + b"UPX!" + b"\x00" * 4096)])
-    res, out, _g = _run(mips, tmp_path, ghidra=FakeGhidra(status="timeout"))
+    res, out, _g = _run(mips, tmp_path, ghidra=FakeGhidra(status="timeout"), runner=_bare())
     _not_pending(res, out, "ghidra_timeout")
     res, out, _g = _run(mips, tmp_path)  # UPX! magic + MIPS-I: the arch wins
     _not_pending(res, out, "unsupported_arch")
-    res, out, _g = _run(mips, tmp_path, ghidra=FakeGhidra(status="failed"))
+    res, out, _g = _run(mips, tmp_path, ghidra=FakeGhidra(status="failed"), runner=_bare())
     _not_pending(res, out, "ghidra_failed")
 
 
 def test_unknown_ghidra_status_is_failed_not_timeout(tmp_path):
-    res, out, _g = _run(FIXTURES / "sample.exe", tmp_path, ghidra=FakeGhidra(status="weird"))
+    res, out, _g = _run(FIXTURES / "sample.exe", tmp_path, ghidra=FakeGhidra(status="weird"), runner=_bare())
     _not_pending(res, out, "ghidra_failed")
     assert sw.ReaSweepEngine._chain_stop(FIXTURES / "sample.exe", "pe", "skipped", None) == "ghidra_failed"
 
