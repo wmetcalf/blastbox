@@ -9,6 +9,7 @@ The only caller-influenced argv element is the sample path.
 from __future__ import annotations
 
 import json
+import mmap
 import os
 import re
 import shutil
@@ -442,6 +443,82 @@ _SCRIPT_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\.(?:java|py)")
 # decompile wrapper caps each process's address space so one runaway function fails alone.
 GHIDRA_MAX_CPU = 2
 
+GhidraProfile = Literal["full", "light"]
+GhidraRunStatus = Literal["ok", "partial", "timeout", "failed"]
+# The pre-script (deploy/rea/ghidra_scripts) that switches the "light" profile's expensive
+# analyzers off: Decompiler Parameter ID, Call Convention ID, Decompiler Switch Analysis, Stack and
+# the x86 Constant Reference Analyzer, 60-95% of auto-analysis on the samples that exceeded the
+# sweep's 420 s budget.
+LIGHT_SCRIPT = "LightAnalysis.java"
+# ELF/Mach-O images this large go light (every PE goes light, see ghidra_profile): a 6.5 MB Rust PE,
+# a 7.6 MB PE32+ DLL and a 12.5 MB Go PE needed 600-2400 s of full analysis.
+LIGHT_MIN_BYTES = 4 * 1024 * 1024
+_LIGHT_SCAN_BYTES = 64 * 1024 * 1024
+_GO_BUILDINFO = b"\xff Go buildinf:"  # .go.buildinfo, every Go >= 1.13 binary (= gostrings.GO_MAGIC)
+_RUST_MARKERS = (b"/rustc/", b"\\rustc\\")  # std's panic locations name the rustc source tree
+_TIMED_OUT = b"REPORT: Analysis timed out"
+_MAX_LOG_SCAN = 256 * 1024 * 1024
+
+
+def _has_marker(path: Path, size: int, markers: tuple[bytes, ...]) -> bool:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        with mmap.mmap(fd, min(size, _LIGHT_SCAN_BYTES), access=mmap.ACCESS_READ) as m:
+            return any(m.find(marker) != -1 for marker in markers)
+    except (OSError, ValueError):
+        return False
+    finally:
+        os.close(fd)
+
+
+def ghidra_profile(sample: Path, kind: str) -> GhidraProfile:
+    """The analysis profile for the image Ghidra will import, from cheap facts; never raises.
+
+    ``kind`` is :func:`classify`'s answer for ``sample``. Every PE and .NET image is "light":
+    Ghidra turns Decompiler Parameter ID on for any PE under 2 MiB of address space, i.e. most
+    malware, and it plus Call Convention ID and switch analysis took 415-614 s of 474-629 s on an
+    800 KB .NET assembly and a 655 KB DLL, while the light profile kept the function count of
+    every PE measured within 0.5% (or above it). An ELF or Mach-O image is "light" from
+    ``LIGHT_MIN_BYTES`` or when it carries a Go or Rust marker (a statically linked runtime:
+    thousands of functions), "full" otherwise. Anything else is "full" (Ghidra does not see it).
+    """
+    if kind in ("pe", "dotnet"):
+        return "light"
+    if kind not in ("elf", "macho"):
+        return "full"
+    try:
+        st = os.stat(sample, follow_symlinks=False)
+    except OSError:
+        return "full"
+    if not stat.S_ISREG(st.st_mode) or st.st_size == 0:
+        return "full"
+    if st.st_size >= LIGHT_MIN_BYTES:
+        return "light"
+    return "light" if _has_marker(sample, st.st_size, (_GO_BUILDINFO, *_RUST_MARKERS)) else "full"
+
+
+def _analysis_timed_out(log: Path) -> bool:
+    """True when Ghidra's ``-log`` file says ``-analysisTimeoutPerFile`` cut auto-analysis."""
+    try:
+        fd = os.open(log, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    with os.fdopen(fd, "rb") as f:
+        tail = b""
+        read = 0
+        while read < _MAX_LOG_SCAN:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                return False
+            read += len(chunk)
+            if _TIMED_OUT in tail + chunk:
+                return True
+            tail = chunk[-len(_TIMED_OUT) :]
+    return False
+
 
 def run_ghidra_analysis(
     sample: Path,
@@ -451,15 +528,40 @@ def run_ghidra_analysis(
     env: Mapping[str, str],
     run_fn: RunFn = bounded_run,
     post_script: tuple[Path, str, Path] | None = None,
-) -> Literal["ok", "timeout", "failed"]:
+    profile: GhidraProfile = "full",
+    script_dir: Path | None = None,
+    analysis_timeout_s: int | None = None,
+) -> GhidraRunStatus:
     """Import ``sample`` into a fresh Ghidra project named ``sample`` under ``project_dir``.
 
     ``env`` should come from :func:`rea_env` (must carry GHIDRA_INSTALL_DIR).
     ``post_script`` is ``(script_dir, script_name, output_path)``: appends
     ``-scriptPath <dir> -postScript <name> <output_path>`` (paths resolved absolute).
+
+    ``profile="light"`` runs :data:`LIGHT_SCRIPT` as a ``-preScript`` from ``script_dir``
+    (default: ``post_script``'s directory, which it must equal; one of the two is required).
+
+    ``analysis_timeout_s`` passes ``-analysisTimeoutPerFile``: Ghidra stops auto-analysis there,
+    still runs the post-script and saves the project, and the result is ``"partial"`` (a usable
+    project with incomplete analysis) instead of ``"ok"``. Ghidra's log then goes to
+    ``<project_dir>.log`` (beside the project, not in it), where the cut is read from. Leave
+    ``timeout_s`` room above it for JVM start, import, the post-script and the save (measured
+    15-45 s). Without it the result is never ``"partial"``.
     """
     if post_script is not None and not _SCRIPT_NAME.fullmatch(post_script[1]):
         raise ValueError(f"bad Ghidra script name: {post_script[1]!r}")
+    if profile not in ("full", "light"):
+        raise ValueError(f"bad Ghidra profile: {profile!r}")
+    if post_script is not None:
+        if script_dir is not None and script_dir.resolve() != post_script[0].resolve():
+            raise ValueError("the pre- and post-script must share one script directory")
+        script_dir = post_script[0]
+    if profile == "light" and script_dir is None:
+        raise ValueError("the light Ghidra profile needs a script directory")
+    if analysis_timeout_s is not None and (
+        not isinstance(analysis_timeout_s, int) or isinstance(analysis_timeout_s, bool) or analysis_timeout_s < 1
+    ):
+        raise ValueError(f"bad Ghidra analysis timeout: {analysis_timeout_s!r}")
     install = env.get("GHIDRA_INSTALL_DIR")
     if not install:
         return "failed"
@@ -476,11 +578,18 @@ def run_ghidra_analysis(
         "-max-cpu",
         str(GHIDRA_MAX_CPU),
     ]
+    log: Path | None = None
+    if analysis_timeout_s is not None:
+        log = project_dir.with_name(project_dir.name + ".log")
+        log.unlink(missing_ok=True)
+        argv += ["-analysisTimeoutPerFile", str(analysis_timeout_s), "-log", str(log)]
+    if script_dir is not None:
+        argv += ["-scriptPath", str(script_dir.resolve())]
+    if profile == "light":
+        argv += ["-preScript", LIGHT_SCRIPT]
     if post_script is not None:
-        script_dir, script_name, output_path = post_script
+        _post_dir, script_name, output_path = post_script
         argv += [
-            "-scriptPath",
-            str(script_dir.resolve()),
             "-postScript",
             script_name,
             str(output_path.resolve()),
@@ -489,7 +598,7 @@ def run_ghidra_analysis(
     if out.timed_out:
         return "timeout"
     if out.rc == 0 and (project_dir / "sample.gpr").exists():
-        return "ok"
+        return "partial" if log is not None and _analysis_timed_out(log) else "ok"
     return "failed"
 
 

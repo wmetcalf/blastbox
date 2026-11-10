@@ -642,3 +642,9 @@ def test_the_agent_is_handed_the_decompiled_code():
     msg = _first_message({"decompiled": {"images": [digest]}})
     assert "ILSpy" in msg and "Demo.Program" in msg
     assert "ILSpy" not in _first_message({})
+
+
+def test_the_agent_is_told_when_ghidra_cut_its_analysis_short():
+    msg = _first_message({"ghidra_analysis": "cut"})
+    assert "cut short" in msg and "not evidence" in msg
+    assert "cut short" not in _first_message({})

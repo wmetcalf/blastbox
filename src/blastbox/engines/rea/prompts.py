@@ -463,6 +463,11 @@ class Framer:
                      "resources), each with an outline of its types and excerpts of the methods ranked most "
                      "telling. It is the program's own code and far easier to read than the disassembly: use "
                      "it to pick the functions to read and to explain what they do.")
+        if state.sweep.get("ghidra_analysis") == "cut":
+            lead += (" Ghidra's auto-analysis of this binary ran out of time and was cut short: the project "
+                     "is incomplete, so some functions, strings and cross-references are missing from it. "
+                     "Something not found in the project is not evidence that the sample lacks it; say so "
+                     "in unknowns.")
         if state.gaps:
             lead += (" open_gaps lists what the engine found missing when it checked the previous "
                      "pass's report against the evidence; close those first (the functions they point "

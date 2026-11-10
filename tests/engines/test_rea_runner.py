@@ -496,3 +496,129 @@ def test_run_capa_statuses(tmp_path: Path, outcome, expect) -> None:
     status, out = r.run_capa(tmp_path / "s", "elf", 9, env={}, capa_bin="c", rules=Path("r"), signatures=Path("s"),
                              max_kb=1, max_stdout=1, run_fn=Fake(outcome))
     assert (status, out) == (expect, b"")
+
+
+# ------------------------------------------------------- ghidra analysis profile
+SCRIPTS = Path(__file__).resolve().parents[2] / "deploy" / "rea" / "ghidra_scripts"
+
+
+_ELF = b"\x7fELF\x02\x01\x01" + b"\0" * 200
+
+
+@pytest.mark.parametrize(("data", "kind", "expect"), [
+    (_pe(clr=True), "dotnet", "light"),
+    (_pe(clr=False, pe32plus=False), "pe", "light"),       # every PE: Decompiler Parameter ID default-on
+    (_pe(clr=False), "pe", "light"),
+    (_ELF, "elf", "full"),                                  # a small ELF keeps the full profile
+    (_ELF + b"\0" * 64 + b"\xff Go buildinf:\x08\x02", "elf", "light"),
+    (_ELF + b"/rustc/90b35a6239c3d8bdabc530a6a0816f7ff89a0aaf/library/core", "elf", "light"),
+    (_ELF + b"C:\\rustc\\abc\\library\\std", "macho", "light"),
+    (b"\xcf\xfa\xed\xfe" + b"\0" * 200, "macho", "full"),
+    (b"PK\x03\x04" + b"\0" * 100 + b"\xff Go buildinf:", "archive", "full"),  # Ghidra never sees it
+    (_pe(clr=False), "other", "full"),
+])
+def test_ghidra_profile(tmp_path: Path, data: bytes, kind: str, expect: str) -> None:
+    p = tmp_path / "img"
+    p.write_bytes(data)
+    assert r.ghidra_profile(p, kind) == expect
+
+
+def test_ghidra_profile_size_and_bad_paths(tmp_path: Path) -> None:
+    big = tmp_path / "big"
+    with big.open("wb") as f:  # sparse: a small ELF header, LIGHT_MIN_BYTES long
+        f.write(_ELF)
+        f.truncate(r.LIGHT_MIN_BYTES)
+    assert r.ghidra_profile(big, "elf") == "light"
+    with big.open("r+b") as f:
+        f.truncate(r.LIGHT_MIN_BYTES - 1)
+    assert r.ghidra_profile(big, "elf") == "full"
+    link = tmp_path / "link"
+    small = tmp_path / "small"
+    small.write_bytes(_ELF + b"/rustc/")
+    link.symlink_to(small)
+    assert r.ghidra_profile(small, "elf") == "light"
+    assert r.ghidra_profile(link, "elf") == "full"            # never follows a link
+    assert r.ghidra_profile(tmp_path / "missing", "elf") == "full"
+    assert r.ghidra_profile(tmp_path, "elf") == "full"       # a directory
+    (tmp_path / "empty").write_bytes(b"")
+    assert r.ghidra_profile(tmp_path / "empty", "elf") == "full"
+
+
+def test_ghidra_light_profile_argv(tmp_path: Path) -> None:
+    proj = tmp_path / "proj"
+    fake = Fake(hook=lambda a, kw: ((proj / "sample.gpr").write_text(""), RunOutcome(0))[1])
+    res = run_ghidra_analysis(
+        tmp_path / "s.exe", proj, 9, env=_ghidra_env(tmp_path), run_fn=fake, profile="light",
+        post_script=(tmp_path / "scripts", "ListStrings.java", tmp_path / "o.jsonl"),
+    )
+    assert res == "ok"
+    assert fake.calls[0][0] == [
+        "/opt/ghidra/support/analyzeHeadless", str(proj), "sample", "-import", str(tmp_path / "s.exe"),
+        "-overwrite", "-max-cpu", "2", "-scriptPath", str(tmp_path / "scripts"),
+        "-preScript", "LightAnalysis.java", "-postScript", "ListStrings.java", str(tmp_path / "o.jsonl"),
+    ]
+    fake2 = Fake(hook=lambda a, kw: ((proj / "sample.gpr").write_text(""), RunOutcome(0))[1])
+    assert run_ghidra_analysis(tmp_path / "s.exe", proj, 9, env=_ghidra_env(tmp_path), run_fn=fake2,
+                               profile="light", script_dir=tmp_path / "scripts") == "ok"
+    assert fake2.calls[0][0][8:] == ["-scriptPath", str(tmp_path / "scripts"), "-preScript", "LightAnalysis.java"]
+
+
+def test_ghidra_profile_argument_errors(tmp_path: Path) -> None:
+    env = _ghidra_env(tmp_path)
+    s, p = tmp_path / "s", tmp_path / "p"
+    with pytest.raises(ValueError):
+        run_ghidra_analysis(s, p, 1, env=env, run_fn=Fake(), profile="light")  # no script dir
+    with pytest.raises(ValueError):
+        run_ghidra_analysis(s, p, 1, env=env, run_fn=Fake(), profile="fast")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        run_ghidra_analysis(s, p, 1, env=env, run_fn=Fake(), profile="light", script_dir=tmp_path / "a",
+                            post_script=(tmp_path / "b", "ListStrings.java", tmp_path / "o"))
+    for bad in (0, -5, True, 1.5):
+        with pytest.raises(ValueError):
+            run_ghidra_analysis(s, p, 1, env=env, run_fn=Fake(), analysis_timeout_s=bad)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(("log_text", "expect"), [
+    (b"INFO REPORT: Analysis succeeded for file: /x\n", "ok"),
+    (b"ERROR (HeadlessAnalyzer) REPORT: Analysis timed out at 300 seconds. Processing not completed\n",
+     "partial"),
+    # the marker straddles the 1 MiB read boundary
+    (b"x" * (1024 * 1024 - 10) + b"REPORT: Analysis timed out at 3 seconds\n", "partial"),
+    (None, "ok"),                                         # no log written at all
+])
+def test_ghidra_analysis_timeout_partial(tmp_path: Path, log_text: bytes | None, expect: str) -> None:
+    proj = tmp_path / "proj"
+
+    def hook(argv, kw):
+        if log_text is not None:
+            Path(argv[argv.index("-log") + 1]).write_bytes(log_text)
+        (proj / "sample.gpr").write_text("")
+        return RunOutcome(0)
+
+    fake = Fake(hook=hook)
+    stale = tmp_path / "proj.log"
+    stale.write_bytes(b"REPORT: Analysis timed out")    # a previous run's log never counts
+    res = run_ghidra_analysis(tmp_path / "s.exe", proj, 420, env=_ghidra_env(tmp_path), run_fn=fake,
+                              analysis_timeout_s=360)
+    argv = fake.calls[0][0]
+    assert argv[8:12] == ["-analysisTimeoutPerFile", "360", "-log", str(tmp_path / "proj.log")]
+    assert res == expect
+
+
+def test_ghidra_analysis_timeout_never_rescues_failures(tmp_path: Path) -> None:
+    env = _ghidra_env(tmp_path)
+    s = tmp_path / "s"
+    assert run_ghidra_analysis(s, tmp_path / "p1", 1, env=env, analysis_timeout_s=5,
+                               run_fn=Fake(RunOutcome(None, timed_out=True))) == "timeout"
+    assert run_ghidra_analysis(s, tmp_path / "p2", 1, env=env, analysis_timeout_s=5,
+                               run_fn=Fake(RunOutcome(1))) == "failed"
+    assert run_ghidra_analysis(s, tmp_path / "p3", 1, env=env, analysis_timeout_s=5,
+                               run_fn=Fake(RunOutcome(0))) == "failed"  # no .gpr
+
+
+def test_light_analysis_script_names_known_analyzers() -> None:
+    src = (SCRIPTS / r.LIGHT_SCRIPT).read_text()
+    assert "public class LightAnalysis extends GhidraScript" in src
+    for name in ("Decompiler Parameter ID", "Call Convention ID", "Decompiler Switch Analysis", "Stack",
+                 "x86 Constant Reference Analyzer"):
+        assert f'"{name}",' in src

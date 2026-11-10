@@ -61,8 +61,8 @@ class FakeGhidra:
 
     def __call__(self, sample, project_dir, timeout_s, *, env, post_script=None, **kw):
         self.calls.append(dict(sample=sample, project_dir=project_dir, timeout_s=timeout_s,
-                               env=dict(env), post_script=post_script))
-        if self.status == "ok":
+                               env=dict(env), post_script=post_script, kw=kw))
+        if self.status in ("ok", "partial"):
             project_dir.mkdir(parents=True, exist_ok=True)
             (project_dir / "sample.gpr").write_text("gpr")
             (project_dir / "sample.rep").mkdir(exist_ok=True)
@@ -137,7 +137,7 @@ class FakeSignatures:
 def _run(sample: Path, tmp_path: Path, *, runner=None, ghidra=None, limits=None, unpack=None, capa=None,
          signatures=None):
     out = tmp_path / "out"
-    out.mkdir(exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
     ghidra = ghidra or FakeGhidra()
     eng = ReaSweepEngine(runner_factory=runner or factory(), ghidra_fn=ghidra, unpack_fn=unpack or FakeUnpack("failed"),
                          capa_fn=capa or FakeCapa(), signatures_fn=signatures or FakeSignatures("unavailable"))
@@ -289,6 +289,35 @@ def test_ghidra_stop_keeps_its_chain_stop_when_the_evidence_cannot_be_packed(tmp
     f = _fields(res)
     assert f["more_pending"] is False and f["chain_stop"] == "ghidra_timeout"
     assert "continuation" not in _by_id(res) and "continuation_too_large" in _codes(res)
+
+
+def test_ghidra_gets_the_profile_and_an_analysis_cut_short_of_the_kill(tmp_path: Path, monkeypatch) -> None:
+    # Live (cape7): 5 of 20 samples ended in ghidra_timeout. Every PE now gets the trimmed profile,
+    # and Ghidra is told to stop its own analysis before the sweep's kill.
+    _res, _o, g = _run(FIXTURES / "sample.exe", tmp_path)
+    call = g.calls[0]
+    assert call["kw"]["profile"] == "light"
+    assert call["kw"]["analysis_timeout_s"] == int(call["timeout_s"]) - 60 > 0
+    _res, _o, g = _run(FIXTURES / "sample.elf", tmp_path / "elf")
+    assert g.calls[0]["kw"]["profile"] == "full"  # a small ELF with no Go or Rust runtime
+    # too short a budget to cut inside: the kill is the only limit
+    monkeypatch.setenv("REA_GHIDRA_SWEEP_S", "100")
+    _res, _o, g = _run(FIXTURES / "sample.exe", tmp_path / "short")
+    assert g.calls[0]["kw"]["analysis_timeout_s"] is None
+
+
+def test_a_cut_ghidra_analysis_is_a_usable_project_the_agent_is_warned_about(tmp_path: Path) -> None:
+    res, out, _g = _run(FIXTURES / "sample.exe", tmp_path, ghidra=FakeGhidra(status="partial"))
+    f = _fields(res)
+    assert f["ghidra_status"] == "ok" and f["more_pending"] is True and "chain_stop" not in f
+    assert "ghidra_partial" in _codes(res) and "ghidra_timeout" not in _codes(res)
+    assert any(s.startswith("ghidra") for _t, _v, s in _iocs(f))  # its strings were still read
+    _s, project, st = unpack(out / "continuation.tar.gz", tmp_path / "chk", max_bytes=1 << 26)
+    assert project is not None and st.ghidra_status == "ok" and st.sweep["ghidra_analysis"] == "cut"
+    # a complete analysis leaves no such mark
+    _res, out2, _g = _run(FIXTURES / "sample.exe", tmp_path / "full")
+    _s, _p, st2 = unpack(out2 / "continuation.tar.gz", tmp_path / "chk2", max_bytes=1 << 26)
+    assert "ghidra_analysis" not in st2.sweep
 
 
 def test_ghidra_failed_not_pending(tmp_path: Path) -> None:

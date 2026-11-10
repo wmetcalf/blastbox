@@ -5,7 +5,7 @@ dir in ``BLASTBOX_WORK_DIR``:
 
 1. unpack and check the continuation (sample hash, program name); a corrupt one is ``rejected``;
 2. if it carries no Ghidra project (the sweep timed out), run ``run_ghidra_analysis`` first with
-   the remaining budget;
+   the remaining budget, under the sweep's profile and analysis cut (``sweep._ghidra``);
 3. start REA's MCP server (``[REA_BIN, "--mcp"]``) over the saved project with ``rea_env`` plus
    ``REA_ANALYSIS_PROVIDER/REA_GHIDRA_PROJECT_PATH/REA_GHIDRA_PROGRAM_NAME``; the child gets no
    proxy variables (only ``ModelClient``, in this process, talks to the network);
@@ -130,9 +130,15 @@ from blastbox.engines.rea.prompts import (
     report_response_format,
 )
 from blastbox.engines.rea.report import ReportInvalid, complete_sections, report_addresses, validate_report
-from blastbox.engines.rea.runner import rea_env, run_ghidra_analysis
+from blastbox.engines.rea.runner import classify, ghidra_profile, rea_env, run_ghidra_analysis
 from blastbox.engines.rea.sufficiency import MAX_FACTS, assess, facts_of
-from blastbox.engines.rea.sweep import _env_seconds, _sha256, _string_leaves
+from blastbox.engines.rea.sweep import (
+    DEFAULT_SCRIPTS_DIR,
+    GHIDRA_CUT_RESERVE_S,
+    _env_seconds,
+    _sha256,
+    _string_leaves,
+)
 from blastbox.limits import Limits
 from blastbox.worker.engine import DetonationResult
 
@@ -842,6 +848,8 @@ class ReaAgentEngine:
                 ghidra_status = self._ghidra(sample, project, job, remaining() - MIN_MCP_S, p)
                 if ghidra_status == "ok":
                     program_name = sample.name
+                    if p.sweep.get("ghidra_analysis") == "cut":
+                        state.sweep["ghidra_analysis"] = "cut"  # this pass's first message reads state.sweep
                 else:
                     project = None
             # 3-6. MCP session + model loop
@@ -942,14 +950,24 @@ class ReaAgentEngine:
             p.model_status = "budget"
             p.warnings.append(Warning(code="ghidra_timeout", message="no time left for Ghidra analysis"))
             return "timeout"
+        # Same profile and analysis cut as the sweep's run (sweep._ghidra).
+        profile = ghidra_profile(sample, classify(sample))
+        cut = int(budget) - GHIDRA_CUT_RESERVE_S if budget >= 2 * GHIDRA_CUT_RESERVE_S else None
         try:
-            status = self._ghidra_fn(sample, project, budget, env=rea_env(job / "ghidra", os.environ))
+            status = self._ghidra_fn(sample, project, budget, env=rea_env(job / "ghidra", os.environ),
+                                     profile=profile, analysis_timeout_s=cut,
+                                     script_dir=Path(os.environ.get("REA_GHIDRA_SCRIPTS") or DEFAULT_SCRIPTS_DIR))
         except Exception as exc:
             status = "failed"
             p.warnings.append(Warning(code="ghidra_failed", message=f"exception:{type(exc).__name__}"))
             p.model_status = "skipped"
             return "failed"
-        if status == "ok" and (project / "sample.gpr").is_file():
+        if status in ("ok", "partial") and (project / "sample.gpr").is_file():
+            if status == "partial":
+                p.sweep["ghidra_analysis"] = "cut"
+                p.warnings.append(Warning(code="ghidra_partial",
+                                          message=f"Ghidra's auto-analysis ({profile} profile) was cut at {cut}s: "
+                                                  "the project is usable but incomplete"))
             return "ok"
         # A second miss would just repeat: stop the chain rather than loop on it.
         p.model_status = "skipped"

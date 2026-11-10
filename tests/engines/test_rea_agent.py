@@ -768,6 +768,29 @@ def test_no_project_runs_ghidra_first(tmp_path):
     assert res.payload.fields["model_status"] == "ok"
 
 
+def test_no_project_ghidra_run_uses_the_sweeps_profile_and_survives_an_analysis_cut(tmp_path, monkeypatch):
+    monkeypatch.setenv("REA_GHIDRA_SCRIPTS", str(tmp_path / "scripts"))
+    cont = make_continuation(tmp_path, project=False, ghidra_status="timeout", todo=["0x140001420"])
+    seen = {}
+
+    def ghidra(sample, project_dir, timeout_s, *, env, **kw):
+        seen.update(timeout_s=timeout_s, **kw)
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "sample.gpr").write_text("gpr")
+        (project_dir / "sample.rep").mkdir(exist_ok=True)
+        return "partial"
+
+    model = FakeModel([answer({"summary": "s", "functions": [], "iocs": [], "todo": [], "done": False})])
+    res, out = run(tmp_path, cont, model, McpRig(tmp_path), ghidra_fn=ghidra, limits=Limits(timeout_s=600))
+    assert seen["profile"] in ("light", "full") and seen["script_dir"] == tmp_path / "scripts"
+    assert seen["analysis_timeout_s"] == int(seen["timeout_s"]) - 60 > 0
+    assert res.payload.fields["model_status"] == "ok" and "ghidra_partial" in _codes(res)
+    first = "".join(str(m.get("content")) for m in model.calls[0]["messages"])
+    assert "cut short" in first
+    _s, proj, st = unpack(out / "continuation.tar.gz", out / "_c", max_bytes=1 << 26)
+    assert proj is not None and st.ghidra_status == "ok" and st.sweep["ghidra_analysis"] == "cut"
+
+
 def test_no_project_and_ghidra_fails(tmp_path):
     cont = make_continuation(tmp_path, project=False, ghidra_status="timeout", todo=[])
     model = FakeModel([])

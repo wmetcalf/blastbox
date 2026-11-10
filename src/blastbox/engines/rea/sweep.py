@@ -73,7 +73,16 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
    fails or times out is a ``signatures_failed`` / ``signatures_timeout`` warning and keeps what it
    matched before that;
 5. native code (pe/elf/macho/dotnet): ``analyzeHeadless`` import + auto-analysis with the
-   bundled ``ListStrings.java`` post-script dumping defined strings and the image base;
+   bundled ``ListStrings.java`` post-script dumping defined strings and the image base. The
+   analysis profile is ``runner.ghidra_profile``'s: every PE, and a large or Go/Rust ELF/Mach-O,
+   gets the "light" one (``LightAnalysis.java`` pre-script: Decompiler Parameter ID, Call
+   Convention ID, Decompiler Switch Analysis, Stack and the x86 constant-reference analyzer off;
+   they took 60-95% of the time on the five of 20 labelled samples that ended in
+   ``ghidra_timeout``, which now finish in 42-384 s of the 420 s budget with the function count
+   within 0.5% on all but a Go binary, 8% lower). Ghidra is also told to stop its own
+   analysis ``GHIDRA_CUT_RESERVE_S`` before the kill: a run it cuts keeps a usable, incomplete
+   project (``ghidra_status`` stays ``ok``, warning ``ghidra_partial``,
+   ``State.sweep["ghidra_analysis"] = "cut"`` so the agent is told) where a kill kept nothing;
 5a. after it, ``capa`` (pe/elf/dotnet; ``capa.py``): rule matches with ATT&CK/MBC
    ids and the functions they hit, moved into Ghidra's image base. They go to the payload
    (``capa_status``, ``capabilities_total``, ``capabilities`` columns), the report and
@@ -176,6 +185,7 @@ from blastbox.engines.rea.runner import (
     CapaStatus,
     MAX_MEMBER_BYTES,
     MAX_MEMBERS,
+    ghidra_profile,
     rea_env,
     run_capa,
     run_dotnet_resources,
@@ -237,6 +247,10 @@ DEFAULT_CAPA_BIN = "/opt/capa/bin/capa"
 DEFAULT_CAPA_DATA = "/opt/capa"
 GHIDRA_SCRIPT = "ListStrings.java"
 DEFAULT_SCRIPTS_DIR = "/opt/rea/ghidra_scripts"
+# Ghidra is told to stop its own auto-analysis this long before the kill (-analysisTimeoutPerFile):
+# JVM start and import (up to 32 s measured) plus the strings post-script and the project save run
+# outside that cut. A run it cuts still leaves a usable project; a kill leaves nothing.
+GHIDRA_CUT_RESERVE_S = 60
 
 MAX_STRINGS_BYTES = 64 * 1024 * 1024
 MAX_STRINGS = 50_000
@@ -537,10 +551,12 @@ class ReaSweepEngine:
 
         # 4. Ghidra
         ghidra_status: GhidraStatus = "skipped"
+        ghidra_cut = False
         project = job / "proj"
         strings_path = job / "strings.jsonl"
         if kind in NATIVE_KINDS and not code_read:
-            ghidra_status = self._ghidra(analysed, project, strings_path, job, remaining(), warnings)
+            ghidra_status, ghidra_cut = self._ghidra(analysed, kind, project, strings_path, job, remaining(),
+                                                     warnings)
 
         # 5. IOCs
         gstrings: list[tuple[str, str]] = []
@@ -633,6 +649,9 @@ class ReaSweepEngine:
             sweep_evidence["dotnet_resources"] = resources
         if decompiled is not None:
             sweep_evidence["decompiled"] = decompiled
+        if ghidra_cut:
+            # Not an evidence source: it tells the agent its project is incomplete.
+            sweep_evidence["ghidra_analysis"] = "cut"
         if capabilities:
             sweep_evidence["capabilities"] = capabilities[:STATE_CAPABILITIES]
         if api_hashes is not None:
@@ -1178,27 +1197,43 @@ class ReaSweepEngine:
                                     message=f"{len(others) - MAX_DROP_WARNINGS} further member(s) dropped"))
         return [p for p in res.files if p.is_file() and not p.is_symlink()]
 
-    def _ghidra(self, sample: Path, project: Path, strings_path: Path, job: Path,
-                remaining_s: float, warnings: list[Warning]) -> GhidraStatus:
+    def _ghidra(self, sample: Path, kind: str, project: Path, strings_path: Path, job: Path,
+                remaining_s: float, warnings: list[Warning]) -> tuple[GhidraStatus, bool]:
+        """Run Ghidra; the bool says its auto-analysis was cut short (the project is still usable).
+
+        The profile is ``runner.ghidra_profile``'s (every PE is "light": the analyzers it drops took
+        60-95% of the time on the samples that used to end in ``ghidra_timeout``, and the agent's
+        decompiler redoes their work on demand). With room for it, Ghidra is also told to stop its
+        own analysis ``GHIDRA_CUT_RESERVE_S`` before the kill, so a slow image yields an incomplete
+        project (``ghidra_partial`` warning, status still ``ok``) instead of none.
+        """
         budget = min(_env_seconds("REA_GHIDRA_SWEEP_S", DEFAULT_GHIDRA_SWEEP_S), remaining_s)
         if budget < 1:
             warnings.append(Warning(code="ghidra_timeout", message="no time left for Ghidra analysis"))
-            return "timeout"
+            return "timeout", False
         scripts = Path(os.environ.get("REA_GHIDRA_SCRIPTS") or DEFAULT_SCRIPTS_DIR)
+        profile = ghidra_profile(sample, kind)
+        cut = int(budget) - GHIDRA_CUT_RESERVE_S if budget >= 2 * GHIDRA_CUT_RESERVE_S else None
         try:
             status = self._ghidra_fn(sample, project, budget, env=rea_env(job / "ghidra", os.environ),
-                                     post_script=(scripts, GHIDRA_SCRIPT, strings_path))
+                                     post_script=(scripts, GHIDRA_SCRIPT, strings_path),
+                                     profile=profile, analysis_timeout_s=cut)
         except Exception as exc:
             warnings.append(Warning(code="ghidra_failed", message=f"exception:{type(exc).__name__}"))
-            return "failed"
+            return "failed", False
         if status == "timeout":
             warnings.append(Warning(code="ghidra_timeout",
                                     message=f"Ghidra analysis exceeded its {budget:.0f}s sweep budget"))
-            return "timeout"
+            return "timeout", False
+        if status == "partial":
+            warnings.append(Warning(code="ghidra_partial",
+                                    message=f"Ghidra's auto-analysis ({profile} profile) was cut at {cut}s: "
+                                            "the project is usable but incomplete"))
+            return "ok", True
         if status != "ok":
             warnings.append(Warning(code="ghidra_failed", message="Ghidra analysis failed"))
-            return "failed"
-        return "ok"
+            return "failed", False
+        return "ok", False
 
     @staticmethod
     def _continuation(sample: Path, outdir: Path, project: Path, ghidra_status: GhidraStatus,

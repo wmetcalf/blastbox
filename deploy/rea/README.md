@@ -196,6 +196,18 @@ Three things in the plan's Step 2 cannot work as written. Each was found live:
    ABI register pairs. The sweep adds those literals as IOC source `gostring:0x<va>`; sweep and
    agent clip an IOC that starts with a literal's IOC but runs past it back to that IOC. A literal
    no header names keeps its old boundary.
+   **Ghidra runs a trimmed analysis on PEs.** Five of the 20 labelled samples ended in
+   `ghidra_timeout` because auto-analysis alone needed 500-2400 s of the 420 s budget. Every PE,
+   and any ELF or Mach-O that is 4 MiB or larger or carries a Go or Rust marker, is now imported
+   with the `LightAnalysis.java` pre-script, which switches off Decompiler Parameter ID, Call
+   Convention ID, Decompiler Switch Analysis, Stack and the x86 Constant Reference Analyzer. Those
+   five then finish in 42-384 s, with the function count within 0.5% (8% lower on the Go binary).
+   What the project loses is committed parameter signatures and stack variables; the decompiler
+   recovers them when the agent decompiles a function. Ghidra is also given
+   `-analysisTimeoutPerFile` 60 s short of the budget: a run that hits it saves an incomplete but
+   usable project (`ghidra_status` stays `ok`, warning `ghidra_partial`, and the agent is told to
+   treat absences as unknown) instead of being killed with nothing.
+
    **Limit:** 512 MiB of scratch is the ceiling for a Ghidra project plus REA's private copy, so a
    very large sample can fail in the slot even though `BLASTBOX_MAX_INPUT` is 1 GiB.
 
