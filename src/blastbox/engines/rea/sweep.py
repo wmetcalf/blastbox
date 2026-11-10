@@ -37,10 +37,13 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
    emulator is ``emulation_failed``, a budget stop ``emulation_budget``; the stub is analysed as before;
 4b. a .NET assembly's ManifestResources (``dotnet_resources.py``, run under the capa venv's python
    as a bounded subprocess): name/size/entropy per resource and ``.resources`` entry, the loader APIs
-   the code references, and hidden payloads (large + high-entropy, or decoding to a PE), which become
-   members and ``hidden_payload`` warnings. Evidence ``State.sweep["dotnet_resources"] =
+   the code references, and hidden payloads (large + high-entropy, decoding to a PE, or a PNG/BMP
+   whose pixels decode to one or are noise), which become members and ``hidden_payload`` warnings.
+   A recovered .NET PE is described (``stage``) and its own resources scanned, named
+   ``<module>!<resource>``. Evidence ``State.sweep["dotnet_resources"] =
    {"resources_total", "resources", "loader_refs", "hidden_payloads": [{"resource"[, "entry"], "size",
-   "entropy"[, "member"][, "decoded"[, "decoded_member", "decoded_sha256"]]}]}``; a failed scan is a
+   "entropy"[, "image"[, "noise"]][, "member"][, "decoded"[, "decoded_member", "decoded_sha256"]
+   [, "stage": {"dotnet"[, "module", "types", "methods", "loader_refs"]}]]}]}``; a failed scan is a
    ``dotnet_resources_failed`` warning;
 5. native code (pe/elf/macho/dotnet): ``analyzeHeadless`` import + auto-analysis with the
    bundled ``ListStrings.java`` post-script dumping defined strings and the image base;
@@ -155,7 +158,9 @@ MAX_DOTNET_JSON = 4 * 1024 * 1024
 MAX_DOTNET_WRITE = 256 * 1024 * 1024
 STATE_RESOURCES = 32  # resources (and entries per container) carried in the continuation
 _SCAN_FILE = re.compile(r"(?:hidden|decoded)-[0-9]{1,4}\.bin")
-_DECODED = re.compile(r"plain|gzip|zlib|deflate|base64|xor:0x[0-9a-f]{2}")
+_DECODED = re.compile(r"(?:image:(?:col|row)-(?:rgb|bgr|rgba|bgra|argb)(?:\+len)?/)?"
+                      r"(?:plain|gzip|zlib|deflate|base64|xor:0x(?:[0-9a-f]{2}){1,30})")
+_IMAGE = re.compile(r"(?:png|bmp) [0-9]{1,5}x[0-9]{1,5}")
 # The installer's whole extracted tree (bytes, entries), before the members caps apply.
 MAX_INSTALLER_BYTES = 512 * 1024 * 1024
 MAX_INSTALLER_FILES = 4096
@@ -765,9 +770,14 @@ class ReaSweepEngine:
             return None, []
         if isinstance(doc.get("error"), str):
             warnings.append(Warning(code="dotnet_resources_failed", message=f"resource scan: {_short(doc['error'], 64)}"))
-
         def num(v: Any, kind: type | tuple[type, ...]) -> Any:
             return v if isinstance(v, (int, float)) and not isinstance(v, bool) and isinstance(v, kind) else 0
+
+        unread = num(doc.get("images_unread"), int)
+        if unread:
+            warnings.append(Warning(code="dotnet_resources_failed",
+                                    message=f"resource scan: {unread} image resource(s) not read (time budget)"))
+
 
         def text(v: Any) -> str:
             return _short(v, 200) if isinstance(v, str) else ""
@@ -811,6 +821,11 @@ class ReaSweepEngine:
                                     "entropy": float(num(h.get("entropy"), (int, float)))}
             if isinstance(h.get("entry"), str):
                 item["entry"] = text(h["entry"])
+            image = h.get("image")
+            if isinstance(image, str) and _IMAGE.fullmatch(image):
+                item["image"] = image
+                if num(h.get("noise"), (int, float)):
+                    item["noise"] = float(h["noise"])
             raw = take(h.get("file"))
             if raw is not None:
                 item["member"] = raw.name
@@ -821,11 +836,28 @@ class ReaSweepEngine:
                 if pe is not None:
                     item["decoded_member"] = pe.name
                     item["decoded_sha256"] = _sha256(pe)
+                stage = h.get("stage")
+                if isinstance(stage, dict):
+                    item["stage"] = {"dotnet": stage.get("dotnet") is True}
+                    if item["stage"]["dotnet"]:
+                        srefs = stage.get("loader_refs")
+                        item["stage"].update(
+                            module=text(stage.get("module")), types=num(stage.get("types"), int),
+                            methods=num(stage.get("methods"), int),
+                            loader_refs=[text(r) for r in (srefs if isinstance(srefs, list) else [])[:32]
+                                         if isinstance(r, str)])
             hidden.append(item)
             where = item["resource"] + (f"/{item['entry']}" if "entry" in item else "")
-            how = f", decodes ({item['decoded']}) to a PE" if "decoded" in item else ""
+            what = f"{item['image']} image" if "image" in item else "embedded resource"
+            how = ""
+            if "decoded" in item:
+                module = item.get("stage", {}).get("module")
+                how = (f", {'its pixels decode' if 'image' in item else 'decodes'} ({item['decoded']}) to a PE"
+                       + (f" ({module}, .NET)" if module else ""))
+            elif "noise" in item:
+                how = f", pixels are noise (entropy {item['noise']:.2f}): an encrypted payload, not a picture"
             warnings.append(Warning(code="hidden_payload",
-                                    message=_short(f"embedded resource {where}: {item['size']} bytes, entropy "
+                                    message=_short(f"{what} {where}: {item['size']} bytes, entropy "
                                                    f"{item['entropy']:.2f}{how}", 1000)))
         shutil.rmtree(scan_dir, ignore_errors=True)
         evidence = {"resources_total": num(doc.get("resources_total"), int), "resources": rows,

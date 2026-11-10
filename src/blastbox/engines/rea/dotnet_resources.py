@@ -6,16 +6,35 @@ encrypted resource. This scan lists every embedded ManifestResource (name, size,
 entropy; for a ``.resources`` container its entries with size, entropy and type), flags hidden
 payloads and notes whether the managed code references the APIs that load one.
 
-A resource or container entry is a hidden payload when either
+A resource or container entry is a hidden payload when
 - it is at least ``HIDDEN_MIN_BYTES`` with entropy at least ``HIDDEN_MIN_ENTROPY`` and is not a
   recognised media file. 7.2 bits/byte is the triage packer threshold: compressed or encrypted
   data sits at 7.9+, while code, text, string tables and uncompressed bitmaps sit well below 7;
   the observed Formbook blob was 7.69. 64 KiB keeps small compressed assets (icons, cursors,
-  short gzip'd configs) out. Images (PNG/JPEG/GIF/ICO, also inside a serialized Bitmap) are
-  high-entropy by nature and are skipped, which leaves steganographic bitmap carriers to the
-  model (their size and type are still listed); or
-- it is, or plainly decodes to, a PE (:func:`decode`: gzip, zlib, raw deflate, base64 or a
-  single-byte XOR whose key turns the first byte into ``M``). Nothing further is tried.
+  short gzip'd configs) out; or
+- it is, or plainly decodes to, a PE (:func:`decode`: gzip, zlib, raw deflate, base64, a
+  single-byte XOR whose key turns the first byte into ``M``, or a repeating XOR key of up to
+  ``MAX_XOR_KEY`` bytes that turns the first 60 bytes into the standard DOS header); or
+- it is a lossless image (PNG or BMP, also one serialized inside a ``System.Drawing.Bitmap``)
+  whose PIXELS are a payload (:func:`image_payload`). The carriers seen live (Formbook,
+  AgentTesla and NanoCore from MalwareBazaar, one crypter) keep a loader DLL in a small bitmap
+  read column by column as R,G,B, and the next stage in a larger PNG read column by column as
+  little-endian ARGB integers behind a 4-byte length and a 3-byte XOR key, drawn in the top-left
+  corner of a canvas whose remainder is transparent padding and a second, opaque block. So each
+  diagonal block of the image is read in both pixel orders and five channel orders, with and
+  without a length prefix, through :func:`decode`. A block that decodes to nothing but whose
+  pixels are statistically noise (:func:`pixel_noise`: byte entropy AND entropy of the
+  differences between horizontal neighbours both at least ``NOISE_MIN_ENTROPY``, which no
+  picture reaches because neighbouring pixels of a picture resemble each other) is flagged as an
+  encrypted carrier. Lossy formats (JPEG) cannot carry exact bytes in pixels and are skipped.
+
+A recovered .NET stage is described (``stage``: module name, type and method counts, the loader
+APIs it references) and scanned in turn (``MAX_DEPTH`` levels), its findings listed under
+``<module>!<resource>``.
+
+dnfile does not materialise the bytes of user-typed ``.resources`` entries (Bitmap, Icon: it
+hands ``None``), which is how the carriers above were first missed: those are sliced out of the
+container's data section by the entries' own offsets.
 
 THIS FILE RUNS AS A STANDALONE SCRIPT under the capa venv's python (which carries the
 hash-locked ``dnfile`` already pinned for capa), as a bounded subprocess
@@ -26,8 +45,10 @@ hidden payload (``hidden-<n>.bin``) and decoded PE (``decoded-<n>.bin``) into ``
 
 JSON: ``{"resources_total", "resources": [{"name", "size", "entropy", "container"[, "format"]
 [, "entries_total", "entries": [{"name", "size", "entropy", "type"}]]}], "loader_refs": [...],
-"hidden": [{"resource"[, "entry"], "size", "entropy"[, "file"][, "decoded", "decoded_file"]}]
-[, "error"]}``. Counts, names and bytes written are capped.
+"hidden": [{"resource"[, "entry"], "size", "entropy"[, "file"][, "image"][, "noise"]
+[, "decoded", "decoded_file"][, "stage"]}][, "error"]}``. ``decoded`` is a :func:`decode` method,
+prefixed ``image:<col|row>-<channels>[+len]/`` when the bytes came from pixels. Counts, names and
+bytes written are capped.
 """
 
 from __future__ import annotations
@@ -40,8 +61,10 @@ import os
 import re
 import struct
 import sys
+import time
 import zlib
 from collections import Counter
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +79,17 @@ MAX_DECODED_BYTES = 64 * 1024 * 1024
 MAX_WRITE_BYTES = 256 * 1024 * 1024
 MAX_FILE_BYTES = 64 * 1024 * 1024
 MIN_BASE64 = 64
+MAX_XOR_KEY = 30  # half the known DOS header, so every key byte is confirmed at least once
+MAX_DEPTH = 3  # stages scanned inside a recovered stage
+MIN_IMAGE_PIXELS = 1024
+MAX_IMAGE_PIXELS = 4 * 1024 * 1024
+IMAGE_BUDGET_S = 40.0  # pixel decoding is pure Python: all images of one scan share this
+MAX_UNFILTER_BYTES = 16 * 1024 * 1024  # PNG rows un-filtered in pure Python, per image
+MAX_IMAGE_BLOCKS = 4
+MAX_IMAGE_SCAN = 512  # an image file starts within this many bytes of a serialized Bitmap
+NOISE_MIN_ENTROPY = 7.2
+NOISE_SAMPLE_BYTES = 1024 * 1024
+BLOCK_PROBE = 8  # leading rows/columns that give a block's extent
 
 # (type, member) pairs a resource-borne loader needs; rendered "Type.Member".
 LOADER_MEMBERS = frozenset({
@@ -64,10 +98,16 @@ LOADER_MEMBERS = frozenset({
     ("Type", "InvokeMember"), ("Activator", "CreateInstance"), ("ResourceManager", ".ctor"),
     ("ResourceManager", "GetObject"), ("SymmetricAlgorithm", "CreateDecryptor"),
     ("Convert", "FromBase64String"), ("GZipStream", ".ctor"), ("DeflateStream", ".ctor"),
+    ("Bitmap", "GetPixel"), ("Bitmap", "LockBits"), ("CryptoStream", ".ctor"),
+    ("AesCryptoServiceProvider", ".ctor"), ("RijndaelManaged", ".ctor"), ("Aes", "Create"),
 })
 _MEDIA = ((b"\x89PNG\r\n\x1a\n", "png"), (b"\xff\xd8\xff", "jpeg"), (b"GIF87a", "gif"), (b"GIF89a", "gif"),
           (b"\x00\x00\x01\x00", "ico"), (b"RIFF", "riff"), (b"wOFF", "woff"), (b"wOF2", "woff2"))
 _B64 = re.compile(rb"[A-Za-z0-9+/=\r\n]+")
+_PNG = b"\x89PNG\r\n\x1a\n"
+# The DOS header every mainstream linker emits, up to (not including) e_lfanew.
+_DOS = bytes.fromhex("4d5a90000300000004000000ffff0000b800000000000000400000000000000000000000"
+                     "000000000000000000000000000000000000000000000000")
 
 
 def entropy(data: bytes) -> float:
@@ -97,13 +137,14 @@ def is_pe(data: bytes) -> bool:
     return 0x40 <= off <= len(data) - 4 and data[off:off + 4] == b"PE\x00\x00"
 
 
-def _inflate(data: bytes, wbits: int) -> bytes | None:
+def _inflate(data: bytes, wbits: int, limit: int | None = None) -> bytes | None:
+    limit = MAX_DECODED_BYTES if limit is None else limit
     try:
         z = zlib.decompressobj(wbits)
-        out = z.decompress(data, MAX_DECODED_BYTES + 1)
+        out = z.decompress(data, limit + 1)
     except zlib.error:
         return None
-    return out if len(out) <= MAX_DECODED_BYTES else None
+    return out if len(out) <= limit else None
 
 
 def decode(data: bytes) -> tuple[str, bytes] | None:
@@ -135,7 +176,303 @@ def decode(data: bytes) -> tuple[str, bytes] | None:
             out = data[:MAX_DECODED_BYTES].translate(table)
             if is_pe(out):
                 return f"xor:{key:#04x}", out
+    if len(data) >= len(_DOS) + 4:
+        stream = bytes(a ^ b for a, b in zip(data, _DOS))
+        for period in range(2, MAX_XOR_KEY + 1):
+            if stream == (stream[:period] * len(_DOS))[:len(_DOS)]:
+                out = _xor(data[:MAX_DECODED_BYTES], stream[:period])
+                if is_pe(out):
+                    return "xor:0x" + stream[:period].hex(), out
+                break
     return None
+
+
+def _xor(data: bytes, key: bytes) -> bytes:
+    pad = (key * (len(data) // len(key) + 1))[:len(data)]
+    return (int.from_bytes(data, "little") ^ int.from_bytes(pad, "little")).to_bytes(len(data), "little")
+
+
+def _pe_end(data: bytes) -> int:
+    """The offset a PE's headers say its file content ends at (sections, certificate table); 0 when
+    the headers cannot be read. It may lie past ``len(data)``."""
+    try:
+        (off,) = struct.unpack_from("<I", data, 0x3C)
+        count, opt = struct.unpack_from("<H", data, off + 6)[0], struct.unpack_from("<H", data, off + 20)[0]
+        table = off + 24 + opt
+        end = table + 40 * count
+        for i in range(min(count, 96)):
+            size, ptr = struct.unpack_from("<II", data, table + 40 * i + 16)
+            if ptr:
+                end = max(end, ptr + size)
+        (magic,) = struct.unpack_from("<H", data, off + 24)
+        dirs = off + 24 + (112 if magic == 0x20B else 96)
+        if dirs + 8 * 5 <= table:
+            cert, cert_size = struct.unpack_from("<II", data, dirs + 8 * 4)
+            if cert:
+                end = max(end, cert + cert_size)
+    except struct.error:
+        return 0
+    return end
+
+
+def pe_extent(data: bytes) -> int:
+    """Where a PE's file content ends within ``data``, or ``len(data)``."""
+    end = _pe_end(data)
+    return end if 0x40 < end <= len(data) else len(data)
+
+
+def trim_pe(data: bytes) -> bytes:
+    """``data`` without the zero padding a carrier leaves after the PE it holds."""
+    end = pe_extent(data)
+    return data[:end] if end < len(data) and not data[end:].strip(b"\x00") else data
+
+
+class Image:
+    """A decoded lossless image: one ``bytes`` plane per channel, row-major from the top row.
+    ``a`` is ``None`` when the file has no alpha channel."""
+
+    def __init__(self, fmt: str, w: int, h: int, r: bytes, g: bytes, b: bytes, a: bytes | None) -> None:
+        self.fmt, self.w, self.h, self.r, self.g, self.b, self.a = fmt, w, h, r, g, b, a
+        self.spare_w = self.spare_h = 0  # all-zero columns / rows cut off a block: maybe its own zeros
+
+    def planes(self) -> list[bytes]:
+        return [self.r, self.g, self.b] + ([self.a] if self.a is not None else [])
+
+    def crop(self, x0: int, y0: int, w: int, h: int) -> Image:
+        def cut(plane: bytes | None) -> Any:
+            if plane is None:
+                return None
+            return b"".join(plane[y * self.w + x0:y * self.w + x0 + w] for y in range(y0, y0 + h))
+        return Image(self.fmt, w, h, cut(self.r), cut(self.g), cut(self.b), cut(self.a))
+
+
+def _unfilter(raw: bytes, h: int, stride: int, bpp: int) -> bytes | None:
+    """PNG scanlines without their filter bytes (filters 0-4 undone)."""
+    line_len = stride + 1
+    if len(raw) < h * line_len:
+        return None
+    if not raw[0:h * line_len:line_len].strip(b"\x00"):  # every row unfiltered: what noise compresses best with
+        return b"".join(raw[y * line_len + 1:(y + 1) * line_len] for y in range(h))
+    if h * stride > MAX_UNFILTER_BYTES:
+        return None
+    out = bytearray(h * stride)
+    prev = bytearray(stride)
+    for y in range(h):
+        kind = raw[y * line_len]
+        line = bytearray(raw[y * line_len + 1:(y + 1) * line_len])
+        if kind == 1:
+            for i in range(bpp, stride):
+                line[i] = (line[i] + line[i - bpp]) & 255
+        elif kind == 2:
+            line = bytearray((a + b) & 255 for a, b in zip(line, prev))
+        elif kind == 3:
+            for i in range(stride):
+                left = line[i - bpp] if i >= bpp else 0
+                line[i] = (line[i] + ((left + prev[i]) >> 1)) & 255
+        elif kind == 4:
+            for i in range(stride):
+                left = line[i - bpp] if i >= bpp else 0
+                up = prev[i]
+                corner = prev[i - bpp] if i >= bpp else 0
+                pa, pb, pc = abs(up - corner), abs(left - corner), abs(left + up - 2 * corner)
+                line[i] = (line[i] + (left if pa <= pb and pa <= pc else up if pb <= pc else corner)) & 255
+        elif kind != 0:
+            return None
+        out[y * stride:(y + 1) * stride] = line
+        prev = line
+    return bytes(out)
+
+
+def _png(data: bytes, start: int) -> Image | None:
+    pos = start + len(_PNG)
+    header: tuple[int, ...] | None = None
+    idat: list[bytes] = []
+    while pos + 8 <= len(data):
+        length, kind = struct.unpack_from(">I4s", data, pos)
+        body = data[pos + 8:pos + 8 + length]
+        if kind == b"IHDR" and length == 13:
+            header = struct.unpack(">IIBBBBB", body)
+        elif kind == b"IDAT":
+            idat.append(body)
+        elif kind == b"IEND":
+            break
+        pos += 12 + length
+    if header is None or not idat:
+        return None
+    w, h, depth, colour, _, _, interlace = header
+    if depth != 8 or colour not in (2, 6) or interlace or not w or not h or w * h > MAX_IMAGE_PIXELS:
+        return None
+    bpp = 4 if colour == 6 else 3
+    raw = _inflate(b"".join(idat), zlib.MAX_WBITS, limit=h * (w * bpp + 1))
+    if raw is None:
+        return None
+    px = _unfilter(raw, h, w * bpp, bpp)
+    if px is None:
+        return None
+    return Image("png", w, h, px[0::bpp], px[1::bpp], px[2::bpp], px[3::4] if bpp == 4 else None)
+
+
+def _bmp(data: bytes, start: int) -> Image | None:
+    try:
+        offset, dib, w, h, planes, bits, compression = struct.unpack_from("<IIiiHHI", data, start + 10)
+    except struct.error:
+        return None
+    if dib not in (40, 52, 56, 108, 124) or planes != 1 or bits not in (24, 32) or compression not in (0, 3):
+        return None
+    rows = abs(h)
+    if w <= 0 or not rows or w * rows > MAX_IMAGE_PIXELS:
+        return None
+    bpp = bits // 8
+    stride = (w * bpp + 3) & ~3
+    body = data[start + offset:start + offset + stride * rows]
+    if len(body) < stride * rows:
+        return None
+    order = range(rows) if h < 0 else range(rows - 1, -1, -1)  # a positive height is stored bottom-up
+    px = b"".join(body[y * stride:y * stride + w * bpp] for y in order)
+    return Image("bmp", w, rows, px[2::bpp], px[1::bpp], px[0::bpp], px[3::4] if bpp == 4 else None)
+
+
+def load_image(data: bytes) -> Image | None:
+    """The PNG or BMP that ``data`` is, or that a serialized Bitmap wraps, as channel planes."""
+    head = data[:MAX_IMAGE_SCAN]
+    start = head.find(_PNG)
+    if start >= 0:
+        return _png(data, start)
+    start = head.find(b"BM")
+    while start >= 0:
+        image = _bmp(data, start)
+        if image is not None:
+            return image
+        start = head.find(b"BM", start + 1)
+    return None
+
+
+def _blank(image: Image, start: int, stop: int, step: int) -> bool:
+    return not any(plane[start:stop:step].strip(b"\x00") for plane in image.planes())
+
+
+def blocks(image: Image) -> list[Image]:
+    """The image as the diagonal run of blocks a padded carrier canvas is made of: each block's
+    extent is where its rows and columns stop being all-zero pixels (a block shares no row or
+    column with the next, so its own rows and columns bound it). A picture is one block."""
+    out: list[Image] = []
+    x0 = y0 = 0
+    w, h = image.w, image.h
+    while x0 < w and y0 < h and len(out) < MAX_IMAGE_BLOCKS:
+        while x0 < w and _blank(image, y0 * w + x0, h * w, w):  # leading empty columns
+            x0 += 1
+        while y0 < h and _blank(image, y0 * w + x0, (y0 + 1) * w, 1):  # leading empty rows
+            y0 += 1
+        if x0 >= w or y0 >= h:
+            break
+        bw = bh = 0
+        for plane in image.planes():
+            for y in range(y0, min(y0 + BLOCK_PROBE, h)):
+                bw = max(bw, len(plane[y * w + x0:(y + 1) * w].rstrip(b"\x00")))
+            for x in range(x0, min(x0 + BLOCK_PROBE, w)):
+                bh = max(bh, len(plane[y0 * w + x:h * w:w].rstrip(b"\x00")))
+        if not bw or not bh:
+            break
+        for _ in range(2):  # the probe under-reads an edge that is zero there: widen over the whole block
+            bw = max(len(plane[y * w + x0:(y + 1) * w].rstrip(b"\x00"))
+                     for plane in image.planes() for y in range(y0, y0 + bh))
+            bh = max(len(plane[y0 * w + x:h * w:w].rstrip(b"\x00"))
+                     for plane in image.planes() for x in range(x0, x0 + bw))
+        if (x0, y0, bw, bh) == (0, 0, w, h):
+            return [image]
+        block = image.crop(x0, y0, bw, bh)
+        block.spare_w, block.spare_h = w - x0 - bw, h - y0 - bh
+        out.append(block)
+        x0, y0 = x0 + bw, y0 + bh
+    return out or [image]
+
+
+def _alpha(image: Image) -> bytes | None:
+    """The alpha plane when it carries anything (it is not one constant value)."""
+    a = image.a
+    return a if a and a.count(a[:1]) != len(a) else None
+
+
+def pixel_streams(image: Image) -> Iterator[tuple[str, bytes]]:
+    """``(layout, bytes)`` for every way a loader plausibly reads the pixels: column- or row-major,
+    in each channel order (4-channel orders only when the alpha channel carries anything)."""
+    n = image.w * image.h
+    alpha = _alpha(image)
+    orders = ["rgb", "bgr"] + (["bgra", "rgba", "argb"] if alpha is not None else [])
+    for major in ("col", "row"):
+        planes: dict[str, bytes] = {"r": image.r, "g": image.g, "b": image.b}
+        if alpha is not None:
+            planes["a"] = alpha
+        if major == "col":
+            planes = {k: b"".join(v[x::image.w] for x in range(image.w)) for k, v in planes.items()}
+        for order in orders:
+            buf = bytearray(n * len(order))
+            for i, ch in enumerate(order):
+                buf[i::len(order)] = planes[ch]
+            yield f"{major}-{order}", bytes(buf)
+
+
+def pixel_noise(image: Image) -> float | None:
+    """How noise-like the pixels are: the lower of the byte entropy and the entropy of the
+    differences between horizontal neighbours, over the colour channels (and a varying alpha).
+    ``None`` when there are too few bytes to carry a payload."""
+    planes = [image.r, image.g, image.b]
+    alpha = _alpha(image)
+    if alpha is not None:
+        planes.append(alpha)
+    if image.w * image.h * len(planes) < HIDDEN_MIN_BYTES:
+        return None
+    lowest = 8.0
+    for plane in planes:
+        sample = plane[:NOISE_SAMPLE_BYTES // len(planes)]
+        delta = bytes((a - b) & 255 for a, b in zip(sample[1:], sample))
+        lowest = min(lowest, entropy(sample), entropy(delta))
+    return lowest
+
+
+def _carve(stream: bytes, spare: int) -> tuple[str, bytes] | None:
+    """:func:`decode` of a pixel stream, bare or behind a 4-byte length. ``spare`` zero bytes may
+    follow the stream: a block is cut where its pixels turn all-zero, which a payload's own
+    trailing zeros (section padding) do too."""
+    found = decode(stream)
+    if found is not None:
+        method, pe = found
+        short = _pe_end(pe) - len(pe)
+        if 0 < short <= spare and (method == "plain" or method.startswith("xor:")):
+            found = decode(stream + bytes(short)) or found
+        return found[0], trim_pe(found[1])
+    if len(stream) > 8:
+        (length,) = struct.unpack_from("<I", stream, 0)
+        if 0x40 <= length <= len(stream) - 4 + spare:
+            body = stream[4:4 + length]
+            found = decode(body + bytes(length - len(body)))
+            if found is not None:
+                return "+len/" + found[0], found[1]
+    return None
+
+
+def image_payload(image: Image) -> tuple[str, bytes] | None:
+    """``("image:<layout>[+len]/<method>", PE bytes)`` when a block's pixels decode to a PE."""
+    for block in blocks(image):
+        if block.w * block.h < MIN_IMAGE_PIXELS:
+            continue
+        for layout, stream in pixel_streams(block):
+            lost = block.spare_w * block.h if layout.startswith("col") else block.spare_h * block.w
+            found = _carve(stream, min(lost * (len(layout) - 4), MAX_DECODED_BYTES))
+            if found is not None:
+                method = found[0] if found[0].startswith("+len/") else "/" + found[0]
+                return f"image:{layout}{method}", found[1]
+    return None
+
+
+def image_noise(image: Image) -> float | None:
+    """The highest :func:`pixel_noise` among the image's blocks that reach ``NOISE_MIN_ENTROPY``."""
+    best: float | None = None
+    for block in blocks(image):
+        noise = pixel_noise(block)
+        if noise is not None and noise >= NOISE_MIN_ENTROPY and (best is None or noise > best):
+            best = noise
+    return best
 
 
 def _name(value: Any) -> str:
@@ -159,6 +496,22 @@ def _entry_bytes(entry: Any) -> bytes:
         return value.encode("utf-8", "replace")
     data = getattr(entry, "data", None)
     return bytes(data) if isinstance(data, (bytes, bytearray)) else b""
+
+
+def _raw_entries(container: Any, entries: list[Any]) -> dict[int, bytes]:
+    """Each entry's serialized bytes by position, sliced from the container's data section between
+    its offset and the next entry's: what dnfile leaves unread for user types (Bitmap, Icon)."""
+    raw = getattr(container, "_data", None)
+    base = getattr(getattr(container, "struct", None), "DataSectionOffset", None)
+    if not isinstance(raw, (bytes, bytearray)) or not isinstance(base, int) or base < 0:
+        return {}
+    starts: dict[int, int] = {}
+    for i, e in enumerate(entries):
+        off = getattr(getattr(e, "struct", None), "DataOffset", None)
+        if isinstance(off, int) and 0 <= off and base + off < len(raw):
+            starts[i] = base + off
+    bounds = sorted(set(starts.values())) + [len(raw)]
+    return {i: bytes(raw[o:bounds[bounds.index(o) + 1]]) for i, o in starts.items()}
 
 
 def _loader_refs(pe: Any) -> list[str]:
@@ -197,28 +550,140 @@ class _Writer:
         return name
 
 
-def _consider(hidden: list[dict[str, Any]], writer: _Writer, data: bytes, ent: float, resource: str,
-              entry: str | None) -> None:
-    if len(hidden) >= MAX_HIDDEN:
-        return
-    decoded = decode(data)
-    big = len(data) >= HIDDEN_MIN_BYTES and ent >= HIDDEN_MIN_ENTROPY and media_format(data) is None
-    if decoded is None and not big:
-        return
-    item: dict[str, Any] = {"resource": resource, "size": len(data), "entropy": round(ent, 3)}
-    if entry is not None:
-        item["entry"] = entry
-    raw = writer.write("hidden", data)
-    if raw is not None:
-        item["file"] = raw
-    if decoded is not None:
-        method, pe = decoded
+def _stage(pe: Any) -> dict[str, Any]:
+    """What a recovered PE is: for a .NET stage its module name, size in types and methods and the
+    loader APIs it references."""
+    net = getattr(pe, "net", None)
+    tables = getattr(net, "mdtables", None)
+    if tables is None:
+        return {"dotnet": False}
+    out: dict[str, Any] = {"dotnet": True, "loader_refs": _loader_refs(pe)}
+    try:
+        out["module"] = _name(tables.Module.rows[0].Name)
+        out["types"] = len(tables.TypeDef.rows)
+        out["methods"] = len(tables.MethodDef.rows)
+    except (AttributeError, IndexError, TypeError):
+        pass
+    return out
+
+
+class _Scan:
+    """One scan's state: the hidden payloads found so far and the files written for them."""
+
+    def __init__(self, outdir: Path | None) -> None:
+        self.hidden: list[dict[str, Any]] = []
+        self.writer = _Writer(outdir)
+        self.images_unread = 0
+        self._image_deadline = time.monotonic() + IMAGE_BUDGET_S
+
+    def image(self, data: bytes) -> Image | None:
+        """``data`` as an image, while the scan's image time budget lasts."""
+        if time.monotonic() < self._image_deadline:
+            return load_image(data)
+        head = data[:MAX_IMAGE_SCAN]
+        if _PNG in head or b"BM" in head:
+            self.images_unread += 1
+        return None
+
+    def consider(self, data: bytes, ent: float, resource: str, entry: str | None, depth: int) -> None:
+        if len(self.hidden) >= MAX_HIDDEN:
+            return
+        decoded = decode(data)
+        image = self.image(data) if decoded is None else None
+        noise: float | None = None
+        if image is not None:
+            decoded = image_payload(image)
+            noise = image_noise(image) if decoded is None else None
+        big = (image is None and len(data) >= HIDDEN_MIN_BYTES and ent >= HIDDEN_MIN_ENTROPY
+               and media_format(data) is None)
+        if decoded is None and noise is None and not big:
+            return
+        item: dict[str, Any] = {"resource": resource, "size": len(data), "entropy": round(ent, 3)}
+        if entry is not None:
+            item["entry"] = entry
+        if image is not None:
+            item["image"] = f"{image.fmt} {image.w}x{image.h}"
+        if noise is not None:
+            item["noise"] = round(noise, 3)
+        raw = self.writer.write("hidden", data)
+        if raw is not None:
+            item["file"] = raw
+        self.hidden.append(item)
+        if decoded is None:
+            return
+        method, payload = decoded
         item["decoded"] = method
         if method != "plain":
-            out = writer.write("decoded", pe)
+            out = self.writer.write("decoded", payload)
             if out is not None:
                 item["decoded_file"] = out
-    hidden.append(item)
+        self.stage(item, payload, depth)
+
+    def stage(self, item: dict[str, Any], payload: bytes, depth: int) -> None:
+        """Describe a recovered PE and, when it is .NET, scan its own resources one level down."""
+        try:
+            import dnfile
+
+            pe = dnfile.dnPE(data=payload)
+        except Exception:  # dnfile/pefile raise many types on hostile input
+            return
+        try:
+            item["stage"] = _stage(pe)
+            if item["stage"]["dotnet"] and depth < MAX_DEPTH:
+                self.resources(pe, None, _name(item["stage"].get("module") or "stage") + "!", depth + 1)
+        finally:
+            _close(pe)
+
+    def resources(self, pe: Any, doc: dict[str, Any] | None, prefix: str, depth: int) -> None:
+        """Walk ``pe``'s ManifestResources: list them into ``doc`` (the submitted assembly only)
+        and consider each, and each container entry, as a hidden payload."""
+        try:
+            resources = list(pe.net.resources or [])
+        except Exception:
+            resources = []
+            if doc is not None:
+                doc["error"] = "resources_unreadable"
+        if doc is not None:
+            doc["resources_total"] = len(resources)
+        for res in resources[:MAX_RESOURCES]:
+            name = prefix + _name(getattr(res, "name", ""))
+            data = getattr(res, "data", None)
+            if isinstance(data, (bytes, bytearray)):
+                raw = bytes(data)
+                ent = entropy(raw)
+                row: dict[str, Any] = {"name": name, "size": len(raw), "entropy": round(ent, 3),
+                                       "container": False}
+                fmt = media_format(raw)
+                if fmt:
+                    row["format"] = fmt
+                if doc is not None:
+                    doc["resources"].append(row)
+                self.consider(raw, ent, name, None, depth)
+                continue
+            entries = list(getattr(data, "entries", None) or [])
+            size = getattr(res, "size", 0)
+            row = {"name": name, "size": size if isinstance(size, int) else 0, "entropy": 0.0, "container": True,
+                   "entries_total": len(entries), "entries": []}
+            raw_container = getattr(data, "_data", b"")
+            if isinstance(raw_container, (bytes, bytearray)):
+                row["entropy"] = round(entropy(bytes(raw_container)), 3)
+            serialized = _raw_entries(data, entries[:MAX_ENTRIES])
+            for i, e in enumerate(entries[:MAX_ENTRIES]):
+                blob = _entry_bytes(e) or serialized.get(i, b"")
+                ent = entropy(blob)
+                ename = _name(getattr(e, "name", ""))
+                row["entries"].append({"name": ename, "size": len(blob), "entropy": round(ent, 3),
+                                       "type": _name(getattr(e, "type_name", "") or "")})
+                self.consider(blob, ent, name, ename, depth)
+            if doc is not None:
+                doc["resources"].append(row)
+
+
+def _close(pe: Any) -> None:
+    try:
+        pe.close()
+    except Exception:
+        pass
 
 
 def scan(sample: Path, outdir: Path | None) -> dict[str, Any]:
@@ -238,48 +703,14 @@ def scan(sample: Path, outdir: Path | None) -> dict[str, Any]:
         if getattr(pe, "net", None) is None:
             doc["error"] = "not_dotnet"
             return doc
-        try:
-            resources = list(pe.net.resources or [])
-        except Exception:
-            resources = []
-            doc["error"] = "resources_unreadable"
-        doc["resources_total"] = len(resources)
         doc["loader_refs"] = _loader_refs(pe)
-        writer = _Writer(outdir)
-        for res in resources[:MAX_RESOURCES]:
-            name = _name(getattr(res, "name", ""))
-            data = getattr(res, "data", None)
-            if isinstance(data, (bytes, bytearray)):
-                raw = bytes(data)
-                ent = entropy(raw)
-                row: dict[str, Any] = {"name": name, "size": len(raw), "entropy": round(ent, 3),
-                                       "container": False}
-                fmt = media_format(raw)
-                if fmt:
-                    row["format"] = fmt
-                doc["resources"].append(row)
-                _consider(doc["hidden"], writer, raw, ent, name, None)
-                continue
-            entries = list(getattr(data, "entries", None) or [])
-            size = getattr(res, "size", 0)
-            row = {"name": name, "size": size if isinstance(size, int) else 0, "entropy": 0.0, "container": True,
-                   "entries_total": len(entries), "entries": []}
-            raw_container = getattr(data, "_data", b"")
-            if isinstance(raw_container, (bytes, bytearray)):
-                row["entropy"] = round(entropy(bytes(raw_container)), 3)
-            for e in entries[:MAX_ENTRIES]:
-                blob = _entry_bytes(e)
-                ent = entropy(blob)
-                ename = _name(getattr(e, "name", ""))
-                row["entries"].append({"name": ename, "size": len(blob), "entropy": round(ent, 3),
-                                       "type": _name(getattr(e, "type_name", "") or "")})
-                _consider(doc["hidden"], writer, blob, ent, name, ename)
-            doc["resources"].append(row)
+        state = _Scan(outdir)
+        doc["hidden"] = state.hidden
+        state.resources(pe, doc, "", 0)
+        if state.images_unread:
+            doc["images_unread"] = state.images_unread
     finally:
-        try:
-            pe.close()
-        except Exception:
-            pass
+        _close(pe)
     return doc
 
 

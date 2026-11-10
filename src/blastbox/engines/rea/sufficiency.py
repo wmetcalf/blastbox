@@ -14,7 +14,7 @@ verify itself, and lists what is still missing (``gaps``):
   those functions;
 - ``benign_hidden_payload``: the verdict is ``benign`` while the sweep found a hidden payload in
   a .NET assembly's resources (``sweep["dotnet_resources"]["hidden_payloads"]``: a large
-  high-entropy resource, or one that decodes to a PE). Live, Formbook and NanoCore carriers were
+  high-entropy resource, one that decodes to a PE, or a picture whose pixels do or are noise). Live, Formbook and NanoCore carriers were
   described by their decoy UI and called benign with the encrypted payload unread. The code that
   loads it is not addressable (CIL tokens), so the gap has no targets; it holds until the verdict
   stops being benign or the chain stops (stalled, pass cap);
@@ -105,7 +105,12 @@ def _hidden_payloads(sweep: dict[str, Any]) -> list[str]:
     for h in items if isinstance(items, list) else []:
         if isinstance(h, dict):
             where = str(h.get("resource") or "?")[:80] + (f"/{str(h['entry'])[:40]}" if h.get("entry") else "")
-            out.append(f"{where}: {h.get('size')} bytes, entropy {h.get('entropy')}")
+            raw_stage = h.get("stage")
+            stage: dict[str, Any] = raw_stage if isinstance(raw_stage, dict) else {}
+            how = (f", decodes ({str(h['decoded'])[:48]}) to a PE" if h.get("decoded") else
+                   ", image pixels are noise" if h.get("noise") else "")
+            module = f" {str(stage['module'])[:60]}" if stage.get("module") else ""
+            out.append(f"{where}: {h.get('size')} bytes, entropy {h.get('entropy')}{how}{module}")
     return out
 
 

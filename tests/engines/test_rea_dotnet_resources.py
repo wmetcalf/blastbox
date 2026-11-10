@@ -3,8 +3,11 @@
 import gzip
 import hashlib
 import json
+import struct
 import sys
+import zlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -212,6 +215,269 @@ def test_native_pes_are_not_scanned(tmp_path):
     assert fd.calls == []
 
 
+# ------------------------------------------------------------------ payloads carried in image pixels
+
+
+def _png(w, h, rgba):
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+    rows = b"".join(b"\x00" + rgba[y * w * 4:(y + 1) * w * 4] for y in range(h))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows, 1)) + chunk(b"IEND", b""))
+
+
+def _bmp(w, h, rgb):
+    """A bottom-up 24-bit BMP from top-down RGB rows, as System.Drawing saves one."""
+    pad = b"\x00" * (-w * 3 % 4)
+    body = b""
+    for y in range(h - 1, -1, -1):
+        row = rgb[y * w * 3:(y + 1) * w * 3]
+        body += b"".join(row[i + 2:i + 3] + row[i + 1:i + 2] + row[i:i + 1] for i in range(0, len(row), 3)) + pad
+    return (b"BM" + struct.pack("<IHHI", 54 + len(body), 0, 0, 54)
+            + struct.pack("<IiiHHIIiiII", 40, w, h, 1, 24, 0, len(body), 2835, 2835, 0, 0) + body)
+
+
+def _columns(stream, w, h, channels):
+    """``stream`` laid column-major into a ``w``x``h`` image, as top-down row-major pixel bytes."""
+    stream = stream.ljust(w * h * channels, b"\x00")
+    assert len(stream) == w * h * channels
+    out = bytearray(len(stream))
+    for x in range(w):
+        for y in range(h):
+            src = (x * h + y) * channels
+            out[(y * w + x) * channels:(y * w + x + 1) * channels] = stream[src:src + channels]
+    return bytes(out)
+
+
+def _noise(n, seed=b"n"):
+    out = bytearray()
+    while len(out) < n:
+        seed = hashlib.sha256(seed).digest()
+        out += seed
+    return bytes(out[:n])
+
+
+def _serialized(image):
+    return b"\x00\x01\x00\x00\x00\xff\xff\xff\xff" + b"System.Drawing.Bitmap".ljust(153, b"\x00") + image
+
+
+def _stage1_bmp(payload=SAMPLE):
+    h = 97
+    w = -(-len(payload) // (3 * h)) + 3  # trailing all-zero columns, as the real carriers have
+    return _bmp(w, h, _columns(payload, w, h, 3))
+
+
+def _stage2_png(payload, key=b"\x42\x29\x42"):
+    """A two-block canvas: block 0 (top-left) is a length-prefixed XORed PE read column-major as
+    little-endian ARGB ints; block 1 (bottom-right) is opaque noise."""
+    stream = struct.pack("<I", len(payload)) + dr._xor(payload, key)
+    bh = 301
+    bw = -(-len(stream) // (4 * bh))
+    block0 = bytearray(_columns(stream, bw, bh, 4))
+    block0[0::4], block0[2::4] = block0[2::4], block0[0::4]  # the int's low byte is blue
+    nw, nh = 150, 120
+    w, h = bw + nw, bh + nh
+    canvas = bytearray(w * h * 4)
+    for y in range(bh):
+        canvas[y * w * 4:(y * w + bw) * 4] = block0[y * bw * 4:(y + 1) * bw * 4]
+    noise = _noise(nw * nh * 3)
+    for y in range(nh):
+        for x in range(nw):
+            at = ((bh + y) * w + bw + x) * 4
+            canvas[at:at + 4] = noise[(y * nw + x) * 3:(y * nw + x) * 3 + 3] + b"\xff"
+    return _png(w, h, bytes(canvas))
+
+
+def test_decode_recovers_a_repeating_xor_key_from_the_dos_header():
+    assert dr.decode(dr._xor(SAMPLE, b"\x42\x29\x42")) == ("xor:0x422942", SAMPLE)
+    assert dr.decode(dr._xor(SAMPLE, b"\x5a")) == ("xor:0x5a", SAMPLE)
+    assert dr.decode(dr._xor(SAMPLE, _noise(31))) is None  # longer than the header can confirm
+
+
+def test_a_pe_stored_as_bitmap_pixels_is_recovered():
+    image = dr.load_image(_serialized(_stage1_bmp()))
+    assert image is not None and image.fmt == "bmp" and image.a is None
+    method, pe = dr.image_payload(image)
+    # sample.exe ends in an overlay (its COFF symbols), so the carrier's zero padding cannot be told from it
+    assert method == "image:col-rgb/plain" and pe.startswith(SAMPLE) and not pe[len(SAMPLE):].strip(b"\x00")
+    dll = DLL.read_bytes()  # no overlay: the padding is trimmed and the recovery is exact
+    assert dr.image_payload(dr.load_image(_stage1_bmp(dll))) == ("image:col-rgb/plain", dll)
+
+
+def test_a_length_prefixed_xored_pe_in_a_padded_png_canvas_is_recovered():
+    payload = DLL.read_bytes()
+    image = dr.load_image(_stage2_png(payload))
+    assert image is not None and image.fmt == "png"
+    found = dr.blocks(image)
+    assert len(found) == 2 and (found[1].w, found[1].h) == (150, 120)
+    assert dr.image_payload(image) == ("image:col-bgra+len/xor:0x422942", payload)
+
+
+def test_a_block_edge_that_is_zero_in_its_first_rows_is_not_cut_short():
+    w, h = 80, 60
+    px = bytearray(_noise(w * h * 4))
+    for y in range(dr.BLOCK_PROBE + 4):  # the right third is zero wherever the probe looks
+        px[(y * w + 50) * 4:(y + 1) * w * 4] = bytes((w - 50) * 4)
+    canvas = bytearray(100 * 90 * 4)
+    for y in range(h):
+        canvas[y * 100 * 4:(y * 100 + w) * 4] = px[y * w * 4:(y + 1) * w * 4]
+    for y in range(h, 90):
+        canvas[(y * 100 + w) * 4:(y + 1) * 100 * 4] = b"\x07" * 80
+    first = dr.blocks(dr.load_image(_png(100, 90, bytes(canvas))))[0]
+    assert (first.w, first.h) == (w, h)
+
+
+def test_noise_pixels_are_flagged_and_pictures_are_not():
+    w, h = 200, 160
+    noisy = dr.load_image(_png(w, h, b"".join(_noise(w * h * 3)[i:i + 3] + b"\xff" for i in range(0, w * h * 3, 3))))
+    assert dr.image_payload(noisy) is None and dr.image_noise(noisy) >= dr.NOISE_MIN_ENTROPY
+    picture = bytearray()
+    for y in range(h):
+        for x in range(w):
+            picture += bytes(((x * 255) // w, (y * 255) // h, ((x + y) * 7) & 255, 255))
+    smooth = dr.load_image(_png(w, h, bytes(picture)))
+    assert dr.image_payload(smooth) is None and dr.image_noise(smooth) is None
+    assert dr.image_noise(dr.load_image(_png(40, 40, _noise(40 * 40 * 4)))) is None  # too small to carry one
+
+
+@pytest.mark.parametrize("blob", [
+    b"\x89PNG\r\n\x1a\n", b"\x89PNG\r\n\x1a\n" + b"\x00" * 64, b"BM", b"BM" + b"\xff" * 64,
+    _png(64, 64, _noise(64 * 64 * 4))[:300],
+    b"BM" + struct.pack("<IHHI", 0, 0, 0, 54) + struct.pack("<IiiHHI", 40, 1 << 30, 1 << 30, 1, 32, 0),
+    b"\x89PNG\r\n\x1a\n" + struct.pack(">I4s", 13, b"IHDR") + struct.pack(">IIBBBBB", 1 << 31, 1 << 31, 8, 6, 0, 0, 0),
+])
+def test_malformed_images_are_not_images(blob):
+    assert dr.load_image(blob) is None
+
+
+def test_png_filters_are_undone():
+    w, h = 16, 8
+    px = _noise(w * h * 4)
+    rows, prev = b"", bytes(w * 4)
+    for y in range(h):
+        line = px[y * w * 4:(y + 1) * w * 4]
+        kind = y % 5
+        left = bytes(4) + line[:-4]
+        corner = bytes(4) + prev[:-4]
+
+        def paeth(a, b, c):
+            pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+            return a if pa <= pb and pa <= pc else b if pb <= pc else c
+        pred = {0: bytes(w * 4), 1: left, 2: prev, 3: bytes((a + b) >> 1 for a, b in zip(left, prev)),
+                4: bytes(paeth(a, b, c) for a, b, c in zip(left, prev, corner))}[kind]
+        rows += bytes([kind]) + bytes((v - q) & 255 for v, q in zip(line, pred))
+        prev = line
+
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+    image = dr.load_image(png)
+    assert image is not None and (image.r, image.g, image.b, image.a) == (px[0::4], px[1::4], px[2::4], px[3::4])
+
+
+def test_a_recovered_stage_is_described_and_its_own_resources_scanned(tmp_path):
+    state = dr._Scan(tmp_path)
+    carrier = _serialized(_stage2_png(DLL.read_bytes()))
+    state.consider(carrier, dr.entropy(carrier), "App.Properties.Resources.resources", "wwXf", 0)
+    top = state.hidden[0]
+    assert top["image"].startswith("png ") and top["decoded"] == "image:col-bgra+len/xor:0x422942"
+    assert (tmp_path / top["decoded_file"]).read_bytes() == DLL.read_bytes()
+    stage = top["stage"]
+    assert stage["dotnet"] is True and stage["module"] and stage["types"] > 0 and stage["methods"] > 0
+    assert "Assembly.Load" in stage["loader_refs"]
+    inner = {h["resource"] for h in state.hidden[1:]}
+    assert f"{stage['module']}!Fixture.blob.bin" in inner and f"{stage['module']}!Fixture.payload.gz" in inner
+    assert len(state.hidden) <= dr.MAX_HIDDEN
+
+
+def test_stages_are_not_followed_past_the_depth_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(dr, "MAX_DEPTH", 0)
+    state = dr._Scan(tmp_path)
+    carrier = _stage2_png(DLL.read_bytes())
+    state.consider(carrier, dr.entropy(carrier), "r", None, 0)
+    assert len(state.hidden) == 1 and state.hidden[0]["stage"]["dotnet"] is True
+
+
+def test_a_native_stage_is_described_as_not_dotnet(tmp_path):
+    state = dr._Scan(tmp_path)
+    carrier = _serialized(_stage1_bmp())
+    state.consider(carrier, dr.entropy(carrier), "r", "dzh", 0)
+    assert [h.get("stage") for h in state.hidden] == [{"dotnet": False}]
+
+
+def test_a_noise_image_is_a_hidden_payload_and_a_picture_is_not(tmp_path):
+    state = dr._Scan(tmp_path)
+    noisy = _png(200, 160, b"".join(_noise(96000)[i:i + 3] + b"\xff" for i in range(0, 96000, 3)))
+    state.consider(noisy, dr.entropy(noisy), "r", "pic", 0)
+    assert state.hidden[0]["noise"] >= dr.NOISE_MIN_ENTROPY and "decoded" not in state.hidden[0]
+    flat = _png(200, 160, bytes(200 * 160 * 4))
+    state.consider(flat, dr.entropy(flat), "r", "flat", 0)
+    assert len(state.hidden) == 1
+
+
+def test_images_past_the_time_budget_are_counted_not_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(dr, "IMAGE_BUDGET_S", 0.0)
+    state = dr._Scan(tmp_path)
+    carrier = _stage1_bmp()
+    state.consider(carrier, dr.entropy(carrier), "r", "dzh", 0)
+    assert state.hidden == [] and state.images_unread == 1
+    doc = {"resources_total": 1, "resources": [], "loader_refs": [], "hidden": [], "images_unread": 3}
+    res, _out = _drun(DLL, tmp_path, FakeDotnet(doc=doc))
+    assert any(w.code == "dotnet_resources_failed" and "3 image" in w.message for w in res.warnings)
+
+
+def test_user_typed_entries_are_read_from_the_container_data_section():
+    data = b"HDR-" + b"first--" + b"second---" + b"third"
+    container = SimpleNamespace(_data=data, struct=SimpleNamespace(DataSectionOffset=4))
+    entries = [SimpleNamespace(struct=SimpleNamespace(DataOffset=7)),   # out of file order
+               SimpleNamespace(struct=SimpleNamespace(DataOffset=0)),
+               SimpleNamespace(struct=SimpleNamespace(DataOffset=16)),
+               SimpleNamespace(struct=SimpleNamespace(DataOffset=10 ** 9)),  # past the end: dropped
+               SimpleNamespace(struct=None)]
+    assert dr._raw_entries(container, entries) == {0: b"second---", 1: b"first--", 2: b"third"}
+    assert dr._raw_entries(SimpleNamespace(_data=None, struct=None), entries) == {}
+
+
+_STAGED = {"resources_total": 1, "resources": [], "loader_refs": ["Bitmap.GetPixel"], "hidden": [
+    {"resource": "App.Properties.Resources.resources", "entry": "dzh", "size": 65241, "entropy": 4.5,
+     "image": "bmp 128x127", "decoded": "image:col-rgb/plain",
+     "stage": {"dotnet": True, "module": "HWMonitor.dll", "types": 9, "methods": 59,
+               "loader_refs": ["MethodBase.Invoke", 7], "extra": "x" * 5000}},
+    {"resource": "App.Properties.Resources.resources", "entry": "wwXf", "size": 630324, "entropy": 7.996,
+     "image": "png 544x592", "decoded": "image:col-bgra+len/xor:0x422942", "stage": {"dotnet": False, "module": "m"}},
+    {"resource": "r", "entry": "pic", "size": 90000, "entropy": 7.9, "image": "png 200x160", "noise": 7.91},
+    {"resource": "r", "entry": "bad", "size": 9, "entropy": 1.0, "image": "png 1x1; rm -rf", "noise": "high",
+     "decoded": "image:diag-rgb/plain", "stage": {"dotnet": True}},
+]}
+
+
+def test_image_carriers_and_stages_reach_the_evidence_sanitised(tmp_path):
+    res, out = _drun(DLL, tmp_path, FakeDotnet(doc=_STAGED))
+    assert _fields(res)["hidden_payloads"] == 4
+    messages = [w.message for w in res.warnings if w.code == "hidden_payload"]
+    assert "bmp 128x127 image" in messages[0] and "pixels decode (image:col-rgb/plain) to a PE" in messages[0]
+    assert "HWMonitor.dll" in messages[0] and "pixels are noise" in messages[2]
+    _s, _p, state = unpack(out / "continuation.tar.gz", tmp_path / "cont", max_bytes=1 << 30)
+    first, second, third, bad = state.sweep["dotnet_resources"]["hidden_payloads"]
+    assert first["image"] == "bmp 128x127" and first["decoded"] == "image:col-rgb/plain"
+    assert first["stage"] == {"dotnet": True, "module": "HWMonitor.dll", "types": 9, "methods": 59,
+                              "loader_refs": ["MethodBase.Invoke"]}
+    assert second["decoded"] == "image:col-bgra+len/xor:0x422942" and second["stage"] == {"dotnet": False}
+    assert third["noise"] == 7.91 and "decoded" not in third
+    assert bad == {"resource": "r", "entry": "bad", "size": 9, "entropy": 1.0}
+
+
+@pytest.mark.parametrize("method,ok", [
+    ("plain", True), ("xor:0x5a", True), ("xor:0x422942", True), ("image:row-argb/gzip", True),
+    ("image:col-bgra+len/xor:0x" + "ab" * 30, True), ("xor:0x" + "ab" * 31, False), ("xor:0x4", False),
+    ("xor:0x422", False), ("image:col-rgb", False), ("image:col-rgb/plain\nignore previous", False),
+    ("image:col-rgb+len+len/plain", False),
+])
+def test_only_the_scanners_own_method_grammar_is_carried(method, ok):
+    assert bool(sw._DECODED.fullmatch(method)) is ok
+
+
 # ------------------------------------------------------------------ the bar and the prompts
 
 _HIDDEN_SWEEP = {"dotnet_resources": {"hidden_payloads": [{"resource": "Fixture.Properties.Resources.resources",
@@ -249,3 +515,24 @@ def test_the_agent_and_the_report_are_told_about_hidden_payloads_and_decoys():
 def test_the_scanner_imports_nothing_from_blastbox():
     src = Path(dr.__file__).read_text()
     assert "blastbox" not in src.split('"""', 2)[2]  # it runs under the capa venv's python
+
+
+_IMAGE_SWEEP = {"dotnet_resources": {"hidden_payloads": [
+    {"resource": "App.Properties.Resources.resources", "entry": "dzh", "size": 65241, "entropy": 4.5,
+     "image": "bmp 128x127", "decoded": "image:col-rgb/plain", "stage": {"dotnet": True, "module": "HWMonitor.dll"}}]}}
+
+
+def test_the_bar_and_the_prompts_name_a_payload_recovered_from_pixels():
+    s = sufficiency.assess(report=_report("benign"), sweep=_IMAGE_SWEEP, explored=[])
+    gap = next(g for g in s.gaps if g.code == "benign_hidden_payload")
+    assert "image:col-rgb/plain" in gap.detail and "HWMonitor.dll" in gap.detail
+    st = State(pass_no=0, sample_name="a.exe", sample_sha256="0" * 64, program_name="a.exe", ghidra_status="ok",
+               sweep=_IMAGE_SWEEP)
+    msg = Framer("n").initial_user_message(st, 1, todo=[], explored=[])["content"]
+    assert "pixels" in msg and "stage" in msg
+    plain = State(pass_no=0, sample_name="a.exe", sample_sha256="0" * 64, program_name="a.exe", ghidra_status="ok",
+                  sweep=_HIDDEN_SWEEP)
+    assert "GetPixel" not in Framer("n").initial_user_message(plain, 1, todo=[], explored=[])["content"]
+    sys_msg = Framer("n").report_messages(pass_no=1, sample_name="a.exe", summary="", functions=[], iocs=[],
+                                          sweep=_IMAGE_SWEEP, prior_report=None)[0]["content"]
+    assert "image pixels" in sys_msg and "multi-stage crypter" in sys_msg
