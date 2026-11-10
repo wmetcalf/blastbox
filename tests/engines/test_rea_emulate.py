@@ -3,7 +3,10 @@
 import hashlib
 import json
 import os
+import signal
+import struct
 import sys
+import time
 from pathlib import Path
 
 import pefile
@@ -275,15 +278,35 @@ def test_captures_are_capped_and_tiny_or_inert_regions_skipped(tmp_path, monkeyp
     monkeypatch.setattr(emulate, "MAX_CAPTURES", 2)
     regions, blobs = [], {}
     for i in range(4):
-        blobs[f"region-{i}.bin"] = bytes([0x90 + i]) * 64
+        blobs[f"region-{i}.bin"] = bytes([0x90 + i, 0xC3]) * 32
         regions.append(_region(f"region-{i}.bin", 0x10000 * (i + 1), 0x1000, executed=True))
     blobs["region-4.bin"] = b"\xc3\x00\x00"  # executed, but almost nothing there
     regions.append(_region("region-4.bin", 0x90000, 0x1000, executed=True))
-    blobs["region-5.bin"] = b"\x90" * 64  # neither executable nor run: not a capture
+    blobs["region-5.bin"] = b"\x90\xc3" * 32  # neither executable nor run: not a capture
     regions.append(_region("region-5.bin", 0xA0000, 0x1000))
     em = _shape(tmp_path, {"regions": regions}, blobs)
     assert len(em.captures) == 2 and all(c.kind == "shellcode" for c in em.captures)
     assert em.evidence["captures_dropped"] == {"capped": 2, "too_small": 1}
+
+
+def test_fill_patterns_and_partial_images_are_not_captures(tmp_path):
+    """A stub that fills buffers with one byte before asking for them executable, and a copy of
+    only an image's headers, left "captures" that were neither code nor a loadable PE."""
+    img = mapped(SAMPLE)
+    blobs = {"region-0.bin": b"\xf8" * 0x3000, "region-1.bin": img[:0x1000], "region-2.bin": SAMPLE[:0x800],
+             "region-3.bin": img}
+    doc = {"regions": [_region("region-0.bin", 0x50000, 0x3000, prot="PAGE_EXECUTE_READWRITE", asked=True),
+                       _region("region-1.bin", 0x60000, 0x1000), _region("region-2.bin", 0x70000, 0x1000),
+                       _region("region-3.bin", 0x80000, len(img), executed=True)],
+           "regions_skipped": {"duplicate": 317, "capped": 0}}
+    em = _shape(tmp_path, doc, blobs)
+    assert [(c.kind, c.layout, c.size) for c in em.captures] == [("pe", "memory", len(img))]
+    assert em.evidence["captures_dropped"] == {"filler": 1, "partial": 2, "duplicate": 317}
+    assert em.evidence["concealment"] == ["exec_alloc", "pe_in_memory"]  # it still asked for executable memory
+    assert emulate.carve(img[:0x1000], 0, 0x60000) is None and emulate.carve(img, 0, 0x60000) is not None
+    hostile = {"regions_skipped": {"duplicate": 10 ** 30, "capped": "many"}}
+    ev = emulate.shape(hostile, tmp_path, tmp_path / "w", input_sha256="", triggers=[]).evidence
+    assert ev["captures_dropped"] == {"duplicate": emulate.MAX_COUNT}
 
 
 def test_hostile_runner_output_is_contained(tmp_path):
@@ -304,6 +327,27 @@ def test_hostile_runner_output_is_contained(tmp_path):
     assert ev["entry_points"] == [{"type": "?", "stop": "exception"}] and ev["apis_total"] == 0
     assert ev["dynamic_code"] == [] and ev["concealment"] == []
     assert [r["api"] for r in ev["apis"]] == ["kernel32.Sleep", "k.X"]
+    assert ev["apis_top"] == [{"api": "kernel32.Sleep", "count": 1}, {"api": "k.X", "count": 1}]
+    hostile = {"entry_points": [{"type": "t" * 500, "error": "e" * 500, "calls": 10 ** 40, "pc": -1, "addr": "0x" + "f" * 40,
+                                 "code": []}, {"type": "x", "error": None, "calls": True}],
+               "apis": [{"n": "k.A" * 100, "a": [["str", "v" * 5000]] * 50}] * 3,
+               "stubbed": ["x", {"n": 7}, {"n": "msvcrt." + "a" * 500, "c": "many"}] + [{"n": f"k.F{i}"} for i in range(300)],
+               "sleep_ms": 10 ** 40, "vectored": -3, "faults_total": "9",
+               "faults": ["x", {"code": "nope", "pc": 1}, {"code": 5, "pc": 2 ** 70},
+                          *[{"code": 0xC0000005, "pc": i, "addr": 4, "handled": "yes", "by": "magic"} for i in range(40)]],
+               "regions_skipped": [1], "events": [{"event": "hard_error", "status": 5, "text": "t" * 5000}]}
+    ev = emulate.shape(hostile, tmp_path / "scan", tmp_path / "work", input_sha256="0" * 64, triggers=[]).evidence
+    assert len(json.dumps(ev)) <= emulate.MAX_EVIDENCE_BYTES
+    assert ev["entry_points"][0] == {"type": "t" * 93 + "...", "stop": "exception", "detail": "e" * 61 + "...",
+                                     "calls": emulate.MAX_COUNT}
+    assert "calls" not in ev["entry_points"][1] and "last_calls" not in ev
+    assert len(ev["stubbed_apis"]) == emulate.STATE_STUBBED and ev["stubbed_apis_total"] == 301
+    assert all(len(n) <= 96 for n in ev["stubbed_apis"])
+    assert ev["sleep_ms"] == emulate.MAX_COUNT and "vectored_exceptions" not in ev
+    assert len(ev["faults"]) == emulate.STATE_FAULTS and ev["faults_total"] == 40
+    assert ev["faults"][0] == {"code": "0xc0000005", "pc": "0x0", "address": "0x4", "handled": False}
+    assert ev["events"] == [{"event": "hard_error", "text": "t" * 253 + "..."}]
+    assert ev["stop"] == "exception" and ev["stop_detail"] == "e" * 61 + "..."  # no exit, so no hard-error detail
 
 
 def test_stop_reasons_and_runner_errors():
@@ -319,6 +363,99 @@ def test_stop_reasons_and_runner_errors():
     crashed = {"error": "UcError: boom", "entry_points": []}
     ev = emulate.shape(crashed, Path("/n"), Path("/n"), input_sha256="", triggers=[]).evidence
     assert ev["stop"] == "exception" and ev["stop_detail"] == "UcError: boom"
+
+
+def test_a_dead_emulator_process_names_how_it_died(tmp_path):
+    """The runner's parent reports a child that left no document; the evidence keeps the reason
+    (it used to be a bare ``failed``)."""
+    for kind, status in (("cpu_limit", "budget"), ("wall_clock", "budget"), ("signal", "failed"), ("exit", "failed"),
+                         ("output", "failed"), ("anything", "failed")):
+        doc = {"error": "emulator process killed at its 150 s CPU limit (SIGKILL, cpu 150 s, peak rss 900 MiB)" * 9,
+               "fatal": kind, "apis": [{"n": "k.X"}], "regions": [_region("region-0.bin", 0x1000, 0x1000, executed=True)]}
+        em = emulate.shape(doc, tmp_path, tmp_path / "w", input_sha256="", triggers=["few_imports"])
+        ev = em.evidence
+        assert ev["status"] == status and ev["triggers"] == ["few_imports"] and em.captures == []
+        assert ev["stop_detail"].startswith("emulator process killed at its 150 s CPU limit") and len(ev["stop_detail"]) <= 200
+        assert set(ev) == ({"status", "triggers", "stop", "stop_detail"} if status == "budget" else
+                           {"status", "triggers", "stop_detail"})
+    ev = emulate.shape({"fatal": "signal", "error": 7}, tmp_path, tmp_path / "w", input_sha256="", triggers=[]).evidence
+    assert ev == {"status": "failed", "triggers": [], "stop_detail": "signal"}
+
+
+def _calls(*names):
+    return [{"n": n, "a": [["int", "0x1"]]} for n in names]
+
+
+def test_why_a_run_ended_is_reported(tmp_path):
+    # An entry point that ended in the unhandled-exception filter is no clean exit.
+    doc = {"entry_points": [{"type": "tls_callback_0", "error": None, "calls": 1},
+                            {"type": "module_entry", "error": "unhandled_exception", "calls": 3, "code": 0xC0000005,
+                             "pc": 0, "addr": 0}],
+           "apis": _calls("k.A", "ole32.CoCreateInstance", "oleaut32.SysAllocString", "k.SetUnhandledExceptionFilter"),
+           "apis_total": 4,
+           "faults": [{"code": 0xC0000005, "pc": 0, "addr": 0, "handled": True, "by": "filter"}], "faults_total": 1}
+    ev = emulate.shape(doc, tmp_path, tmp_path / "w", input_sha256="", triggers=[]).evidence
+    assert ev["stop"] == "exception" and ev["stop_detail"] == "unhandled_exception 0xc0000005 at 0x0 (address 0x0)"
+    assert ev["entry_points"] == [{"type": "tls_callback_0", "stop": "exit", "calls": 1},
+                                  {"type": "module_entry", "stop": "exception", "calls": 3,
+                                   "detail": "unhandled_exception 0xc0000005 at 0x0 (address 0x0)"}]
+    assert ev["last_calls"] == {"entry_point": "module_entry", "calls": [
+        {"api": "ole32.CoCreateInstance", "args": ["0x1"]}, {"api": "oleaut32.SysAllocString", "args": ["0x1"]},
+        {"api": "k.SetUnhandledExceptionFilter", "args": ["0x1"]}]}
+    assert ev["faults"] == [{"code": "0xc0000005", "pc": "0x0", "address": "0x0", "handled": True, "by": "filter"}]
+    assert ev["faults_total"] == 1
+
+    # The API cap names what used it up; the last calls are those of the entry point that hit it.
+    names = ["k.GetStdHandle", "k.WriteFile", "k.OutputDebugStringA"] * 20
+    doc = {"entry_points": [{"type": "module_entry", "error": None, "calls": 2},
+                            {"type": "thread", "error": "max_api_count", "calls": 60, "pc": 0xF4F0B7}],
+           "apis": _calls("k.CreateThread", "k.ExitProcess", *names), "apis_total": 62, "vectored": 1}
+    ev = emulate.shape(doc, tmp_path, tmp_path / "w", input_sha256="", triggers=[]).evidence
+    assert ev["stop"] == "api_limit"
+    assert ev["stop_detail"] == "most calls: k.GetStdHandle x20, k.WriteFile x20, k.OutputDebugStringA x20, k.CreateThread x1"
+    assert ev["apis_top"][0] == {"api": "k.GetStdHandle", "count": 20} and len(ev["apis_top"]) == 5
+    assert ev["last_calls"]["entry_point"] == "thread" and len(ev["last_calls"]["calls"]) == emulate.STATE_LAST_CALLS
+    assert ev["last_calls"]["calls"][-1]["api"] == "k.OutputDebugStringA" and ev["vectored_exceptions"] == 1
+
+    # A clean exit: the checks made just before it, and the message a refusing protector showed.
+    doc = {"entry_points": [{"type": "module_entry", "error": None, "calls": 3}],
+           "apis": _calls("user32.GetCaretBlinkTime", "ntdll.ZwRaiseHardError", "kernel32.ExitProcess"), "apis_total": 3,
+           "events": [{"event": "hard_error", "api": "ntdll.ZwRaiseHardError", "status": "0x50000018",
+                       "text": "This fixture refuses to run | Fixture"}],
+           "stubbed": [{"n": "msvcrt._access", "c": 2, "how": "stub"}, {"n": "user32.GetShellWindow", "c": 1, "how": "signature"},
+                       {"n": "msvcrt._access", "c": 1, "how": "stub"}],
+           "sleep_ms": 6550}
+    em = emulate.shape(doc, tmp_path, tmp_path / "w", input_sha256="", triggers=[])
+    ev = em.evidence
+    assert ev["stop"] == "exit"
+    assert ev["stop_detail"] == "exit after a hard-error message box 0x50000018: This fixture refuses to run | Fixture"
+    assert [c["api"] for c in ev["last_calls"]["calls"]] == ["user32.GetCaretBlinkTime", "ntdll.ZwRaiseHardError",
+                                                             "kernel32.ExitProcess"]
+    assert ev["stubbed_apis"] == ["msvcrt._access", "user32.GetShellWindow"] and ev["stubbed_apis_total"] == 2
+    assert ev["sleep_ms"] == 6550 and "faults" not in ev and "vectored_exceptions" not in ev
+    assert ("emulation:hard_error", "This fixture refuses to run | Fixture") in em.strings
+
+    # Call counts that do not add up to the call list: no last calls rather than wrong ones.
+    doc = {"entry_points": [{"type": "module_entry", "error": None, "calls": 9}], "apis": _calls("k.A")}
+    assert "last_calls" not in emulate.shape(doc, tmp_path, tmp_path / "w", input_sha256="", triggers=[]).evidence
+    # A DLL: the clean exit's last calls are those of the last entry point that called anything.
+    doc = {"entry_points": [{"type": "dll_entry.DLL_PROCESS_ATTACH", "error": None, "calls": 1},
+                            {"type": "export.Run", "error": None, "calls": 1}, {"type": "export.Idle", "error": None, "calls": 0}],
+           "apis": _calls("k.A", "k.B")}
+    ev = emulate.shape(doc, tmp_path, tmp_path / "w", input_sha256="", triggers=[]).evidence
+    assert ev["last_calls"] == {"entry_point": "export.Run", "calls": [{"api": "k.B", "args": ["0x1"]}]}
+
+
+def test_a_delay_loop_is_concealment(tmp_path):
+    n = emulate.DELAY_LOOP_CALLS
+    loop = _calls(*["kernel32.GetTickCount", "user32.GetCursorPos", "kernel32.Sleep"] * n)
+    ev = emulate.shape({"apis": loop}, tmp_path, tmp_path / "w", input_sha256="", triggers=[]).evidence
+    assert ev["concealment"] == ["delay_loop"] and "delay_loop" in emulate.CONCEALMENT
+    for quiet in (loop[:-3],  # one sleep short
+                  _calls(*["kernel32.Sleep"] * 200),  # sleeping without watching the clock
+                  _calls(*["kernel32.QueryPerformanceCounter"] * 200, "kernel32.Sleep")):  # a busy poll
+        assert emulate.shape({"apis": quiet}, tmp_path, tmp_path / "w", input_sha256="", triggers=[]
+                             ).evidence["concealment"] == []
 
 
 def test_behaviour_signals_registry_injection_and_manual_resolution(tmp_path):
@@ -378,6 +515,90 @@ def test_runner_helpers():
     after[text.VirtualAddress:text.VirtualAddress + 600] = b"\xcc" * 600
     assert emulate_runner.changed_bytes(before, bytes(after), spans) >= 512
     assert emulate_runner.prot_text(5) == "r-x"
+
+
+def test_runner_stubs_follow_the_calling_convention_and_do_not_lie():
+    r = emulate_runner
+    assert all(r.is_crt(d) for d in ("msvcrt", "MSVCR100", "ucrtbase", "api-ms-win-crt-runtime-l1-1-0", "vcruntime140"))
+    assert not r.is_crt("kernel32") and not r.is_crt("user32")
+    assert r.stub_return("msvcrt", "_access", [0x1000, 0]) == 0xFFFFFFFF  # the file is not there
+    assert r.stub_return("ucrtbase", "_waccess_s", [0x1000, 0]) == 2  # ENOENT
+    assert r.stub_return("msvcrt", "_onexit", [0x401000]) == 0x401000 and r.stub_return("msvcrt", "_onexit", []) == 0
+    assert r.stub_return("msvcrt", "atexit", [0x401000]) == 0 and r.stub_return("ntdll", "NtFoo", []) == 0
+    assert r.stub_return("ntdll", "RtlFoo", []) == 0 and r.stub_return("user32", "IsFoo", []) == 1
+    assert r.stub_return("user32", "IsFoo", [], declared=7) == 7 and r.stub_return("msvcrt", "_access", [], declared=7) != 7
+    assert r.stub_global("msvcrt", "__p__environ") == "pointer" and r.stub_global("ucrtbase", "__p___argv") == "pointer"
+    assert r.stub_global("msvcrt", "__p__fmode") == "number" and r.stub_global("msvcrt", "_access") is None
+    assert r.stub_global("kernel32", "__p__environ") is None
+
+
+def test_runner_memory_and_exception_helpers():
+    r = emulate_runner
+    assert [r.page_perms(p) for p in (0x01, 0x02, 0x04, 0x20, 0x40, 0x104)] == [0, 1, 3, 5, 7, 3]  # PAGE_GUARD ignored
+    assert r.page_perms(0) is None and r.page_perms(0x03) is None
+    assert [r.page_protect(p) for p in (0, 1, 3, 5, 7)] == [0x01, 0x02, 0x04, 0x20, 0x40]
+    spans = [(0x10000, 0x20000), (0x20000, 0x21000), (0x50000, 0x60000)]
+
+    def clear(spans, size, addr):
+        base, length = r.free_range(spans, size, addr)
+        assert base % 0x1000 == 0 and length % 0x1000 == 0 and length >= size and base >= addr - addr % 0x1000
+        assert all(end <= base or start >= base + length for start, end in spans)
+        return base
+
+    assert clear(spans, 0x1000, 0x10000) >= 0x21000  # steps past what is mapped
+    assert clear(spans, 0x2F001, 0x10000) >= 0x60000  # the gap is too small for it
+    assert r.free_range([], 1, 0x12345) == (0x12000, 0x1000) and r.free_range(spans, 0x1000, 0x70000) == (0x70000, 0x1000)
+    assert r.free_range(spans, 0x2000, 0x21000) == (0x21000, 0x2000)  # a gap that fits is taken where asked
+    assert clear([(0x30000, 0x31000), (0x10000, 0x40000)], 0x1000, 0x32000) >= 0x40000  # a span inside another
+    with pytest.raises(MemoryError):
+        r.free_range([(0, 1 << 62)], 0x1000, 0x10000)
+    rec = r.exception_record(0xC0000005, 0x140001EFF, 8, (0, 0x832000))
+    assert len(rec) == 152 and struct.unpack_from("<IIQQI4xQQ", rec) == (0xC0000005, 0, 0, 0x140001EFF, 2, 0, 0x832000)
+    rec = r.exception_record(0xC0000005, 0x401000, 4, (1, 0x832000))
+    assert len(rec) == 80 and struct.unpack_from("<IIIIIII", rec) == (0xC0000005, 0, 0, 0x401000, 2, 1, 0x832000)
+    assert len(r.exception_record(1, 2, 8, tuple(range(40)))) == 152
+
+
+def test_the_runner_keeps_cpu_time_back_and_names_a_dead_child():
+    r = emulate_runner
+    assert r.cpu_budget(120, None, 3) == 120 and r.cpu_budget(120, 150, 5) == 120
+    assert r.cpu_budget(120, 100, 5) == 100 - 5 - r.CPU_RESERVE_S and r.cpu_budget(120, 10, 5) == 1.0
+    assert r.GRACE_S < emulate.OVERHEAD_S  # the parent reports before the engine kills the process group
+    use = {"cpu_s": 149.5, "wall_s": 145.0, "rss_kb": 900 * 1024, "got_bytes": 0}
+    kind, text = r.death_reason(signal.SIGKILL, cpu_limit=150.0, wall_killed=False, **use)
+    assert kind == "cpu_limit" and "150 s CPU limit" in text and "SIGKILL" in text and "900 MiB" in text
+    assert r.death_reason(signal.SIGKILL, cpu_limit=None, wall_killed=False, **use)[0] == "signal"
+    assert r.death_reason(signal.SIGSEGV, cpu_limit=150.0, wall_killed=False, **use) == (
+        "signal", "emulator process killed by SIGSEGV (cpu 150 s, peak rss 900 MiB)")
+    assert r.death_reason(signal.SIGKILL, cpu_limit=150.0, wall_killed=True, **use)[0] == "wall_clock"
+    assert r.death_reason(3 << 8, cpu_limit=None, wall_killed=False, **use)[0] == "exit"
+    assert r.death_reason(0, cpu_limit=None, wall_killed=False, **use)[0] == "output"
+    assert r.death_reason(0, cpu_limit=None, wall_killed=False, **{**use, "got_bytes": r.MAX_DOC_BYTES + 1})[0] == "output"
+    assert all(len(r.death_reason(s, cpu_limit=150.0, wall_killed=w, **use)[1]) <= 200
+               for s in (0, 9, 3 << 8) for w in (False, True))
+
+
+def test_the_runner_parent_always_has_a_document(tmp_path, monkeypatch):
+    """The emulation runs in a forked child; however it ends, the parent returns one document."""
+    r = emulate_runner
+    monkeypatch.setattr(r, "emulate", lambda *a: {"arch": "x64", "entry_points": []})
+    assert r.supervise("s", str(tmp_path), 5, 10, -1) == {"arch": "x64", "entry_points": []}
+
+    def boom(*a):
+        raise MemoryError("no room")
+    monkeypatch.setattr(r, "emulate", boom)
+    assert r.supervise("s", str(tmp_path), 5, 10, -1) == {"error": "MemoryError: no room"}
+    monkeypatch.setattr(r, "emulate", lambda *a: os.kill(os.getpid(), signal.SIGKILL))
+    doc = r.supervise("s", str(tmp_path), 5, 10, -1)
+    assert doc["fatal"] == "signal" and "SIGKILL" in doc["error"]
+    monkeypatch.setattr(r, "emulate", lambda *a: os._exit(3))
+    assert r.supervise("s", str(tmp_path), 5, 10, -1)["fatal"] == "exit"
+    monkeypatch.setattr(r, "GRACE_S", 0.2)
+    monkeypatch.setattr(r, "emulate", lambda *a: time.sleep(30))
+    began = time.monotonic()
+    doc = r.supervise("s", str(tmp_path), 0.2, 10, -1)
+    assert doc["fatal"] == "wall_clock" and time.monotonic() - began < 10
+    assert emulate.shape(doc, tmp_path, tmp_path / "w", input_sha256="", triggers=[]).evidence["status"] == "budget"
 
 
 def test_the_runner_imports_nothing_from_blastbox():
@@ -596,6 +817,18 @@ def test_a_speakeasy_error_or_budget_stop_keeps_partial_results(tmp_path):
     assert "emulation_budget" in _codes(res) and _fields(res)["unpacked"] == "emulated"
 
 
+@pytest.mark.parametrize("kind,state,code", [("cpu_limit", "budget", "emulation_budget"), ("signal", "failed", None)])
+def test_a_killed_emulator_process_reaches_the_report_with_its_reason(tmp_path, kind, state, code):
+    doc = {"error": "emulator process killed by SIGKILL (cpu 3 s, peak rss 40 MiB)", "fatal": kind}
+    res, out, ghidra = _erun(UNPACK, tmp_path, FakeEmulate(doc=doc, blobs={}))
+    f = _fields(res)
+    assert f["emulation"] == state and f["emulation_captures"] == 0 and "unpacked" not in f
+    assert "emulation_failed" in _codes(res) and (code is None or code in _codes(res))
+    em = _state(out, tmp_path).sweep["emulation"]
+    assert em["status"] == state and em["stop_detail"].startswith("emulator process killed by SIGKILL")
+    assert ghidra.calls[0]["sample"].name == "unpack.exe"  # the stub is analysed as before
+
+
 def test_no_trigger_no_emulation(tmp_path, monkeypatch):
     fake = FakeEmulate()
     monkeypatch.setattr(emulate, "triggers", lambda *a, **k: [])
@@ -643,6 +876,12 @@ def test_a_benign_stub_that_concealed_a_stage_does_not_meet_the_bar():
     swapped = {"emulation": {**_CONCEALED["emulation"], "payload_sha256": SAMPLE_SHA}}
     assert sufficiency.assess(report=_report("benign"), sweep=swapped, explored=[]).met
     assert sufficiency.assess(report=_report("benign"), sweep={"emulation": {"concealment": []}}, explored=[]).met
+    # stalling alone is not a hidden stage; with another signal it is reported beside it
+    assert sufficiency.assess(report=_report("benign"), sweep={"emulation": {"concealment": ["delay_loop"]}},
+                              explored=[]).met
+    both = sufficiency.assess(report=_report("benign"), explored=[],
+                              sweep={"emulation": {"concealment": ["delay_loop", "exec_alloc"]}})
+    assert "delay_loop, exec_alloc" in next(g for g in both.gaps if g.code == "benign_emulated_stage").detail
 
 
 def test_the_agent_and_the_report_are_told_about_emulation():
@@ -651,9 +890,11 @@ def test_the_agent_and_the_report_are_told_about_emulation():
                sweep=sweep)
     msg = Framer("n").initial_user_message(st, 1, todo=[], explored=[])["content"]
     assert '"emulation"' in msg and "Speakeasy" in msg and "emulated" in msg and "not proof of absence" in msg
+    assert "stubbed_apis" in msg and "last_calls" in msg
     sys_msg = Framer("n").report_messages(pass_no=1, sample_name="a.exe", summary="", functions=[], iocs=[],
                                           sweep=sweep, prior_report=None)[0]["content"]
     assert "sweep.emulation" in sys_msg and "OBSERVED" in sys_msg and "never benign" in sys_msg
+    assert "stubbed_apis" in sys_msg and "delay_loop on its own" in sys_msg and "stop_detail" in sys_msg
     inner = {**_CONCEALED, "unpacked": {"packer": "nsis", "inner": [{"packer": "emulated"}]}}
     st.sweep = inner
     assert "\"emulated\" layer" in Framer("n").initial_user_message(st, 1, todo=[], explored=[])["content"]

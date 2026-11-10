@@ -139,12 +139,17 @@ def _installer_concealment(sweep: dict[str, Any]) -> str:
     return "; ".join(why)
 
 
+_STALLING = frozenset({"delay_loop"})
+
+
 def _concealment(sweep: dict[str, Any]) -> list[str]:
     em = sweep.get("emulation")
     if not isinstance(em, dict) or em.get("payload_sha256"):
         return []
     items = em.get("concealment")
-    return [str(c)[:40] for c in items if isinstance(c, str)][:8] if isinstance(items, list) else []
+    found = [str(c)[:40] for c in items if isinstance(c, str)][:8] if isinstance(items, list) else []
+    # Stalling alone is not a hidden stage: plenty of honest programs sleep on a timer.
+    return found if any(c not in _STALLING for c in found) else []
 
 
 def facts_of(report: dict[str, Any] | None, functions: list[dict[str, Any]],

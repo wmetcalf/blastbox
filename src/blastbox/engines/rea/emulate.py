@@ -23,25 +23,49 @@ the side of running, since the wall-clock budget bounds the cost.
 
     {"status": "ok" | "budget" | "failed", "triggers": [...], "arch"?, "dll"?,
      "stop"?: "exit" | "budget" | "api_limit" | "unsupported_api" | "exception", "stop_detail"?,
-     "entry_points": [{"type", "stop"[, "detail"]}], "apis_total", "apis_distinct",
+     "entry_points": [{"type", "stop"[, "detail"][, "calls"]}], "apis_total", "apis_distinct",
      "apis": [{"api", "category", "count"[, "args": [[display, ...], ...]]}],
+     "apis_top"?: [{"api", "count"}], "last_calls"?: {"entry_point", "calls": [{"api"[, "args": [display, ...]]}]},
+     "stubbed_apis"?: ["<dll>.<function>", ...], "stubbed_apis_total"?, "sleep_ms"?,
+     "faults"?: [{"code", "pc"[, "address"], "handled"[, "by": "vectored" | "seh" | "filter"]}],
+     "faults_total"?, "vectored_exceptions"?,
      "strings": [{"api", "value"}], "events": [{"event", ...}], "dynamic_code": [{"tag", "base", "size"}],
      "concealment": [...], "unimported_apis"?: [...], "truncated"?: true,
      "captures": [{"member"?, "sha256", "size", "kind": "pe" | "shellcode",
        "layout"?: "file" | "memory", "dll"?, "source", "region": {"base", "size", "protect"},
        "executed", "exec_requested"}],
-     "captures_dropped": {"same_as_input"?, "decoy_module"?, "duplicate"?, "too_small"?, "capped"?},
+     "captures_dropped": {"same_as_input"?, "decoy_module"?, "duplicate"?, "too_small"?, "capped"?,
+       "filler"?, "partial"?},
      "payload_sha256"?}
 
-Bases are ``0x``-hex strings, sizes ints. ``protect`` is the protection the stub asked for
-(``PAGE_*``) or else the emulator's page permissions (``rwx`` letters). ``concealment`` codes
-(:data:`CONCEALMENT`): ``exec_alloc`` (the stub asked for executable memory), ``dynamic_code``
-(code ran outside its image), ``pe_in_memory`` (a PE capture), ``self_modified`` (it rewrote its
-own code or empty sections), ``injection_apis`` (WriteProcessMemory, CreateRemoteThread, ...),
-``manual_api_resolution`` (it called APIs it neither imports nor looked up by name:
-``unimported_apis``). A failed run has only ``status``, ``triggers`` and maybe ``stop_detail``. An emulator is not Windows: a stage may never appear
-(anti-emulation checks, an unsupported API), and behaviour seen here is behaviour of the stub
-under Speakeasy, which the agent and report prompts say.
+Bases, addresses and exception codes are ``0x``-hex strings, sizes and counts ints. ``protect`` is
+the protection the stub asked for (``PAGE_*``) or else the emulator's page permissions (``rwx``
+letters). ``concealment`` codes (:data:`CONCEALMENT`): ``exec_alloc`` (the stub asked for
+executable memory), ``dynamic_code`` (code ran outside its image), ``pe_in_memory`` (a PE
+capture), ``self_modified`` (it rewrote its own code or empty sections), ``injection_apis``
+(WriteProcessMemory, CreateRemoteThread, ...), ``manual_api_resolution`` (it called APIs it
+neither imports nor looked up by name: ``unimported_apis``), ``delay_loop`` (it slept at least
+``DELAY_LOOP_CALLS`` times while reading the clock or the pointer position as often: stalling).
+
+Why a run ended where it did: ``stop`` is the worst entry-point stop and ``stop_detail`` one
+bounded sentence for it (the API cap names the calls that used it up; an exit after a hard-error
+message box quotes it). An entry point that ended in the stub's unhandled-exception filter is an
+``exception`` (``unhandled_exception <code> at <pc>``), not the clean exit Speakeasy reports.
+``last_calls`` are the final API calls of the entry point that set ``stop`` (for a clean exit:
+the checks made just before it). ``apis_top`` are the most-called APIs. ``stubbed_apis`` are the
+APIs the emulator has no implementation of and answered with a default value (first-call order,
+``stubbed_apis_total`` distinct ones): what the stub did after one rests on that answer.
+``sleep_ms`` is the emulated time it slept. ``faults`` are the first exceptions the stub raised or
+caused (``by``: who took it: a vectored handler, a frame handler, or the unhandled-exception
+filter, after which the run ends), ``vectored_exceptions`` how many went to its vectored handlers.
+``captures_dropped``: ``filler`` is an executable region holding one repeated byte, ``partial`` a
+PE header whose region holds only part of the image; ``duplicate`` and ``capped`` include the
+regions the runner itself skipped.
+
+A failed run has only ``status``, ``triggers`` and maybe ``stop_detail`` (and ``stop`` ``budget``
+when the emulator process was killed at its wall clock or CPU limit). An emulator is not Windows:
+a stage may never appear (anti-emulation checks, an unsupported API), and behaviour seen here is
+behaviour of the stub under Speakeasy, which the agent and report prompts say.
 """
 
 from __future__ import annotations
@@ -85,6 +109,12 @@ STATE_STRINGS = 64
 STATE_EVENTS = 32
 STATE_ENTRY_POINTS = 16
 STATE_DYNAMIC = 16
+STATE_TOP_APIS = 8
+STATE_LAST_CALLS = 8
+STATE_STUBBED = 32
+STATE_FAULTS = 8
+DELAY_LOOP_CALLS = 16
+MAX_COUNT = 1 << 53  # a count or duration from the runner is clamped to what JSON numbers keep exact
 MAX_TEXT = 256
 ARG_TEXT = 128
 MAX_ARGS = 8
@@ -101,11 +131,18 @@ _LOADER_IMPORTS = frozenset({
     "getmodulehandlew", "getmodulehandleexa", "getmodulehandleexw", "virtualalloc", "virtualprotect", "virtualfree",
     "exitprocess", "ldrloaddll", "ldrgetprocedureaddress", "ldrgetdllhandle",
 })
-CONCEALMENT = ("exec_alloc", "dynamic_code", "pe_in_memory", "self_modified", "injection_apis", "manual_api_resolution")
+CONCEALMENT = ("exec_alloc", "dynamic_code", "pe_in_memory", "self_modified", "injection_apis", "manual_api_resolution",
+               "delay_loop")
 _RESOLVERS = frozenset({"getprocaddress", "ldrgetprocedureaddress", "ldrgetprocedureaddressforcaller"})
 _INJECTION = frozenset({"writeprocessmemory", "createremotethread", "createremotethreadex", "ntcreatethreadex",
                         "queueuserapc", "ntqueueapcthread", "setthreadcontext", "ntsetcontextthread",
                         "ntunmapviewofsection", "zwunmapviewofsection", "ntwritevirtualmemory"})
+_SLEEPS = frozenset({"sleep", "sleepex", "ntdelayexecution", "zwdelayexecution"})
+_CLOCKS = frozenset({"gettickcount", "gettickcount64", "queryperformancecounter", "getsystemtimeasfiletime",
+                     "getsystemtime", "getlocaltime", "timegettime", "ntquerysystemtime", "getcursorpos",
+                     "getlastinputinfo"})
+_FATAL_STATUS = {"wall_clock": "budget", "cpu_limit": "budget"}  # the runner's ``fatal`` kinds; the rest: failed
+_FAULT_BY = frozenset({"vectored", "seh", "filter"})
 _STOPS = {None: "exit", "timeout": "budget", "max_total_time": "budget", "max_instructions": "budget",
           "max_api_count": "api_limit", "unsupported_api": "unsupported_api"}
 _STOP_ORDER = ("budget", "api_limit", "unsupported_api", "exception", "exit")
@@ -355,7 +392,8 @@ def carve(blob: bytes, off: int, base: int, alloc_size: int | None = None) -> Ca
     to its RVA and virtual size, and ImageBase to where it was mapped, so Ghidra loads it at the
     addresses it ran at. ``alloc_size`` (the size the stub asked VirtualAlloc for) bounds a
     file copy at the start of its allocation exactly, trailing zeros included. None when the
-    headers do not parse or the region holds only part of the file."""
+    headers do not parse or the region holds only part of the file or image (its last section's
+    initialised data lies past the region's end)."""
     hdr = _headers(blob, off)
     if hdr is None:
         return None
@@ -363,6 +401,9 @@ def carve(blob: bytes, off: int, base: int, alloc_size: int | None = None) -> Ca
     identity = (machine, timestamp, entry, size_of_image)
     dll = bool(chars & 0x2000)
     if _memory_layout(blob, off, secs):
+        mapped_end = max([size_of_headers] + [va + min(vsize or raw, raw) for vsize, va, raw, _p in secs if raw])
+        if len(blob) - off < min(mapped_end, size_of_image):
+            return None  # the region holds only part of the image (a header copy)
         img = bytearray(blob[off:off + size_of_image].ljust(size_of_image, b"\x00"))
         p = lfanew
         opt_size = struct.unpack_from("<H", img, p + 20)[0]
@@ -454,6 +495,17 @@ def _as_int(v: Any) -> int | None:
     return None
 
 
+def _count(v: Any) -> int:
+    """A non-negative count from the runner, clamped; 0 for anything else."""
+    return min(v, MAX_COUNT) if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
+
+def _addr(v: Any) -> str | None:
+    """An address or code from the runner as ``0x`` hex, or None."""
+    n = _as_int(v)
+    return f"{n:#x}" if n is not None and 0 <= n < 1 << 64 else None
+
+
 def _source(tag: str) -> str:
     """``VirtualAlloc`` from ``api.VirtualAlloc.0x50000``; ``module`` for the stub's own image."""
     if tag == "module":
@@ -468,17 +520,20 @@ def _stop(error: Any) -> str:
     return "exception"
 
 
-def _api_rows(apis: list[Any]) -> tuple[list[dict[str, Any]], list[str], list[tuple[str, str]], int]:
-    """``(per-API summary rows, every distinct API, (api, string arg) pairs, injection API calls)``;
-    both lists keep first-call order."""
+def _api_rows(apis: list[Any]) -> tuple[list[dict[str, Any]], list[str], list[tuple[str, str]], int,
+                                         Counter[str], list[dict[str, Any]]]:
+    """``(per-API summary rows, every distinct API, (api, string arg) pairs, injection API calls,
+    calls per API, every call as {"api"[, "args"]})``; the lists keep call order."""
     order: list[str] = []
     counts: Counter[str] = Counter()
+    calls: list[dict[str, Any]] = []
     samples: dict[str, list[list[str]]] = {}
     strings: list[tuple[str, str]] = []
     seen_strings: set[tuple[str, str]] = set()
     injection = 0
     for ev in apis:
         if not isinstance(ev, dict) or not isinstance(ev.get("n"), str):
+            calls.append({"api": "?"})  # keeps the entry points' call counts aligned
             continue
         name = _short(ev["n"], 96)
         if name not in counts:
@@ -497,6 +552,7 @@ def _api_rows(apis: list[Any]) -> tuple[list[dict[str, Any]], list[str], list[tu
             if (name, display) not in seen_strings and len(seen_strings) < 4096:
                 seen_strings.add((name, display))
                 strings.append((name, display))
+        calls.append({"api": name, "args": args[:MAX_ARGS]} if args else {"api": name})
         if category(name) in _ARG_CATEGORIES:
             sample = [_short(d, ARG_TEXT) for _t, d in args[:MAX_ARGS]]
             bucket = samples.setdefault(name, [])
@@ -508,7 +564,7 @@ def _api_rows(apis: list[Any]) -> tuple[list[dict[str, Any]], list[str], list[tu
         if name in samples:
             row["args"] = samples[name]
         rows.append(row)
-    return rows, order, strings, injection
+    return rows, order, strings, injection, counts, calls
 
 
 def manual_resolution(called: Iterable[str], imported: list[str] | None,
@@ -534,6 +590,12 @@ def shape(doc: dict[str, Any], scan_dir: Path, work: Path, *, input_sha256: str,
     under ``scan_dir``. Carved files go under ``work``. Everything the runner wrote is treated
     as hostile: types are checked, names validated, sizes capped."""
     ev: dict[str, Any] = {"status": "ok", "triggers": list(triggers)}
+    if isinstance(doc.get("fatal"), str):  # the emulator process died: the runner's parent says how
+        ev["status"] = _FATAL_STATUS.get(doc["fatal"], "failed")
+        if ev["status"] == "budget":
+            ev["stop"] = "budget"
+        ev["stop_detail"] = _short(doc["error"] if isinstance(doc.get("error"), str) else doc["fatal"], 200)
+        return Emulation(ev)
     if isinstance(doc.get("arch"), str):
         ev["arch"] = _short(doc["arch"], 16)
     if isinstance(doc.get("dll"), bool):
@@ -544,12 +606,16 @@ def shape(doc: dict[str, Any], scan_dir: Path, work: Path, *, input_sha256: str,
         if not isinstance(ep, dict):
             continue
         err = ep.get("error")
-        row = {"type": _short(ep.get("type") if isinstance(ep.get("type"), str) else "?", 96),
-               "stop": _stop(err if isinstance(err, str) or err is None else "?")}
+        row: dict[str, Any] = {"type": _short(ep.get("type") if isinstance(ep.get("type"), str) else "?", 96),
+                               "stop": _stop(err if isinstance(err, str) or err is None else "?")}
         if row["stop"] == "exception" and isinstance(err, str):
-            row["detail"] = _short(err, 64)
+            code, pc, addr = _addr(ep.get("code")), _addr(ep.get("pc")), _addr(ep.get("addr"))
+            row["detail"] = _short(err, 64) + (f" {code}" if code else "") + (f" at {pc}" if pc else "") \
+                + (f" (address {addr})" if addr else "")
         elif row["stop"] == "unsupported_api" and isinstance(ep.get("api"), str):
             row["detail"] = _short(ep["api"], 96)
+        if isinstance(ep.get("calls"), int) and not isinstance(ep["calls"], bool) and ep["calls"] >= 0:
+            row["calls"] = _count(ep["calls"])
         eps.append(row)
     ev["entry_points"] = eps[:STATE_ENTRY_POINTS]
     stops = [e["stop"] for e in eps]
@@ -565,11 +631,45 @@ def shape(doc: dict[str, Any], scan_dir: Path, work: Path, *, input_sha256: str,
         ev["stop"] = stop
 
     raw_apis = doc.get("apis")
-    rows, called, strings, injection = _api_rows(raw_apis if isinstance(raw_apis, list) else [])
+    rows, called, strings, injection, counts, calls = _api_rows(raw_apis if isinstance(raw_apis, list) else [])
     total = doc.get("apis_total")
     ev["apis_total"] = total if isinstance(total, int) and not isinstance(total, bool) and total >= 0 else 0
     ev["apis_distinct"] = len(called)
     ev["apis"] = rows
+    top = counts.most_common(STATE_TOP_APIS)
+    if top:
+        ev["apis_top"] = [{"api": a, "count": n} for a, n in top]
+    if stop == "api_limit" and top:
+        ev["stop_detail"] = _short("most calls: " + ", ".join(f"{a} x{n}" for a, n in top[:4]), 200)
+    last = _last_calls(eps, calls, stop)
+    if last is not None:
+        ev["last_calls"] = last
+    stubbed = []
+    raw_stubbed = doc.get("stubbed")
+    for row in raw_stubbed if isinstance(raw_stubbed, list) else []:
+        if isinstance(row, dict) and isinstance(row.get("n"), str) and _short(row["n"], 96) not in stubbed:
+            stubbed.append(_short(row["n"], 96))
+    if stubbed:
+        ev["stubbed_apis"], ev["stubbed_apis_total"] = stubbed[:STATE_STUBBED], len(stubbed)
+    if _count(doc.get("sleep_ms")):
+        ev["sleep_ms"] = _count(doc["sleep_ms"])
+    faults = []
+    raw_faults = doc.get("faults")
+    for f in raw_faults if isinstance(raw_faults, list) else []:
+        if not isinstance(f, dict) or _addr(f.get("code")) is None or _addr(f.get("pc")) is None:
+            continue
+        fault: dict[str, Any] = {"code": _addr(f["code"]), "pc": _addr(f["pc"])}
+        if _addr(f.get("addr")) is not None:
+            fault["address"] = _addr(f["addr"])
+        fault["handled"] = f.get("handled") is True
+        if fault["handled"] and f.get("by") in _FAULT_BY:
+            fault["by"] = f["by"]
+        faults.append(fault)
+    if faults:
+        ev["faults"] = faults[:STATE_FAULTS]
+        ev["faults_total"] = max(_count(doc.get("faults_total")), len(faults))
+    if _count(doc.get("vectored")):
+        ev["vectored_exceptions"] = _count(doc["vectored"])
 
     events = []
     raw_events = doc.get("events")
@@ -581,7 +681,10 @@ def shape(doc: dict[str, Any], scan_dir: Path, work: Path, *, input_sha256: str,
         row = {_short(k, 32): _short(v, MAX_TEXT) for k, v in list(e.items())[:8]
                if isinstance(k, str) and isinstance(v, str)}
         events.append(row)
-        for k in ("server", "query", "path", "cmdline", "url"):
+        if e["event"] == "hard_error" and stop == "exit" and "stop_detail" not in ev:
+            ev["stop_detail"] = _short("exit after a hard-error message box" + (f" {row['status']}" if "status" in row else "")
+                                       + (f": {row['text']}" if "text" in row else ""), 200)
+        for k in ("server", "query", "path", "cmdline", "url", "text"):
             v = e.get(k)
             if isinstance(v, str) and len(v) >= 4 and (e["event"], v) not in strings:
                 strings.append((e["event"], v))
@@ -604,6 +707,11 @@ def shape(doc: dict[str, Any], scan_dir: Path, work: Path, *, input_sha256: str,
             decoys.add(d["sha256"])
 
     captures, dropped = _captures(doc.get("regions"), scan_dir, work, input_sha256, decoys)
+    skipped = doc.get("regions_skipped")
+    for k in ("duplicate", "capped"):  # what the runner did not write
+        n = _count(skipped.get(k)) if isinstance(skipped, dict) else 0
+        if n:
+            dropped[k] = min(dropped.get(k, 0) + n, MAX_COUNT)
     ev["captures"] = []  # filled by the caller once members are numbered (Capture.row)
     if dropped:
         ev["captures_dropped"] = dropped
@@ -627,10 +735,43 @@ def shape(doc: dict[str, Any], scan_dir: Path, work: Path, *, input_sha256: str,
     if manual:
         concealment.append("manual_api_resolution")
         ev["unimported_apis"] = manual[:32]
+    by_function: Counter[str] = Counter()
+    for api, n in counts.items():
+        by_function[api.rsplit(".", 1)[-1].lower()] += n
+    if min(sum(by_function[f] for f in _SLEEPS), sum(by_function[f] for f in _CLOCKS)) >= DELAY_LOOP_CALLS:
+        concealment.append("delay_loop")
     ev["concealment"] = concealment
     fit(ev)
     ioc_strings = [(f"emulation:{a}", v) for a, v in strings]
     return Emulation(ev, captures, ioc_strings)
+
+
+def _last_calls(eps: list[dict[str, Any]], calls: list[dict[str, Any]], stop: str | None) -> dict[str, Any] | None:
+    """The final API calls of the entry point that set ``stop`` (for a clean exit: the module
+    entry point, else the last one that made a call), from the runner's flat call list and the
+    entry points' call counts. None when the counts do not add up to the list."""
+    spans: list[tuple[dict[str, Any], int, int]] = []
+    at = 0
+    for ep in eps:
+        n = ep.get("calls")
+        if not isinstance(n, int) or at + n > len(calls):
+            return None
+        spans.append((ep, at, at + n))
+        at += n
+    with_calls = [s for s in spans if s[2] > s[1]]
+    if stop == "exit":
+        pick = next((s for s in with_calls if s[0]["type"] == "module_entry"), with_calls[-1] if with_calls else None)
+    else:
+        pick = next((s for s in with_calls if s[0]["stop"] == stop), None)
+    if pick is None:
+        return None
+    rows = []
+    for call in calls[max(pick[1], pick[2] - STATE_LAST_CALLS):pick[2]]:
+        row: dict[str, Any] = {"api": call["api"]}
+        if call.get("args"):
+            row["args"] = [_short(d, ARG_TEXT) for _t, d in call["args"]]
+        rows.append(row)
+    return {"entry_point": pick[0]["type"], "calls": rows}
 
 
 def fit(ev: dict[str, Any], limit: int = MAX_EVIDENCE_BYTES) -> None:
@@ -647,6 +788,9 @@ def fit(ev: dict[str, Any], limit: int = MAX_EVIDENCE_BYTES) -> None:
         for k in ("apis", "strings", "events"):
             if len(ev.get(k, [])) > 1:
                 ev[k] = ev[k][: len(ev[k]) // 2]
+    if size() > limit:
+        for call in ev.get("last_calls", {}).get("calls", []):
+            call.pop("args", None)
     ev["truncated"] = True
 
 
@@ -713,6 +857,7 @@ def _captures(regions: Any, scan_dir: Path, work: Path, input_sha256: str,
         for off in offs:
             c = carve(blob, off, base, alloc)
             if c is None:
+                dropped["partial"] += 1
                 continue
             img = blob[off:off + c.identity[3]]
             if c.layout == "memory" and _sha(img) in decoys:
@@ -726,6 +871,9 @@ def _captures(regions: Any, scan_dir: Path, work: Path, input_sha256: str,
             code = blob.rstrip(b"\x00")
             if len(code) - code.count(0) < SHELLCODE_MIN_BYTES:
                 dropped["too_small"] += 1
+                continue
+            if code.count(code[0]) == len(code):  # one repeated byte: a fill pattern, not code
+                dropped["filler"] += 1
                 continue
             keep(code, Capture(Path(), _sha(code), len(code), "shellcode", src, region, executed, asked))
     return out, dict(dropped)
