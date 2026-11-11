@@ -83,6 +83,16 @@ def _short(text: Any, n: int = MAX_TEXT) -> str:
     return s if len(s) <= n else s[: n - 3] + "..."
 
 
+# Families whose rule matches a tool honest people also run (a remote-support product, a sandbox
+# checker): the match says the tool is there, not that the file is malware. Lower case.
+DUAL_USE = frozenset({"netsupport", "pafish"})
+
+
+def dual_use(name: Any) -> bool:
+    """Whether ``name`` (a match's ``family``) is a dual-use tool rather than a malware family."""
+    return isinstance(name, str) and name.strip().lower() in DUAL_USE
+
+
 def family(meta: Mapping[str, Any]) -> str:
     """The family a rule names: ``family`` / ``malware`` meta, else ``cape_type`` minus its kind word."""
     for key in ("family", "malware"):

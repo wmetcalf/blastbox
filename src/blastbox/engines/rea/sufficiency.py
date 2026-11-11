@@ -43,8 +43,8 @@ verify itself, and lists what is still missing (``gaps``):
 
 The three hidden-evidence gaps (``benign_hidden_payload``, ``benign_emulated_stage``,
 ``benign_installer_concealment``) also hold when the *model* read the sample as benign and the
-verdict rule (``verdict.py``) overrode it on that same concealment (``opinion``, known only for a
-report this pass wrote): the rule fixes the label, but the model has still not explained what is
+verdict rule (``verdict.py``) overrode it on that same concealment (``opinion``, carried in the
+continuation with the report it stands behind): the rule fixes the label, but the model has still not explained what is
 hidden, and the next pass should. ``benign_unexplored`` goes by the final label alone.
 
 IOC precision and dropped claims are not gaps: they measure the model's care, not what is left
@@ -154,12 +154,18 @@ def installer_concealment(sweep: dict[str, Any]) -> str:
 STALLING = frozenset({"delay_loop"})
 
 
+# A decompiler run's code counts as read on these statuses, given excerpts: a run cut short by its
+# clock or its size cap still left real C#; one that failed left whatever it left.
+DECOMPILE_READ = ("ok", "timeout", "too_large")
+
+
 def sample_decompiled(sweep: dict[str, Any]) -> bool:
     """Whether the sweep's decompiler read the analysed assembly itself (label ``sample``)."""
     decompiled = sweep.get("decompiled")
     images = decompiled.get("images") if isinstance(decompiled, dict) else None
     return isinstance(images, list) and any(
-        isinstance(i, dict) and i.get("label") == "sample" and bool(i.get("excerpts")) for i in images)
+        isinstance(i, dict) and i.get("label") == "sample" and isinstance(i.get("status"), str)
+        and i["status"] in DECOMPILE_READ and bool(i.get("excerpts")) for i in images)
 
 
 def _concealment(sweep: dict[str, Any]) -> list[str]:
@@ -183,7 +189,7 @@ def facts_of(report: dict[str, Any] | None, functions: list[dict[str, Any]],
 
 def assess(*, report: dict[str, Any] | None, sweep: dict[str, Any], explored: list[str],
            program_functions: list[str] | None = None, opinion: str | None = None) -> Sufficiency:
-    """``opinion``: the model's own call in ``report`` when this pass wrote it (``verdict.py``)."""
+    """``opinion``: the model's own call behind ``report``, before the verdict rule (``verdict.py``)."""
     gaps: list[Gap] = []
     if not isinstance(report, dict):
         gaps.append(Gap("no_report", "no valid analysis report has been written yet"))

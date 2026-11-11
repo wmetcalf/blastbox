@@ -176,6 +176,7 @@ from blastbox.engines.rea.gostrings import clip_overruns, exact_iocs, go_strings
 from blastbox.engines.rea.icons import extract_icons
 from blastbox.engines.rea.iocs import Ioc, extract_iocs, utf16le_urls
 from blastbox.engines.rea.prompts import evidence_sources
+from blastbox.engines.rea.sufficiency import DECOMPILE_READ
 from blastbox.engines.rea.triage import packed, unsupported_arch, upx_marked
 from blastbox.engines.rea.runner import (
     INSPECT_MAP,
@@ -218,8 +219,6 @@ DECOMPILE_STAGES_S = 120.0  # ... on the recovered .NET stages together
 MAX_DECOMPILE_STAGES = 3
 DECOMPILE_CHARS = 30_000  # the assembly's C# digest in the model's evidence, in JSON characters
 DECOMPILE_STAGE_CHARS = 10_000  # ... each recovered stage's
-# The assembly's code counts as read (and Ghidra is skipped) on these statuses, given excerpts.
-DECOMPILE_READ = ("ok", "timeout", "too_large")
 DEFAULT_DOTNET_PYTHON = "/opt/capa/bin/python"  # the capa venv carries the hash-locked dnfile
 DOTNET_MAX_KB = 2 * 1024 * 1024
 MAX_DOTNET_JSON = 4 * 1024 * 1024
@@ -228,7 +227,8 @@ STATE_RESOURCES = 32  # resources (and entries per container) carried in the con
 _SCAN_FILE = re.compile(r"(?:hidden|decoded)-[0-9]{1,4}\.bin")
 _DECODED = re.compile(r"(?:image:(?:col|row)-(?:rgb|bgr|rgba|bgra|argb)(?:\+len)?/)?"
                       r"(?:plain|gzip|zlib|deflate|base64|xor:0x(?:[0-9a-f]{2}){1,30})")
-_IMAGE = re.compile(r"(?:png|bmp) [0-9]{1,5}x[0-9]{1,5}")
+# Either side may be all of dotnet_resources.MAX_IMAGE_PIXELS (one row of 4,194,304): 7 digits.
+_IMAGE = re.compile(r"(?:png|bmp) [0-9]{1,7}x[0-9]{1,7}")
 # The installer's whole extracted tree (bytes, entries), before the members caps apply.
 MAX_INSTALLER_BYTES = 512 * 1024 * 1024
 MAX_INSTALLER_FILES = 4096
@@ -982,6 +982,8 @@ class ReaSweepEngine:
         shutil.rmtree(scan_dir, ignore_errors=True)
         evidence = {"resources_total": num(doc.get("resources_total"), int), "resources": rows,
                     "loader_refs": [text(r) for r in refs[:32] if isinstance(r, str)], "hidden_payloads": hidden}
+        if unread > 0:  # the verdict rule (verdict.py) will not call the program benign over these
+            evidence["images_unread"] = min(unread, dotnet_resources.MAX_RESOURCES * dotnet_resources.MAX_ENTRIES)
         return evidence, paths
 
     def _decompile(self, sample: Path, resources: dict[str, Any] | None, members_dir: Path, job: Path,
@@ -1011,7 +1013,8 @@ class ReaSweepEngine:
             if d.status != "ok":
                 warnings.append(Warning(code=f"decompile_{d.status}",
                                         message=_short(f"{label}: {d.reason or d.status}", 1000)))
-            digest = dotnet_decompile.digest(d, label=label, budget_chars=chars)
+            digest = dotnet_decompile.digest(d, label=label, budget_chars=chars,
+                                             deadline=time.monotonic() + dotnet_decompile.DIGEST_S)
             if digest is not None:
                 images.append(digest)
                 strings.extend((source, s) for s in d.literals)
@@ -1115,6 +1118,11 @@ class ReaSweepEngine:
         try:
             em = emulate.shape(doc, scan, job / "captures", input_sha256=_sha256(sample), triggers=reasons,
                                imported=emulate.imports(sample))
+        except Exception as exc:  # what the run left is the sample's to shape; reading it fails only this stage
+            shutil.rmtree(job / "captures", ignore_errors=True)
+            why = f"reading the run's output: {type(exc).__module__}.{type(exc).__name__}"
+            warnings.append(Warning(code="emulation_failed", message=f"emulation: {why}; analysing the stub"))
+            return {**evidence, "stop_detail": why}, [], None, None, []
         finally:
             shutil.rmtree(scan, ignore_errors=True)
         evidence = em.evidence

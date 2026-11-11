@@ -121,10 +121,16 @@ def test_an_evidence_only_report_leaves_the_code_unread():
               "sections": [{"key": "network", "status": "observed"}]}
     assert [g.code for g in assess(report=report, sweep={}, explored=[]).gaps] == ["code_unread"]
     # Decompiler output stands in for the disassembly: the usual bar applies.
-    image = {"label": "sample", "excerpts": [{"type": "Stub", "member": "Main", "why": [], "code": "x"}]}
-    assert assess(report=report, sweep={"decompiled": {"images": [image]}}, explored=[]).met
-    # ... but only for the assembly itself: a recovered stage's code, or an outline alone, does not.
-    for images in ([{**image, "label": "stage Inner.dll (member-2)"}], [{**image, "excerpts": []}], "x", [None]):
+    image = {"label": "sample", "status": "ok",
+             "excerpts": [{"type": "Stub", "member": "Main", "why": [], "code": "x"}]}
+    for status in ("ok", "timeout", "too_large"):  # a partial tree still holds real C#
+        assert assess(report=report, sweep={"decompiled": {"images": [{**image, "status": status}]}}, explored=[]).met
+    # ... but only for the assembly itself: a recovered stage's code, or an outline alone, does not;
+    # nor does whatever a decompiler that failed left behind.
+    unstated = {k: v for k, v in image.items() if k != "status"}
+    for images in ([{**image, "label": "stage Inner.dll (member-2)"}], [{**image, "excerpts": []}], "x", [None],
+                   [{**image, "status": "failed"}], [{**image, "status": "unavailable"}], [{**image, "status": 1}],
+                   [unstated]):
         got = assess(report=report, sweep={"decompiled": {"images": images}}, explored=[])
         assert [g.code for g in got.gaps] == ["code_unread"], images
     assert assess(report={**report, "basis": None}, sweep={}, explored=[]).met

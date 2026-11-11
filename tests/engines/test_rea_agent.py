@@ -1876,6 +1876,57 @@ def test_a_benign_reading_of_a_concealing_stub_is_overridden_and_owes_the_next_p
     assert "benign_emulated_stage" in f["gaps"] and f["bar_met"] is False
 
 
+def test_a_benign_call_from_a_pass_that_read_no_code_is_not_sealed_benign(tmp_path, monkeypatch):
+    """A function pass whose model answers at once has read nothing: the entry point is citable
+    only because the engine listed it. Benign needs code read."""
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    cont = make_continuation(tmp_path, todo=[], explored=[], sweep={"kind": "pe"})
+    final = {"summary": "A harmless updater.", "functions": [], "iocs": [], "todo": [], "done": True}
+    sections = {k: _section() for k in prompts.REPORT_KEYS}
+    sections["overview"] = _section("observed", "A harmless updater.", [], "Overview")
+    sections["execution_flow"] = _section("observed", "Starts at its entry point.", [
+        {"address": FN_MAIN, "function": "entry", "note": "start"}])
+    report = {"verdict": {"label": "benign", "grounds": [], "rationale": "nothing hostile"}, "sections": sections}
+    rig = McpRig(tmp_path, {"procedure_info": {"text": json.dumps(
+        {"normalized_result": {"name": "entry", "entrypoint": FN_MAIN}})}})
+    res, out = run(tmp_path, cont, FakeModel([answer(final), answer(report)]), rig)
+    f = res.payload.fields
+    assert f["tool_calls"] == 0 and f["explored_count"] == 0
+    verdict = json.loads(f["analysis_report"])["verdict"]
+    assert (verdict["label"], verdict["confidence"]) == ("unknown", "low")
+    assert verdict["rationale"].startswith("Rule: unknown/low; a benign call needs the program's code read")
+    assert f["bar_met"] is False
+
+
+def _second_pass(tmp_path, cont, report_resp):
+    final = {"summary": "Reads its config.", "functions": [
+        {"address": "0x140001500", "name": "FUN_140001500", "claim": "reads a config file", "evidence": ["t1"]}],
+        "iocs": [], "todo": [], "done": True}
+    model = FakeModel([tc(("procedure_pseudo_code", {"procedure": "0x140001500"}, "a")), answer(final), report_resp])
+    res, _out = run(tmp_path, cont, model, McpRig(tmp_path, {"procedure_pseudo_code": {"text": DECOMP}}))
+    return res.payload.fields
+
+
+@pytest.mark.parametrize("second", ["failed", "invalid", "benign"])
+def test_the_gap_an_overridden_benign_reading_left_outlives_a_pass_that_writes_no_report(
+        tmp_path, monkeypatch, second):
+    """The rule sealed suspicious over a benign reading and the hidden stage is still unexplained.
+    A next pass whose report call fails (or is invalid) is measured on that report: the model's
+    own call must come with it, or the label alone meets the bar."""
+    sweep = {"emulation": {"status": "ok", "concealment": ["exec_alloc", "dynamic_code"]}}
+    first = tmp_path / "p1"
+    first.mkdir()
+    res, out, _m = _report_run(first, monkeypatch, answer(_report()), sweep=sweep)
+    assert "benign_emulated_stage" in res.payload.fields["gaps"]
+    resp = {"failed": ModelError("malformed", "invalid_json"),
+            "invalid": answer(_report(sections={"overview": _section("seen", "x")})),
+            "benign": answer(_report())}[second]
+    nxt = tmp_path / "p2"
+    nxt.mkdir()
+    f = _second_pass(nxt, out / "continuation.tar.gz", resp)
+    assert "benign_emulated_stage" in f["gaps"] and f["bar_met"] is False and f["stop_reason"] != "bar_met"
+
+
 def test_an_invalid_report_records_no_verdict_rule_event(tmp_path, monkeypatch):
     bad = _report(verdict={"label": "evil", "grounds": [], "rationale": "x"})
     res, out, _m = _report_run(tmp_path, monkeypatch, answer(bad))
@@ -2307,11 +2358,13 @@ def test_evidence_only_pass_never_meets_the_bar_without_code(tmp_path, monkeypat
     res, _o, _m, _r = _ev_run(tmp_path, monkeypatch, answer(_ev_report()), status="failed")
     f = res.payload.fields
     assert f["stop_reason"] == "evidence_only" and f["bar_met"] is False and f["gaps"] == ["code_unread"]
-    # The model's ground cites a source the sweep holds, so the rule takes it.
+    # The model's ground cites a source the sweep holds, so the rule takes it; but it is the model's
+    # alone, and the model itself called the sample suspicious, so the label goes no higher.
     verdict = json.loads(f["analysis_report"])["verdict"]
-    assert (verdict["label"], verdict["confidence"]) == ("malicious", "medium")
-    assert verdict["rationale"] == ("Rule: malicious/medium on download execute (iocs). Model's call: suspicious.\n"
-                                    "an installer with a URL")
+    assert (verdict["label"], verdict["confidence"]) == ("suspicious", "medium")
+    assert verdict["rationale"] == (
+        "Rule: suspicious/medium, not malicious (the model's call was suspicious and no engine ground is "
+        "hostile), on download execute (iocs).\nan installer with a URL")
     assert "failed" in next(w.message for w in res.warnings if w.code == "evidence_only")
 
 
@@ -2394,6 +2447,58 @@ def test_sealed_evidence_report_round_trips_and_rejects_what_it_should():
         validate_report({**_ev_wire(), "basis": "vibes"}, 1, None)
     with pytest.raises(ReportInvalid):
         validate_report(_ev_wire(), 1, None, basis="vibes")
+
+
+def test_an_over_long_evidence_annotation_is_cut_to_its_cap_not_fatal():
+    # Live: one 201-character evidence note cost an evidence-only pass its whole report.
+    wire = _ev_wire()
+    wire["sections"]["overview"]["title"] = "T" * (prompts.REPORT_TITLE + 1)
+    wire["sections"]["network"]["evidence"] = [
+        {"source": "iocs", "item": "http://evil.example/" + "a" * 200, "note": "n" * (prompts.REPORT_NOTE + 1)}]
+    wire["sections"]["execution_flow"] = _section("observed", "x", [
+        {"address": FN_MAIN, "function": "f" * (prompts.REPORT_FUNCTION + 1), "note": "  " + "word " * 60}])
+    v = validate_report(wire, 1, None, basis="evidence")
+    secs = {s["key"]: s for s in v.report["sections"]}
+    row = secs["network"]["evidence"][0]
+    assert row["note"] == "n" * (prompts.REPORT_NOTE - 1) + "…"
+    assert len(row["item"]) == prompts.REPORT_ITEM and row["item"].startswith("http://evil.example/aaa")
+    assert row["item"].endswith("a…")
+    assert secs["overview"]["title"] == "T" * (prompts.REPORT_TITLE - 1) + "…"
+    row = secs["execution_flow"]["evidence"][0]
+    assert row["function"] == "f" * (prompts.REPORT_FUNCTION - 1) + "…"
+    assert len(row["note"]) <= prompts.REPORT_NOTE and row["note"].endswith("word…")
+    again = validate_report(v.report, 1, None)  # the cut report is a valid sealed one
+    assert again.report == v.report
+    # At the cap: untouched.
+    wire["sections"]["network"]["evidence"] = [{"source": "iocs", "note": "n" * prompts.REPORT_NOTE}]
+    v = validate_report(wire, 1, None, basis="evidence")
+    assert v.report["sections"][3]["key"] == "network"
+    assert v.report["sections"][3]["evidence"][0]["note"] == "n" * prompts.REPORT_NOTE
+    # Still fatal: an annotation that is not a string, and over-long prose (the report's substance).
+    for evidence in ([{"source": "iocs", "note": 7}], [{"source": "iocs", "item": ["x"]}],
+                     [{"address": FN_MAIN, "function": 7}]):
+        bad = _ev_wire()
+        bad["sections"]["network"]["evidence"] = evidence
+        with pytest.raises(ReportInvalid):
+            validate_report(bad, 1, None, basis="evidence")
+    bad = _ev_wire()
+    bad["sections"]["network"]["text"] = "x" * (prompts.REPORT_TEXT + 1)
+    with pytest.raises(ReportInvalid):
+        validate_report(bad, 1, None, basis="evidence")
+    bad = _ev_wire()
+    bad["sections"]["network"]["title"] = 7
+    with pytest.raises(ReportInvalid):
+        validate_report(bad, 1, None, basis="evidence")
+
+
+def test_evidence_only_pass_keeps_its_report_when_a_note_runs_long(tmp_path, monkeypatch):
+    rep = _ev_report()
+    rep["sections"]["network"]["evidence"][0]["note"] = "n" * (prompts.REPORT_NOTE + 1)
+    res, _out, _m, _r = _ev_run(tmp_path, monkeypatch, answer(rep))
+    f = res.payload.fields
+    assert f["model_status"] == "ok" and "report_invalid" not in _codes(res)
+    secs = {s["key"]: s for s in json.loads(f["analysis_report"])["sections"]}
+    assert secs["network"]["evidence"][0]["note"] == "n" * (prompts.REPORT_NOTE - 1) + "…"
 
 
 def test_evidence_sources_ignore_scans_that_found_nothing():

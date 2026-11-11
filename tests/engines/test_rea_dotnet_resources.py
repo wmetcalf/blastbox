@@ -423,8 +423,30 @@ def test_images_past_the_time_budget_are_counted_not_read(tmp_path, monkeypatch)
     state.consider(carrier, dr.entropy(carrier), "r", "dzh", 0)
     assert state.hidden == [] and state.images_unread == 1
     doc = {"resources_total": 1, "resources": [], "loader_refs": [], "hidden": [], "images_unread": 3}
-    res, _out = _drun(DLL, tmp_path, FakeDotnet(doc=doc))
+    res, out = _drun(DLL, tmp_path, FakeDotnet(doc=doc))
     assert any(w.code == "dotnet_resources_failed" and "3 image" in w.message for w in res.warnings)
+    # ... and the evidence says so: the verdict rule will not call the program benign over them.
+    _s, _p, state = unpack(out / "continuation.tar.gz", tmp_path / "cont", max_bytes=1 << 30)
+    assert state.sweep["dotnet_resources"]["images_unread"] == 3
+
+
+def test_a_scan_that_read_every_image_says_nothing_of_unread_ones(tmp_path):
+    _res, out = _drun(DLL, tmp_path, FakeDotnet())
+    _s, _p, state = unpack(out / "continuation.tar.gz", tmp_path / "cont", max_bytes=1 << 30)
+    assert "images_unread" not in state.sweep["dotnet_resources"]
+
+
+def test_the_sweep_keeps_the_dimensions_of_the_widest_image_the_scanner_reads(tmp_path):
+    """One row of MAX_IMAGE_PIXELS pixels is a 7-digit width: the scanner reads it, so the sweep
+    must not drop its ``image`` (the pixel-hidden-executable ground and the prompts key on it)."""
+    wide = f"png {dr.MAX_IMAGE_PIXELS}x1"
+    assert sw._IMAGE.fullmatch(wide) and not sw._IMAGE.fullmatch(f"png {dr.MAX_IMAGE_PIXELS * 10}x1")
+    hidden = {"resource": "r.resources", "entry": "pic", "size": 300_000, "entropy": 7.9, "image": wide,
+              "noise": 7.9}
+    doc = {"resources_total": 1, "resources": [], "loader_refs": [], "hidden": [hidden]}
+    _res, out = _drun(DLL, tmp_path, FakeDotnet(doc=doc))
+    _s, _p, state = unpack(out / "continuation.tar.gz", tmp_path / "cont", max_bytes=1 << 30)
+    assert state.sweep["dotnet_resources"]["hidden_payloads"][0]["image"] == wide
 
 
 def test_user_typed_entries_are_read_from_the_container_data_section():

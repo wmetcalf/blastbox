@@ -87,6 +87,13 @@ least ``MODULE_MIN_CHANGED`` bytes of its code or empty sections (an in-place un
 with the same bytes are written once (``copies``), PE-bearing and executed ones first.
 Speakeasy's own decoy system modules are never written; their image hashes go to ``decoys`` so
 the engine can drop a sample's copy of one. Every count and size is capped.
+
+Not seen (a known limit, measured against Speakeasy 2.0.0b9 with benign synthetic stubs): code a
+stub decodes into heap memory (``HeapAlloc``/``malloc``) or into an initialised writable section
+of its own image, and then runs. Speakeasy maps the heap executable, so no protect call is made,
+and it records dynamic code only for ``VirtualAlloc`` buffers; the ``module`` count covers only
+executable and empty sections. Such a run exits cleanly with no region, no dynamic-code row and
+no capture, so a quiet emulation is not evidence that nothing was unpacked.
 """
 
 from __future__ import annotations
@@ -152,12 +159,40 @@ def pe_image_size(data: bytes, off: int = 0) -> int | None:
         return None
 
 
+PE_MAX_SECTIONS = 96  # triage.MAX_SECTIONS
+PE_MAX_IMAGE = 256 * 1024 * 1024  # emulate.MAX_IMAGE
+
+
+def _pe_header(data: bytes, off: int) -> bool:
+    """Whether a PE header the engine would carve sits at ``off``: the engine's own tests (its
+    ``emulate._headers``), repeated because this file stands alone; a test holds the two together.
+    A page that only carries the two signatures is not one, and must not outrank a region that ran."""
+    try:
+        (lfanew,) = struct.unpack_from("<I", data, off + 0x3C)
+        p = off + lfanew
+        if not 0x40 <= lfanew <= 0x1000 or data[p:p + 4] != b"PE\x00\x00":
+            return False
+        (nsec,) = struct.unpack_from("<H", data, p + 6)
+        opt_size, magic = struct.unpack_from("<H", data, p + 20)[0], struct.unpack_from("<H", data, p + 24)[0]
+        if magic not in (0x10B, 0x20B) or not 1 <= nsec <= PE_MAX_SECTIONS:
+            return False
+        if opt_size < (112 if magic == 0x20B else 96):
+            return False
+        size_of_image, size_of_headers = struct.unpack_from("<II", data, p + 24 + 56)
+        if not 0 < size_of_headers <= size_of_image <= PE_MAX_IMAGE:
+            return False
+        table = lfanew + 24 + opt_size
+        if table + 40 * nsec > size_of_headers:
+            return False
+        struct.unpack_from("<IIII", data, off + table + 40 * (nsec - 1) + 8)  # the table is in the region
+        return True
+    except struct.error:
+        return False
+
+
 def has_pe(data: bytes, page: int = 0x1000) -> bool:
-    """An MZ/PE header at the start of ``data`` or of any page in it."""
-    for off in range(0, len(data), page):
-        if data[off:off + 2] == b"MZ" and pe_image_size(data, off) is not None:
-            return True
-    return False
+    """A PE header at the start of ``data`` or of any page in it."""
+    return any(data[off:off + 2] == b"MZ" and _pe_header(data, off) for off in range(0, len(data), page))
 
 
 def code_spans(data: bytes) -> list[tuple[int, int]]:

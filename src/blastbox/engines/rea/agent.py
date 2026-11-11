@@ -923,6 +923,7 @@ class ReaAgentEngine:
             facts=facts,
             gaps=p.gaps if p.assessed else list(state.gaps),
             program_functions=p.program_functions[:MAX_PROGRAM_FUNCTIONS],
+            opinion=p.opinion if p.report is not None else state.opinion,
         )
         transcript_reserve = min(MAX_TRANSCRIPT_BYTES, limits.max_artifact_bytes)
         if p.model_status == "ok" and p.assessed:
@@ -1468,8 +1469,11 @@ class ReaAgentEngine:
             if isinstance(obj, dict):
                 obj.pop("basis", None)  # the engine, not the model, says what the report rests on
             # The verdict rule: the model's call and grounds in, the wire verdict out (verdict.py).
+            # ... benign only over code that was read: the sweep's decompiler read the assembly, or
+            # (a function pass) this chain has opened at least one function.
+            code_read = sample_decompiled(p.sweep) or (not sources and bool(p.explored))
             decision = apply_verdict_rule(obj, sweep=p.sweep, known=known, sources=sources or (),
-                                          code_read=not sources or sample_decompiled(p.sweep))
+                                          code_read=code_read)
             try:
                 v = validate_report(obj, p.pass_no, known, sources=sources or (),
                                     basis=REPORT_BASIS if sources else None)
@@ -1605,8 +1609,9 @@ class ReaAgentEngine:
         front of the todo list. The model's ``done`` flag is recorded but decides nothing.
         """
         report = p.report if p.report is not None else p.prior_report
+        # A pass that wrote no report is measured on the carried one, with the call behind it.
         suff = assess(report=report, sweep=p.sweep, explored=p.explored, program_functions=p.program_functions,
-                      opinion=p.opinion if p.report is not None else None)
+                      opinion=p.opinion if p.report is not None else state.opinion)
         known = set(state.facts)
         new = [f for f in _dedup(facts_of(report, p.functions, p.iocs)) if f not in known]
         max_passes = _env_int("REA_MAX_PASSES", DEFAULT_MAX_PASSES, 1, MAX_STEPS_CEILING)

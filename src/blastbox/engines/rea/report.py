@@ -18,8 +18,12 @@ instead), a piece of the sweep's evidence: ``source`` is one of ``prompts.EVIDEN
 
 Rules (the interface, docs/.../g3-interface.md in Loadout):
 
-- A shape violation (unknown enum, over-long string, more than ``REPORT_EVIDENCE`` entries, a
-  malformed address, a missing field, a repeated or unknown key) rejects the whole report.
+- A shape violation (unknown enum, over-long rationale or section text, more than
+  ``REPORT_EVIDENCE`` entries, a malformed address, a missing field, a repeated or unknown key)
+  rejects the whole report.
+- An over-long annotation (a section title, or an evidence row's ``function``, ``item`` or
+  ``note``) is cut to its cap and ends in ``…``: live, one 201-character note cost a pass its
+  whole report.
 - Every key appears once, in ``REPORT_KEYS`` order; a missing one is filled as ``not_analysed``.
 - An evidence address the pass has not seen (``known``) is dropped, not fatal, and so is a row
   citing a source the sweep evidence does not hold (``sources``). A section left
@@ -83,6 +87,14 @@ def _str(value: Any, cap: int, what: str) -> str:
     if not isinstance(value, str) or len(value) > cap:
         raise ReportInvalid(f"{what}: not a string of at most {cap} chars")
     return _C0.sub(" ", value).strip()
+
+
+def _cut(value: Any, cap: int, what: str) -> str:
+    """An annotation: cleaned like :func:`_str`, but an over-long one is cut to ``cap``, not fatal."""
+    if not isinstance(value, str):
+        raise ReportInvalid(f"{what}: not a string")
+    text = _C0.sub(" ", value[:4 * cap]).strip()
+    return text if len(text) <= cap else text[:cap - 1].rstrip() + "…"
 
 
 def _norm(addr: str) -> str:
@@ -153,7 +165,7 @@ def validate_report(obj: Any, pass_no: int, known: set[str] | None, *,
         status = sec["status"]
         if status not in REPORT_STATUSES:
             raise ReportInvalid(f"{key}: status outside the enum")
-        title = _str(sec["title"], REPORT_TITLE, f"{key}.title")
+        title = _cut(sec["title"], REPORT_TITLE, f"{key}.title")
         if not title or title.lower().replace(" ", "_") == key:  # live: the model echoes the key
             title = REPORT_TITLES[key]
         text = _str(sec["text"], REPORT_TEXT, f"{key}.text")
@@ -178,7 +190,7 @@ def validate_report(obj: Any, pass_no: int, known: set[str] | None, *,
                 extra = (("function", REPORT_FUNCTION), ("note", REPORT_NOTE))
             for name, cap in extra:
                 if e.get(name) is not None:
-                    v = _str(e[name], cap, f"{key}.evidence.{name}")
+                    v = _cut(e[name], cap, f"{key}.evidence.{name}")
                     if v:
                         row[name] = v
             if by_source:

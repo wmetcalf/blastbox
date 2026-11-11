@@ -6,6 +6,7 @@ where the .NET runtime / ilspycmd are not installed (outside the worker image).
 """
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -648,3 +649,148 @@ def test_the_agent_is_told_when_ghidra_cut_its_analysis_short():
     msg = _first_message({"ghidra_analysis": "cut"})
     assert "cut short" in msg and "not evidence" in msg
     assert "cut short" not in _first_message({})
+
+
+# ------------------------------------------------------- hostile-size C# output
+
+
+class Clock:
+    """A clock that moves ``step`` seconds each time it is read."""
+
+    def __init__(self, step=1.0):
+        self.t, self.step = 0.0, step
+
+    def __call__(self):
+        self.t += self.step
+        return self.t
+
+
+@pytest.mark.parametrize("line,name", [
+    ("public delegate void Callback(int x);", "Callback"),
+    ("delegate void Bare();", "Bare"),
+    ("internal unsafe delegate int* Reader(byte* p);", "Reader"),
+    ("public delegate TResult Fn<in T, out TResult>(T arg);", "Fn"),
+    ("private delegate (int, string) Pair(int a);", "Pair"),
+    ("public delegate Dictionary<string, List<int>> Build(int n);", "Build"),
+    ('public const string K = "a delegate void b(";', None),  # a field whose text mentions one
+    ("public delegate void NoParens;", None),
+    ("public delegate void Unfinished(int x)", None),
+    ("public delegate a x< x< x< y(;", "y"),  # words with an unclosed "<" are passed over
+    ("public delegate a x< x< x< y;", None),
+    ("public delegate void " + "N" * dd.MAX_DECL_LINE + "(int x);", None),  # past the line cap
+])
+def test_a_delegate_line_names_the_type_it_declares(line, name):
+    assert dd._delegate_name(line) == name
+
+
+def test_long_lines_of_delegate_words_do_not_stall_the_parser():
+    lit = "x delegate " * 8000  # one 88 KB line: 18.7 s under the regex search this replaced
+    hostile = [T + "public delegate a " + "x< " * 1300 + ";"] * 300  # under the line cap, never closed
+    src = "\n".join(["namespace N", "{", T + "public class C", T + "{",
+                     T + T + f'public const string K = "{lit}";',
+                     T + T + "public delegate void Inner(int x);", T + "}", *hostile,
+                     T + "public delegate void After(int x);", "}", ""])
+    t0 = time.monotonic()
+    types, members, _ = dd.parse(src)
+    assert time.monotonic() - t0 < 3
+    assert {t.name: t.kind for t in types} == {"N.C": "class", "N.C.Inner": "delegate", "N.After": "delegate"}
+    assert _members(members)[("N.C", "<fields>")].code.startswith('public const string K = "x delegate')
+
+
+def _classes(n):
+    """``n`` one-method classes in ILSpy's layout (seven lines each)."""
+    out = ["namespace Many", "{"]
+    for i in range(n):
+        out += [T + f"public class C{i}", T + "{", T + T + f"public void M{i}()", T + T + "{",
+                T + T + T + 'new WebClient().DownloadString("http://a.example/x");', T + T + "}", T + "}"]
+    return "\n".join([*out, "}", ""])
+
+
+def test_reading_a_runs_output_stops_at_its_time_budget_and_keeps_what_it_read(tmp_path, tools, monkeypatch):
+    n = 4 * dd.PARSE_CHECK_LINES // 7 + 10  # more than four clock checks' worth of lines
+    run = FakeRun(main=RunOutcome(0, _classes(n).encode()))
+    whole = dd.decompile(DLL, tmp_path / "a", timeout_s=120, run=run, **tools)
+    assert whole.status == "ok" and len(whole.members) == n and len(whole.scores) == n
+    monkeypatch.setattr(dd, "_clock", Clock(dd.POST_S / 2.5))  # the third check is past the budget
+    d = dd.decompile(DLL, tmp_path / "b", timeout_s=120, run=run, **tools)
+    assert d.status == "timeout" and "stopped" in d.reason and str(int(dd.POST_S)) in d.reason
+    assert 0 < len(d.members) < n and d.types_total == len(d.types) < n
+    assert d.scores is not None and len(d.scores) <= len(d.members)
+    g = dd.digest(d, label="sample", budget_chars=30000)
+    assert g["status"] == "timeout" and g["omitted"] == len(d.members) - len(g["excerpts"])
+
+
+def test_a_run_already_cut_short_says_so_when_reading_it_also_ran_out(tmp_path, tools, monkeypatch):
+    n = 4 * dd.PARSE_CHECK_LINES // 7 + 10
+    run = FakeRun(main=RunOutcome(None, _classes(n).encode(), capped=True))
+    monkeypatch.setattr(dd, "_clock", Clock(dd.POST_S / 2.5))
+    d = dd.decompile(DLL, tmp_path / "w", timeout_s=120, run=run, **tools)
+    assert d.status == "too_large" and "MiB" in d.reason and "stopped" in d.reason
+
+
+def test_scoring_stops_at_its_deadline_and_the_rest_rank_unscored(monkeypatch):
+    _, members, _ = dd.parse(_classes(8))
+    monkeypatch.setattr(dd, "_clock", Clock(1.0))
+    scores = dd._scores(members, 3.5)
+    assert len(scores) == 3 and all(s > 0 for s, _ in scores)
+    d = dd.Decompiled("ok", members=members, scores=scores)
+    ranked = dd.rank(d)
+    assert [bool(why) for _, why in ranked] == [True] * 3 + [False] * 5
+    assert len(dd._scores(members, None)) == 8
+
+
+def test_a_digest_scores_each_member_once(tmp_path, tools, monkeypatch):
+    calls = []
+    real = dd.score
+    monkeypatch.setattr(dd, "score", lambda m: calls.append(m) or real(m))
+    by_hand = _decompiled()
+    g = dd.digest(by_hand, label="sample", budget_chars=30000)
+    assert len(calls) == len(by_hand.members)
+    del calls[:]
+    d = dd.decompile(DLL, tmp_path / "w", timeout_s=120, run=FakeRun(), **tools)
+    assert len(calls) == len(d.members) == len(d.scores)  # scored in the run, under its budget
+    assert dd.digest(d, label="sample", budget_chars=30000) == g and len(calls) == len(d.members)
+
+
+def test_a_digest_past_its_deadline_stops_adding_excerpts(monkeypatch):
+    d = _decompiled()
+    d.scores = dd._scores(d.members, None)
+    full = dd.digest(d, label="sample", budget_chars=30000)
+    monkeypatch.setattr(dd, "_clock", Clock(1.0))
+    g = dd.digest(d, label="sample", budget_chars=30000, deadline=2.5)
+    assert g["excerpts"] == full["excerpts"][:2] and g["omitted"] == len(d.members) - 2
+    assert g["outline"] == full["outline"]
+
+
+def test_cutting_a_long_method_stops_looking_for_signals_at_its_deadline(monkeypatch):
+    lines = ["void M()", "{", *[f"\tint a{i} = {i};" for i in range(4 * dd.CUT_CHECK_LINES)],
+             "\tClipboard.GetText();", "}"]
+    code = "\n".join(lines)
+    assert "Clipboard" in dd._cut(code, 2000)
+    monkeypatch.setattr(dd, "_clock", Clock(1.0))
+    cut = dd._cut(code, 2000, deadline=1.5)
+    assert len(cut) <= 2000 and cut.startswith("void M()") and "Clipboard" not in cut
+
+
+def test_literals_pair_surrogate_escapes_and_never_carry_a_lone_one():
+    src = 'a = "\\ud83d\\udd11Passwords"; b = "lone \\ud800 here"; c = "\\udc00tail"; d = "end \\ud83d";'
+    out = dd.literals(src)
+    assert out == ["\U0001f511Passwords", "lone \ufffd here", "\ufffdtail", "end \ufffd"]
+    json.dumps(out, ensure_ascii=False).encode("utf-8")  # what sealing the sweep does with them
+
+
+def test_clean_is_one_pass_over_hostile_text():
+    text = "a\x00b\u202ec\ue000d\U000f0000e\n\t" * 200000  # 2.2M characters, four in eleven escaped
+    t0 = time.monotonic()
+    out = dd.clean(text, 1 << 30)
+    assert time.monotonic() - t0 < 3
+    assert out.startswith("a\\u0000b\\u202ec\\ue000d\\uf0000e\n\t") and len(out) == 200000 * 32
+    assert dd.clean("ab\x00cd", 4) == "ab\\\u2026" and dd.clean("abcdef", 4) == "abcd" and dd.clean("", 9) == ""
+
+
+def test_a_digest_out_of_time_leaves_the_code_unread_and_ghidra_runs(tmp_path, monkeypatch):
+    monkeypatch.setattr(dd, "DIGEST_S", -1.0)
+    res, _out, ghidra = _srun(tmp_path, FakeDecompile())
+    f = _fields(res)
+    assert len(ghidra.calls) == 1  # no excerpt was built, so the decompiler did not read the code
+    assert f["decompile_status"] == "ok" and f["decompiled_images"] == 1

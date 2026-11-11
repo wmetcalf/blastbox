@@ -31,13 +31,15 @@ capped. Obfuscated names stay as they are.
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 import struct
+import sys
 import time
 import unicodedata
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -73,6 +75,20 @@ MAX_WHY = 8
 MIN_BUDGET = 2000
 CUT_CONTEXT = 2
 MIN_EXCERPT = 300  # stop looking for an excerpt that fits when less room than this is left
+# The C# a run printed is read in this process, after the child's own clock has stopped: these bound
+# that work by wall clock. Past POST_S the rest of the text is not parsed or scored (status
+# ``timeout``, what was read is kept); past a digest's deadline no further excerpt is built.
+POST_S = 20.0
+DIGEST_S = 10.0
+PARSE_CHECK_LINES = 2048  # lines between clock checks
+CUT_CHECK_LINES = 512
+MAX_DECL_LINE = 4096  # a declaration line longer than this is not searched for a delegate name
+
+_clock = time.monotonic  # deadlines read this
+
+
+def _expired(deadline: float | None) -> bool:
+    return deadline is not None and _clock() > deadline
 
 Status = Literal["ok", "unavailable", "timeout", "failed", "too_large"]
 
@@ -167,6 +183,9 @@ class Decompiled:
     types: list[TypeInfo] = field(default_factory=list)
     members: list[Member] = field(default_factory=list)
     literals: list[str] = field(default_factory=list)  # whole string literals, for IOC extraction
+    # score() of members[i], set by decompile(); shorter than members when scoring ran out of time
+    # (the rest rank unscored). None: digest() scores them itself.
+    scores: list[tuple[int, list[str]]] | None = None
 
 
 # ------------------------------------------------------------------- strings
@@ -176,12 +195,17 @@ _LITERAL = re.compile(r'"(?:[^"\\\n]|\\.)*"')
 
 _ESCAPE = re.compile(r"\\(u[0-9a-fA-F]{4}|.)")
 _ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "0": "\x00"}
+_SURROGATE = re.compile("[\ud800-\udfff]")
 
 
 def literals(source: str, limit: int = MAX_LITERALS) -> list[str]:
     """The distinct string literals of C# ``source`` in order of first use, unescaped: at least
     ``MIN_LITERAL_CHARS`` characters each, cut to ``MAX_LITERAL_CHARS``, at most ``limit`` of them.
-    Members' code carries them shortened (``MAX_LITERAL``); IOC extraction needs them whole."""
+    Members' code carries them shortened (``MAX_LITERAL``); IOC extraction needs them whole.
+
+    ILSpy escapes a character outside the BMP as its two UTF-16 halves (``\\ud83d\\udd11``): the
+    halves are joined back into the character, and a half with no partner becomes U+FFFD, so no
+    literal carries a lone surrogate (text that cannot be encoded, hence not sealed)."""
 
     def unescape(m: re.Match[str]) -> str:
         esc = m.group(1)
@@ -192,7 +216,10 @@ def literals(source: str, limit: int = MAX_LITERALS) -> list[str]:
         raw = m.group(0)[1:-1]
         if len(raw) < MIN_LITERAL_CHARS:
             continue
-        value = _ESCAPE.sub(unescape, raw[: MAX_LITERAL_CHARS * 6])[:MAX_LITERAL_CHARS]
+        value = _ESCAPE.sub(unescape, raw[: MAX_LITERAL_CHARS * 6])
+        if _SURROGATE.search(value):
+            value = value.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+        value = value[:MAX_LITERAL_CHARS]
         if len(value) >= MIN_LITERAL_CHARS and value not in seen:
             seen[value] = None
             if len(seen) >= limit:
@@ -200,19 +227,28 @@ def literals(source: str, limit: int = MAX_LITERALS) -> list[str]:
     return list(seen)
 
 
+_ESCAPED = frozenset({"Cc", "Cf", "Co", "Cs", "Zl", "Zp"})
+
+
+@functools.cache
+def _unsafe() -> re.Pattern[str]:
+    """One character class for what ``clean`` escapes (built once, from this Python's Unicode tables)."""
+    spans: list[list[int]] = []
+    for c in range(sys.maxunicode + 1):
+        ch = chr(c)
+        if ch in "\n\t" or unicodedata.category(ch) not in _ESCAPED:
+            continue
+        if spans and spans[-1][1] == c - 1:
+            spans[-1][1] = c
+        else:
+            spans.append([c, c])
+    return re.compile("[" + "".join(f"\\U{a:08x}-\\U{b:08x}" for a, b in spans) + "]")
+
+
 def clean(text: str, limit: int) -> str:
     """``text`` with control/format/private-use characters escaped (``\\uXXXX``; newlines and tabs
     kept) and at most ``limit`` characters."""
-    out: list[str] = []
-    n = 0
-    for ch in text:
-        if ch not in "\n\t" and unicodedata.category(ch) in ("Cc", "Cf", "Co", "Cs", "Zl", "Zp"):
-            ch = f"\\u{ord(ch):04x}"
-        out.append(ch)
-        n += len(ch)
-        if n >= limit:
-            break
-    s = "".join(out)
+    s = _unsafe().sub(lambda m: f"\\u{ord(m.group()):04x}", text[:limit])
     return s if len(s) <= limit else s[: max(0, limit - 1)] + "…"
 
 
@@ -237,8 +273,35 @@ def _code(lines: Iterable[str], dedent: int) -> str:
 # --------------------------------------------------------------------- parse
 
 _TYPE_DECL = re.compile(r"(?:^|\s)(class|struct|interface|enum)\s+([^\s:{(]+(?:<[^>]*>)?)")
-_DELEGATE = re.compile(r"(?:^|\s)delegate\s+.+?\s([^\s(<]+)(?:<[^>]*>)?\s*\(")
+_DELEGATE_HEAD = re.compile(r"(?:(?:public|private|protected|internal|unsafe|new)\s+)*delegate\s+")
+_WORD = re.compile(r"\s([^\s(<]+)")
+_OPEN_PAREN = re.compile(r"\s*\(")
 _GENERIC = re.compile(r"(?<=[\w>])<[^<>]*>")  # type arguments, not "<Module>" itself
+
+
+def _delegate_name(s: str) -> str | None:
+    """The name a delegate declaration line declares (``public delegate void Name<T>(int x);``), else
+    None: the first word after the return type that ``(`` follows, type parameters between. One pass
+    over the line: every line of a namespace or type body comes here, a field's string initializer
+    printed whole among them, and a search from each ``delegate`` in such a line was quadratic."""
+    if len(s) > MAX_DECL_LINE or not s.endswith(";"):
+        return None
+    head = _DELEGATE_HEAD.match(s)
+    if head is None:
+        return None
+    gt = 0  # the ">" the last "<" ran to; -1 once the line has none left
+    for m in _WORD.finditer(s, head.end()):
+        end = m.end()
+        if s.startswith("<", end):
+            if gt < 0 or gt >= end:
+                continue  # no ">" left, or the same one an earlier word already failed on
+            gt = s.find(">", end)
+            if gt < 0:
+                continue
+            end = gt + 1
+        if _OPEN_PAREN.match(s, end):
+            return m.group(1)
+    return None
 
 
 def _depth(line: str) -> int:
@@ -288,7 +351,15 @@ def parse(source: str) -> tuple[list[TypeInfo], list[Member], int]:
     """ILSpy's whole-file C# -> (types, members, methods_total). Depends on ILSpy's layout (one
     tab per nesting level, ``{``/``}`` alone on their lines); an unclosed tail (a capped run) is
     closed at the end of the text."""
+    types, members, methods, _ = _parse(source, None)
+    return types, members, methods
+
+
+def _parse(source: str, deadline: float | None) -> tuple[list[TypeInfo], list[Member], int, bool]:
+    """``parse`` that stops reading lines once ``deadline`` (``_clock`` time) has passed, closing what
+    is open there: ``(types, members, methods_total, whether the whole text was read)``."""
     lines = source.split("\n")
+    last = len(lines) - 1
     stack: list[_Scope] = []
     pending: list[int] = []  # attribute/header line numbers at the current level
     types: dict[str, dict[str, Any]] = {}
@@ -346,6 +417,9 @@ def parse(source: str) -> tuple[list[TypeInfo], list[Member], int]:
             add_line_to_type(i)
 
     for i, raw in enumerate(lines):
+        if not i % PARSE_CHECK_LINES and _expired(deadline):
+            last = i - 1
+            break
         line = raw.rstrip()
         s = line.strip()
         d = _depth(line)
@@ -394,9 +468,9 @@ def parse(source: str) -> tuple[list[TypeInfo], list[Member], int]:
             stack.append(_Scope("ns", qualify(s[10:-1].strip()), -1, i))
             pending = []
             continue
-        dm = _DELEGATE.search(s)
-        if dm and s.endswith(";") and "(" in s:
-            add_type(qualify(dm.group(1)), "delegate")
+        delegate = _delegate_name(s)
+        if delegate is not None:
+            add_type(qualify(delegate), "delegate")
             pending = []
             continue
         ts = type_scope()
@@ -419,7 +493,7 @@ def parse(source: str) -> tuple[list[TypeInfo], list[Member], int]:
             continue
         pending.append(i)
     while stack:
-        close(stack.pop(), len(lines) - 1)
+        close(stack.pop(), last)
 
     infos: list[TypeInfo] = []
     for name in order:
@@ -438,7 +512,7 @@ def parse(source: str) -> tuple[list[TypeInfo], list[Member], int]:
             dep = min(_depth(lines[j]) for j in ex)
             members.append(Member(type=clean(name, MAX_NAME * 2), name="<extern>", kind="extern", header="",
                                   code=_code((lines[j] for j in ex), dep), noise=t["noise"]))
-    return infos, members, methods
+    return infos, members, methods, last == len(lines) - 1
 
 
 # ------------------------------------------------------------------ PE header
@@ -546,9 +620,10 @@ def _entry(image: Path, token: int, members: list[Member], env: dict[str, str], 
         return None
     # members' code is literal-shortened; compare the same way
     want = "\n".join(_short_literals(ln) for ln in want.split("\n"))
-    hits = [m for m in members if m.kind not in ("fields", "extern") and _body(m.code) == want]
+    first = want.split("\n", 1)[0]  # a member whose code lacks this line cannot be the body
+    hits = [m for m in members if m.kind not in ("fields", "extern") and first in m.code and _body(m.code) == want]
     if len(hits) != 1:
-        first = want.split("\n", 1)[0].strip()
+        first = first.strip()
         hits = [m for m in members if m.kind not in ("fields", "extern") and m.header == first]
     return f"{hits[0].type}.{hits[0].name}" if len(hits) == 1 else None
 
@@ -594,12 +669,18 @@ def decompile(image: Path, workdir: Path, *, timeout_s: float, run: RunFn = boun
         status, reason = "failed", "no output"
     d = Decompiled(status, reason, mixed_mode=mixed, source_chars=len(text))
     if text.strip():
+        post_end = _clock() + POST_S
+        whole = True
         try:
-            d.types, d.members, d.methods_total = parse(text)
+            d.types, d.members, d.methods_total, whole = _parse(text, post_end)
         except (RecursionError, ValueError, IndexError) as exc:
             d.status, d.reason = "failed", f"parse:{type(exc).__name__}"
         d.types_total = len(d.types)
         d.literals = literals(text)
+        d.scores = _scores(d.members, post_end)
+        if d.status != "failed" and (not whole or len(d.scores) < len(d.members)):
+            cut = f"reading the C# stopped after {POST_S:.0f}s"
+            d.status, d.reason = ("timeout", cut) if d.status == "ok" else (d.status, f"{d.reason}; {cut}")
     if not flags & 0x10 and token >> 24 == 0x06:
         d.entry_token = token
         left = timeout_s - (time.monotonic() - t0)
@@ -628,6 +709,16 @@ def score(m: Member) -> tuple[int, list[str]]:
     return total, why
 
 
+def _scores(members: list[Member], deadline: float | None) -> list[tuple[int, list[str]]]:
+    """``score`` of each member in order, stopping once ``deadline`` has passed."""
+    out: list[tuple[int, list[str]]] = []
+    for m in members:
+        if _expired(deadline):
+            break
+        out.append(score(m))
+    return out
+
+
 def _calls(code: str) -> set[str]:
     return set(re.findall(r"([A-Za-z_\u0080-￿][\w\u0080-￿]*)\s*\(", code))
 
@@ -635,12 +726,13 @@ def _calls(code: str) -> set[str]:
 def rank(d: Decompiled) -> list[tuple[Member, list[str]]]:
     """Members in excerpt order with their reasons: the entry point, then the module initializer,
     then by score (callees of the entry point get a bonus), then the unscored, noise last."""
+    scores = d.scores if d.scores is not None else _scores(d.members, None)
     entry = d.entry_point
     entry_m = next((m for m in d.members if f"{m.type}.{m.name}" == entry), None)
     callees = _calls(entry_m.code) if entry_m is not None else set()
     keyed: list[tuple[tuple[int, int, int, int], Member, list[str]]] = []
     for idx, m in enumerate(d.members):
-        s, why = score(m)
+        s, why = (scores[idx][0], list(scores[idx][1])) if idx < len(scores) else (0, [])
         if m is entry_m:
             tier = 0
             why = ["entry_point", *why]
@@ -669,16 +761,21 @@ def _size(obj: Any) -> int:
     return len(json.dumps(obj, ensure_ascii=False))
 
 
-def digest(d: Decompiled, *, label: str, budget_chars: int) -> dict[str, Any] | None:
+def digest(d: Decompiled, *, label: str, budget_chars: int, deadline: float | None = None
+           ) -> dict[str, Any] | None:
     """The bounded C# evidence for the model, about ``budget_chars`` characters of JSON:
 
     ``{"label", "tool", "status", "types_total", "methods_total", "entry_point", "outline": [str],
     "excerpts": [{"type", "member", "why": [str], "code"}], "omitted": int}``. ``outline`` is one
     line per non-noise type (``Name (kind): member, member, ...``), capped to a sixth of the budget;
-    ``omitted`` counts the members left out. None when nothing was decompiled.
+    ``omitted`` counts the members left out. None when nothing was decompiled. Once ``deadline``
+    (``_clock`` time) has passed, no further member is scored or excerpted.
     """
     if not d.members and not d.types:
         return None
+    if d.scores is None:
+        d = replace(d, scores=_scores(d.members, deadline))
+    assert d.scores is not None
     budget = max(MIN_BUDGET, budget_chars)
     out: dict[str, Any] = {"label": clean(label, MAX_NAME), "tool": d.tool, "status": d.status,
                            "types_total": d.types_total, "methods_total": d.methods_total,
@@ -688,8 +785,8 @@ def digest(d: Decompiled, *, label: str, budget_chars: int) -> dict[str, Any] | 
     outline_budget = budget // 6
     used = 0
     weight: dict[str, int] = {}
-    for m in d.members:
-        weight[m.type] = weight.get(m.type, 0) + score(m)[0]
+    for m, (points, _why) in zip(d.members, d.scores, strict=False):
+        weight[m.type] = weight.get(m.type, 0) + points
     shown = [t for t in d.types if not t.noise and t.kind != "delegate"]
     for t in sorted(shown, key=lambda t: (-weight.get(t.name, 0), -len(t.members)))[:MAX_OUTLINE]:
         names = [n for n in t.members if n not in NOISE_MEMBERS]
@@ -706,14 +803,14 @@ def digest(d: Decompiled, *, label: str, budget_chars: int) -> dict[str, Any] | 
     size = _size(out)
     per = max(1000, budget // 3)  # one method takes at most a third of the budget
     for m, why in rank(d):
-        if budget - size < MIN_EXCERPT:
+        if budget - size < MIN_EXCERPT or _expired(deadline):
             break
-        ex = {"type": m.type, "member": m.name, "why": why, "code": _cut(m.code, per)}
+        ex = {"type": m.type, "member": m.name, "why": why, "code": _cut(m.code, per, deadline)}
         need = _size(ex) + 2
         if size + need > budget:
             if why[:1] not in (["entry_point"], ["module_initializer"]):
                 continue  # whole methods only; a smaller one further down may still fit
-            ex["code"] = _cut(m.code, max(200, budget - size - (need - len(ex["code"])) - 60))
+            ex["code"] = _cut(m.code, max(200, budget - size - (need - len(ex["code"])) - 60), deadline)
             need = _size(ex) + 2
             if size + need > budget:
                 continue
@@ -723,16 +820,18 @@ def digest(d: Decompiled, *, label: str, budget_chars: int) -> dict[str, Any] | 
     return out
 
 
-def _cut(code: str, limit: int) -> str:
+def _cut(code: str, limit: int, deadline: float | None = None) -> str:
     """``code`` within ``limit`` characters. A long method keeps its first lines, the lines that
     match ``SIGNALS`` (with ``CUT_CONTEXT`` lines around each) and its last line, the gaps elided
     (designer ``InitializeComponent`` methods bury a loader at the end of thousands of lines);
-    failing that, its head."""
+    failing that, its head. Lines past ``deadline`` are not searched for signals."""
     if len(code) <= limit:
         return code
     lines = code.split("\n")
     keep = {0, 1, len(lines) - 1}
     for i, ln in enumerate(lines):
+        if not i % CUT_CHECK_LINES and _expired(deadline):
+            break
         if any(rx.search(ln) for _, _, rx in _SIGNALS):
             keep.update(range(max(0, i - CUT_CONTEXT), min(len(lines), i + CUT_CONTEXT + 1)))
     if len(keep) < len(lines):

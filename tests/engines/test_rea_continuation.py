@@ -205,3 +205,16 @@ def test_state_from_an_older_continuation_has_no_report() -> None:
     assert st.analysis_report is None and st.sweep == {}
     with pytest.raises(ContinuationError):
         State.from_json(json.dumps({**old, "analysis_report": ["not", "an", "object"]}))
+
+
+def test_state_carries_the_models_own_call_behind_the_last_report() -> None:
+    """The verdict rule may override the model's label; the bar needs the model's call on later
+    passes too (a pass that writes no report is measured on the carried one)."""
+    st = State(pass_no=2, sample_name="s", sample_sha256="0" * 64, program_name="s", ghidra_status="ok",
+               opinion="benign")
+    assert State.from_json(st.to_json()).opinion == "benign"
+    old = json.loads(st.to_json())
+    del old["opinion"]
+    assert State.from_json(json.dumps(old)).opinion is None
+    for junk in ("evil", 7, ["benign"], ""):
+        assert State.from_json(json.dumps({**old, "opinion": junk})).opinion is None, junk

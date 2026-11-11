@@ -147,6 +147,111 @@ def test_pes_are_found_at_page_offsets_and_bad_headers_are_refused():
     assert emulate.pe_offsets(b"MZ" + b"\x00" * 0x2000) == []
 
 
+
+def _hdr(*, lfanew=0x80, size_of_image=0x3000, size_of_headers=0x400, sections=((0x200, 0x1000, 0x200, 0x400),),
+         stamp=1, magic=0x20B, opt=0xF0, nsec=None, length=0x2000) -> bytearray:
+    """A page-aligned buffer that starts with a hand-built x64 PE header (no code; never a program)."""
+    b = bytearray(length)
+    p = lfanew
+    for i, sec in enumerate(sections):
+        struct.pack_into("<IIII", b, p + 24 + opt + 40 * i + 8, *sec)
+    b[0:2] = b"MZ"
+    struct.pack_into("<I", b, 0x3C, lfanew)
+    b[p:p + 4] = b"PE\x00\x00"
+    struct.pack_into("<HHI", b, p + 4, 0x8664, len(sections) if nsec is None else nsec, stamp)
+    struct.pack_into("<HH", b, p + 20, opt, 0x22)
+    struct.pack_into("<H", b, p + 24, magic)
+    struct.pack_into("<II", b, p + 24 + 56, size_of_image, size_of_headers)
+    return b
+
+
+# Headers a loader would refuse; the engine and the runner must both refuse them.
+BAD_HEADERS = {
+    # the section table (0x408) lies past SizeOfHeaders == SizeOfImage == 0x400
+    "table_past_headers": _hdr(lfanew=0x300, size_of_image=0x400, size_of_headers=0x400,
+                               sections=((0x200, 0x1000, 0x200, 0x800),)),
+    "table_past_headers_many": _hdr(size_of_headers=0x200, sections=((0x200, 0x1000, 0x200, 0x400),) * 8),
+    "short_optional_header": _hdr(opt=0x10),
+    "bad_magic": _hdr(magic=0x107),
+    "no_sections": _hdr(sections=()),
+    "headers_past_image": _hdr(size_of_image=0x200),
+    "signature_only": bytearray(b"MZ" + bytes(0x3A) + b"\x40\x00\x00\x00" + b"PE\x00\x00" + bytes(200)),
+}
+
+
+@pytest.mark.parametrize("name", sorted(BAD_HEADERS))
+def test_a_header_no_loader_would_map_is_not_a_pe(name, tmp_path):
+    """A stub can write any header into memory it allocated. One whose section table lay past its own
+    SizeOfImage made the carve write outside the image it had cut, and the exception left the engine."""
+    blob = bytes(BAD_HEADERS[name])
+    assert emulate.pe_offsets(blob) == [] and emulate.carve(blob, 0, 0x50000) is None
+    em = _shape(tmp_path, {"regions": [_region("region-0.bin", 0x50000, len(blob))]}, {"region-0.bin": blob})
+    assert em.captures == []
+
+
+def test_the_runner_and_the_engine_agree_on_what_a_pe_header_is():
+    """The runner ranks regions that hold a PE first and writes only its first MAX_REGIONS: pages it
+    alone took for PEs pushed the real stage out."""
+    blobs = [bytes(b) for b in BAD_HEADERS.values()] + [
+        SAMPLE, mapped(SAMPLE), b"\x00" * 0x1000 + SAMPLE, bytes(_hdr()), bytes(_hdr(magic=0x10B, opt=0xE0)),
+        b"MZ" * 100, b""]
+    for blob in blobs:
+        assert emulate_runner.has_pe(blob) == bool(emulate.pe_offsets(blob)), blob[:0x90].hex()
+    assert emulate_runner.has_pe(bytes(_hdr())) and not emulate_runner.has_pe(bytes(BAD_HEADERS["signature_only"]))
+    assert emulate_runner.PE_MAX_IMAGE == emulate.MAX_IMAGE
+    assert emulate_runner.PE_MAX_SECTIONS == emulate.triage.MAX_SECTIONS
+
+
+def test_a_mapped_image_is_cut_at_the_region_never_padded_to_the_size_it_claims():
+    """SizeOfImage comes from the sample: a 4 KiB header claiming 256 MiB was padded to 256 MiB, sixteen
+    times over, in the engine process."""
+    big = _hdr(size_of_image=emulate.MAX_IMAGE, sections=((0x3000, 0x1000, 0x200, 0x400),))
+    big[0x1000:0x1200] = b"\xab" * 0x200
+    c = emulate.carve(bytes(big), 0, 0x50000)
+    assert c is not None and c.layout == "memory" and len(c.data) == len(big)
+    pe = pefile.PE(data=c.data)
+    (sec,) = pe.sections
+    assert sec.PointerToRawData == 0x1000 and sec.SizeOfRawData == 0x1000  # what the region holds of it
+    assert sec.get_data()[:0x200] == b"\xab" * 0x200 and pe.OPTIONAL_HEADER.ImageBase == 0x50000
+    # A section that starts past the region has no file bytes at all.
+    two = _hdr(size_of_image=emulate.MAX_IMAGE, sections=((0x200, 0x1000, 0x200, 0x400), (0x5000, 0x9000, 0, 0)))
+    c = emulate.carve(bytes(two), 0, 0x50000)
+    assert c is not None and len(c.data) == len(two)
+    assert [(s.PointerToRawData, s.SizeOfRawData) for s in pefile.PE(data=c.data).sections] == [(0x1000, 0x200), (0, 0)]
+    # A whole image is still carved whole.
+    img = mapped(SAMPLE)
+    whole = emulate.carve(img + b"\x00" * 0x1000, 0, 0x74000)
+    assert whole is not None and len(whole.data) == len(img)
+
+
+def test_captures_share_one_byte_budget(tmp_path, monkeypatch):
+    monkeypatch.setattr(emulate, "MAX_CAPTURES_BYTES", 3 * 0x2000 + 0x800)
+    blobs = {f"region-{i}.bin": bytes(_hdr(stamp=i + 1)) for i in range(5)}
+    blobs["region-5.bin"] = b"\x90\xc3" * 0x200  # small enough for what is left
+    regions = [_region(f"region-{i}.bin", 0x100000 * (i + 1), 0x2000) for i in range(5)]
+    regions.append(_region("region-5.bin", 0x900000, 0x1000, executed=True))
+    em = _shape(tmp_path, {"regions": regions}, blobs)
+    assert [(c.kind, c.size) for c in em.captures] == [("pe", 0x2000)] * 3 + [("shellcode", 0x400)]
+    assert em.evidence["captures_dropped"] == {"capped": 2}
+    assert sum(p.stat().st_size for p in (tmp_path / "work").iterdir()) <= emulate.MAX_CAPTURES_BYTES
+
+
+def test_a_region_file_that_is_a_fifo_is_skipped_not_waited_on(tmp_path):
+    import threading
+    scan = tmp_path / "scan"
+    scan.mkdir()
+    os.mkfifo(scan / "region-0.bin")
+    got: list = []
+    th = threading.Thread(target=lambda: got.append(emulate._read_region(scan, "region-0.bin")), daemon=True)
+    th.start()
+    th.join(3)
+    if th.is_alive():  # unblock the reader before failing
+        fd = os.open(scan / "region-0.bin", os.O_WRONLY | os.O_NONBLOCK)
+        os.close(fd)
+        th.join(3)
+        pytest.fail("the engine blocked opening a FIFO the runner left as a region file")
+    assert got == [None]
+
 # ------------------------------------------------------------------- evidence
 
 def _write_regions(d: Path, blobs: dict[str, bytes]) -> None:
@@ -804,6 +909,17 @@ def test_an_exception_or_a_malformed_document_is_emulation_failed(tmp_path):
     bad.doc = None  # json "null"
     res, _out, _g = _erun(UNPACK, tmp_path / "b", bad)
     assert "emulation_failed" in _codes(res)
+
+
+def test_a_failure_reading_the_runs_output_fails_only_the_emulation(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise struct.error("pack_into requires a buffer of at least 1056 bytes")
+    monkeypatch.setattr(emulate, "shape", boom)
+    res, out, ghidra = _erun(UNPACK, tmp_path, FakeEmulate())
+    assert "emulation_failed" in _codes(res) and len(ghidra.calls) == 1
+    assert ghidra.data == UNPACK.read_bytes()  # the stub is analysed
+    ev = _state(out, tmp_path).sweep["emulation"]
+    assert ev["status"] == "failed" and "struct.error" in ev["stop_detail"]
 
 
 def test_a_speakeasy_error_or_budget_stop_keeps_partial_results(tmp_path):

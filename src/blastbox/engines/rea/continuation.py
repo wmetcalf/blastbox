@@ -53,6 +53,13 @@ _FILE_MODE = 0o640
 _DIR_MODE = 0o750
 
 
+_OPINIONS = ("benign", "suspicious", "malicious", "unknown")  # prompts.REPORT_LABELS
+
+
+def _opinion(v: Any) -> str | None:
+    return v if isinstance(v, str) and v in _OPINIONS else None
+
+
 class ContinuationError(Exception):
     """The archive is malformed, unsafe, or over its size budget."""
 
@@ -81,6 +88,10 @@ class State:
     # The program's own functions as the pass-1 seed found them (Go: main.* and third-party
     # modules), which a benign verdict must have read.
     program_functions: list[str] = field(default_factory=list)
+    # The model's own call behind ``analysis_report``, before the verdict rule (verdict.py) set the
+    # label: the bar reads it when a later pass writes no report of its own. Absent from older
+    # continuations.
+    opinion: str | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), sort_keys=True)
@@ -104,6 +115,7 @@ class State:
                 facts=[str(x) for x in d.get("facts") or []],
                 gaps=[{"code": str(g["code"]), "detail": str(g["detail"])} for g in d.get("gaps") or []],
                 program_functions=[str(x) for x in d.get("program_functions") or []],
+                opinion=_opinion(d.get("opinion")),
             )
         except (ValueError, KeyError, TypeError) as exc:
             raise ContinuationError(f"bad state.json: {exc}") from exc

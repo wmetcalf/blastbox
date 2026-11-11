@@ -11,7 +11,8 @@ verdict.
 Engine grounds (:func:`engine_grounds`; deterministic, from the sweep's evidence):
 
 ```text
-family_signature         hostile     a YARA family rule matched (sweep.signatures.matches)
+family_signature         hostile     a YARA rule matched whose meta names a malware family
+dual_use_signature       concealing  ... whose meta names a dual-use tool (signatures.DUAL_USE)
 pixel_hidden_executable  hostile     a PE decoded out of a resource image's pixels
 hidden_payload           concealing  a hidden resource payload beside code that can load it (loader_refs)
 emulated_concealment     concealing  emulation saw the stub hide a stage (any code but stalling)
@@ -19,29 +20,37 @@ installer_concealment    concealing  the installer hides what it runs (sufficien
 api_hashing              concealing  imports resolved by hash (sweep.api_hashes.hits)
 ```
 
+A match of a rule that names no family (a rule for an obfuscator, say) is no ground: the model
+sees it in the evidence and may cite what it means.
+
 Model grounds (:func:`model_grounds`) are kept when their code is in the vocabulary and their
 evidence row cites something the pass has: an address it has seen (``known``), or, in a report
 written from the sweep's evidence alone, a source the sweep holds (``sources``). That is all the
 engine checks. It does not check that the cited function *does* what the ground says; a model
 that cites a real address for a behaviour that is not there still moves the verdict. What the rule
 removes is the free choice of confidence and the ungrounded malicious call, not the model's
-judgement of code. A ground that fails the check is dropped and counted, never fatal.
+judgement of code. A ground that fails the check is dropped and counted, never fatal. The grounds
+kept do not depend on the order the model listed them in: one per code, hostile ones first, each
+tier in vocabulary order, at most ``GEN_GROUNDS``.
 
 The rule (:func:`decide`):
 
 ```text
 any hostile ground      malicious   high: the pixel-hidden executable, two hostile grounds, or an
                                     engine ground beside any second ground; else medium
+  ... all of them the   suspicious  when the model's own call was not malicious. medium: its call
+  model's                           was suspicious, or as for concealing grounds; else low
 concealing grounds only suspicious  medium: an engine ground, or two model grounds; else low
 no ground               suspicious/low when the model called it malicious or suspicious;
-                        benign/medium when it called it benign and the code was read;
-                        unknown/low otherwise
+                        benign/medium when it called it benign, the code was read and no
+                        resource image went unread; unknown/low otherwise
 ```
 
 The wire shape does not change (``{"label", "confidence", "rationale"}``; a consumer that rejects
 unknown verdict keys keeps working). The rule's line goes first in the rationale (``Rule: ...``)
-and the model's own text follows. The line is built from engine vocabulary, addresses and source
-names only: nothing the sample controls is copied into it.
+and the model's own text follows, less any line of it that itself reads as a rule line. The line
+is built from engine vocabulary, addresses and source names only: nothing the sample controls is
+copied into it.
 
 Thresholds are first guesses. The scoring set they were shaped on holds no benign programs, so
 how often legitimately packed software reads ``suspicious`` here is unmeasured.
@@ -50,6 +59,7 @@ how often legitimately packed software reads ``suspicious`` here is unmeasured.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Collection
 from dataclasses import dataclass, replace
 from typing import Any
@@ -65,6 +75,7 @@ from blastbox.engines.rea.prompts import (
     REPORT_RATIONALE,
 )
 from blastbox.engines.rea.report import address_of
+from blastbox.engines.rea.signatures import dual_use
 from blastbox.engines.rea.sufficiency import STALLING, installer_concealment
 
 __all__ = ["CONCEALING", "HOSTILE", "RULE_LINE", "Decision", "Ground", "apply", "decide", "engine_grounds",
@@ -77,7 +88,8 @@ RULE_LINE_MAX = REPORT_RATIONALE - GEN_RATIONALE - 1
 MAX_ROWS = 16  # model ground rows looked at; the schema allows GEN_GROUNDS
 CONCLUSIVE = "pixel_hidden_executable"
 _PLAIN = re.compile(r"[^A-Za-z0-9_.\-]")
-_ECHO = re.compile(r"^\s*rule:", re.IGNORECASE)
+_ECHO = re.compile(r"\s*rule\s*:", re.IGNORECASE)
+_VOCABULARY = (*HOSTILE_GROUNDS, *CONCEALING_GROUNDS)  # hostile first
 _SHOWN = tuple(c for c in CONCEALMENT if c not in STALLING)
 
 
@@ -115,18 +127,26 @@ def engine_grounds(sweep: dict[str, Any]) -> list[Ground]:
     """The grounds the sweep's evidence shows by itself, in a fixed order."""
     out: list[Ground] = []
     matches = [m for m in _list(_dict(sweep.get("signatures")).get("matches")) if isinstance(m, dict)]
-    if matches:
-        families: list[str] = []
-        for m in matches:
-            name = _plain(m.get("family"), 32) or _plain(m.get("rule"), 32)
-            if name and name not in families:
-                families.append(name)
-        shown = ", ".join(families[:3]) + (f", +{len(families) - 3}" if len(families) > 3 else "")
-        out.append(Ground("family_signature", HOSTILE, True,
-                          f"family signature ({shown})" if shown else "family signature"))
+    families: list[str] = []
+    tools: list[str] = []
+    for m in matches:
+        name = _plain(m.get("family"), 32)  # a rule that names no family is no ground
+        names = tools if dual_use(m.get("family")) else families
+        if name and name not in names:
+            names.append(name)
+
+    def shown(names: list[str]) -> str:
+        return ", ".join(names[:3]) + (f", +{len(names) - 3}" if len(names) > 3 else "")
+
+    if families:
+        out.append(Ground("family_signature", HOSTILE, True, f"family signature ({shown(families)})"))
+    if tools:
+        out.append(Ground("dual_use_signature", CONCEALING, True,
+                          f"signature of a dual-use tool ({shown(tools)})"))
     res = _dict(sweep.get("dotnet_resources"))
     hidden = [h for h in _list(res.get("hidden_payloads")) if isinstance(h, dict)]
-    if any(h.get("image") and h.get("decoded") for h in hidden):
+    # The decoding says where the PE was: ``image:...`` is the pixels of a resource image.
+    if any(isinstance(h.get("decoded"), str) and h["decoded"].startswith("image:") for h in hidden):
         out.append(Ground(CONCLUSIVE, HOSTILE, True, "executable hidden in image pixels"))
     elif hidden and _list(res.get("loader_refs")):
         out.append(Ground("hidden_payload", CONCEALING, True, "hidden payload in resources beside loader code"))
@@ -152,11 +172,13 @@ def model_grounds(raw: Any, *, known: set[str] | None,
 
     ``known`` and ``sources`` are those of ``report.validate_report``: ``None`` skips that check; a
     pass that read functions passes ``sources=()`` (only addresses count) and an evidence-only one
-    ``known=set()`` (only sources count). One ground per code; at most ``GEN_GROUNDS``.
+    ``known=set()`` (only sources count). One ground per code (its lowest citation), hostile
+    codes first and each tier in vocabulary order, at most ``GEN_GROUNDS``: the same rows in any
+    order give the same grounds.
     """
     if not isinstance(raw, list):
         return [], 0
-    out: list[Ground] = []
+    best: dict[str, tuple[int, str]] = {}
     dropped = max(0, len(raw) - MAX_ROWS)
     for row in raw[:MAX_ROWS]:
         code = row.get("code") if isinstance(row, dict) else None
@@ -176,13 +198,11 @@ def model_grounds(raw: Any, *, known: set[str] | None,
                     where = source
         if where is None:
             dropped += 1
-        elif any(g.code == code for g in out):
-            continue
-        elif len(out) >= GEN_GROUNDS:
-            dropped += 1
-        else:
-            out.append(Ground(str(code), tier, False, f"{str(code).replace('_', ' ')} ({where})"))
-    return out, dropped
+        elif str(code) not in best or where < best[str(code)][1]:
+            best[str(code)] = (tier, where)
+    codes = sorted(best, key=_VOCABULARY.index)
+    out = [Ground(c, best[c][0], False, f"{c.replace('_', ' ')} ({best[c][1]})") for c in codes[:GEN_GROUNDS]]
+    return out, dropped + max(0, len(codes) - GEN_GROUNDS)
 
 
 def _line(head: str, cites: list[str], tail: str) -> str:
@@ -198,50 +218,69 @@ def _line(head: str, cites: list[str], tail: str) -> str:
     return line[:RULE_LINE_MAX]
 
 
-def decide(opinion: str, grounds: list[Ground], *, code_read: bool) -> Decision:
+def images_unread(sweep: dict[str, Any]) -> int:
+    """Resource images the sweep's scan could not read in its time budget (0 when it read all)."""
+    n = _dict(sweep.get("dotnet_resources")).get("images_unread")
+    return n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else 0
+
+
+def decide(opinion: str, grounds: list[Ground], *, code_read: bool, images_unread: int = 0) -> Decision:
     """The verdict for the model's call and the checked grounds.
 
     ``code_read``: the pass read the program's code (functions, or the sample's own decompiled
-    C#), which a benign verdict needs.
+    C#), which a benign verdict needs. ``images_unread``: resource images nothing decoded, any of
+    which may carry an executable in its pixels; a benign verdict needs none.
     """
     hostile = {g.code for g in grounds if g.tier == HOSTILE}
     concealing = [g for g in grounds if g.tier == CONCEALING]
     codes = {g.code for g in grounds}
     cites = [g.cite for g in sorted(grounds, key=lambda g: -g.tier)]  # hostile first; stable within a tier
-    if hostile:
+    held = ""
+    if hostile and (opinion == "malicious" or any(g.engine for g in grounds if g.tier == HOSTILE)):
         label = "malicious"
         strong = (CONCLUSIVE in hostile or len(hostile) >= 2
                   or (any(g.engine for g in grounds) and len(codes) >= 2))
         confidence = "high" if strong else "medium"
-    elif concealing:
+    elif hostile or concealing:
+        # A hostile ground of the model's is checked only for existing evidence, so by itself it
+        # does not outrank the call the model made with it.
         label = "suspicious"
-        strong = any(g.engine for g in concealing) or len({g.code for g in concealing}) >= 2
+        strong = (any(g.engine for g in concealing) or len({g.code for g in concealing}) >= 2
+                  or (bool(hostile) and opinion == "suspicious"))
         confidence = "medium" if strong else "low"
+        if hostile:
+            held = f", not malicious (the model's call was {opinion} and no engine ground is hostile),"
     elif opinion in ("malicious", "suspicious"):
         label, confidence = "suspicious", "low"
         why = f"the model's call ({opinion}) cites no ground the engine could check."
-    elif opinion == "benign" and code_read:
+    elif opinion == "benign" and code_read and not images_unread:
         label, confidence = "benign", "medium"
         why = "no ground for suspicion in the code read."
     elif opinion == "benign":
         label, confidence = "unknown", "low"
-        why = "a benign call needs the program's code read, and it was not."
+        why = ("a benign call needs the program's code read, and it was not." if not code_read else
+               f"a benign call needs the resource images read, and {images_unread} were not (time budget).")
     else:
         label, confidence = "unknown", "low"
         why = "no ground either way."
     if grounds:
-        line = _line(f"{RULE_LINE}{label}/{confidence} on ", cites,
-                     f" Model's call: {opinion}." if opinion != label else "")
+        line = _line(f"{RULE_LINE}{label}/{confidence}{held} on ", cites,
+                     f" Model's call: {opinion}." if opinion != label and not held else "")
     else:
         line = f"{RULE_LINE}{label}/{confidence}; {why}"
     return Decision(label=label, confidence=confidence, grounds=list(grounds), opinion=opinion, rule_line=line)
 
 
+def _echo(line: str) -> bool:
+    """Whether a line of the model's text reads as a rule line, however it is dressed: width and
+    compatibility forms folded, invisible characters removed."""
+    bare = "".join(ch for ch in unicodedata.normalize("NFKC", line) if unicodedata.category(ch)[0] != "C")
+    return _ECHO.match(bare) is not None
+
+
 def _rationale(rule_line: str, text: str) -> str:
-    lines = text.strip().split("\n")
-    while lines and _ECHO.match(lines[0]):  # the rule line of a previous report, copied
-        lines.pop(0)
-    own = "\n".join(lines).strip()
+    # Only the engine's line says "Rule:". A copy of a previous report's, or a forged one, goes.
+    own = "\n".join(line for line in text.splitlines() if not _echo(line)).strip()
     if not own:
         return rule_line
     room = REPORT_RATIONALE - len(rule_line) - 1
@@ -266,7 +305,8 @@ def apply(obj: Any, *, sweep: dict[str, Any], known: set[str] | None, sources: C
     if not isinstance(opinion, str) or opinion not in REPORT_LABELS:
         return None
     cited, dropped = model_grounds(verdict.get("grounds"), known=known, sources=sources)
-    decision = replace(decide(opinion, engine_grounds(sweep) + cited, code_read=code_read), dropped=dropped)
+    decision = replace(decide(opinion, engine_grounds(sweep) + cited, code_read=code_read,
+                              images_unread=images_unread(sweep)), dropped=dropped)
     rationale = verdict.get("rationale")
     if isinstance(rationale, str) and len(rationale) <= REPORT_RATIONALE:
         rationale = _rationale(decision.rule_line, rationale)

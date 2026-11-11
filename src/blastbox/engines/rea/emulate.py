@@ -101,6 +101,7 @@ PAYLOAD_MIN_BYTES = 4096
 SHELLCODE_MIN_BYTES = 16
 MAX_CAPTURES = 16
 MAX_CAPTURE_BYTES = 64 * 1024 * 1024
+MAX_CAPTURES_BYTES = 256 * 1024 * 1024  # all captures of one run together
 MAX_PE_PER_REGION = 4
 MAX_IMAGE = 256 * 1024 * 1024
 STATE_APIS = 64
@@ -339,7 +340,11 @@ class Carved:
 
 def _headers(blob: bytes, off: int) -> tuple[int, int, int, int, int, int, int, int, list[tuple[int, int, int, int]]] | None:
     """``(lfanew, machine, chars, timestamp, magic, entry, size_of_image, size_of_headers,
-    [(vsize, va, raw_size, raw_ptr)])`` of the PE at ``off`` in ``blob``, or None."""
+    [(vsize, va, raw_size, raw_ptr)])`` of the PE at ``off`` in ``blob``, or None.
+
+    The optional header must be whole and the section table must end inside SizeOfHeaders (so
+    inside SizeOfImage): ``carve`` rewrites both in an image cut to that size.
+    ``emulate_runner.has_pe`` applies the same tests."""
     try:
         if blob[off:off + 2] != b"MZ":
             return None
@@ -352,9 +357,13 @@ def _headers(blob: bytes, off: int) -> tuple[int, int, int, int, int, int, int, 
         (magic,) = struct.unpack_from("<H", blob, p + 24)
         if magic not in (0x10B, 0x20B) or not 1 <= nsec <= triage.MAX_SECTIONS:
             return None
+        if opt_size < (112 if magic == 0x20B else 96):
+            return None
         (entry,) = struct.unpack_from("<I", blob, p + 24 + 16)
         size_of_image, size_of_headers = struct.unpack_from("<II", blob, p + 24 + 56)
         if not 0 < size_of_headers <= size_of_image <= MAX_IMAGE:
+            return None
+        if lfanew + 24 + opt_size + 40 * nsec > size_of_headers:
             return None
         table = p + 24 + opt_size
         secs = []
@@ -390,7 +399,8 @@ def carve(blob: bytes, off: int, base: int, alloc_size: int | None = None) -> Ca
     table and any non-zero overlay up to the region's end). A mapped (memory-layout) image is
     realigned: the image is kept as mapped, every section's file offset and size are rewritten
     to its RVA and virtual size, and ImageBase to where it was mapped, so Ghidra loads it at the
-    addresses it ran at. ``alloc_size`` (the size the stub asked VirtualAlloc for) bounds a
+    addresses it ran at. It is cut at the region's end, never padded out to SizeOfImage (a number
+    the sample chose): a section past the cut keeps only the bytes the region holds. ``alloc_size`` (the size the stub asked VirtualAlloc for) bounds a
     file copy at the start of its allocation exactly, trailing zeros included. None when the
     headers do not parse or the region holds only part of the file or image (its last section's
     initialised data lies past the region's end)."""
@@ -402,22 +412,26 @@ def carve(blob: bytes, off: int, base: int, alloc_size: int | None = None) -> Ca
     dll = bool(chars & 0x2000)
     if _memory_layout(blob, off, secs):
         mapped_end = max([size_of_headers] + [va + min(vsize or raw, raw) for vsize, va, raw, _p in secs if raw])
-        if len(blob) - off < min(mapped_end, size_of_image):
+        held = min(size_of_image, len(blob) - off)
+        if held < min(mapped_end, size_of_image):
             return None  # the region holds only part of the image (a header copy)
-        img = bytearray(blob[off:off + size_of_image].ljust(size_of_image, b"\x00"))
+        img = bytearray(blob[off:off + held])
         p = lfanew
-        opt_size = struct.unpack_from("<H", img, p + 20)[0]
-        (file_align,) = struct.unpack_from("<I", img, p + 24 + 36)
-        align = file_align if file_align and not file_align & (file_align - 1) and file_align <= 0x10000 else 1
-        table = p + 24 + opt_size
-        for i, (vsize, va, raw, _ptr) in enumerate(secs):
-            want = (vsize or raw) + align - 1 & ~(align - 1)
-            span = max(0, min(want, size_of_image - va)) if va < size_of_image else 0
-            struct.pack_into("<II", img, table + 40 * i + 16, span, va if span else 0)
-        if magic == 0x20B:
-            struct.pack_into("<Q", img, p + 24 + 24, base + off)
-        elif base + off < 1 << 32:
-            struct.pack_into("<I", img, p + 24 + 28, base + off)
+        try:
+            opt_size = struct.unpack_from("<H", img, p + 20)[0]
+            (file_align,) = struct.unpack_from("<I", img, p + 24 + 36)
+            align = file_align if file_align and not file_align & (file_align - 1) and file_align <= 0x10000 else 1
+            table = p + 24 + opt_size
+            for i, (vsize, va, raw, _ptr) in enumerate(secs):
+                want = (vsize or raw) + align - 1 & ~(align - 1)
+                span = max(0, min(want, held - va)) if va < held else 0
+                struct.pack_into("<II", img, table + 40 * i + 16, span, va if span else 0)
+            if magic == 0x20B:
+                struct.pack_into("<Q", img, p + 24 + 24, base + off)
+            elif base + off < 1 << 32:
+                struct.pack_into("<I", img, p + 24 + 28, base + off)
+        except struct.error:
+            return None  # _headers keeps these fields inside the image; never past it regardless
         return Carved(bytes(img), "memory", machine, dll, identity)
     end = max([size_of_headers] + [ptr + raw for _vs, _va, raw, ptr in secs if raw])
     try:
@@ -805,7 +819,9 @@ def _sha(data: bytes) -> str:
 
 def _read_region(scan_dir: Path, name: str) -> bytes | None:
     try:
-        fd = os.open(scan_dir / name, os.O_RDONLY | os.O_NOFOLLOW)
+        # O_NONBLOCK: opening a FIFO left under this name returns at once instead of waiting for a
+        # writer that will never come; it changes nothing for the regular file read below.
+        fd = os.open(scan_dir / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
     with os.fdopen(fd, "rb") as f:
@@ -819,8 +835,10 @@ def _captures(regions: Any, scan_dir: Path, work: Path, input_sha256: str,
     out: list[Capture] = []
     seen: set[str] = set()
     dropped: Counter[str] = Counter()
+    total = 0
 
     def keep(data: bytes, cap: Capture) -> None:
+        nonlocal total
         if len(out) >= MAX_CAPTURES:
             dropped["capped"] += 1
             return
@@ -830,6 +848,10 @@ def _captures(regions: Any, scan_dir: Path, work: Path, input_sha256: str,
         if cap.sha256 in seen:
             dropped["duplicate"] += 1
             return
+        if total + len(data) > MAX_CAPTURES_BYTES:  # PE headers on several pages of one region overlap
+            dropped["capped"] += 1
+            return
+        total += len(data)
         seen.add(cap.sha256)
         work.mkdir(parents=True, exist_ok=True)
         cap.path = work / f"capture-{len(out)}.bin"
