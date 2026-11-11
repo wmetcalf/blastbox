@@ -726,16 +726,19 @@ def run_dotnet_resources(
 
     dnfile parses hostile metadata, so it runs out of process: ``ulimit -v`` caps memory,
     ``ulimit -f`` each file it writes into ``outdir``, ``max_stdout`` its JSON, ``timeout_s`` its
-    time. ``-I`` keeps the script's own directory and the environment out of ``sys.path``.
+    time. The scanner is told two thirds of that time as its own budget, so that it stops reading,
+    counts what it did not read and still answers before it is killed with nothing to show.
+    ``-I`` keeps the script's own directory and the environment out of ``sys.path``.
     """
     from blastbox.engines.rea import dotnet_resources
 
     outdir = outdir.resolve()
     outdir.mkdir(parents=True, exist_ok=True)
     blocks = max(1, max_write_bytes // 512)
-    argv = ["sh", "-c", 'ulimit -v "$1" || exit 1; ulimit -f "$2" || exit 1; exec "$3" -I "$4" "$5" "$6"',
+    budget = max(1.0, min(dotnet_resources.SCAN_BUDGET_S, timeout_s * 2 / 3))  # the rest: parse, output
+    argv = ["sh", "-c", 'ulimit -v "$1" || exit 1; ulimit -f "$2" || exit 1; exec "$3" -I "$4" "$5" "$6" "$7"',
             "sh", str(max_kb), str(blocks), python, str(Path(dotnet_resources.__file__).resolve()),
-            str(sample.resolve()), str(outdir)]
+            str(sample.resolve()), str(outdir), f"{budget:.1f}"]
     out = run_fn(argv, env=env, cwd=outdir, timeout_s=timeout_s, max_stdout=max_stdout)
     if out.timed_out:
         return "timeout", b""

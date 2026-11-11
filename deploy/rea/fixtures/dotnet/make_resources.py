@@ -6,7 +6,8 @@ blob.bin            72 KiB of hash-chain bytes: a high-entropy raw resource (hid
 payload.gz          gzip of sample.exe: decodes to a PE
 x.dat               sample.exe's first 1 KiB (its headers) XOR 0x5A: decodes to a PE header
 b64.txt             base64 of the same 1 KiB: decodes to a PE header
-logo.png            a PNG signature + 80 KiB of hash-chain bytes: high entropy, but media
+logo.png            a PNG signature + 80 KiB of hash-chain bytes: starts like media and is not
+                    a PNG, so it is a hidden payload too
 Resources.resources a v2 .resources container: "AppTitle" (string), "Blob" (66 KiB byte[] of
                     hash-chain bytes, a hidden payload) and "Pad" (2 KiB of zeros, byte[])
 """

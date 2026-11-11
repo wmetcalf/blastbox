@@ -223,12 +223,14 @@ def _line(head: str, cites: list[str], tail: str) -> str:
 def resources_unread(sweep: dict[str, Any]) -> str:
     """What the sweep's .NET resource scan did not read, as a clause for the rule line ("" when it
     read everything, or the sample has no such scan): the scan failed, or it left items unread at
-    its time, size and count limits. Any of them may be a hidden payload."""
+    its time, size and count limits. Any of them may be a hidden payload. ``images_unread`` is the
+    same count under the name an older sweep sealed it by."""
     res = _dict(sweep.get("dotnet_resources"))
     if res.get("scan_failed") is True:
         return "the resource scan failed"
-    n = res.get("items_unread")
-    if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+    counts = (res.get("items_unread"), res.get("images_unread"))
+    n = sum(c for c in counts if isinstance(c, int) and not isinstance(c, bool) and c > 0)
+    if n:
         return f"{n} resource item(s) were not read (time, size or count limit)"
     return ""
 

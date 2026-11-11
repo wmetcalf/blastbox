@@ -389,7 +389,7 @@ RUN --mount=type=bind,source=deploy/rea,target=/mnt/rea \
     echo '== .NET resource scan (capa venv python, hash-locked dnfile) over the dotnet fixture'; \
     scanner=$(python -c 'import blastbox.engines.rea.dotnet_resources as m; print(m.__file__)'); \
     /opt/capa/bin/python -I "$scanner" /mnt/rea/fixtures/dotnet.dll "$w/dres" > "$w/dres.json"; \
-    python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['resources_total'] == 6 and len(d['hidden']) == 5, d; print('hidden payloads:', len(d['hidden']))" \
+    python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['resources_total'] == 6 and len(d['hidden']) == 6, d; print('hidden payloads:', len(d['hidden']))" \
         "$w/dres.json"; \
     echo '== emulated unpacking (speakeasy venv, unicorn only) of the loader fixture under its ulimits'; \
     runner=$(python -c 'import blastbox.engines.rea.emulate_runner as m; print(m.__file__)'); \

@@ -17,6 +17,7 @@ from blastbox.engines.rea.verdict import (
     decide,
     engine_grounds,
     model_grounds,
+    resources_unread,
 )
 
 PIXEL = {"resource": "a.resources", "size": 9000, "entropy": 7.9, "image": "bmp 128x127",
@@ -339,6 +340,20 @@ def test_a_benign_call_needs_every_resource_read():
         obj = _obj("benign")
         apply(obj, sweep={"dotnet_resources": {"items_unread": junk}}, known=KNOWN, sources=(), code_read=True)
         assert obj["verdict"]["label"] == "benign"
+
+
+def test_an_older_sweeps_unread_images_hold_a_benign_call_too():
+    # Evidence sealed before items_unread existed counts images_unread; a chain continued across
+    # the upgrade must not read it as a clean scan.
+    obj = _obj("benign")
+    apply(obj, sweep={"dotnet_resources": {"hidden_payloads": [], "images_unread": 2}}, known=KNOWN,
+          sources=(), code_read=True)
+    assert (obj["verdict"]["label"], obj["verdict"]["confidence"]) == ("unknown", "low")
+    assert "2 resource item(s) were not read" in obj["verdict"]["rationale"]
+    both = {"dotnet_resources": {"items_unread": 3, "images_unread": 2}}
+    assert resources_unread(both).startswith("5 resource item(s)")
+    for junk in (True, -1, "4", None, 0):
+        assert resources_unread({"dotnet_resources": {"images_unread": junk}}) == ""
 
 
 def test_a_benign_call_does_not_stand_on_a_resource_scan_that_failed():

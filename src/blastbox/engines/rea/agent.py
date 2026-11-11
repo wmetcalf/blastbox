@@ -378,6 +378,71 @@ def compact_for_model(text: str) -> str:
     return text
 
 
+BATCH_NOTE = ("not_shown were asked for and did not fit in this result: "
+              "ask for them again, fewer per call")
+MAX_BATCH_ITEMS = 64
+
+
+def batch_view(text: str, asked: list[str], cap: int = TOOL_RESULT_CHARS) -> tuple[str, int, list[str]] | None:
+    """What the model is shown of a batch decompile: ``(text, chars omitted, addresses read)``, or
+    None when the result is not a batch.
+
+    The result is rebuilt to hold whole functions, in the tool's order, up to ``cap``; the ones
+    that do not fit are named under ``not_shown`` rather than lost in a cut through the middle of
+    the JSON. A first function larger than the cap is shown with its code cut, as a single
+    decompile is. ``addresses read`` are the asked-for functions shown with code: only those
+    count as opened, so a batch of sixteen of which four were seen opens four."""
+    obj = _parse_json(text)
+    res = obj.get("normalized_result") if isinstance(obj, dict) and "normalized_result" in obj else obj
+    if not isinstance(res, dict) or not isinstance(res.get("items"), list):
+        return None
+    items: list[Any] = res["items"]
+    counts = {k: res[k] for k in ("total", "succeeded", "failed")
+              if isinstance(res.get(k), int) and not isinstance(res.get(k), bool)}
+
+    def label(item: Any) -> str:
+        return (norm_addr(item.get("address")) if isinstance(item, dict) else None) or "?"
+
+    def render(shown: list[Any], later: list[str]) -> str:
+        body: dict[str, Any] = {"items": shown, **counts}
+        if later:
+            body["not_shown"], body["note"] = later, BATCH_NOTE
+        return json.dumps({"operation": "batch_decompile", "normalized_result": body}, ensure_ascii=False)
+
+    shown = list(items[:MAX_BATCH_ITEMS])
+    later = [label(i) for i in items[MAX_BATCH_ITEMS:MAX_BATCH_ITEMS * 2]]
+    sizes = [len(json.dumps(i, ensure_ascii=False)) for i in shown]
+    keep, used = 0, 0
+    while keep < len(shown) and (keep == 0 or used + sizes[keep] <= cap):
+        used += sizes[keep]
+        keep += 1
+    shown, later = shown[:keep], [label(i) for i in shown[keep:]] + later
+    out = render(shown, later)
+    while len(out) > cap and len(shown) > 1:
+        later.insert(0, label(shown.pop()))
+        out = render(shown, later)
+    cut = False
+    if len(out) > cap:  # one function, larger than the cap on its own
+        first = shown[0] if shown else None
+        code = first.get("pseudocode") if isinstance(first, dict) else None
+        if not isinstance(first, dict) or not isinstance(code, str):
+            return None
+        budget = cap
+        while len(out) > cap and budget > 0:
+            budget = budget * 3 // 4
+            shown = [dict(first, pseudocode=cap_tool_text(code, budget)[0])]
+            out = render(shown, later)
+        if len(out) > cap:
+            return None
+        cut = True
+    want = set(asked)
+    read = [a for a in (label(i) for i in shown if isinstance(i, dict) and i.get("status") == "ok"
+                        and isinstance(i.get("pseudocode"), str) and i["pseudocode"].strip())
+            if a in want]
+    omitted = max(0, len(compact_for_model(text)) - len(out)) if later or cut else 0
+    return out, omitted, _dedup(read)
+
+
 class TranscriptWriter:
     """JSONL, capped while writing; the last line is a truncation marker once the cap is hit."""
 
@@ -1324,11 +1389,17 @@ class ReaAgentEngine:
                         a = norm_addr(args.get(key))
                         if a is not None:
                             explored_now.append(a)
-                    if c["name"] in CODE_TOOLS:
+                view = None
+                if not is_error and c["name"] in CODE_TOOLS:
+                    read = _code_addresses(args)
+                    if c["name"] == "batch_decompile":  # only what it showed the model was read
+                        view = batch_view(text, read)
+                        read = view[2] if view is not None else []
+                    if read or c["name"] != "batch_decompile":
                         p.code_read = True
-                        p.opened = _dedup(p.opened + _code_addresses(args))
-                        explored_now.extend(_code_addresses(args))
-                shown, omitted = cap_tool_text(compact_for_model(text))
+                    p.opened = _dedup(p.opened + read)
+                    explored_now.extend(read)
+                shown, omitted = view[:2] if view is not None else cap_tool_text(compact_for_model(text))
                 messages.append(framer.tool_result(c["id"], cid, c["name"], shown,
                                                    is_error=is_error, omitted_chars=omitted))
             if out_of_time:
@@ -1643,6 +1714,8 @@ class ReaAgentEngine:
                       program_functions=p.program_functions,
                       opinion=p.opinion if p.report is not None else state.opinion)
         known = set(state.facts)
+        before = set(state.opened)
+        fresh = [a for a in p.opened if a not in before]  # code first read this pass is progress too
         new = [f for f in _dedup(facts_of(report, p.functions, p.iocs)) if f not in known]
         max_passes = _env_int("REA_MAX_PASSES", DEFAULT_MAX_PASSES, 1, MAX_STEPS_CEILING)
         # A gap's targets are what it still needs (sufficiency.py leaves out what is done): a
@@ -1653,7 +1726,7 @@ class ReaAgentEngine:
             stop = "bar_met"
         elif p.evidence_only:  # no tool can add to the sweep's evidence: one report, then stop
             stop = "evidence_only"
-        elif p.pass_no >= 2 and not new:
+        elif p.pass_no >= 2 and not new and not fresh:
             stop = "stalled"
         elif p.pass_no >= max_passes:
             stop = "pass_cap"

@@ -256,6 +256,7 @@ def test_path_args_are_overwritten_with_the_sample():
     ("search_strings", {"pattern": "ok", "mode": "glob"}),
     ("batch_decompile", {"addresses": ["0x401000", "../x"]}),
     ("batch_decompile", {"addresses": ["0x1"] * 100}),
+    ("batch_decompile", {"addresses": []}),
     ("build_call_path", {"functions": [], "start": {}, "goal": {}}),
     ("inspect_rust_binary", {"view": {"x": 1}}),
     ("get_evidence_bundle", {"filters": {"evidence_id": "nope"}}),
@@ -2259,13 +2260,28 @@ _GO_ROWS = [{"address": a, "value": n, "symbol": {"external": False, "source": "
                          ("0x403000", "main::main.stealCookies")]]
 
 
+def _batch(*items, **extra):
+    """A batch_decompile result as the tool returns it: ``(address, pseudocode)`` per function, or
+    ``(address, None)`` for one it could not decompile."""
+    rows = [{"address": a, "procedure": {"address": a, "name": "f", "status": "ok"}, "status": "ok",
+             "pseudocode": code} if code is not None else
+            {"address": a, "procedure": {"error": "no function", "status": "error"}, "status": "error",
+             "error": "no function"} for a, code in items]
+    ok = sum(1 for _a, code in items if code is not None)
+    return json.dumps({"evidence_id": "e1", "operation": "batch_decompile",
+                       "parameters": {"addresses": [a for a, _c in items]}, "raw_result": None,
+                       "normalized_result": {"items": rows, "total": len(rows), "succeeded": ok,
+                                             "failed": len(rows) - ok, **extra}})
+
+
 def _go_benign_pass(tmp_path, turns, *, claims=("0x402000", "0x403000"), explored=(), **state_kw):
     """A Go program (two functions of its own) called benign after ``turns`` of tool use."""
     cont = make_continuation(tmp_path, todo=[], explored=list(explored), sweep={"kind": "elf"}, **state_kw)
     rig = McpRig(tmp_path, {
         "list_procedures": {"text": json.dumps({"normalized_result": _GO_ROWS})},
         "procedure_info": {"text": json.dumps({"normalized_result": {"name": "entry", "entrypoint": "0x401000"}})},
-        "procedure_pseudo_code": {"text": DECOMP}, "batch_decompile": {"text": DECOMP},
+        "procedure_pseudo_code": {"text": DECOMP},
+        "batch_decompile": {"text": _batch(("0x403000", "void f(void) { play(); }"))},
         "procedure_callees": {"text": DECOMP}})
     final = {"summary": "A board game.", "functions": [
         {"address": a, "name": "f", "claim": "part of the game", "evidence": []} for a in claims],
@@ -2314,7 +2330,8 @@ def test_functions_opened_by_an_earlier_pass_stay_opened(tmp_path, monkeypatch):
 def test_a_failed_code_tool_opens_nothing(tmp_path):
     cont = make_continuation(tmp_path, todo=["0x140001420", "0x140009000"])
     rig = McpRig(tmp_path, {"procedure_pseudo_code": {"error": "no such procedure"},
-                            "batch_decompile": {"text": DECOMP}})
+                            "batch_decompile": {"text": _batch(("0x140001500", "void a(void) {}"),
+                                                               ("0x140001600", "void b(void) {}"))}})
     model = FakeModel([tc(("procedure_pseudo_code", {"procedure": "0x140001420"}, "a"),
                           ("batch_decompile", {"addresses": ["0x140001500", "0x0140001600"]}, "b")),
                        _findings_answer(False)])
@@ -2322,6 +2339,61 @@ def test_a_failed_code_tool_opens_nothing(tmp_path):
     st = next_state(out)
     assert st.opened == ["0x140001500", "0x140001600"]
     assert {"0x140001500", "0x140001600"} <= set(st.explored)  # a decompiled function is explored too
+
+
+def test_batch_view_holds_whole_functions_and_names_the_rest():
+    """A batch result is cut to what fits; the functions that did not fit are named, not shown as
+    a middle torn out of the JSON, and only the ones shown with code count as read."""
+    small, big = "void s(void) { run(); }", "x = 1;\n" * 2000
+    text = _batch(("0x1000", small), ("0x2000", big), ("0x3000", small), ("0x4000", None))
+    asked = ["0x1000", "0x2000", "0x3000", "0x4000"]
+    shown, omitted, read = ag.batch_view(text, asked, 12_000)
+    obj = json.loads(shown)
+    res = obj["normalized_result"]
+    assert len(shown) <= 12_000 and omitted == len(ag.compact_for_model(text)) - len(shown) > 0
+    assert [i["address"] for i in res["items"]] == ["0x1000"] and res["items"][0]["pseudocode"] == small
+    assert res["not_shown"] == ["0x2000", "0x3000", "0x4000"] and "fewer" in res["note"]
+    assert (res["total"], res["succeeded"], res["failed"]) == (4, 3, 1) and read == ["0x1000"]
+    # Everything fits: nothing is held back, a failed item is shown and is not code read.
+    shown, omitted, read = ag.batch_view(_batch(("0x1000", small), ("0x4000", None), ("0x00003000", small)),
+                                         ["0x1000", "0x4000", "0x3000"], 12_000)
+    res = json.loads(shown)["normalized_result"]
+    assert omitted == 0 and "not_shown" not in res and len(res["items"]) == 3 and read == ["0x1000", "0x3000"]
+    # One function larger than the cap is shown cut, as a single decompile is.
+    shown, omitted, read = ag.batch_view(_batch(("0x2000", big), ("0x1000", small)), ["0x2000", "0x1000"], 12_000)
+    res = json.loads(shown)["normalized_result"]
+    assert len(shown) <= 12_000 and omitted > 0 and read == ["0x2000"] and res["not_shown"] == ["0x1000"]
+    assert "truncated by the engine" in res["items"][0]["pseudocode"]
+    # Code for an address nobody asked for, an empty body, and a result of another shape count nothing.
+    assert ag.batch_view(_batch(("0x9000", small), ("0x1000", "  ")), ["0x1000"], 12_000)[2] == []
+    for other in (DECOMP, "not json", json.dumps({"normalized_result": {"items": "x"}}), json.dumps([1])):
+        assert ag.batch_view(other, ["0x1000"], 12_000) is None
+
+
+def test_a_batch_opens_only_the_functions_the_model_was_shown(tmp_path):
+    big = "x = 1;\n" * 2000
+    cont = make_continuation(tmp_path, todo=["0x140001500", "0x140001600", "0x140001700"])
+    rig = McpRig(tmp_path, {"batch_decompile": {"text": _batch(
+        ("0x140001500", "void a(void) {}"), ("0x140001600", big), ("0x140001700", "void c(void) {}"))}})
+    asked = ["0x140001500", "0x140001600", "0x140001700"]
+    model = FakeModel([tc(("batch_decompile", {"addresses": asked}, "a")), _findings_answer(False)])
+    _res, out = run(tmp_path, cont, model, rig)
+    st = next_state(out)
+    assert st.opened == ["0x140001500"] and st.code_read is True
+    assert "0x140001600" not in st.explored and st.todo[:2] == ["0x140001600", "0x140001700"]
+    told = next(m["content"] for m in model.calls[1]["messages"] if m["role"] == "tool")
+    assert "not_shown" in told and "0x140001700" in told and "void c(void)" not in told
+
+
+@pytest.mark.parametrize("result", [DECOMP, "decompiled nothing"], ids=["other-shape", "text"])
+def test_a_batch_that_returns_no_function_reads_no_code(tmp_path, result):
+    cont = make_continuation(tmp_path, todo=[])
+    rig = McpRig(tmp_path, {"batch_decompile": {"text": result}})
+    model = FakeModel([tc(("batch_decompile", {}, "a"), ("batch_decompile", {"addresses": ["0x140001500"]}, "b")),
+                       _findings_answer(False)])
+    _res, out = run(tmp_path, cont, model, rig)
+    st = next_state(out)
+    assert st.opened == [] and st.code_read is False
 
 
 # ---------------------------------------------------------------- the deepening bar
@@ -2379,9 +2451,17 @@ def test_capa_lead_targets_lead_the_next_todo(tmp_path, monkeypatch):
 
 def test_a_pass_that_adds_no_fact_stalls_the_chain(tmp_path, monkeypatch):
     known = [f"fn:{FN_MAIN}", "sec:execution_flow", "ioc:url:http://evil.example/a.php"]
-    res, _o, _m = _bar_run(tmp_path, monkeypatch, _report(**_LOW), pass_no=1, facts=known)
+    res, _o, _m = _bar_run(tmp_path, monkeypatch, _report(**_LOW), pass_no=1, facts=known, opened=[FN_MAIN])
     f = res.payload.fields
     assert f["pass_no"] == 2 and f["stop_reason"] == "stalled" and f["more_pending"] is False
+
+
+def test_a_pass_that_opens_code_it_had_only_named_is_not_stalled(tmp_path, monkeypatch):
+    """Reading a function an earlier pass listed adds no fact, and it is the work the bar asked for."""
+    known = [f"fn:{FN_MAIN}", "sec:execution_flow", "ioc:url:http://evil.example/a.php"]
+    res, _o, _m = _bar_run(tmp_path, monkeypatch, _report(**_LOW), pass_no=1, facts=known)
+    f = res.payload.fields
+    assert f["pass_no"] == 2 and f["stop_reason"] == "" and f["more_pending"] is True
 
 
 def test_the_pass_cap_ends_an_unmet_chain(tmp_path, monkeypatch):
