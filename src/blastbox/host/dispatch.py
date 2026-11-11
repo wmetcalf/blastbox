@@ -565,14 +565,21 @@ class Dispatcher:
         self._scratch_max_age_s = max(0.0, float(
             os.environ.get("BLASTBOX_SCRATCH_MAX_AGE_S", "21600") or "21600"))
         self._retained_lock = threading.Lock()
-        # Job ids one of THIS process's dispatch threads holds between claim and return. The cold
-        # requeue sweep reads worker liveness from `docker ps`, which lists RUNNING containers only,
-        # so a job whose worker has exited but whose owner thread is still removing the container,
-        # validating, sealing or uploading looks exactly like an orphan. It is not one while its
-        # owner is alive in this process, and this set is how the sweep knows. In-memory on
-        # purpose: it is empty after a restart, so crash recovery is unchanged.
+        # Claims one of THIS process's dispatch threads holds between claim and return, each with
+        # the monotonic time of its last progress. The cold requeue sweep reads worker liveness
+        # from `docker ps`, which lists RUNNING containers only, so a job whose worker has exited
+        # but whose owner thread is still removing the container, validating, sealing or uploading
+        # looks exactly like an orphan. It is not one while its owner is at work in this process,
+        # and this map is how the sweep knows.
+        #   Keyed by (job_id, claim_id), not job_id: two threads here can hold the same job (one
+        #   on a claim since requeued, one on the re-claim), and the first to return must not
+        #   unregister the other.
+        #   Bounded by `worker_timeout_s + requeue_grace_s` since the last progress (the claim,
+        #   then the worker's exit), the same deadline the warm pass uses: an owner thread stuck
+        #   for longer than that is not finishing anything, and its job is recovered.
+        # In-memory on purpose: it is empty after a restart, so crash recovery is unchanged.
         self._inflight_lock = threading.Lock()
-        self._inflight_job_ids: set[str] = set()
+        self._inflight: dict[tuple[str, str | None], float] = {}
         # Set once shutdown begins: a dispatch worker abandoned past the join deadline (e.g. blocked
         # in a slow claim_next) must NOT acquire a cold permit and spawn a container after the CLI
         # has removed the node reservation. The cold path checks this before acquiring the gate.
@@ -906,15 +913,23 @@ class Dispatcher:
         # From here _dispatch_claimed_job owns releasing the reservation (freed once the slot is
         # resolved there); do NOT release it again in this method.
         # In flight from claim to return, so the maintenance sweep on another thread cannot
-        # requeue this job while this thread is still finishing it (see _inflight_job_ids).
+        # requeue this job while this thread is still finishing it (see _inflight).
+        held = (job.job_id, job.claim_id)
         with self._inflight_lock:
-            self._inflight_job_ids.add(job.job_id)
+            self._inflight[held] = time.monotonic()
         try:
             self._dispatch_claimed_job(job, warm_reserved=reserved)
         finally:
             with self._inflight_lock:
-                self._inflight_job_ids.discard(job.job_id)
+                self._inflight.pop(held, None)
         return True
+
+    def _inflight_progress(self, job: Job) -> None:
+        """Restart the in-flight bound for a claim this process holds (see ``_inflight``)."""
+        held = (job.job_id, job.claim_id)
+        with self._inflight_lock:
+            if held in self._inflight:
+                self._inflight[held] = time.monotonic()
 
     def self_test(self, *, gate: bool) -> bool:
         """Prove this dispatcher can actually store and serve a result, before it claims a job.
@@ -1172,8 +1187,12 @@ class Dispatcher:
         A cold job one of this process's own dispatch threads still holds is skipped too: after
         its worker exits it is absent from ``docker ps`` for as long as the owner takes to remove
         the container, validate, seal and upload, and requeuing it there wipes the owner's output
-        and runs the same untrusted input again. The WARM pass is deliberately NOT given this
-        exemption: its deadline is the only bound on a warm job whose owner thread is stuck.
+        and runs the same untrusted input again. That holds for ``worker_timeout_s +
+        requeue_grace_s`` since the claim's last progress (the claim itself, then the worker's
+        exit); past it the owner thread is stuck and the job is requeued as before. It covers this
+        process only: a second dispatcher on the same store and docker host does not know what
+        this one holds. The WARM pass is deliberately NOT given this exemption: its deadline is
+        the only bound on a warm job whose owner thread is stuck.
 
         All recovery + terminal writes are CAS-fenced on (status, claim_id), so a stale owner can
         never clobber a job that was reclaimed (RUNNING->QUEUED->RUNNING), and recovery never
@@ -1239,14 +1258,17 @@ class Dispatcher:
             # docker ps failed — skip cold requeue (warm recovery above already ran).
             return recovered
         # Taken after `docker ps` (which can be slow) so the snapshot is as fresh as it can be. A
-        # job deregisters only after its owner returns, and the CAS below still fences one whose
-        # owner wrote its terminal status in between.
+        # claim deregisters only after its owner returns, and the CAS below still fences one whose
+        # owner wrote its terminal status in between. A claim with no progress for longer than a
+        # worker may run plus the grace window is left out: its owner is stuck, not finishing.
+        inflight_cutoff = time.monotonic() - (self._worker_timeout_s + self._requeue_grace_s)
         with self._inflight_lock:
-            inflight = frozenset(self._inflight_job_ids)
+            inflight = frozenset(
+                held for held, progressed in self._inflight.items() if progressed >= inflight_cutoff)
         for job in running:
             if (
                 job.job_id in excluded
-                or job.job_id in inflight
+                or (job.job_id, job.claim_id) in inflight
                 or job.job_id in active_job_ids
                 or job.worker_runtime == "warm"  # handled above
             ):
@@ -2896,6 +2918,7 @@ class Dispatcher:
                 timeout=self._worker_timeout_s,
             )
         except subprocess.TimeoutExpired:
+            self._inflight_progress(job)
             # Kill the stuck container. If the kill is NOT confirmed, flag a possible orphan so the
             # caller keeps its cold-permit reservation (the container may still hold node RAM).
             if not self._kill_container(container_name) and orphan_out is not None:
@@ -2905,6 +2928,9 @@ class Dispatcher:
         except Exception as exc:  # noqa: BLE001
             self._fail_job(job, f"docker launch failed: {exc}")
             return
+        # The worker has exited: from here the job is absent from `docker ps` until this thread
+        # writes its terminal status, and the in-flight bound for that phase starts now.
+        self._inflight_progress(job)
         finished_at_ms = _attest.now_ms()
         observation = None if receipt_input_sha256 is None else _attest.RunObservation(
             job_id=job.job_id, engine=job.engine, input_sha256=receipt_input_sha256,

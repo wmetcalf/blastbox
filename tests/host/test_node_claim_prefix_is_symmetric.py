@@ -114,7 +114,7 @@ class TestADispatcherSharingTheQueueLeavesNodeClaimsAlone:
         d._job_retention_seconds = 0
         d._list_active_worker_job_ids = lambda: set()      # nothing of ours is running
         d._inflight_lock = threading.Lock()
-        d._inflight_job_ids = set()                         # and no thread of ours holds a job
+        d._inflight = {}                                    # and no thread of ours holds a job
         d._delete_input = lambda p: None
         return d
 
