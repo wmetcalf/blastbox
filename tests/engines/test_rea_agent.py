@@ -145,10 +145,11 @@ class FakeModel:
         return self
 
     def chat(self, messages, tools, max_tokens, *, response_format=None, timeout_s=None,
-             chat_template_kwargs=None):
+             chat_template_kwargs=None, temperature=None):
         self.calls.append({"messages": copy.deepcopy(messages), "tools": copy.deepcopy(tools),
                            "max_tokens": max_tokens, "response_format": response_format,
-                           "timeout_s": timeout_s, "chat_template_kwargs": chat_template_kwargs})
+                           "timeout_s": timeout_s, "chat_template_kwargs": chat_template_kwargs,
+                           "temperature": temperature})
         if self.on_chat:
             self.on_chat()
         if not self.script:
@@ -1696,11 +1697,13 @@ def _report(**over):
     sections["network"] = _section("not_observed", "No sockets.", [{"address": FN_MAIN, "function": "", "note": ""}],
                                    "network")
     sections.update(over.pop("sections", {}))
-    obj = {"verdict": {"label": "benign", "confidence": "medium", "rationale": "prints and exits"},
+    obj = {"verdict": {"label": "benign", "grounds": [], "rationale": "prints and exits"},
            "sections": sections}
     obj.update(over)
     return obj
 
+
+BENIGN_RULE = "Rule: benign/medium; no ground for suspicion in the code read."
 
 FINAL_OK = {"summary": "Prints hello.", "functions": [
     {"address": FN_MAIN, "name": "entry", "claim": "prints hello", "evidence": ["t1"]}],
@@ -1713,13 +1716,13 @@ def _with_usage(resp, tokens):
 
 
 def _report_run(tmp_path, monkeypatch, report_resp, *, prior=None, clock=time.monotonic, on_chat=None,
-                tokens=None, tool_turn=None):
+                tokens=None, tool_turn=None, sweep=None):
     monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
     if tokens is not None:
         monkeypatch.setenv("REA_REPORT_MAX_TOKENS", str(tokens))
     cont = make_continuation(tmp_path, analysis_report=prior,
                              sweep={"kind": "pe", "iocs": [{"type": "domain", "value": "sweep.example",
-                                                            "source": "ghidra:0x1"}]})
+                                                            "source": "ghidra:0x1"}], **(sweep or {})})
     script = [tool_turn or tc(("procedure_pseudo_code", {"procedure": FN_MAIN}, "a")), answer(FINAL_OK)]
     if report_resp is not None:
         script.append(report_resp)
@@ -1740,13 +1743,16 @@ def test_report_schema_is_the_interface_shape_and_fits_the_token_budget():
     assert sch["properties"]["sections"]["required"] == list(p.REPORT_KEYS)
     v = sch["properties"]["verdict"]["properties"]
     assert v["label"]["enum"] == ["benign", "suspicious", "malicious", "unknown"]
-    assert v["confidence"]["enum"] == ["low", "medium", "high"]
+    # The model gives its call and its grounds; label and confidence on the wire are the rule's.
+    assert sch["properties"]["verdict"]["required"] == ["label", "grounds", "rationale"] and "confidence" not in v
+    assert v["grounds"]["maxItems"] == p.GEN_GROUNDS
+    assert v["grounds"]["items"]["properties"]["code"]["enum"] == [*p.HOSTILE_GROUNDS, *p.CONCEALING_GROUNDS]
     assert p.GEN_RATIONALE <= p.REPORT_RATIONALE and p.GEN_TITLE <= p.REPORT_TITLE
     assert p.GEN_FUNCTION <= p.REPORT_FUNCTION and p.GEN_NOTE <= p.REPORT_NOTE
     assert all(t <= p.REPORT_TEXT and e <= p.REPORT_EVIDENCE for t, e in p.GEN_SECTIONS.values())
     # ~4 chars/token for bounded strings, ~12 tokens of syntax per evidence row, ~20 per section.
     ev = 6 + p.GEN_FUNCTION // 4 + p.GEN_NOTE // 4 + 12
-    worst = (p.GEN_RATIONALE // 4 + 20
+    worst = (p.GEN_RATIONALE // 4 + 20 + p.GEN_GROUNDS * (ev + 12)
              + sum(p.GEN_TITLE // 4 + t // 4 + e * ev + 20 for t, e in p.GEN_SECTIONS.values()))
     assert worst <= ag.DEFAULT_REPORT_TOKENS
 
@@ -1760,7 +1766,7 @@ def test_report_is_written_validated_and_carried_to_the_next_pass(tmp_path, monk
     assert f["model_status"] == "ok" and cols(res.payload, "functions")["address"] == [FN_MAIN]
     rep = json.loads(f["analysis_report"])
     assert rep["schema"] == "rea.analysis/1" and rep["pass"] == 1
-    assert rep["verdict"] == {"label": "benign", "confidence": "medium", "rationale": "prints and exits"}
+    assert rep["verdict"] == {"label": "benign", "confidence": "medium", "rationale": BENIGN_RULE + "\nprints and exits"}
     secs = {s["key"]: s for s in rep["sections"]}
     assert [s["key"] for s in rep["sections"]] == list(prompts.REPORT_KEYS)
     assert secs["overview"]["status"] == "observed" and secs["overview"]["evidence"] == []
@@ -1777,6 +1783,8 @@ def test_report_is_written_validated_and_carried_to_the_next_pass(tmp_path, monk
     assert call["tools"] == [] and call["max_tokens"] == ag.DEFAULT_REPORT_TOKENS
     assert call["response_format"]["json_schema"]["name"] == "rea_analysis"
     assert call["chat_template_kwargs"] == {"thinking": False}
+    # Sampled at temperature 0; the tool turns before it are left to the server.
+    assert call["temperature"] == 0.0 and all(c["temperature"] is None for c in model.calls[:-1])
     body = json.dumps(call["messages"])
     assert "prior overview" in body and "prints hello" in body and "sweep.example" in body
     assert "found_in_sample" in body and len(call["messages"]) == 2
@@ -1816,7 +1824,79 @@ def test_report_with_a_raw_control_character_is_kept_and_cleaned(tmp_path, monke
     assert "\x01" in raw
     res, _o, _m = _report_run(tmp_path, monkeypatch, answer(raw), prior=PRIOR_REPORT)
     rep = json.loads(res.payload.fields["analysis_report"])
-    assert rep["verdict"]["rationale"] == "prints and exits" and "report_invalid" not in _codes(res)
+    assert rep["verdict"]["rationale"] == BENIGN_RULE + "\nprints and exits" and "report_invalid" not in _codes(res)
+
+
+def _events(out, kind):
+    lines = (out / "transcript.jsonl").read_text().splitlines()
+    return [{k: v for k, v in e.items() if k != "t"} for e in map(json.loads, lines) if e.get("event") == kind]
+
+
+def test_the_verdict_is_the_rules_not_the_models(tmp_path, monkeypatch):
+    # The model states a confidence it is not asked for and cites two grounds: one at a function this
+    # pass read, one at an address nobody saw. Only the first counts.
+    rep = _report(verdict={"label": "malicious", "confidence": "high", "rationale": "talks to a C2", "grounds": [
+        {"code": "remote_control", "evidence": {"address": FN_MAIN, "function": "entry", "note": "command loop"}},
+        {"code": "credential_theft", "evidence": {"address": "0xdeadbeef", "function": "ghost", "note": "invented"}}]})
+    res, out, _m = _report_run(tmp_path, monkeypatch, answer(rep))
+    verdict = json.loads(res.payload.fields["analysis_report"])["verdict"]
+    assert verdict == {"label": "malicious", "confidence": "medium",
+                       "rationale": f"Rule: malicious/medium on remote control ({FN_MAIN}).\ntalks to a C2"}
+    assert _events(out, "verdict_rule") == [{
+        "event": "verdict_rule", "opinion": "malicious", "label": "malicious", "confidence": "medium", "dropped": 1,
+        "grounds": [{"code": "remote_control", "tier": "hostile", "engine": False,
+                     "cite": f"remote control ({FN_MAIN})"}]}]
+
+
+def test_a_malicious_call_with_no_checkable_ground_is_only_suspicious(tmp_path, monkeypatch):
+    rep = _report(verdict={"label": "malicious", "rationale": "looks bad", "grounds": [
+        {"code": "remote_control", "evidence": {"address": "0xdeadbeef", "function": "ghost", "note": "invented"}},
+        {"code": "remote_control", "evidence": {"source": "iocs", "item": "sweep.example", "note": "a domain"}}]})
+    res, out, _m = _report_run(tmp_path, monkeypatch, answer(rep))
+    verdict = json.loads(res.payload.fields["analysis_report"])["verdict"]
+    assert (verdict["label"], verdict["confidence"]) == ("suspicious", "low")
+    assert verdict["rationale"].startswith("Rule: suspicious/low; the model's call (malicious) cites no ground")
+    # A pass that read functions counts addresses only: the sweep-source row is dropped too.
+    assert _events(out, "verdict_rule")[0]["dropped"] == 2
+
+
+def test_a_benign_reading_of_a_concealing_stub_is_overridden_and_owes_the_next_pass(tmp_path, monkeypatch):
+    sweep = {"emulation": {"status": "ok", "concealment": ["exec_alloc", "dynamic_code", "delay_loop"]}}
+    res, out, _m = _report_run(tmp_path, monkeypatch, answer(_report()), sweep=sweep)
+    f = res.payload.fields
+    verdict = json.loads(f["analysis_report"])["verdict"]
+    assert (verdict["label"], verdict["confidence"]) == ("suspicious", "medium")
+    assert verdict["rationale"] == ("Rule: suspicious/medium on emulated concealment (exec_alloc, dynamic_code). "
+                                    "Model's call: benign.\nprints and exits")
+    event = _events(out, "verdict_rule")[0]
+    assert event["opinion"] == "benign" and event["grounds"] == [{
+        "code": "emulated_concealment", "tier": "concealing", "engine": True,
+        "cite": "emulated concealment (exec_alloc, dynamic_code)"}]
+    # The label is no longer benign, but the model has not explained the stage: the gap still holds.
+    assert "benign_emulated_stage" in f["gaps"] and f["bar_met"] is False
+
+
+def test_an_invalid_report_records_no_verdict_rule_event(tmp_path, monkeypatch):
+    bad = _report(verdict={"label": "evil", "grounds": [], "rationale": "x"})
+    res, out, _m = _report_run(tmp_path, monkeypatch, answer(bad))
+    assert "report_invalid" in _codes(res) and _events(out, "verdict_rule") == []
+
+
+@pytest.mark.parametrize("raw, sent", [("0.7", 0.7), ("-1", None), ("9", 2.0), ("junk", 0.0), ("nan", 0.0),
+                                       ("inf", 0.0), ("", 0.0)])
+def test_report_temperature_knob(tmp_path, monkeypatch, raw, sent):
+    monkeypatch.setenv("REA_REPORT_TEMPERATURE", raw)
+    _res, _o, model = _report_run(tmp_path, monkeypatch, answer(_report()))
+    assert model.calls[-1]["temperature"] == sent
+
+
+def test_model_client_sends_temperature_only_when_given():
+    op = FakeOpener(json.dumps({"choices": [{"message": {"content": "{}"}}]}).encode())
+    m = ModelClient("http://m:1/v1", "x", 30, opener=op)
+    m.chat([{"role": "user", "content": "q"}], [], 16, temperature=0.0)
+    assert json.loads(op.requests[0].data)["temperature"] == 0.0
+    m.chat([{"role": "user", "content": "q"}], [], 16)
+    assert "temperature" not in json.loads(op.requests[1].data)
 
 
 def test_unparseable_report_is_invalid(tmp_path, monkeypatch):
@@ -2167,10 +2247,17 @@ def _ev_report(**over):
         {"address": FN_MAIN, "function": "entry", "note": "no function was read"}])
     sections["persistence"] = _section("observed", "Adds a Run key.", [
         {"source": "capabilities", "item": "persist via Run key", "note": "capa did not run"}])
-    obj = {"verdict": {"label": "suspicious", "confidence": "medium", "rationale": "an installer with a URL"},
+    obj = {"verdict": {"label": "suspicious", "rationale": "an installer with a URL", "grounds": [
+        {"code": "download_execute", "evidence": {"source": "iocs", "item": "http://evil.example/a.php",
+                                                  "note": "fetched and run"}}]},
            "sections": sections}
     obj.update(over)
     return obj
+
+
+def _ev_wire():
+    """``_ev_report`` as the verdict rule leaves it: the wire verdict ``validate_report`` takes."""
+    return {**_ev_report(), "verdict": {"label": "suspicious", "confidence": "medium", "rationale": "a URL"}}
 
 
 def _ev_run(tmp_path, monkeypatch, resp, *, status="timeout", sweep=None, **cont_kw):
@@ -2217,10 +2304,14 @@ def test_evidence_only_pass_writes_the_report_from_the_sweep(tmp_path, monkeypat
 
 
 def test_evidence_only_pass_never_meets_the_bar_without_code(tmp_path, monkeypatch):
-    rep = _ev_report(verdict={"label": "malicious", "confidence": "high", "rationale": "known C2 URL"})
-    res, _o, _m, _r = _ev_run(tmp_path, monkeypatch, answer(rep), status="failed")
+    res, _o, _m, _r = _ev_run(tmp_path, monkeypatch, answer(_ev_report()), status="failed")
     f = res.payload.fields
     assert f["stop_reason"] == "evidence_only" and f["bar_met"] is False and f["gaps"] == ["code_unread"]
+    # The model's ground cites a source the sweep holds, so the rule takes it.
+    verdict = json.loads(f["analysis_report"])["verdict"]
+    assert (verdict["label"], verdict["confidence"]) == ("malicious", "medium")
+    assert verdict["rationale"] == ("Rule: malicious/medium on download execute (iocs). Model's call: suspicious.\n"
+                                    "an installer with a URL")
     assert "failed" in next(w.message for w in res.warnings if w.code == "evidence_only")
 
 
@@ -2238,6 +2329,23 @@ def test_evidence_only_pass_over_decompiled_code_can_meet_the_bar(tmp_path, monk
     secs = {s["key"]: s for s in json.loads(f["analysis_report"])["sections"]}
     assert secs["execution_flow"]["evidence"][0]["source"] == "decompiled"
     assert "decompiled it to C#" in model.calls[0]["messages"][0]["content"]
+
+
+@pytest.mark.parametrize("verdict, wire", [
+    # No ground at all, or one citing a function (nothing was read) or a source the sweep is empty under.
+    ({"label": "malicious", "grounds": [], "rationale": "known C2 URL"}, ("suspicious", "low")),
+    ({"label": "malicious", "rationale": "x", "grounds": [
+        {"code": "remote_control", "evidence": {"address": FN_MAIN, "function": "entry", "note": "n"}},
+        {"code": "download_execute", "evidence": {"source": "capabilities", "item": "x", "note": "n"}}]},
+     ("suspicious", "low")),
+    # Benign needs the program's code read; an evidence-only pass over a native sample read none.
+    ({"label": "benign", "grounds": [], "rationale": "an ordinary installer"}, ("unknown", "low")),
+])
+def test_evidence_only_verdict_without_a_checkable_ground(tmp_path, monkeypatch, verdict, wire):
+    res, _o, _m, _r = _ev_run(tmp_path, monkeypatch, answer(_ev_report(verdict=verdict)))
+    got = json.loads(res.payload.fields["analysis_report"])["verdict"]
+    assert (got["label"], got["confidence"]) == wire
+    assert res.payload.fields["bar_met"] is False
 
 
 @pytest.mark.parametrize("resp, status, code", [
@@ -2273,19 +2381,19 @@ def test_a_pass_that_read_functions_cannot_claim_the_evidence_basis(tmp_path, mo
 
 
 def test_sealed_evidence_report_round_trips_and_rejects_what_it_should():
-    v = validate_report(_ev_report(), 1, set(), sources=["iocs", "unpacked"], basis="evidence")
+    v = validate_report(_ev_wire(), 1, set(), sources=["iocs", "unpacked"], basis="evidence")
     assert v.dropped == 3 and v.downgraded == ["persistence"]
     again = validate_report(v.report, 1, None)  # a sealed report: its own basis, nothing re-checked
     assert again.report == v.report and again.dropped == 0
     assert report_addresses(v.report) == set()
-    bad = _ev_report()
+    bad = _ev_wire()
     bad["sections"]["network"]["evidence"] = [{"source": "the model's memory", "item": "x"}]
     with pytest.raises(ReportInvalid):
         validate_report(bad, 1, set(), sources=["iocs"], basis="evidence")
     with pytest.raises(ReportInvalid):
-        validate_report({**_ev_report(), "basis": "vibes"}, 1, None)
+        validate_report({**_ev_wire(), "basis": "vibes"}, 1, None)
     with pytest.raises(ReportInvalid):
-        validate_report(_ev_report(), 1, None, basis="vibes")
+        validate_report(_ev_wire(), 1, None, basis="vibes")
 
 
 def test_evidence_sources_ignore_scans_that_found_nothing():

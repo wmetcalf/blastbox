@@ -41,6 +41,12 @@ verify itself, and lists what is still missing (``gaps``):
   gap's ``targets``, which go to the front of the next pass's todo list; a lead with no target
   left is not a gap.
 
+The three hidden-evidence gaps (``benign_hidden_payload``, ``benign_emulated_stage``,
+``benign_installer_concealment``) also hold when the *model* read the sample as benign and the
+verdict rule (``verdict.py``) overrode it on that same concealment (``opinion``, known only for a
+report this pass wrote): the rule fixes the label, but the model has still not explained what is
+hidden, and the next pass should. ``benign_unexplored`` goes by the final label alone.
+
 IOC precision and dropped claims are not gaps: they measure the model's care, not what is left
 to analyse, and live they did not improve with another pass (a DLL's pass 2 verified 0 of 6
 IOCs) while a pass could clear them by proposing nothing. Both stay visible in the payload (IOC
@@ -59,7 +65,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-__all__ = ["BEHAVIOUR_KEYS", "LEAD_SECTIONS", "Gap", "Sufficiency", "assess", "facts_of"]
+__all__ = ["BEHAVIOUR_KEYS", "LEAD_SECTIONS", "STALLING", "Gap", "Sufficiency", "assess", "facts_of",
+           "installer_concealment", "sample_decompiled"]
 
 MAX_TARGETS = 16  # per lead gap
 MAX_GAPS = 16
@@ -127,7 +134,7 @@ def _hidden_payloads(sweep: dict[str, Any]) -> list[str]:
     return out
 
 
-def _installer_concealment(sweep: dict[str, Any]) -> str:
+def installer_concealment(sweep: dict[str, Any]) -> str:
     """Why the installer evidence rules out a benign call ("" when it does not)."""
     unpacked, stub = sweep.get("unpacked"), sweep.get("installer_stub")
     layers = [unpacked, *(unpacked.get("inner") or [])] if isinstance(unpacked, dict) else []
@@ -144,7 +151,7 @@ def _installer_concealment(sweep: dict[str, Any]) -> str:
     return "; ".join(why)
 
 
-_STALLING = frozenset({"delay_loop"})
+STALLING = frozenset({"delay_loop"})
 
 
 def sample_decompiled(sweep: dict[str, Any]) -> bool:
@@ -162,7 +169,7 @@ def _concealment(sweep: dict[str, Any]) -> list[str]:
     items = em.get("concealment")
     found = [str(c)[:40] for c in items if isinstance(c, str)][:8] if isinstance(items, list) else []
     # Stalling alone is not a hidden stage: plenty of honest programs sleep on a timer.
-    return found if any(c not in _STALLING for c in found) else []
+    return found if any(c not in STALLING for c in found) else []
 
 
 def facts_of(report: dict[str, Any] | None, functions: list[dict[str, Any]],
@@ -175,7 +182,8 @@ def facts_of(report: dict[str, Any] | None, functions: list[dict[str, Any]],
 
 
 def assess(*, report: dict[str, Any] | None, sweep: dict[str, Any], explored: list[str],
-           program_functions: list[str] | None = None) -> Sufficiency:
+           program_functions: list[str] | None = None, opinion: str | None = None) -> Sufficiency:
+    """``opinion``: the model's own call in ``report`` when this pass wrote it (``verdict.py``)."""
     gaps: list[Gap] = []
     if not isinstance(report, dict):
         gaps.append(Gap("no_report", "no valid analysis report has been written yet"))
@@ -196,6 +204,8 @@ def assess(*, report: dict[str, Any] | None, sweep: dict[str, Any], explored: li
             gaps.append(Gap("code_unread", "the report rests on the sweep's evidence alone: the disassembler "
                                            "produced no code to read, so what the sample does beyond that "
                                            "evidence is unknown"))
+        said = ("the verdict is benign" if label == "benign"
+                else "the analysis reads the sample as benign" if opinion == "benign" else "")
         if label == "benign":
             seen = set(explored)
             left = [f for f in program_functions or [] if f not in seen]
@@ -204,21 +214,22 @@ def assess(*, report: dict[str, Any] | None, sweep: dict[str, Any], explored: li
                                 f"the verdict is benign but {len(left)} of the program's own "
                                 f"{len(program_functions or [])} functions are unexplored: read them "
                                 "before ruling out hostile behaviour", left[:MAX_TARGETS]))
+        if said:
             hidden = _hidden_payloads(sweep)
             if hidden:
                 gaps.append(Gap("benign_hidden_payload",
-                                ("the verdict is benign but the assembly carries a hidden payload the analysis "
+                                (said + " but the assembly carries a hidden payload the analysis "
                                  "has not explained (" + "; ".join(hidden) + "): the visible program may be a "
                                  "decoy; find the code that loads it")[:MAX_DETAIL]))
-            installer = _installer_concealment(sweep)
+            installer = installer_concealment(sweep)
             if installer:
                 gaps.append(Gap("benign_installer_concealment",
-                                ("the verdict is benign but the installer hides what it runs: " + installer
+                                (said + " but the installer hides what it runs: " + installer
                                  + "; explain what its script loads")[:MAX_DETAIL]))
             concealed = _concealment(sweep)
             if concealed:
                 gaps.append(Gap("benign_emulated_stage",
-                                ("the verdict is benign but emulating the stub showed it concealing a stage ("
+                                (said + " but emulating the stub showed it concealing a stage ("
                                  + ", ".join(concealed) + "): the analysed code is a loader; explain what it "
                                  "decrypts and runs")[:MAX_DETAIL]))
     if isinstance(report, dict):

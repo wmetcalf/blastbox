@@ -76,8 +76,11 @@ class ModelClient:
 
     def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], max_tokens: int, *,
              response_format: dict[str, Any] | None = None, timeout_s: float | None = None,
-             chat_template_kwargs: dict[str, Any] | None = None) -> dict[str, Any]:
+             chat_template_kwargs: dict[str, Any] | None = None,
+             temperature: float | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {"model": self.model, "messages": messages, "max_tokens": int(max_tokens)}
+        if temperature is not None:  # unset: the server's default sampling
+            body["temperature"] = float(temperature)
         if chat_template_kwargs is not None:
             if self.dialect == "openrouter":
                 # OpenRouter's spelling; only the thinking switch has an equivalent.

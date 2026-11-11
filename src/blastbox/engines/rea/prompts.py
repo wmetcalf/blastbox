@@ -120,6 +120,27 @@ REPORT_BASIS = "evidence"
 EVIDENCE_SOURCES = ("iocs", "unpacked", "installer_stub", "emulation", "dotnet_resources", "capabilities",
                     "api_hashes", "signatures", "decompiled")
 REPORT_ITEM = 128
+# Verdict grounds (``verdict.py``): behaviours the model may cite for its call, each with one
+# evidence row. The engine checks the citation, adds what the sweep itself shows and sets the
+# label and confidence by rule; grounds never reach the wire except as the rationale's rule line.
+HOSTILE_GROUNDS: dict[str, str] = {
+    "credential_theft": "reads credentials, cookies, tokens or wallets that belong to other applications",
+    "covert_capture": "records keystrokes, the screen, the clipboard, microphone or camera unasked",
+    "remote_control": "takes commands from a remote server and carries them out",
+    "download_execute": "fetches further code from the network and runs it unasked",
+    "process_injection": "writes or maps code into another process and runs it there",
+    "security_tampering": "disables or blinds security tools, logging or recovery",
+    "data_exfiltration": "collects the user's files or data and sends them out covertly",
+    "disguised_persistence": "installs itself to start automatically under a name or place that imitates "
+                             "something else",
+    "destruction": "encrypts for ransom, wipes or corrupts the user's files or disk",
+}
+CONCEALING_GROUNDS: dict[str, str] = {
+    "runtime_payload_loading": "decrypts, unpacks or decodes embedded code and runs it from memory",
+    "anti_analysis": "looks for debuggers, virtual machines, sandboxes or analysis tools and changes course",
+    "obfuscation": "strings, imports or control flow deliberately obscured",
+}
+GEN_GROUNDS = 4  # verdict grounds the model may cite
 GEN_RATIONALE = 400
 GEN_TITLE = 60
 GEN_FUNCTION = 64
@@ -161,7 +182,9 @@ def report_schema(sources: Sequence[str] | None = None) -> dict[str, Any]:
     """JSON Schema the report is decoded under: ``sections`` is an object with every key, in order.
 
     With ``sources`` (an evidence-only report) evidence rows cite sweep evidence
-    (``source``/``item``/``note``) instead of a function address.
+    (``source``/``item``/``note``) instead of a function address. The verdict is the model's side
+    of the verdict rule (``verdict.py``): its own ``label``, the ``grounds`` it cites (one evidence
+    row each) and a rationale. It carries no confidence; the engine sets that, and the wire label.
     """
     if sources:
         row: dict[str, Any] = {
@@ -201,10 +224,15 @@ def report_schema(sources: Sequence[str] | None = None) -> dict[str, Any]:
         "properties": {
             "verdict": {
                 "type": "object", "additionalProperties": False,
-                "required": ["label", "confidence", "rationale"],
+                "required": ["label", "grounds", "rationale"],
                 "properties": {
                     "label": {"type": "string", "enum": list(REPORT_LABELS)},
-                    "confidence": {"type": "string", "enum": list(REPORT_CONFIDENCES)},
+                    "grounds": {"type": "array", "maxItems": GEN_GROUNDS, "items": {
+                        "type": "object", "additionalProperties": False, "required": ["code", "evidence"],
+                        "properties": {
+                            "code": {"type": "string", "enum": [*HOSTILE_GROUNDS, *CONCEALING_GROUNDS]},
+                            "evidence": row,
+                        }}},
                     "rationale": {"type": "string", "maxLength": GEN_RATIONALE},
                 }},
             "sections": {
@@ -231,7 +259,29 @@ Sections, each exactly once, in this order: {keys}.
 - status "not_analysed": the analysis has not looked far enough to say.
 If a section's text says the program does not do something, its status is not_observed, never observed. Say not_observed or not_analysed rather than guess. Compiler and runtime startup code (CRT initialisation, the Go or .NET runtime, library internals) is not the program's own behaviour: mention it at most in the overview. not_observed and not_analysed sections get one short sentence and no evidence. Plain prose, no markdown headings, no lists."""
 
-_REPORT_VERDICT = """verdict: benign, suspicious, malicious or unknown, with a confidence and a short rationale. It is an opinion from the evidence above. Use "unknown" only when the analysis could not see what the program's own code does. Code built to hide what it does (a packed or encrypted stage decrypted and loaded at run time, imports resolved by hash, obfuscated names over logic that was not read) is at least "suspicious" even when the hidden part was not recovered; say what is hidden in the rationale. Never call a program malicious for using ordinary APIs, and never call it benign while part of its own code is unread."""
+_GROUNDS_TEXT = ("Hostile grounds: " + "; ".join(f"{c} ({d})" for c, d in HOSTILE_GROUNDS.items())
+                 + ". Concealing grounds: " + "; ".join(f"{c} ({d})" for c, d in CONCEALING_GROUNDS.items()) + ".")
+_VERDICT_RULE = (
+    " The engine, not you, sets the final label and its confidence: it checks the grounds you cite, adds "
+    "what the sweep itself shows (a family signature match, a payload hidden in resources or image pixels, "
+    "concealment seen in emulation, imports resolved by hash, an installer that hides what it runs) and "
+    "applies a fixed rule. A hostile ground makes the verdict malicious, a concealing one at least "
+    "suspicious, and a call with no ground the engine can check is held at low confidence. So give no "
+    "confidence, and cite every ground the evidence supports. " + _GROUNDS_TEXT + " One entry per "
+    "behaviour, each with ONE evidence row for the place that shows it; a ground whose evidence the analysis "
+    "never saw is discarded. Cite a ground only when the cited evidence shows that behaviour: ordinary API "
+    "use (a socket, a registry write, a file read) is not a ground, and an empty list is the right answer "
+    "when nothing qualifies. In the rationale say what the call rests on and what stays hidden; do not "
+    "repeat the label, and do not copy the line starting \"Rule:\" that the engine put at the head of a "
+    "previous report's rationale.")
+_REPORT_VERDICT = (
+    "verdict: your own call (benign, suspicious, malicious or unknown), the grounds for it, and a short "
+    "rationale. It is an opinion from the evidence above. Use \"unknown\" only when the analysis could not "
+    "see what the program's own code does. Code built to hide what it does (a packed or encrypted stage "
+    "decrypted and loaded at run time, imports resolved by hash, obfuscated names over logic that was not "
+    "read) is at least \"suspicious\" even when the hidden part was not recovered; say what is hidden in "
+    "the rationale. Never call a program malicious for using ordinary APIs, and never call it benign while "
+    "part of its own code is unread." + _VERDICT_RULE)
 
 _REPORT_SWEEP = """If sweep.dotnet_resources.hidden_payloads is non-empty, the assembly carries an embedded payload (large and high-entropy, or decoding to a PE) and the visible application may be a decoy. The overview must say so (name the resource, its size and entropy) and must not describe the sample by its decoy UI alone; the verdict is never benign while that payload is unexplained, and it is at least suspicious when the code loads or decrypts it (sweep.dotnet_resources.loader_refs). An item with "image" is a picture resource (PNG or BMP) whose pixels carry the payload: "decoded" beginning "image:" means the pixel bytes, read in the named order (col- or row-major, channel order, "+len" a 4-byte length prefix, then plain or the named XOR key or compression), ARE a Windows executable, recovered by the engine as decoded_member; "noise" means the pixels are random-looking data rather than a picture, an encrypted payload the engine could not decode. "stage" describes a recovered executable (for .NET: module name, type and method counts, and the loader APIs it references); a resource named "<module>!<name>" was found inside that recovered stage, one level further down. A program that hides an executable in image pixels is a loader built to conceal it, and that has no benign use: describe the chain in order (visible application, each recovered stage by module name and what its loader_refs show it does, and where the chain ends), say plainly when the last stage's payload is encrypted and was not recovered, and never describe the sample as the application its forms and class names imitate. The verdict for such a chain is at least suspicious, and malicious when a recovered stage itself decrypts and loads a further hidden payload (decryptor and Assembly.Load or Invoke references with a high-entropy resource inside it): that is a multi-stage crypter, whatever the final payload is. The final payload's family and capabilities are not_analysed unless evidence shows them.
 
@@ -273,7 +323,16 @@ Sections, each exactly once, in this order: {keys}.
 - status "not_analysed": the evidence does not reach it. For behaviour the evidence does not show this is the honest status: the code that would show it was not read.
 A string or IOC in the sample's bytes shows the program carries that value, not that it uses it: write "contains", not "connects to", unless emulation or decompiled code shows the use. A capability rule or signature match is a pattern over the bytes: name the rule and say what it indicates. not_observed and not_analysed sections get one short sentence and no evidence. The unknowns section must say which code was not read and what that leaves unexplained. Plain prose, no markdown headings, no lists."""
 
-_EVIDENCE_VERDICT = """verdict: benign, suspicious, malicious or unknown, with a confidence and a short rationale. It is an opinion from the evidence above. A recovered concealed stage, a signature match that names a malware family, hostile behaviour seen in emulation or in decompiled code can each carry a suspicious or malicious verdict; say which one it rests on. Code built to hide what it does (a packed or encrypted stage decrypted and loaded at run time, a payload hidden in resources or image pixels, an installer with an altered signature) is at least "suspicious" even when the hidden part was not recovered. When the evidence shows nothing either way the verdict is "unknown", never benign: a benign verdict needs the program's code to have been read (sweep.decompiled covering it), and never holds while part of it is hidden or unread. Never call a program malicious for using ordinary APIs."""
+_EVIDENCE_VERDICT = (
+    "verdict: your own call (benign, suspicious, malicious or unknown), the grounds for it, and a short "
+    "rationale. It is an opinion from the evidence above. A recovered concealed stage, a signature match "
+    "that names a malware family, hostile behaviour seen in emulation or in decompiled code can each carry "
+    "a suspicious or malicious call; say which one it rests on. Code built to hide what it does (a packed "
+    "or encrypted stage decrypted and loaded at run time, a payload hidden in resources or image pixels, an "
+    "installer with an altered signature) is at least \"suspicious\" even when the hidden part was not "
+    "recovered. When the evidence shows nothing either way the call is \"unknown\", never benign: a benign "
+    "call needs the program's code to have been read (sweep.decompiled covering it), and never holds while "
+    "part of it is hidden or unread. Never call a program malicious for using ordinary APIs." + _VERDICT_RULE)
 
 
 _SYSTEM = """You are a static reverse-engineering analyst. You examine ONE binary through read-only \

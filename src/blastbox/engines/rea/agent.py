@@ -26,7 +26,11 @@ dir in ``BLASTBOX_WORK_DIR``:
 7. the analysis report (G3, ``_report``): when the answer was accepted, one more schema-bound
    call (``prompts.report_schema``, reasoning off unless ``REA_FINAL_THINKING``) in its own short
    conversation, given this pass's findings, IOCs and summary, the sweep's evidence
-   (``State.sweep``) and the previous report (``State.analysis_report``). ``report.validate_report``
+   (``State.sweep``) and the previous report (``State.analysis_report``), sampled at
+   ``REA_REPORT_TEMPERATURE`` (0; a negative value leaves it to the server). The model gives its
+   own call and the grounds for it; ``verdict.apply`` checks the grounds, adds the sweep's own and
+   sets the verdict's label and confidence by rule (transcript event ``verdict_rule``).
+   ``report.validate_report``
    drops evidence addresses the analysis never saw and downgrades a section left without evidence;
    a skipped / failed / invalid report (``report_skipped_deadline`` / ``report_failed`` /
    ``report_invalid``) leaves the rest of the pass unchanged;
@@ -84,7 +88,10 @@ cannot hold lists of objects), at most ``MAX_REPORT_JSON`` chars:
                "evidence": [{"address": "0x<hex>", "function"?: <= 128, "note"?: <= 200}] <= 12}]}
 ```
 
-The verdict is a model opinion, never a detection; the whole object is untrusted model output.
+The verdict's label and confidence are set by the verdict rule (``verdict.py``) from grounds the
+engine checked or found itself; its rationale starts with the rule's line (``Rule: ...``), then
+the model's own words. It is still an analysis opinion, never a detection, and everything else in
+the object is untrusted model output.
 
 The report call is capped at ``REA_REPORT_MAX_TOKENS`` (3500; 0 turns it off). The final reserve
 plans for what the final answer and report actually use, not their caps: ``REA_RESERVE_TOKENS``
@@ -131,7 +138,7 @@ from blastbox.engines.rea.prompts import (
 )
 from blastbox.engines.rea.report import ReportInvalid, complete_sections, report_addresses, validate_report
 from blastbox.engines.rea.runner import classify, ghidra_profile, rea_env, run_ghidra_analysis
-from blastbox.engines.rea.sufficiency import MAX_FACTS, assess, facts_of
+from blastbox.engines.rea.sufficiency import MAX_FACTS, assess, facts_of, sample_decompiled
 from blastbox.engines.rea.sweep import (
     DEFAULT_SCRIPTS_DIR,
     GHIDRA_CUT_RESERVE_S,
@@ -139,6 +146,8 @@ from blastbox.engines.rea.sweep import (
     _sha256,
     _string_leaves,
 )
+from blastbox.engines.rea.verdict import HOSTILE
+from blastbox.engines.rea.verdict import apply as apply_verdict_rule
 from blastbox.limits import Limits
 from blastbox.worker.engine import DetonationResult
 
@@ -155,6 +164,7 @@ DEFAULT_MAX_PASSES = 4  # REA_MAX_PASSES: the deepening bar's own pass cap (Load
 DEFAULT_MAX_TOKENS = 4096  # the final answer
 DEFAULT_TURN_MAX_TOKENS = 2048  # each tool-choice turn
 DEFAULT_TOKENS_PER_S = 30.0  # sizes the final-answer reserve (deepseek-v4-flash on vLLM, 1 sequence)
+DEFAULT_REPORT_TEMPERATURE = 0.0  # REA_REPORT_TEMPERATURE; negative leaves sampling to the server
 DEFAULT_REPORT_TOKENS = 3500  # the analysis-report call (REA_REPORT_MAX_TOKENS; 0 turns it off)
 DEFAULT_RESERVE_TOKENS = 4096  # what the final reserve plans for (REA_RESERVE_TOKENS): final + report
 MIN_REPORT_TOKENS = 1024  # below this the report call is skipped (report_skipped_deadline)
@@ -286,6 +296,21 @@ def _env_int(name: str, default: int, lo: int, hi: int) -> int:
         _log.warning("%s=%r is not an integer; using %s", name, raw, default)
         return default
     return max(lo, min(hi, v))
+
+
+def _report_temperature() -> float | None:
+    """``REA_REPORT_TEMPERATURE`` in [0, 2]; ``None`` (a negative value) sends no temperature."""
+    raw = os.environ.get("REA_REPORT_TEMPERATURE")
+    value = DEFAULT_REPORT_TEMPERATURE
+    if raw is not None:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = float("nan")
+        if value != value or value in (float("inf"), float("-inf")):
+            _log.warning("REA_REPORT_TEMPERATURE=%r is not a number; using %s", raw, DEFAULT_REPORT_TEMPERATURE)
+            value = DEFAULT_REPORT_TEMPERATURE
+    return None if value < 0 else min(2.0, value)
 
 
 def _cap(text: str, n: int) -> str:
@@ -743,6 +768,7 @@ class _Pass:
     good_turns: int = 0  # model responses that parsed (with or without tool calls)
     report_tokens: int = DEFAULT_REPORT_TOKENS
     report: dict[str, Any] | None = None  # this pass's validated rea.analysis/1 report
+    opinion: str | None = None  # the model's own call in that report, before the verdict rule
     prior_report: dict[str, Any] | None = None  # the continuation's (last valid) report
     sweep: dict[str, Any] = field(default_factory=dict)
     program_functions: list[str] = field(default_factory=list)
@@ -1417,6 +1443,9 @@ class ReaAgentEngine:
                                                   functions=p.functions, iocs=p.iocs, sweep=p.sweep,
                                                   prior_report=p.prior_report)
             kw: dict[str, Any] = {"response_format": report_response_format(sources)}
+            temperature = _report_temperature()
+            if temperature is not None:  # the report is a reading of evidence, not a draw
+                kw["temperature"] = temperature
             if not p.final_thinking:
                 kw["chat_template_kwargs"] = {"thinking": False}
             try:
@@ -1438,6 +1467,9 @@ class ReaAgentEngine:
                     obj["sections"] = complete_sections(obj["sections"])
             if isinstance(obj, dict):
                 obj.pop("basis", None)  # the engine, not the model, says what the report rests on
+            # The verdict rule: the model's call and grounds in, the wire verdict out (verdict.py).
+            decision = apply_verdict_rule(obj, sweep=p.sweep, known=known, sources=sources or (),
+                                          code_read=not sources or sample_decompiled(p.sweep))
             try:
                 v = validate_report(obj, p.pass_no, known, sources=sources or (),
                                     basis=REPORT_BASIS if sources else None)
@@ -1459,6 +1491,12 @@ class ReaAgentEngine:
                     message=f"{v.dropped} report evidence row(s) citing what the analysis never saw were dropped"
                             + (f"; downgraded to not_analysed: {', '.join(v.downgraded)}" if v.downgraded else "")))
             p.report = v.report
+            if decision is not None:
+                p.opinion = decision.opinion
+                tw.write({"event": "verdict_rule", "opinion": decision.opinion, "label": decision.label,
+                          "confidence": decision.confidence, "dropped": decision.dropped,
+                          "grounds": [{"code": g.code, "tier": "hostile" if g.tier == HOSTILE else "concealing",
+                                       "engine": g.engine, "cite": g.cite} for g in decision.grounds]})
             tw.write({"event": "report", "report": v.report, "evidence_dropped": v.dropped})
             return "ok"
         except Exception as exc:  # the report never costs the pass its findings
@@ -1567,7 +1605,8 @@ class ReaAgentEngine:
         front of the todo list. The model's ``done`` flag is recorded but decides nothing.
         """
         report = p.report if p.report is not None else p.prior_report
-        suff = assess(report=report, sweep=p.sweep, explored=p.explored, program_functions=p.program_functions)
+        suff = assess(report=report, sweep=p.sweep, explored=p.explored, program_functions=p.program_functions,
+                      opinion=p.opinion if p.report is not None else None)
         known = set(state.facts)
         new = [f for f in _dedup(facts_of(report, p.functions, p.iocs)) if f not in known]
         max_passes = _env_int("REA_MAX_PASSES", DEFAULT_MAX_PASSES, 1, MAX_STEPS_CEILING)

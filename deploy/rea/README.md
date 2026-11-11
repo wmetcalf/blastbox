@@ -132,8 +132,13 @@ Three things in the plan's Step 2 cannot work as written. Each was found live:
    schema-bound call (thinking off, `prompts.report_schema`) that writes `analysis_report`, a
    `rea.analysis/1` object describing what the program does (overview, execution flow,
    capabilities, network, persistence, host activity, anti-analysis, unknowns), each section
-   `observed`/`not_observed`/`not_analysed` with function-address evidence, plus an AI-proposed
-   verdict. It sees this pass's findings, IOCs and summary, the sweep's kind and first 64 IOCs
+   `observed`/`not_observed`/`not_analysed` with function-address evidence, plus a verdict. The
+   model gives its own call and up to four grounds from a fixed vocabulary, each with one
+   evidence row; the engine keeps the grounds whose evidence it holds, adds the ones the sweep
+   shows (family signature, hidden payload, emulated concealment, installer concealment, API
+   hashing) and sets label and confidence by rule (`verdict.py`). The rule's line leads the
+   rationale (`Rule: ...`); the model's text follows. The call is sampled at
+   `REA_REPORT_TEMPERATURE=0` (negative: the server's default). It sees this pass's findings, IOCs and summary, the sweep's kind and first 64 IOCs
    (`State.sweep`) and the previous pass's report (`State.analysis_report`, which pass N+1
    rewrites). Evidence addresses the passes never saw are dropped (`report_evidence_dropped`); an
    `observed` section left without evidence becomes `not_analysed`. It is sealed in `rea.pass/1`

@@ -128,3 +128,25 @@ def test_an_evidence_only_report_leaves_the_code_unread():
         got = assess(report=report, sweep={"decompiled": {"images": images}}, explored=[])
         assert [g.code for g in got.gaps] == ["code_unread"], images
     assert assess(report={**report, "basis": None}, sweep={}, explored=[]).met
+
+
+def test_a_benign_reading_the_rule_overrode_still_owes_an_explanation_of_what_is_hidden():
+    """The verdict rule (verdict.py) turns a benign call into suspicious when the sweep shows
+    concealment, so the label alone would meet the bar with the hidden part unexplained."""
+    ruled = _rep("suspicious", "medium")
+    hidden = {"dotnet_resources": {"hidden_payloads": [{"resource": "r", "size": 9, "entropy": 7.9}]}}
+    assert _codes(report=ruled, sweep=hidden) == []
+    s = assess(report=ruled, sweep=hidden, explored=[], opinion="benign")
+    assert [g.code for g in s.gaps] == ["benign_hidden_payload"]
+    assert s.gaps[0].detail.startswith("the analysis reads the sample as benign but ")
+    assert assess(report=_rep("benign", "medium"), sweep=hidden, explored=[],
+                  opinion="benign").gaps[0].detail.startswith("the verdict is benign but ")
+    emulated = {"emulation": {"concealment": ["exec_alloc"]}}
+    assert _codes(report=ruled, sweep=emulated, opinion="benign") == ["benign_emulated_stage"]
+    altered = {"unpacked": {"packer": "nsis", "signature": "altered"}}
+    assert _codes(report=ruled, sweep=altered, opinion="benign") == ["benign_installer_concealment"]
+    # Any other reading, or none (the report is an earlier pass's), adds nothing.
+    for opinion in ("suspicious", "malicious", "unknown", None):
+        assert _codes(report=ruled, sweep={**hidden, **emulated, **altered}, opinion=opinion) == []
+    # Unread program code is a burden of the benign verdict itself, not of the reading.
+    assert _codes(report=ruled, sweep={}, explored=[], program_functions=["0x10"], opinion="benign") == []

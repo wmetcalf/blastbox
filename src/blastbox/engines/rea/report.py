@@ -54,7 +54,7 @@ from blastbox.engines.rea.prompts import (
     REPORT_TITLES,
 )
 
-__all__ = ["ReportInvalid", "Validated", "report_addresses", "validate_report"]
+__all__ = ["ReportInvalid", "Validated", "address_of", "report_addresses", "validate_report"]
 
 _ADDR = re.compile(r"^0x[0-9a-fA-F]{1,16}$")
 MISSING_TEXT = "Not covered by this report."
@@ -87,6 +87,11 @@ def _str(value: Any, cap: int, what: str) -> str:
 
 def _norm(addr: str) -> str:
     return "0x" + (addr[2:].lower().lstrip("0") or "0")
+
+
+def address_of(value: Any) -> str | None:
+    """The normalised form of a report evidence address; None when ``value`` is not one."""
+    return _norm(value) if isinstance(value, str) and _ADDR.fullmatch(value) else None
 
 
 def complete_sections(raw: dict[str, Any]) -> dict[str, Any]:
