@@ -32,6 +32,8 @@ import urllib.request
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
+from blastbox.engines.rea.wellformed import well_formed
+
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
 _log = logging.getLogger("blastbox.engines.rea.model")
@@ -103,7 +105,7 @@ class ModelClient:
         if len(raw) > MAX_RESPONSE_BYTES:
             raise ModelError("malformed", "response_too_large")
         try:
-            out = json.loads(raw)
+            out = well_formed(json.loads(raw))
         except (ValueError, RecursionError):
             raise ModelError("malformed", "invalid_json") from None
         if not isinstance(out, dict):

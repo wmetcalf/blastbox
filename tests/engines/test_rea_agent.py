@@ -1766,7 +1766,7 @@ def test_report_is_written_validated_and_carried_to_the_next_pass(tmp_path, monk
     assert f["model_status"] == "ok" and cols(res.payload, "functions")["address"] == [FN_MAIN]
     rep = json.loads(f["analysis_report"])
     assert rep["schema"] == "rea.analysis/1" and rep["pass"] == 1
-    assert rep["verdict"] == {"label": "benign", "confidence": "medium", "rationale": BENIGN_RULE + "\nprints and exits"}
+    assert rep["verdict"] == {"label": "benign", "confidence": "medium", "rationale": BENIGN_RULE + "\nModel: prints and exits"}
     secs = {s["key"]: s for s in rep["sections"]}
     assert [s["key"] for s in rep["sections"]] == list(prompts.REPORT_KEYS)
     assert secs["overview"]["status"] == "observed" and secs["overview"]["evidence"] == []
@@ -1824,7 +1824,7 @@ def test_report_with_a_raw_control_character_is_kept_and_cleaned(tmp_path, monke
     assert "\x01" in raw
     res, _o, _m = _report_run(tmp_path, monkeypatch, answer(raw), prior=PRIOR_REPORT)
     rep = json.loads(res.payload.fields["analysis_report"])
-    assert rep["verdict"]["rationale"] == BENIGN_RULE + "\nprints and exits" and "report_invalid" not in _codes(res)
+    assert rep["verdict"]["rationale"] == BENIGN_RULE + "\nModel: prints and exits" and "report_invalid" not in _codes(res)
 
 
 def _events(out, kind):
@@ -1841,7 +1841,7 @@ def test_the_verdict_is_the_rules_not_the_models(tmp_path, monkeypatch):
     res, out, _m = _report_run(tmp_path, monkeypatch, answer(rep))
     verdict = json.loads(res.payload.fields["analysis_report"])["verdict"]
     assert verdict == {"label": "malicious", "confidence": "medium",
-                       "rationale": f"Rule: malicious/medium on remote control ({FN_MAIN}).\ntalks to a C2"}
+                       "rationale": f"Rule: malicious/medium on remote control ({FN_MAIN}).\nModel: talks to a C2"}
     assert _events(out, "verdict_rule") == [{
         "event": "verdict_rule", "opinion": "malicious", "label": "malicious", "confidence": "medium", "dropped": 1,
         "grounds": [{"code": "remote_control", "tier": "hostile", "engine": False,
@@ -1867,7 +1867,7 @@ def test_a_benign_reading_of_a_concealing_stub_is_overridden_and_owes_the_next_p
     verdict = json.loads(f["analysis_report"])["verdict"]
     assert (verdict["label"], verdict["confidence"]) == ("suspicious", "medium")
     assert verdict["rationale"] == ("Rule: suspicious/medium on emulated concealment (exec_alloc, dynamic_code). "
-                                    "Model's call: benign.\nprints and exits")
+                                    "Model's call: benign.\nModel: prints and exits")
     event = _events(out, "verdict_rule")[0]
     assert event["opinion"] == "benign" and event["grounds"] == [{
         "code": "emulated_concealment", "tier": "concealing", "engine": True,
@@ -1896,6 +1896,126 @@ def test_a_benign_call_from_a_pass_that_read_no_code_is_not_sealed_benign(tmp_pa
     assert (verdict["label"], verdict["confidence"]) == ("unknown", "low")
     assert verdict["rationale"].startswith("Rule: unknown/low; a benign call needs the program's code read")
     assert f["bar_met"] is False
+
+
+def _benign_pass(tmp_path, model_turns, *, explored=(), **state_kw):
+    """A function pass whose model calls benign over ``model_turns`` of tool use; the wire verdict."""
+    cont = make_continuation(tmp_path, todo=[], explored=list(explored), sweep={"kind": "pe"}, **state_kw)
+    sections = {k: _section() for k in prompts.REPORT_KEYS}
+    sections["overview"] = _section("observed", "A harmless updater.", [], "Overview")
+    sections["execution_flow"] = _section("observed", "Starts at its entry point.", [
+        {"address": FN_MAIN, "function": "entry", "note": "start"}])
+    report = {"verdict": {"label": "benign", "grounds": [], "rationale": "nothing hostile"}, "sections": sections}
+    rig = McpRig(tmp_path, {
+        "procedure_info": {"text": json.dumps({"normalized_result": {"name": "entry", "entrypoint": FN_MAIN}})},
+        "procedure_pseudo_code": {"text": DECOMP}})
+    res, out = run(tmp_path, cont, FakeModel([*model_turns, answer(report)]), rig)
+    verdict = json.loads(res.payload.fields["analysis_report"])["verdict"]
+    return (verdict["label"], verdict["confidence"]), res, out
+
+
+_HARMLESS = {"summary": "A harmless updater.", "functions": [], "iocs": [], "todo": [], "done": True}
+
+
+def test_a_metadata_call_is_not_code_read(tmp_path, monkeypatch):
+    """procedure_info names a function and returns no code: benign still needs code read."""
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    got, res, _out = _benign_pass(tmp_path, [tc(("procedure_info", {"procedure": FN_MAIN}, "a")),
+                                             answer(_HARMLESS)])
+    assert res.payload.fields["tool_calls"] == 1 and res.payload.fields["explored_count"] == 1
+    assert got == ("unknown", "low")
+
+
+def test_a_function_the_model_only_lists_is_not_code_read(tmp_path, monkeypatch):
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    final = dict(_HARMLESS, functions=[
+        {"address": FN_MAIN, "name": "entry", "claim": "starts the updater", "evidence": []}])
+    got, _res, _out = _benign_pass(tmp_path, [answer(final)])
+    assert got == ("unknown", "low")
+
+
+def test_an_explored_list_from_the_continuation_is_not_code_read(tmp_path, monkeypatch):
+    """An older continuation carries explored addresses and no code_read flag."""
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    got, _res, _out = _benign_pass(tmp_path, [answer(_HARMLESS)], explored=[FN_MAIN])
+    assert got == ("unknown", "low")
+    old = {k: v for k, v in json.loads(State(
+        pass_no=1, sample_name="s", sample_sha256="0" * 64, program_name=None, ghidra_status="ok",
+        explored=[FN_MAIN], todo=[], summary="", started_at=1.0, code_read=True).to_json()).items()
+        if k != "code_read"}
+    assert State.from_json(json.dumps(old)).code_read is False
+    assert State.from_json(json.dumps(dict(old, code_read=True))).code_read is True
+    assert State.from_json(json.dumps(dict(old, code_read="yes"))).code_read is False
+
+
+def test_a_decompile_that_returned_code_is_code_read_and_survives_the_continuation(tmp_path, monkeypatch):
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    got, _res, out = _benign_pass(tmp_path, [tc(("procedure_pseudo_code", {"procedure": FN_MAIN}, "a")),
+                                             answer(_HARMLESS)])
+    assert got == ("benign", "medium")
+    # ... and a later pass that opens nothing rests on the read its continuation records.
+    (tmp_path / "p2").mkdir()
+    got, _res, _out = _benign_pass(tmp_path / "p2", [answer(_HARMLESS)], explored=[FN_MAIN], code_read=True)
+    assert got == ("benign", "medium")
+
+
+@pytest.mark.parametrize(("tool", "carried", "want"), [
+    ("procedure_pseudo_code", False, True), ("procedure_info", False, False), ("procedure_info", True, True)])
+def test_the_continuation_records_whether_code_was_read(tmp_path, tool, carried, want):
+    cont = make_continuation(tmp_path, todo=["0x140001420"], code_read=carried)
+    model = FakeModel([tc((tool, {"procedure": "0x140001420"}, "a")), _findings_answer(False)])
+    rig = McpRig(tmp_path, {"procedure_pseudo_code": {"text": DECOMP}, "procedure_info": {"text": DECOMP}})
+    res, out = run(tmp_path, cont, model, rig)
+    assert res.payload.fields["more_pending"] is True and next_state(out).code_read is want
+
+
+def test_a_failed_decompile_is_not_code_read(tmp_path, monkeypatch):
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    cont = make_continuation(tmp_path, todo=[], explored=[], sweep={"kind": "pe"})
+    sections = {k: _section() for k in prompts.REPORT_KEYS}
+    sections["overview"] = _section("observed", "A harmless updater.", [], "Overview")
+    report = {"verdict": {"label": "benign", "grounds": [], "rationale": "nothing hostile"}, "sections": sections}
+    rig = McpRig(tmp_path, {"procedure_pseudo_code": {"error": "no such procedure"}})
+    model = FakeModel([tc(("procedure_pseudo_code", {"procedure": FN_MAIN}, "a")), answer(_HARMLESS), answer(report)])
+    res, _out = run(tmp_path, cont, model, rig)
+    verdict = json.loads(res.payload.fields["analysis_report"])["verdict"]
+    assert (verdict["label"], verdict["confidence"]) == ("unknown", "low")
+
+
+@pytest.mark.parametrize("where", ["report_text", "report_note", "rationale", "summary", "function_name"])
+def test_a_lone_surrogate_in_the_models_text_does_not_cost_the_pass(tmp_path, monkeypatch, where):
+    """JSON admits a lone UTF-16 surrogate escape, and a model copying a sample's strings writes
+    one. It cannot be encoded, so the sealed payload could not be written: the whole pass was lost."""
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    cont = make_continuation(tmp_path, todo=[], explored=[], sweep={"kind": "pe"})
+    final = json.dumps({"summary": "Reads its config.", "functions": [
+        {"address": FN_MAIN, "name": "entry", "claim": "reads a config", "evidence": ["t1"]}],
+        "iocs": [], "todo": [], "done": True})
+    sections = {k: _section() for k in prompts.REPORT_KEYS}
+    sections["overview"] = _section("observed", "A harmless updater.", [], "Overview")
+    sections["execution_flow"] = _section("observed", "Starts at its entry point.", [
+        {"address": FN_MAIN, "function": "entry", "note": "start"}])
+    report = json.dumps({"verdict": {"label": "benign", "grounds": [], "rationale": "nothing hostile"},
+                         "sections": sections})
+    old, new = {"report_text": ("A harmless updater.", "A harmless updater \\ud800."),
+                "report_note": ('"note": "start"', '"note": "start \\udfff"'),
+                "rationale": ("nothing hostile", "nothing hostile \\ud83d"),
+                "summary": ("Reads its config.", "Reads its config \\ud800."),
+                "function_name": ('"name": "entry"', '"name": "entry\\udc00"')}[where]
+    assert (final + report).count(old) == 1
+    final, report = final.replace(old, new), report.replace(old, new)
+    rig = McpRig(tmp_path, {"procedure_pseudo_code": {"text": DECOMP}})
+    model = FakeModel([tc(("procedure_pseudo_code", {"procedure": FN_MAIN}, "a")), answer(final), answer(report)])
+    res, _out = run(tmp_path, cont, model, rig)
+    sealed = res.payload.model_dump_json()  # what the harness writes; a lone surrogate raises here
+    assert "�" in sealed and res.payload.fields["analysis_report"] is not None
+    assert [w.code for w in res.warnings if w.code in ("agent_failed", "report_invalid", "report_failed")] == []
+
+
+def test_model_client_replaces_lone_surrogates_in_the_response():
+    body = b'{"choices": [{"finish_reason": "stop\\udfff", "message": {"content": "a\\ud800b \\ud83d\\ude00"}}]}'
+    r = ModelClient("http://m:1/v1", "x", 5, opener=FakeOpener(body)).chat([{"role": "user", "content": "q"}], [], 16)
+    assert r["choices"][0] == {"finish_reason": "stop�", "message": {"content": "a�b \U0001f600"}}
 
 
 def _second_pass(tmp_path, cont, report_resp):
@@ -2133,6 +2253,77 @@ def test_go_program_functions_are_seeded_before_the_runtime(tmp_path):
     assert st.program_functions == ["0x4d2180", "0x4d0000"]  # main.main, then the program's own
 
 
+_GO_ROWS = [{"address": a, "value": n, "symbol": {"external": False, "source": "default"},
+             "procedure": {"external": False, "thunk": False}}
+            for a, n in [("0x401000", "entry"), ("0x402000", "main::main.main"),
+                         ("0x403000", "main::main.stealCookies")]]
+
+
+def _go_benign_pass(tmp_path, turns, *, claims=("0x402000", "0x403000"), explored=(), **state_kw):
+    """A Go program (two functions of its own) called benign after ``turns`` of tool use."""
+    cont = make_continuation(tmp_path, todo=[], explored=list(explored), sweep={"kind": "elf"}, **state_kw)
+    rig = McpRig(tmp_path, {
+        "list_procedures": {"text": json.dumps({"normalized_result": _GO_ROWS})},
+        "procedure_info": {"text": json.dumps({"normalized_result": {"name": "entry", "entrypoint": "0x401000"}})},
+        "procedure_pseudo_code": {"text": DECOMP}, "batch_decompile": {"text": DECOMP},
+        "procedure_callees": {"text": DECOMP}})
+    final = {"summary": "A board game.", "functions": [
+        {"address": a, "name": "f", "claim": "part of the game", "evidence": []} for a in claims],
+        "iocs": [], "todo": [], "done": True}
+    sections = {k: _section() for k in prompts.REPORT_KEYS}
+    sections["overview"] = _section("observed", "A board game.", [], "Overview")
+    sections["execution_flow"] = _section("observed", "main runs the game.", [
+        {"address": "0x402000", "function": "main.main", "note": "start"}])
+    report = {"verdict": {"label": "benign", "grounds": [], "rationale": "a game"}, "sections": sections}
+    res, out = run(tmp_path, cont, FakeModel([*turns, answer(final), answer(report)]), rig)
+    f = res.payload.fields
+    verdict = json.loads(f["analysis_report"])["verdict"]
+    return (verdict["label"], verdict["confidence"]), f, out
+
+
+def test_a_go_function_the_model_only_claims_or_names_is_still_unread(tmp_path, monkeypatch):
+    """benign_unexplored asks that the program's own functions were read. Listing one in the
+    answer, or a metadata call on it, used to count: a decoy main was called benign with the
+    function that does the work never opened."""
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    got, f, out = _go_benign_pass(tmp_path, [
+        tc(("procedure_pseudo_code", {"procedure": "0x402000"}, "a")),
+        tc(("procedure_callees", {"procedure": "0x403000"}, "b"))])
+    assert got == ("benign", "medium") and f["explored_count"] == 2
+    assert f["gaps"] == ["benign_unexplored"] and f["bar_met"] is False
+    st = next_state(out)
+    assert st.opened == ["0x402000"] and st.todo[0] == "0x403000"  # the unread one leads the next pass
+
+
+def test_go_functions_a_code_tool_returned_close_the_gap(tmp_path, monkeypatch):
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    got, f, _out = _go_benign_pass(tmp_path, [
+        tc(("procedure_pseudo_code", {"procedure": "0x402000"}, "a")),
+        tc(("batch_decompile", {"addresses": ["0x00403000"]}, "b"))])
+    assert got == ("benign", "medium") and f["gaps"] == [] and f["bar_met"] is True
+
+
+def test_functions_opened_by_an_earlier_pass_stay_opened(tmp_path, monkeypatch):
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    got, f, _out = _go_benign_pass(
+        tmp_path, [tc(("procedure_pseudo_code", {"procedure": "0x403000"}, "a"))], code_read=True,
+        explored=["0x402000"], opened=["0x402000"], program_functions=["0x402000", "0x403000"])
+    assert got == ("benign", "medium") and f["gaps"] == [] and f["bar_met"] is True
+
+
+def test_a_failed_code_tool_opens_nothing(tmp_path):
+    cont = make_continuation(tmp_path, todo=["0x140001420", "0x140009000"])
+    rig = McpRig(tmp_path, {"procedure_pseudo_code": {"error": "no such procedure"},
+                            "batch_decompile": {"text": DECOMP}})
+    model = FakeModel([tc(("procedure_pseudo_code", {"procedure": "0x140001420"}, "a"),
+                          ("batch_decompile", {"addresses": ["0x140001500", "0x0140001600"]}, "b")),
+                       _findings_answer(False)])
+    _res, out = run(tmp_path, cont, model, rig)
+    st = next_state(out)
+    assert st.opened == ["0x140001500", "0x140001600"]
+    assert {"0x140001500", "0x140001600"} <= set(st.explored)  # a decompiled function is explored too
+
+
 # ---------------------------------------------------------------- the deepening bar
 
 _LOW = {"verdict": {"label": "suspicious", "confidence": "low", "rationale": "unclear"}}
@@ -2364,7 +2555,7 @@ def test_evidence_only_pass_never_meets_the_bar_without_code(tmp_path, monkeypat
     assert (verdict["label"], verdict["confidence"]) == ("suspicious", "medium")
     assert verdict["rationale"] == (
         "Rule: suspicious/medium, not malicious (the model's call was suspicious and no engine ground is "
-        "hostile), on download execute (iocs).\nan installer with a URL")
+        "hostile), on download execute (iocs).\nModel: an installer with a URL")
     assert "failed" in next(w.message for w in res.warnings if w.code == "evidence_only")
 
 

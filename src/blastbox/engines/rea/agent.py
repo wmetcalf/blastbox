@@ -148,6 +148,7 @@ from blastbox.engines.rea.sweep import (
 )
 from blastbox.engines.rea.verdict import HOSTILE
 from blastbox.engines.rea.verdict import apply as apply_verdict_rule
+from blastbox.engines.rea.wellformed import well_formed
 from blastbox.limits import Limits
 from blastbox.worker.engine import DetonationResult
 
@@ -237,6 +238,13 @@ CONTENT_TOOLS: frozenset[str] = frozenset({
     "procedure_callers", "procedure_info", "procedure_pseudo_code", "procedure_references",
     "read_function_instructions", "resolve_containing_procedure", "resolve_native_call_targets", "xrefs",
 })
+# Tools whose result is a function's code: its decompilation, its disassembly, or the analysis of
+# its body. One that returned this chain is what "the program's code was read" means to the
+# verdict rule; naming a function (procedure_info, xrefs) or listing one in the answer is not.
+CODE_TOOLS: frozenset[str] = frozenset({
+    "analyze_function", "batch_decompile", "procedure_assembly", "procedure_pseudo_code",
+    "read_function_instructions",
+})
 MAX_VERIFY_IOCS = 128  # Ruling R: sample-byte searches per pass
 VERIFY_BUDGET_S = 60.0  # Ruling W: wall-clock cap on the sample-byte scan (also clamped to the pass)
 VERIFY_RESERVE_S = 20.0  # kept out of the final answer's timeout for that scan
@@ -284,6 +292,16 @@ def norm_addr(value: object) -> str | None:
         return None
     digits = value[2:] if value[:2].lower() == "0x" else value
     return "0x" + (digits.lower().lstrip("0") or "0")
+
+
+def _code_addresses(args: dict[str, Any]) -> list[str]:
+    """The addresses a CODE_TOOLS call asked for. A call that names its function instead gives
+    none: that function counts as opened only once a call asks for it by address."""
+    asked = [args.get("address"), args.get("procedure")]
+    batch = args.get("addresses")
+    if isinstance(batch, list):
+        asked += batch
+    return [a for a in map(norm_addr, asked) if a is not None]
 
 
 def _env_int(name: str, default: int, lo: int, hi: int) -> int:
@@ -343,9 +361,10 @@ def render_result(result: dict[str, Any]) -> tuple[str, bool]:
 
 def _parse_json(text: str) -> Any:
     # strict=False: the model copies sample strings into its JSON, raw control characters and all
-    # (a rejected report on a real ELF held one); they are cleaned where the text is kept.
+    # (a rejected report on a real ELF held one); they are cleaned where the text is kept. A lone
+    # surrogate escape is replaced here: no later step could write it down (wellformed.py).
     try:
-        return json.loads(text, strict=False)
+        return well_formed(json.loads(text, strict=False))
     except (ValueError, RecursionError):
         return None
 
@@ -759,6 +778,8 @@ class _Pass:
     iocs: list[dict[str, Any]] = field(default_factory=list)
     todo: list[str] = field(default_factory=list)
     explored: list[str] = field(default_factory=list)
+    code_read: bool = False  # a CODE_TOOLS call returned code, this pass or an earlier one
+    opened: list[str] = field(default_factory=list)  # the addresses those calls asked for
     done: bool = False
     final_reserve_s: float = 0.0
     wall_s: float = 0.0
@@ -845,7 +866,8 @@ class ReaAgentEngine:
             return self._rejected("bad_continuation", "bad program_name in state.json")
 
         p = _Pass(pass_no=state.pass_no + 1, model_id=model_id, summary=state.summary,
-                  todo=list(state.todo), explored=list(state.explored),
+                  todo=list(state.todo), explored=list(state.explored), code_read=state.code_read,
+                  opened=list(state.opened),
                   final_reserve_s=final_reserve(wall, reserve_tokens, tokens_per_s), wall_s=wall,
                   turn_tokens=turn_tokens, tokens_per_s=tokens_per_s,
                   final_thinking=os.environ.get("REA_FINAL_THINKING", "").strip().lower()
@@ -924,6 +946,8 @@ class ReaAgentEngine:
             gaps=p.gaps if p.assessed else list(state.gaps),
             program_functions=p.program_functions[:MAX_PROGRAM_FUNCTIONS],
             opinion=p.opinion if p.report is not None else state.opinion,
+            code_read=p.code_read,
+            opened=p.opened[-MAX_EXPLORED:],
         )
         transcript_reserve = min(MAX_TRANSCRIPT_BYTES, limits.max_artifact_bytes)
         if p.model_status == "ok" and p.assessed:
@@ -1300,6 +1324,10 @@ class ReaAgentEngine:
                         a = norm_addr(args.get(key))
                         if a is not None:
                             explored_now.append(a)
+                    if c["name"] in CODE_TOOLS:
+                        p.code_read = True
+                        p.opened = _dedup(p.opened + _code_addresses(args))
+                        explored_now.extend(_code_addresses(args))
                 shown, omitted = cap_tool_text(compact_for_model(text))
                 messages.append(framer.tool_result(c["id"], cid, c["name"], shown,
                                                    is_error=is_error, omitted_chars=omitted))
@@ -1470,8 +1498,9 @@ class ReaAgentEngine:
                 obj.pop("basis", None)  # the engine, not the model, says what the report rests on
             # The verdict rule: the model's call and grounds in, the wire verdict out (verdict.py).
             # ... benign only over code that was read: the sweep's decompiler read the assembly, or
-            # (a function pass) this chain has opened at least one function.
-            code_read = sample_decompiled(p.sweep) or (not sources and bool(p.explored))
+            # (a function pass) a code tool returned a function's code to this chain. An address
+            # in ``explored`` is not that: a metadata call or the model's own list puts one there.
+            code_read = sample_decompiled(p.sweep) or (not sources and p.code_read)
             decision = apply_verdict_rule(obj, sweep=p.sweep, known=known, sources=sources or (),
                                           code_read=code_read)
             try:
@@ -1610,13 +1639,15 @@ class ReaAgentEngine:
         """
         report = p.report if p.report is not None else p.prior_report
         # A pass that wrote no report is measured on the carried one, with the call behind it.
-        suff = assess(report=report, sweep=p.sweep, explored=p.explored, program_functions=p.program_functions,
+        suff = assess(report=report, sweep=p.sweep, explored=p.explored, opened=p.opened,
+                      program_functions=p.program_functions,
                       opinion=p.opinion if p.report is not None else state.opinion)
         known = set(state.facts)
         new = [f for f in _dedup(facts_of(report, p.functions, p.iocs)) if f not in known]
         max_passes = _env_int("REA_MAX_PASSES", DEFAULT_MAX_PASSES, 1, MAX_STEPS_CEILING)
-        done = set(p.explored)
-        targets = [t for g in suff.gaps for t in g.targets if t not in done]
+        # A gap's targets are what it still needs (sufficiency.py leaves out what is done): a
+        # function the chain touched but no code tool returned is still a target.
+        targets = _dedup([t for g in suff.gaps for t in g.targets])
         todo = _dedup(targets + p.todo)[:MAX_TODO]
         if suff.met:
             stop = "bar_met"

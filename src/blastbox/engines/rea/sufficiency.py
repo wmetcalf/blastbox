@@ -12,11 +12,13 @@ verify itself, and lists what is still missing (``gaps``):
   (``sweep["decompiled"]`` holding excerpts of the analysed assembly itself, label ``sample``; a
   recovered stage's code does not cover the sample). Whatever the sample does beyond that evidence is unknown, so the bar
   is never met; no pass can close the gap, and the chain stops with ``evidence_only``;
-- ``benign_unexplored``: the verdict is ``benign`` while some of the program's own functions
-  (``program_functions``: for Go, ``main.*`` and third-party modules) are unexplored. A benign
-  call is a claim about everything the program does; live, a Go sample whose ``main`` is a
-  board-game decoy was called benign/medium with part of its own code unread. Its targets are
-  those functions;
+- ``benign_unexplored``: the verdict is ``benign`` while a code tool has not returned some of
+  the program's own functions (``program_functions``: for Go, ``main.*`` and third-party
+  modules; ``opened``: the addresses the chain's decompile and disassembly calls asked for). A
+  benign call is a claim about everything the program does; live, a Go sample whose ``main`` is
+  a board-game decoy was called benign/medium with part of its own code unread. ``explored``
+  does not count here: a metadata call or the model's own function list puts an address there
+  without anyone reading the function. Its targets are those functions;
 - ``benign_hidden_payload``: the verdict is ``benign`` while the sweep found a hidden payload in
   a .NET assembly's resources (``sweep["dotnet_resources"]["hidden_payloads"]``: a large
   high-entropy resource, one that decodes to a PE, or a picture whose pixels do or are noise). Live, Formbook and NanoCore carriers were
@@ -188,8 +190,10 @@ def facts_of(report: dict[str, Any] | None, functions: list[dict[str, Any]],
 
 
 def assess(*, report: dict[str, Any] | None, sweep: dict[str, Any], explored: list[str],
-           program_functions: list[str] | None = None, opinion: str | None = None) -> Sufficiency:
-    """``opinion``: the model's own call behind ``report``, before the verdict rule (``verdict.py``)."""
+           program_functions: list[str] | None = None, opinion: str | None = None,
+           opened: list[str] | None = None) -> Sufficiency:
+    """``opinion``: the model's own call behind ``report``, before the verdict rule (``verdict.py``).
+    ``opened``: the addresses a code tool was asked for and returned (``agent.CODE_TOOLS``)."""
     gaps: list[Gap] = []
     if not isinstance(report, dict):
         gaps.append(Gap("no_report", "no valid analysis report has been written yet"))
@@ -213,13 +217,13 @@ def assess(*, report: dict[str, Any] | None, sweep: dict[str, Any], explored: li
         said = ("the verdict is benign" if label == "benign"
                 else "the analysis reads the sample as benign" if opinion == "benign" else "")
         if label == "benign":
-            seen = set(explored)
+            seen = set(opened or [])
             left = [f for f in program_functions or [] if f not in seen]
             if left:
                 gaps.append(Gap("benign_unexplored",
                                 f"the verdict is benign but {len(left)} of the program's own "
-                                f"{len(program_functions or [])} functions are unexplored: read them "
-                                "before ruling out hostile behaviour", left[:MAX_TARGETS]))
+                                f"{len(program_functions or [])} functions are unexplored: decompile "
+                                "them by address before ruling out hostile behaviour", left[:MAX_TARGETS]))
         if said:
             hidden = _hidden_payloads(sweep)
             if hidden:

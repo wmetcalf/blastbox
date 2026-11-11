@@ -100,6 +100,8 @@ def test_scan_caps_counts_and_writes(tmp_path, monkeypatch):
     doc = dr.scan(DLL, tmp_path)
     assert len(doc["resources"]) == 2 and doc["resources_total"] == 6 and len(doc["hidden"]) == 1
     assert len(list(tmp_path.iterdir())) <= 2
+    # Everything after the one payload the cap kept: 4 resources and the 3 entries of the container.
+    assert doc["items_unread"] == 7
 
 
 def test_decode_only_accepts_a_real_pe_header():
@@ -345,6 +347,7 @@ def test_noise_pixels_are_flagged_and_pictures_are_not():
     _png(64, 64, _noise(64 * 64 * 4))[:300],
     b"BM" + struct.pack("<IHHI", 0, 0, 0, 54) + struct.pack("<IiiHHI", 40, 1 << 30, 1 << 30, 1, 32, 0),
     b"\x89PNG\r\n\x1a\n" + struct.pack(">I4s", 13, b"IHDR") + struct.pack(">IIBBBBB", 1 << 31, 1 << 31, 8, 6, 0, 0, 0),
+    b"\x89PNG\r\n\x1a\n" + struct.pack(">I4s", 13, b"IHDR") + b"\x00\x00\x00",  # the header chunk is cut short
 ])
 def test_malformed_images_are_not_images(blob):
     assert dr.load_image(blob) is None
@@ -416,24 +419,190 @@ def test_a_noise_image_is_a_hidden_payload_and_a_picture_is_not(tmp_path):
     assert len(state.hidden) == 1
 
 
+def _png_header(w, h, *, depth=8, colour=6, interlace=0):
+    """A PNG that declares ``w`` x ``h`` over one small IDAT: the size check reads only the header."""
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, depth, colour, 0, 0, interlace))
+            + chunk(b"IDAT", zlib.compress(bytes(64))) + chunk(b"IEND", b""))
+
+
+def _bmp_header(w, h):
+    return b"BM" + struct.pack("<IHHI", 54, 0, 0, 54) + struct.pack("<IiiHHIIiiII", 40, w, h, 1, 24, 0, 0, 0, 0, 0, 0)
+
+
+def test_images_over_the_pixel_limit_are_counted_not_read(tmp_path):
+    """A readable kind of image too large to decode may carry anything: it is unread, like one past
+    the time budget, so a benign verdict cannot rest on the scan."""
+    side = int(dr.MAX_IMAGE_PIXELS ** 0.5) + 1
+    state = dr._Scan(tmp_path)
+    for carrier in (_png_header(side, side), _bmp_header(side, side), _bmp_header(side, -side),
+                    _serialized(_bmp_header(side, side))):
+        assert dr.load_image(carrier) is None
+        state.consider(carrier, dr.entropy(carrier), "r", "big", 0)
+    assert state.hidden == [] and state.items_unread == 4
+
+
+def test_images_of_an_unreadable_kind_or_broken_are_not_counted(tmp_path):
+    """Only size is counted: a palette or interlaced PNG, a truncated one and a picture that was
+    read leave the count alone, so an ordinary program's icons do not hold its verdict."""
+    state = dr._Scan(tmp_path)
+    flat = _png(20, 16, bytes(20 * 16 * 4))
+    for carrier in (_png_header(64, 64, colour=3), _png_header(64, 64, interlace=1), _png_header(64, 64),
+                    _png_header(0, 64), _bmp_header(64, 64), flat, b"BM" + bytes(64), b"plain text"):
+        state.consider(carrier, dr.entropy(carrier), "r", "pic", 0)
+    assert state.hidden == [] and state.items_unread == 0
+
+
 def test_images_past_the_time_budget_are_counted_not_read(tmp_path, monkeypatch):
     monkeypatch.setattr(dr, "IMAGE_BUDGET_S", 0.0)
     state = dr._Scan(tmp_path)
-    carrier = _stage1_bmp()
-    state.consider(carrier, dr.entropy(carrier), "r", "dzh", 0)
-    assert state.hidden == [] and state.images_unread == 1
-    doc = {"resources_total": 1, "resources": [], "loader_refs": [], "hidden": [], "images_unread": 3}
+    # Only what the scanner would have read counts: "BM" somewhere in a text is not a bitmap.
+    for carrier in (_stage1_bmp(), _serialized(_stage1_bmp()), b"BM" + bytes(64), b"an IBM mainframe"):
+        state.consider(carrier, dr.entropy(carrier), "r", "dzh", 0)
+    assert state.hidden == [] and state.items_unread == 2
+    doc = {"resources_total": 1, "resources": [], "loader_refs": [], "hidden": [], "items_unread": 3}
     res, out = _drun(DLL, tmp_path, FakeDotnet(doc=doc))
-    assert any(w.code == "dotnet_resources_failed" and "3 image" in w.message for w in res.warnings)
+    assert any(w.code == "dotnet_resources_failed" and "3 resource item(s) not read" in w.message
+               for w in res.warnings)
     # ... and the evidence says so: the verdict rule will not call the program benign over them.
     _s, _p, state = unpack(out / "continuation.tar.gz", tmp_path / "cont", max_bytes=1 << 30)
-    assert state.sweep["dotnet_resources"]["images_unread"] == 3
+    assert state.sweep["dotnet_resources"]["items_unread"] == 3
 
 
 def test_a_scan_that_read_every_image_says_nothing_of_unread_ones(tmp_path):
     _res, out = _drun(DLL, tmp_path, FakeDotnet())
     _s, _p, state = unpack(out / "continuation.tar.gz", tmp_path / "cont", max_bytes=1 << 30)
-    assert "images_unread" not in state.sweep["dotnet_resources"]
+    assert not {"items_unread", "scan_failed"} & set(state.sweep["dotnet_resources"])
+
+
+def _pe(*resources):
+    return SimpleNamespace(net=SimpleNamespace(resources=list(resources)))
+
+
+def _res(name, data):
+    return SimpleNamespace(name=name, data=data, size=len(data) if isinstance(data, bytes) else 0)
+
+
+def _container(entries):
+    return SimpleNamespace(_data=b"", entries=[SimpleNamespace(name=n, value=v, type_name="System.Byte[]")
+                                               for n, v in entries])
+
+
+def _found(state):
+    return {(h["resource"], h.get("entry")): str(h.get("decoded", ""))[:6] for h in state.hidden}
+
+
+def test_a_carrier_past_the_listing_caps_is_still_found(tmp_path):
+    """The caps bound what the scan lists, not what it reads: a payload behind 64 dull resources,
+    or behind 64 dull entries of one container, was never looked at."""
+    dull = [_res(f"r{i}", b"text %d" % i) for i in range(dr.MAX_RESOURCES + 5)]
+    entries = [(f"e{i}", b"text %d" % i) for i in range(dr.MAX_ENTRIES + 5)] + [("late", _stage1_bmp())]
+    state, doc = dr._Scan(tmp_path), {"resources": []}
+    state.resources(_pe(*dull, _res("last.bin", _stage1_bmp()), _res("App.resources", _container(entries))),
+                    doc, "", 0)
+    assert doc["resources_total"] == dr.MAX_RESOURCES + 7 and len(doc["resources"]) == dr.MAX_RESOURCES
+    assert _found(state) == {("last.bin", None): "image:", ("App.resources", "late"): "image:"}
+    assert state.items_unread == 0
+    # A listed container lists MAX_ENTRIES of its entries and says how many it has.
+    (tmp_path / "second").mkdir()
+    state, doc = dr._Scan(tmp_path / "second"), {"resources": []}
+    state.resources(_pe(_res("App.resources", _container(entries))), doc, "", 0)
+    row = doc["resources"][0]
+    assert row["entries_total"] == dr.MAX_ENTRIES + 6 and len(row["entries"]) == dr.MAX_ENTRIES
+    assert _found(state) == {("App.resources", "late"): "image:"}
+
+
+def test_items_the_scan_did_not_reach_are_counted_unread(tmp_path, monkeypatch):
+    """Past the hidden-payload cap or the scan's time budget nothing is decoded, so every item
+    left may be a payload: the count holds a benign verdict back."""
+    pe = _pe(_res("a", _stage1_bmp()), _res("b", b"plain text"), _res("c", _container([("x", _stage1_bmp())])))
+    monkeypatch.setattr(dr, "MAX_HIDDEN", 1)
+    state = dr._Scan(tmp_path)
+    state.resources(pe, None, "", 0)
+    assert _found(state) == {("a", None): "image:"} and state.items_unread == 2
+    monkeypatch.setattr(dr, "SCAN_BUDGET_S", 0.0)
+    state = dr._Scan(tmp_path)
+    state.resources(pe, None, "", 0)
+    assert state.hidden == [] and state.items_unread == 3
+
+
+def test_an_item_that_breaks_the_scanner_costs_that_item_not_the_scan(tmp_path, monkeypatch):
+    real = dr.decode
+
+    def decode(data):
+        if data == b"boom":
+            raise ValueError("a parser bug")
+        return real(data)
+
+    monkeypatch.setattr(dr, "decode", decode)
+    state = dr._Scan(tmp_path)
+    state.resources(_pe(_res("bad", b"boom"), _res("late", _stage1_bmp())), None, "", 0)
+    assert _found(state) == {("late", None): "image:"} and state.items_unread == 1
+    # One entry of a container costs that entry, not the entries after it.
+    (tmp_path / "entries").mkdir()
+    state = dr._Scan(tmp_path / "entries")
+    state.resources(_pe(_res("App.resources", _container([("bad", b"boom"), ("late", _stage1_bmp())]))), None, "", 0)
+    assert _found(state) == {("App.resources", "late"): "image:"} and state.items_unread == 1
+
+
+def test_a_resource_the_parser_cannot_give_costs_that_resource_not_the_scan(tmp_path):
+    """dnfile reads lazily: asking for one resource's data can raise on a crafted table."""
+
+    class Broken:
+        name = "broken"
+
+        @property
+        def data(self):
+            raise ValueError("a bad resource offset")
+
+    state = dr._Scan(tmp_path)
+    state.resources(_pe(Broken(), _res("late", _stage1_bmp())), {"resources": []}, "", 0)
+    assert _found(state) == {("late", None): "image:"} and state.items_unread == 1
+
+
+def test_entries_that_share_one_slice_of_the_container_are_read_once(tmp_path, monkeypatch):
+    """500 user-typed entries at one offset are one slice: reading it 500 times is the sample
+    spending the scan's time budget for it."""
+    read = []
+    monkeypatch.setattr(dr, "decode", lambda data: read.append(len(data)))
+    entries = [SimpleNamespace(name=f"e{i}", value=None, data=None, type_name="System.Drawing.Bitmap",
+                               struct=SimpleNamespace(DataOffset=0)) for i in range(500)]
+    container = SimpleNamespace(entries=entries, _data=b"HDR-" + bytes(4096),
+                                struct=SimpleNamespace(DataSectionOffset=4))
+    state, doc = dr._Scan(tmp_path), {"resources": []}
+    state.resources(_pe(_res("c", container)), doc, "", 0)
+    assert read == [4096] and state.items_unread == 0
+    assert [e["size"] for e in doc["resources"][0]["entries"]] == [4096] * dr.MAX_ENTRIES
+
+
+_FAILED = {"resources_total": 0, "resources": [], "loader_refs": [], "hidden_payloads": [], "scan_failed": True}
+
+
+def _raising(*_a, **_k):
+    raise OSError("no scanner")
+
+
+@pytest.mark.parametrize("dotnet", [
+    FakeDotnet("failed"), FakeDotnet("timeout"), FakeDotnet("too_large"), _raising,
+    FakeDotnet(doc={"resources": "nope", "hidden": []}),
+    FakeDotnet(doc={"resources_total": 0, "resources": [], "loader_refs": [], "hidden": [], "error": "parse_failed"}),
+])
+def test_a_scan_that_read_nothing_is_recorded_as_failed_not_as_clean(tmp_path, dotnet):
+    """Nothing looked for a hidden payload, so the evidence says so (the verdict rule will not call
+    the program benign) and the summary does not count zero hidden payloads."""
+    res, out = _drun(DLL, tmp_path, dotnet)
+    assert "dotnet_resources_failed" in _codes(res) and "hidden_payloads" not in _fields(res)
+    _s, _p, state = unpack(out / "continuation.tar.gz", tmp_path / "cont", max_bytes=1 << 30)
+    assert state.sweep["dotnet_resources"] == _FAILED
+
+
+def test_a_scan_there_was_no_time_for_is_recorded_as_failed(tmp_path):
+    fd, warnings = FakeDotnet(), []
+    eng = sw.ReaSweepEngine(runner_factory=factory(), ghidra_fn=FakeGhidra(), unpack_fn=FakeUnpack("failed"),
+                            dotnet_fn=fd)
+    assert eng._dotnet(DLL, tmp_path, tmp_path / "members", 0, 0.5, warnings) == (_FAILED, [])
+    assert not fd.calls and [w.code for w in warnings] == ["dotnet_resources_failed"]
 
 
 def test_the_sweep_keeps_the_dimensions_of_the_widest_image_the_scanner_reads(tmp_path):
@@ -457,8 +626,8 @@ def test_user_typed_entries_are_read_from_the_container_data_section():
                SimpleNamespace(struct=SimpleNamespace(DataOffset=16)),
                SimpleNamespace(struct=SimpleNamespace(DataOffset=10 ** 9)),  # past the end: dropped
                SimpleNamespace(struct=None)]
-    assert dr._raw_entries(container, entries) == {0: b"second---", 1: b"first--", 2: b"third"}
-    assert dr._raw_entries(SimpleNamespace(_data=None, struct=None), entries) == {}
+    assert dr._entry_spans(container, entries) == {0: (11, 20), 1: (4, 11), 2: (20, 25)}
+    assert dr._entry_spans(SimpleNamespace(_data=None, struct=None), entries) == {}
 
 
 _STAGED = {"resources_total": 1, "resources": [], "loader_refs": ["Bitmap.GetPixel"], "hidden": [
@@ -532,6 +701,7 @@ def test_the_agent_and_the_report_are_told_about_hidden_payloads_and_decoys():
     sys_msg = Framer("n").report_messages(pass_no=1, sample_name="a.exe", summary="", functions=[], iocs=[],
                                           sweep=_HIDDEN_SWEEP, prior_report=None)[0]["content"]
     assert "decoy" in sys_msg and "hidden_payloads" in sys_msg
+    assert "scan_failed" in sys_msg and "items_unread" in sys_msg
 
 
 def test_the_scanner_imports_nothing_from_blastbox():

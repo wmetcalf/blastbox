@@ -46,9 +46,16 @@ hidden payload (``hidden-<n>.bin``) and decoded PE (``decoded-<n>.bin``) into ``
 JSON: ``{"resources_total", "resources": [{"name", "size", "entropy", "container"[, "format"]
 [, "entries_total", "entries": [{"name", "size", "entropy", "type"}]]}], "loader_refs": [...],
 "hidden": [{"resource"[, "entry"], "size", "entropy"[, "file"][, "image"][, "noise"]
-[, "decoded", "decoded_file"][, "stage"]}][, "error"]}``. ``decoded`` is a :func:`decode` method,
-prefixed ``image:<col|row>-<channels>[+len]/`` when the bytes came from pixels. Counts, names and
-bytes written are capped.
+[, "decoded", "decoded_file"][, "stage"]}][, "items_unread"][, "error"]}``. ``decoded`` is a
+:func:`decode` method, prefixed ``image:<col|row>-<channels>[+len]/`` when the bytes came from
+pixels. Counts, names and bytes written are capped.
+
+The caps on resources and entries bound what is LISTED. Every resource and every entry is read
+for a payload, while ``SCAN_BUDGET_S`` and ``MAX_HIDDEN`` last: a carrier placed behind 64 dull
+resources is found like any other. ``items_unread`` counts what the scan did not read: items past
+that budget or that cap, items that broke a parser, and images of a kind the scanner reads that
+were over ``MAX_IMAGE_PIXELS`` or past ``IMAGE_BUDGET_S``. Any of them may be a payload, so the
+verdict rule does not call a program benign while the count is not zero.
 """
 
 from __future__ import annotations
@@ -70,9 +77,10 @@ from typing import Any
 
 HIDDEN_MIN_BYTES = 64 * 1024
 HIDDEN_MIN_ENTROPY = 7.2
-MAX_RESOURCES = 64
-MAX_ENTRIES = 64  # per .resources container
+MAX_RESOURCES = 64  # listed; every resource is read for a payload
+MAX_ENTRIES = 64  # listed per .resources container; every entry is read
 MAX_HIDDEN = 16
+SCAN_BUDGET_S = 60.0  # reading items for payloads; the sweep gives the whole scan 90 s
 MAX_NAME = 200
 MAX_ENTROPY_BYTES = 4 * 1024 * 1024
 MAX_DECODED_BYTES = 64 * 1024 * 1024
@@ -283,26 +291,35 @@ def _unfilter(raw: bytes, h: int, stride: int, bpp: int) -> bytes | None:
     return bytes(out)
 
 
-def _png(data: bytes, start: int) -> Image | None:
+class _TooLarge(Exception):
+    """A PNG or BMP of a kind the scanner reads, with more than ``MAX_IMAGE_PIXELS`` pixels."""
+
+
+def _png(data: bytes, start: int, pixels: bool = True) -> Image | None:
     pos = start + len(_PNG)
     header: tuple[int, ...] | None = None
     idat: list[bytes] = []
     while pos + 8 <= len(data):
         length, kind = struct.unpack_from(">I4s", data, pos)
-        body = data[pos + 8:pos + 8 + length]
         if kind == b"IHDR" and length == 13:
-            header = struct.unpack(">IIBBBBB", body)
+            if pos + 21 > len(data):
+                return None  # the header chunk is cut short
+            header = struct.unpack_from(">IIBBBBB", data, pos + 8)
         elif kind == b"IDAT":
-            idat.append(body)
+            idat.append(data[pos + 8:pos + 8 + length] if pixels else b"")
         elif kind == b"IEND":
             break
         pos += 12 + length
     if header is None or not idat:
         return None
     w, h, depth, colour, _, _, interlace = header
-    if depth != 8 or colour not in (2, 6) or interlace or not w or not h or w * h > MAX_IMAGE_PIXELS:
+    if depth != 8 or colour not in (2, 6) or interlace or not w or not h:
         return None
+    if w * h > MAX_IMAGE_PIXELS:
+        raise _TooLarge
     bpp = 4 if colour == 6 else 3
+    if not pixels:
+        return Image("png", w, h, b"", b"", b"", None)
     raw = _inflate(b"".join(idat), zlib.MAX_WBITS, limit=h * (w * bpp + 1))
     if raw is None:
         return None
@@ -312,7 +329,7 @@ def _png(data: bytes, start: int) -> Image | None:
     return Image("png", w, h, px[0::bpp], px[1::bpp], px[2::bpp], px[3::4] if bpp == 4 else None)
 
 
-def _bmp(data: bytes, start: int) -> Image | None:
+def _bmp(data: bytes, start: int, pixels: bool = True) -> Image | None:
     try:
         offset, dib, w, h, planes, bits, compression = struct.unpack_from("<IIiiHHI", data, start + 10)
     except struct.error:
@@ -320,31 +337,58 @@ def _bmp(data: bytes, start: int) -> Image | None:
     if dib not in (40, 52, 56, 108, 124) or planes != 1 or bits not in (24, 32) or compression not in (0, 3):
         return None
     rows = abs(h)
-    if w <= 0 or not rows or w * rows > MAX_IMAGE_PIXELS:
+    if w <= 0 or not rows:
         return None
+    if w * rows > MAX_IMAGE_PIXELS:
+        raise _TooLarge
     bpp = bits // 8
     stride = (w * bpp + 3) & ~3
-    body = data[start + offset:start + offset + stride * rows]
-    if len(body) < stride * rows:
+    if len(data) - (start + offset) < stride * rows:
         return None
+    if not pixels:
+        return Image("bmp", w, rows, b"", b"", b"", None)
+    body = data[start + offset:start + offset + stride * rows]
     order = range(rows) if h < 0 else range(rows - 1, -1, -1)  # a positive height is stored bottom-up
     px = b"".join(body[y * stride:y * stride + w * bpp] for y in order)
     return Image("bmp", w, rows, px[2::bpp], px[1::bpp], px[0::bpp], px[3::4] if bpp == 4 else None)
 
 
-def load_image(data: bytes) -> Image | None:
-    """The PNG or BMP that ``data`` is, or that a serialized Bitmap wraps, as channel planes."""
+def _load_image(data: bytes, pixels: bool = True) -> Image | None:
+    """:func:`load_image`, raising :class:`_TooLarge` when the only image found is over the limit.
+    ``pixels=False`` reads the headers alone and gives the image without its channel planes."""
     head = data[:MAX_IMAGE_SCAN]
     start = head.find(_PNG)
     if start >= 0:
-        return _png(data, start)
+        return _png(data, start, pixels)
+    too_large = False
     start = head.find(b"BM")
     while start >= 0:
-        image = _bmp(data, start)
+        try:
+            image = _bmp(data, start, pixels)
+        except _TooLarge:
+            image, too_large = None, True
         if image is not None:
             return image
         start = head.find(b"BM", start + 1)
+    if too_large:
+        raise _TooLarge
     return None
+
+
+def _readable_image(data: bytes) -> bool:
+    """Whether ``data`` is an image of a kind the scanner reads, whatever its size, by its headers."""
+    try:
+        return _load_image(data, pixels=False) is not None
+    except _TooLarge:
+        return True
+
+
+def load_image(data: bytes) -> Image | None:
+    """The PNG or BMP that ``data`` is, or that a serialized Bitmap wraps, as channel planes."""
+    try:
+        return _load_image(data)
+    except _TooLarge:
+        return None
 
 
 def _blank(image: Image, start: int, stop: int, step: int) -> bool:
@@ -498,9 +542,10 @@ def _entry_bytes(entry: Any) -> bytes:
     return bytes(data) if isinstance(data, (bytes, bytearray)) else b""
 
 
-def _raw_entries(container: Any, entries: list[Any]) -> dict[int, bytes]:
-    """Each entry's serialized bytes by position, sliced from the container's data section between
-    its offset and the next entry's: what dnfile leaves unread for user types (Bitmap, Icon)."""
+def _entry_spans(container: Any, entries: list[Any]) -> dict[int, tuple[int, int]]:
+    """Where each entry's serialized bytes lie in the container's ``_data``, by position: from its
+    offset in the data section to the next entry's. dnfile leaves these unread for user types
+    (Bitmap, Icon). Spans, not bytes: entries that share an offset share one slice."""
     raw = getattr(container, "_data", None)
     base = getattr(getattr(container, "struct", None), "DataSectionOffset", None)
     if not isinstance(raw, (bytes, bytearray)) or not isinstance(base, int) or base < 0:
@@ -511,7 +556,8 @@ def _raw_entries(container: Any, entries: list[Any]) -> dict[int, bytes]:
         if isinstance(off, int) and 0 <= off and base + off < len(raw):
             starts[i] = base + off
     bounds = sorted(set(starts.values())) + [len(raw)]
-    return {i: bytes(raw[o:bounds[bounds.index(o) + 1]]) for i, o in starts.items()}
+    end = dict(zip(bounds, bounds[1:]))
+    return {i: (o, end[o]) for i, o in starts.items()}
 
 
 def _loader_refs(pe: Any) -> list[str]:
@@ -573,21 +619,38 @@ class _Scan:
     def __init__(self, outdir: Path | None) -> None:
         self.hidden: list[dict[str, Any]] = []
         self.writer = _Writer(outdir)
-        self.images_unread = 0
+        self.items_unread = 0  # see the module docstring: any of them may be a payload
+        self._deadline = time.monotonic() + SCAN_BUDGET_S
         self._image_deadline = time.monotonic() + IMAGE_BUDGET_S
 
     def image(self, data: bytes) -> Image | None:
-        """``data`` as an image, while the scan's image time budget lasts."""
+        """``data`` as an image, while the scan's image time budget lasts.
+
+        An image of a kind the scanner reads that it did not read, for time or because it is over
+        ``MAX_IMAGE_PIXELS``, is counted in ``items_unread``.
+        """
         if time.monotonic() < self._image_deadline:
-            return load_image(data)
-        head = data[:MAX_IMAGE_SCAN]
-        if _PNG in head or b"BM" in head:
-            self.images_unread += 1
+            try:
+                return _load_image(data)
+            except _TooLarge:
+                self.items_unread += 1
+                return None
+        if _readable_image(data):
+            self.items_unread += 1
         return None
 
-    def consider(self, data: bytes, ent: float, resource: str, entry: str | None, depth: int) -> None:
-        if len(self.hidden) >= MAX_HIDDEN:
+    def consider(self, data: bytes, ent: float | None, resource: str, entry: str | None, depth: int) -> None:
+        """Read one resource or entry for a hidden payload (``ent``: its entropy when the caller
+        has it). An item not read, or one that breaks a parser, is counted, never fatal."""
+        if len(self.hidden) >= MAX_HIDDEN or time.monotonic() >= self._deadline:
+            self.items_unread += 1
             return
+        try:
+            self._consider(data, entropy(data) if ent is None else ent, resource, entry, depth)
+        except Exception:  # a parser bug on hostile bytes costs this item, not the scan
+            self.items_unread += 1
+
+    def _consider(self, data: bytes, ent: float, resource: str, entry: str | None, depth: int) -> None:
         decoded = decode(data)
         image = self.image(data) if decoded is None else None
         noise: float | None = None
@@ -645,38 +708,54 @@ class _Scan:
                 doc["error"] = "resources_unreadable"
         if doc is not None:
             doc["resources_total"] = len(resources)
-        for res in resources[:MAX_RESOURCES]:
-            name = prefix + _name(getattr(res, "name", ""))
-            data = getattr(res, "data", None)
-            if isinstance(data, (bytes, bytearray)):
-                raw = bytes(data)
-                ent = entropy(raw)
-                row: dict[str, Any] = {"name": name, "size": len(raw), "entropy": round(ent, 3),
-                                       "container": False}
+        for n, res in enumerate(resources):
+            rows = doc["resources"] if doc is not None and n < MAX_RESOURCES else None
+            try:
+                self.resource(res, rows, prefix, depth)
+            except Exception:  # dnfile reads lazily: a resource it cannot give is one item unread
+                self.items_unread += 1
+
+    def resource(self, res: Any, rows: list[dict[str, Any]] | None, prefix: str, depth: int) -> None:
+        """Read one ManifestResource, and each entry of a container, for a hidden payload; describe
+        it in ``rows`` when it is one of those the document lists."""
+        name = prefix + _name(getattr(res, "name", ""))
+        data = getattr(res, "data", None)
+        if isinstance(data, (bytes, bytearray)):
+            raw = bytes(data)
+            ent = entropy(raw) if rows is not None else None
+            if rows is not None and ent is not None:
+                row: dict[str, Any] = {"name": name, "size": len(raw), "entropy": round(ent, 3), "container": False}
                 fmt = media_format(raw)
                 if fmt:
                     row["format"] = fmt
-                if doc is not None:
-                    doc["resources"].append(row)
-                self.consider(raw, ent, name, None, depth)
-                continue
-            entries = list(getattr(data, "entries", None) or [])
+                rows.append(row)
+            self.consider(raw, ent, name, None, depth)
+            return
+        entries = list(getattr(data, "entries", None) or [])
+        raw_container = getattr(data, "_data", b"")
+        listed: list[dict[str, Any]] = []
+        if rows is not None:
             size = getattr(res, "size", 0)
-            row = {"name": name, "size": size if isinstance(size, int) else 0, "entropy": 0.0, "container": True,
-                   "entries_total": len(entries), "entries": []}
-            raw_container = getattr(data, "_data", b"")
-            if isinstance(raw_container, (bytes, bytearray)):
-                row["entropy"] = round(entropy(bytes(raw_container)), 3)
-            serialized = _raw_entries(data, entries[:MAX_ENTRIES])
-            for i, e in enumerate(entries[:MAX_ENTRIES]):
-                blob = _entry_bytes(e) or serialized.get(i, b"")
+            whole = entropy(bytes(raw_container)) if isinstance(raw_container, (bytes, bytearray)) else 0.0
+            rows.append({"name": name, "size": size if isinstance(size, int) else 0, "entropy": round(whole, 3),
+                         "container": True, "entries_total": len(entries), "entries": listed})
+        spans = _entry_spans(data, entries)
+        read: set[tuple[int, int]] = set()  # entries at one offset share a slice: it is read once
+        for i, e in enumerate(entries):
+            blob = _entry_bytes(e)
+            again = False
+            if not blob and i in spans:
+                again = spans[i] in read
+                read.add(spans[i])
+                blob = bytes(raw_container[spans[i][0]:spans[i][1]])
+            ename = _name(getattr(e, "name", ""))
+            ent = None
+            if rows is not None and i < MAX_ENTRIES:
                 ent = entropy(blob)
-                ename = _name(getattr(e, "name", ""))
-                row["entries"].append({"name": ename, "size": len(blob), "entropy": round(ent, 3),
-                                       "type": _name(getattr(e, "type_name", "") or "")})
+                listed.append({"name": ename, "size": len(blob), "entropy": round(ent, 3),
+                               "type": _name(getattr(e, "type_name", "") or "")})
+            if not again:
                 self.consider(blob, ent, name, ename, depth)
-            if doc is not None:
-                doc["resources"].append(row)
 
 
 def _close(pe: Any) -> None:
@@ -707,8 +786,8 @@ def scan(sample: Path, outdir: Path | None) -> dict[str, Any]:
         state = _Scan(outdir)
         doc["hidden"] = state.hidden
         state.resources(pe, doc, "", 0)
-        if state.images_unread:
-            doc["images_unread"] = state.images_unread
+        if state.items_unread:
+            doc["items_unread"] = state.items_unread
     finally:
         _close(pe)
     return doc

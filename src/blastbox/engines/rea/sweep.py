@@ -48,8 +48,11 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
    ``<module>!<resource>``. Evidence ``State.sweep["dotnet_resources"] =
    {"resources_total", "resources", "loader_refs", "hidden_payloads": [{"resource"[, "entry"], "size",
    "entropy"[, "image"[, "noise"]][, "member"][, "decoded"[, "decoded_member", "decoded_sha256"]
-   [, "stage": {"dotnet"[, "module", "types", "methods", "loader_refs"]}]]}]}``; a failed scan is a
-   ``dotnet_resources_failed`` warning;
+   [, "stage": {"dotnet"[, "module", "types", "methods", "loader_refs"]}]]}][, "items_unread"]
+   [, "scan_failed": true]}``. ``items_unread`` counts the resources, entries and images the scan
+   did not read (its time, size and count limits); a scan that failed or read nothing is a
+   ``dotnet_resources_failed`` warning and the evidence with empty lists and ``scan_failed``, and
+   seals no ``hidden_payloads`` in the summary. The verdict rule calls no program benign over either;
 4b'. .NET only: the assembly to C# (``dotnet_decompile.py``: ILSpy's command-line decompiler, at
    most ``DECOMPILE_S`` a run), then up to ``MAX_DECOMPILE_STAGES`` .NET stages recovered from its
    resources (``DECOMPILE_STAGES_S`` together). Evidence ``State.sweep["decompiled"] = {"images":
@@ -213,6 +216,7 @@ EXTRACT_TIMEOUT_S = 120.0
 UNPACK_TIMEOUT_S = 60.0
 INSTALLER_TIMEOUT_S = 120.0
 DOTNET_RESOURCES_S = 90.0
+MAX_ITEMS_UNREAD = 9999  # the count carried in the evidence; more reads the same
 SIGNATURES_S = 60.0  # wall-clock cap on the YARA scan of the sample and its stages (signatures.py)
 DECOMPILE_S = 120.0  # wall-clock cap on one ILSpy run (dotnet_decompile.py); the cape5 set took 6-21 s
 DECOMPILE_STAGES_S = 120.0  # ... on the recovered .NET stages together
@@ -690,7 +694,7 @@ class ReaSweepEngine:
         if emulation is not None:
             summary["emulation"] = emulation["status"]
             summary["emulation_captures"] = len(emulation.get("captures", []))
-        if resources is not None:
+        if resources is not None and not resources.get("scan_failed"):
             summary["hidden_payloads"] = len(resources["hidden_payloads"])
         if decompile_status is not None:
             summary["decompile_status"] = decompile_status
@@ -863,12 +867,15 @@ class ReaSweepEngine:
 
     def _dotnet(self, sample: Path, job: Path, members_dir: Path, have: int, timeout_s: float,
                 warnings: list[Warning]) -> tuple[dict[str, Any] | None, list[Path]]:
-        """``(State.sweep["dotnet_resources"] or None, member artifacts)`` from the resource scan
+        """``(State.sweep["dotnet_resources"], member artifacts)`` from the resource scan
         (``dotnet_resources.py``). Hidden payloads, and the PEs they decode to, become members and
-        ``hidden_payload`` warnings; a failed scan is a ``dotnet_resources_failed`` warning."""
+        ``hidden_payload`` warnings; a failed scan is a ``dotnet_resources_failed`` warning and
+        evidence that says ``scan_failed``, so nothing downstream reads it as a clean scan."""
+        failed: dict[str, Any] = {"resources_total": 0, "resources": [], "loader_refs": [], "hidden_payloads": [],
+                                  "scan_failed": True}
         if timeout_s < 1:
             warnings.append(Warning(code="dotnet_resources_failed", message="no time left for the resource scan"))
-            return None, []
+            return failed, []
         scan_dir = job / "dotnet-res"
         python = DEFAULT_DOTNET_PYTHON
         try:
@@ -877,7 +884,7 @@ class ReaSweepEngine:
                                           max_write_bytes=MAX_DOTNET_WRITE)
         except Exception as exc:
             warnings.append(Warning(code="dotnet_resources_failed", message=f"exception:{type(exc).__name__}"))
-            return None, []
+            return failed, []
         try:
             doc = json.loads(out) if status == "ok" else None
         except (ValueError, RecursionError):
@@ -887,16 +894,18 @@ class ReaSweepEngine:
         if not isinstance(doc, dict) or not isinstance(doc_rows, list) or not isinstance(doc_hidden, list):
             warnings.append(Warning(code="dotnet_resources_failed",
                                     message=f"resource scan: {status if status != 'ok' else 'malformed output'}"))
-            return None, []
+            shutil.rmtree(scan_dir, ignore_errors=True)
+            return failed, []
         if isinstance(doc.get("error"), str):
             warnings.append(Warning(code="dotnet_resources_failed", message=f"resource scan: {_short(doc['error'], 64)}"))
         def num(v: Any, kind: type | tuple[type, ...]) -> Any:
             return v if isinstance(v, (int, float)) and not isinstance(v, bool) and isinstance(v, kind) else 0
 
-        unread = num(doc.get("images_unread"), int)
-        if unread:
+        unread = num(doc.get("items_unread"), int)
+        if unread > 0:
             warnings.append(Warning(code="dotnet_resources_failed",
-                                    message=f"resource scan: {unread} image resource(s) not read (time budget)"))
+                                    message=f"resource scan: {unread} resource item(s) not read "
+                                            "(time, size or count limit)"))
 
 
         def text(v: Any) -> str:
@@ -982,8 +991,11 @@ class ReaSweepEngine:
         shutil.rmtree(scan_dir, ignore_errors=True)
         evidence = {"resources_total": num(doc.get("resources_total"), int), "resources": rows,
                     "loader_refs": [text(r) for r in refs[:32] if isinstance(r, str)], "hidden_payloads": hidden}
-        if unread > 0:  # the verdict rule (verdict.py) will not call the program benign over these
-            evidence["images_unread"] = min(unread, dotnet_resources.MAX_RESOURCES * dotnet_resources.MAX_ENTRIES)
+        # The verdict rule (verdict.py) will not call the program benign over either of these.
+        if unread > 0:
+            evidence["items_unread"] = min(unread, MAX_ITEMS_UNREAD)
+        if isinstance(doc.get("error"), str):
+            evidence["scan_failed"] = True
         return evidence, paths
 
     def _decompile(self, sample: Path, resources: dict[str, Any] | None, members_dir: Path, job: Path,

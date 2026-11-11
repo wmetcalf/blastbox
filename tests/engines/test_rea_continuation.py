@@ -60,6 +60,26 @@ def test_state_json_roundtrip() -> None:
     assert State.from_json(_state().to_json()) == _state()
 
 
+def test_state_json_carries_the_opened_functions_and_older_states_have_none() -> None:
+    st = _state()
+    st.opened = ["0x10", "0x20"]
+    assert State.from_json(st.to_json()).opened == ["0x10", "0x20"]
+    old = {k: v for k, v in json.loads(st.to_json()).items() if k != "opened"}
+    assert State.from_json(json.dumps(old)).opened == []
+
+
+def test_state_json_replaces_lone_surrogates() -> None:
+    """state.json is written ASCII-escaped, so a lone surrogate from the sample (a .NET resource
+    name, a string literal) survives the archive; text read back from it must be sealable."""
+    st = _state()
+    st.summary = "a\ud800b"
+    st.sweep = {"dotnet_resources": {"resources": [{"name": "r\udfff", "k\udc00": ["x\ud83d", "\U0001f600"]}]}}
+    back = State.from_json(st.to_json())
+    assert back.summary == "a�b"
+    assert back.sweep == {"dotnet_resources": {"resources": [{"name": "r�", "k�": ["x�", "\U0001f600"]}]}}
+    back.to_json().encode("utf-8")
+
+
 def test_unpack_normalises_modes(tmp_path: Path) -> None:
     arc = _raw(tmp_path / "m.tar.gz", [
         _file("sample/a.exe", b"x", 0o444),

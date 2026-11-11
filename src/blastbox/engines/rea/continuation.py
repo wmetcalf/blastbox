@@ -18,6 +18,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
+from blastbox.engines.rea.wellformed import well_formed
+
 GhidraStatus = Literal["ok", "timeout", "failed", "skipped"]
 
 _STATE_NAME = "state.json"
@@ -92,6 +94,12 @@ class State:
     # label: the bar reads it when a later pass writes no report of its own. Absent from older
     # continuations.
     opinion: str | None = None
+    # A code tool (agent.CODE_TOOLS) has returned a function's code to this chain: what a benign
+    # verdict needs. Absent from older continuations, which then need a code read again.
+    code_read: bool = False
+    # The addresses those code-tool calls asked for: the functions a benign verdict may count as
+    # read (sufficiency.py, ``benign_unexplored``). Absent from older continuations.
+    opened: list[str] = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), sort_keys=True)
@@ -99,7 +107,7 @@ class State:
     @classmethod
     def from_json(cls, text: str | bytes) -> State:
         try:
-            d: Any = json.loads(text)
+            d: Any = well_formed(json.loads(text))
             return cls(
                 pass_no=int(d["pass_no"]),
                 sample_name=str(d["sample_name"]),
@@ -116,8 +124,10 @@ class State:
                 gaps=[{"code": str(g["code"]), "detail": str(g["detail"])} for g in d.get("gaps") or []],
                 program_functions=[str(x) for x in d.get("program_functions") or []],
                 opinion=_opinion(d.get("opinion")),
+                code_read=d.get("code_read") is True,
+                opened=[str(x) for x in d.get("opened") or []],
             )
-        except (ValueError, KeyError, TypeError) as exc:
+        except (ValueError, KeyError, TypeError, RecursionError) as exc:
             raise ContinuationError(f"bad state.json: {exc}") from exc
 
 
