@@ -23,16 +23,19 @@ api_hashing              concealing  imports resolved by hash (sweep.api_hashes.
 A match of a rule that names no family (a rule for an obfuscator, say) is no ground: the model
 sees it in the evidence and may cite what it means.
 
-Model grounds (:func:`model_grounds`) are kept when their code is in the vocabulary and their
-evidence row cites something the pass has: an address it has seen (``known``), or, in a report
+The model answers every code of the vocabulary, one citation or none (the report schema's
+checklist). It used to list "up to four" grounds, and over the same evidence it listed one in one
+run and four in the next while its prose described the same behaviours; the rule counts hostile
+codes, so the confidence moved with the list. Model grounds (:func:`model_grounds`) are kept when
+their code is in the vocabulary and their citation names something the pass has: an address it has seen (``known``), or, in a report
 written from the sweep's evidence alone, a source the sweep holds (``sources``). That is all the
 engine checks. It does not check that the cited function *does* what the ground says; a model
 that cites a real address for a behaviour that is not there still moves the verdict. What the rule
 removes is the free choice of confidence and the ungrounded malicious call, not the model's
 judgement of code. A ground that fails the check is dropped and counted, never fatal. The grounds
 kept do not depend on the order the model listed them in: one per code, hostile ones first, each
-tier in vocabulary order. Every code that passes the check counts (the rows looked at are bounded,
-``MAX_ROWS``), so a ground the model adds never pushes another out and never lowers the verdict;
+tier in vocabulary order. Every code that passes the check counts (the citations looked at are
+bounded, ``PER_CODE`` and ``MAX_ROWS``), so a ground the model adds never pushes another out and never lowers the verdict;
 the rule line shows as many as fit.
 
 The rule (:func:`decide`):
@@ -87,7 +90,9 @@ RULE_LINE = "Rule: "
 MODEL_LINE = "Model: "  # leads the model's own text, the rationale's second and last line
 # A rationale within the generation limit is never cut to make room for the rule's line.
 RULE_LINE_MAX = REPORT_RATIONALE - GEN_RATIONALE - 1 - len(MODEL_LINE)
-MAX_ROWS = 16  # model ground rows looked at; the schema allows prompts.GEN_GROUNDS
+MAX_ROWS = 16  # model ground rows looked at when the answer is a list
+PER_CODE = 4  # citations looked at per code in a checklist answer; the schema allows one
+_RATIONALE_READ = 4 * REPORT_RATIONALE  # of a model rationale, before it is cut to fit
 CONCLUSIVE = "pixel_hidden_executable"
 _PLAIN = re.compile(r"[^A-Za-z0-9_.\-]")
 _ECHO = re.compile(r"\s*rule\s*:", re.IGNORECASE)
@@ -178,12 +183,14 @@ def model_grounds(raw: Any, *, known: set[str] | None,
     ``known=set()`` (only sources count). One ground per code (its lowest citation), hostile
     codes first and each tier in vocabulary order: the same rows in any order give the same
     grounds, and one more row never takes a ground away.
+
+    ``raw`` is the checklist the report schema asks for, ``{code: [citation] or []}`` with every
+    code answered (an empty or missing answer is "no", not a dropped ground), or a list of
+    ``{"code", "evidence"}`` rows.
     """
-    if not isinstance(raw, list):
-        return [], 0
+    rows, dropped = _rows(raw)
     best: dict[str, tuple[int, str]] = {}
-    dropped = max(0, len(raw) - MAX_ROWS)
-    for row in raw[:MAX_ROWS]:
+    for row in rows:
         code = row.get("code") if isinstance(row, dict) else None
         tier = (HOSTILE if isinstance(code, str) and code in HOSTILE_GROUNDS
                 else CONCEALING if isinstance(code, str) and code in CONCEALING_GROUNDS else 0)
@@ -205,6 +212,30 @@ def model_grounds(raw: Any, *, known: set[str] | None,
             best[str(code)] = (tier, where)
     codes = sorted(best, key=_VOCABULARY.index)
     return [Ground(c, best[c][0], False, f"{c.replace('_', ' ')} ({best[c][1]})") for c in codes], dropped
+
+
+def _rows(raw: Any) -> tuple[list[Any], int]:
+    """The model's answer as ``{"code", "evidence"}`` rows, bounded, and what the bounds or the
+    shape cost: rows past ``MAX_ROWS``, citations past ``PER_CODE``, an answer that is neither a
+    citation nor a list of them, and a citation under a code outside the vocabulary."""
+    if isinstance(raw, list):
+        return raw[:MAX_ROWS], max(0, len(raw) - MAX_ROWS)
+    if not isinstance(raw, dict):
+        return [], 0
+    rows: list[Any] = []
+    dropped = sum(1 for code, answer in raw.items() if answer and code not in _VOCABULARY)
+    for code in _VOCABULARY:
+        answer = raw.get(code)
+        if isinstance(answer, dict):
+            answer = [answer]
+        if not answer:
+            continue
+        if not isinstance(answer, list):
+            dropped += 1
+            continue
+        dropped += max(0, len(answer) - PER_CODE)
+        rows.extend({"code": code, "evidence": cite} for cite in answer[:PER_CODE])
+    return rows, dropped
 
 
 def _line(head: str, cites: list[str], tail: str) -> str:
@@ -312,8 +343,10 @@ def apply(obj: Any, *, sweep: dict[str, Any], known: set[str] | None, sources: C
     rule's, in the wire shape, and return the decision.
 
     ``None`` and ``obj`` untouched when there is no verdict object or its label is outside the
-    enum: ``validate_report`` rejects that report as it always did. A rationale it would reject
-    (not a string, over ``REPORT_RATIONALE``) is left as it is for the same reason.
+    enum: ``validate_report`` rejects that report as it always did, and one whose rationale is
+    not a string, which is left as it is. A rationale of any length is cut to fit beside the rule
+    line: the generation schema's ``maxLength`` is not enforced by every server, and a model that
+    wrote past ``REPORT_RATIONALE`` cost the sample its whole report.
     """
     verdict = obj.get("verdict") if isinstance(obj, dict) else None
     if not isinstance(verdict, dict):
@@ -325,7 +358,7 @@ def apply(obj: Any, *, sweep: dict[str, Any], known: set[str] | None, sources: C
     decision = replace(decide(opinion, engine_grounds(sweep) + cited, code_read=code_read,
                               resources_unread=resources_unread(sweep)), dropped=dropped)
     rationale = verdict.get("rationale")
-    if isinstance(rationale, str) and len(rationale) <= REPORT_RATIONALE:
-        rationale = _rationale(decision.rule_line, rationale)
+    if isinstance(rationale, str):
+        rationale = _rationale(decision.rule_line, rationale[:_RATIONALE_READ])
     obj["verdict"] = {"label": decision.label, "confidence": decision.confidence, "rationale": rationale}
     return decision

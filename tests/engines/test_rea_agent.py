@@ -1698,7 +1698,8 @@ def _report(**over):
     sections["network"] = _section("not_observed", "No sockets.", [{"address": FN_MAIN, "function": "", "note": ""}],
                                    "network")
     sections.update(over.pop("sections", {}))
-    obj = {"verdict": {"label": "benign", "grounds": [], "rationale": "prints and exits"},
+    obj = {"verdict": {"label": "benign", "rationale": "prints and exits",
+                       "grounds": {c: [] for c in (*prompts.HOSTILE_GROUNDS, *prompts.CONCEALING_GROUNDS)}},
            "sections": sections}
     obj.update(over)
     return obj
@@ -1725,8 +1726,8 @@ def _report_run(tmp_path, monkeypatch, report_resp, *, prior=None, clock=time.mo
                              sweep={"kind": "pe", "iocs": [{"type": "domain", "value": "sweep.example",
                                                             "source": "ghidra:0x1"}], **(sweep or {})})
     script = [tool_turn or tc(("procedure_pseudo_code", {"procedure": FN_MAIN}, "a")), answer(FINAL_OK)]
-    if report_resp is not None:
-        script.append(report_resp)
+    if report_resp is not None:  # one response, or one per report call
+        script.extend(report_resp if isinstance(report_resp, list) else [report_resp])
     model = FakeModel(script, on_chat=on_chat)
     res, out = run(tmp_path, cont, model, McpRig(tmp_path, {"procedure_pseudo_code": {"text": DECOMP}}),
                    clock=clock)
@@ -1746,14 +1747,25 @@ def test_report_schema_is_the_interface_shape_and_fits_the_token_budget():
     assert v["label"]["enum"] == ["benign", "suspicious", "malicious", "unknown"]
     # The model gives its call and its grounds; label and confidence on the wire are the rule's.
     assert sch["properties"]["verdict"]["required"] == ["label", "grounds", "rationale"] and "confidence" not in v
-    assert v["grounds"]["maxItems"] == p.GEN_GROUNDS
-    assert v["grounds"]["items"]["properties"]["code"]["enum"] == [*p.HOSTILE_GROUNDS, *p.CONCEALING_GROUNDS]
+    # Every ground is answered, one citation or none: a free list of "up to four" came back with
+    # one ground in one run and four in the next over the same evidence, and the rule counts them.
+    codes = [*p.HOSTILE_GROUNDS, *p.CONCEALING_GROUNDS]
+    assert v["grounds"]["type"] == "object" and v["grounds"]["additionalProperties"] is False
+    assert v["grounds"]["required"] == codes and list(v["grounds"]["properties"]) == codes
+    for answer_schema in v["grounds"]["properties"].values():
+        assert answer_schema["type"] == "array" and answer_schema["maxItems"] == 1
+        assert answer_schema["items"]["required"] == ["address"]
+        assert answer_schema["items"]["additionalProperties"] is False
+    cite = p.report_schema(["iocs", "emulation"])["properties"]["verdict"]["properties"]["grounds"]["properties"]
+    assert cite["remote_control"]["items"]["properties"] == {"source": {"type": "string",
+                                                                        "enum": ["iocs", "emulation"]}}
     assert p.GEN_RATIONALE <= p.REPORT_RATIONALE and p.GEN_TITLE <= p.REPORT_TITLE
     assert p.GEN_FUNCTION <= p.REPORT_FUNCTION and p.GEN_NOTE <= p.REPORT_NOTE
     assert all(t <= p.REPORT_TEXT and e <= p.REPORT_EVIDENCE for t, e in p.GEN_SECTIONS.values())
     # ~4 chars/token for bounded strings, ~12 tokens of syntax per evidence row, ~20 per section.
     ev = 6 + p.GEN_FUNCTION // 4 + p.GEN_NOTE // 4 + 12
-    worst = (p.GEN_RATIONALE // 4 + 20 + p.GEN_GROUNDS * (ev + 12)
+    # A ground's answer: its key, and at most one address in its own object.
+    worst = (p.GEN_RATIONALE // 4 + 20 + len(codes) * (8 + 6 + 8)
              + sum(p.GEN_TITLE // 4 + t // 4 + e * ev + 20 for t, e in p.GEN_SECTIONS.values()))
     assert worst <= ag.DEFAULT_REPORT_TOKENS
 
@@ -1802,7 +1814,7 @@ def test_prior_report_addresses_stay_citable(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("bad", [
     {"verdict": {"label": "evil", "confidence": "high", "rationale": "x"}},
-    {"verdict": {"label": "benign", "confidence": "high", "rationale": "x" * 601}},
+    {"verdict": {"label": "benign", "confidence": "high", "rationale": 7}},
     {"sections": {"overview": _section("seen", "x")}},
     {"sections": {"network": _section("not_observed", "x" * 1501)}},
     {"sections": {"execution_flow": _section("observed", "x", [{"address": "not-an-address"}])}},
@@ -1836,9 +1848,10 @@ def _events(out, kind):
 def test_the_verdict_is_the_rules_not_the_models(tmp_path, monkeypatch):
     # The model states a confidence it is not asked for and cites two grounds: one at a function this
     # pass read, one at an address nobody saw. Only the first counts.
-    rep = _report(verdict={"label": "malicious", "confidence": "high", "rationale": "talks to a C2", "grounds": [
-        {"code": "remote_control", "evidence": {"address": FN_MAIN, "function": "entry", "note": "command loop"}},
-        {"code": "credential_theft", "evidence": {"address": "0xdeadbeef", "function": "ghost", "note": "invented"}}]})
+    grounds = {c: [] for c in (*prompts.HOSTILE_GROUNDS, *prompts.CONCEALING_GROUNDS)}  # every code answered
+    grounds.update(remote_control=[{"address": FN_MAIN}], credential_theft=[{"address": "0xdeadbeef"}])
+    rep = _report(verdict={"label": "malicious", "confidence": "high", "rationale": "talks to a C2",
+                           "grounds": grounds})
     res, out, _m = _report_run(tmp_path, monkeypatch, answer(rep))
     verdict = json.loads(res.payload.fields["analysis_report"])["verdict"]
     assert verdict == {"label": "malicious", "confidence": "medium",
@@ -2069,6 +2082,38 @@ def test_model_client_sends_temperature_only_when_given():
     assert json.loads(op.requests[0].data)["temperature"] == 0.0
     m.chat([{"role": "user", "content": "q"}], [], 16)
     assert "temperature" not in json.loads(op.requests[1].data)
+
+
+def _cut_empty(tokens=3500):
+    """A response that spent the whole output budget and has no content: seen twice in 80 reports
+    on the CAPE set with thinking switched off in the request, so a host that thinks regardless."""
+    return {"choices": [{"message": {"role": "assistant", "content": ""}, "finish_reason": "length"}],
+            "usage": {"completion_tokens": tokens}, "provider": "SomeHost", "model": "vendor/model-x"}
+
+
+def test_an_empty_cut_off_report_is_asked_for_once_more(tmp_path, monkeypatch):
+    res, out, model = _report_run(tmp_path, monkeypatch, [_cut_empty(), answer(_report())])
+    assert json.loads(res.payload.fields["analysis_report"])["verdict"]["label"] == "benign"
+    assert "report_invalid" not in _codes(res)
+    first, second = model.calls[-2], model.calls[-1]
+    assert {k: v for k, v in second.items() if k != "timeout_s"} == {k: v for k, v in first.items()
+                                                                      if k != "timeout_s"}
+    turns = _events(out, "report_turn")
+    assert [t["finish_reason"] for t in turns] == ["length", None] and turns[1]["retry"] == "empty_at_length"
+    # Who served the call is on record: the same request can be routed to different hosts.
+    assert (turns[0]["provider"], turns[0]["served_model"]) == ("SomeHost", "vendor/model-x")
+    assert (turns[1]["provider"], turns[1]["served_model"]) == (None, None)
+
+
+def test_only_an_empty_cut_off_report_is_asked_for_again(tmp_path, monkeypatch):
+    # A report that is simply wrong is not retried: the model would write it again.
+    res, _o, model = _report_run(tmp_path, monkeypatch, answer("not json at all"))
+    assert "report_invalid" in _codes(res) and model.script == []
+    # Once: a second empty answer is an invalid report, as one was before.
+    sub = tmp_path / "twice"
+    sub.mkdir()
+    res, _o, model = _report_run(sub, monkeypatch, [_cut_empty(), _cut_empty()])
+    assert "analysis_report" not in res.payload.fields and "report_invalid" in _codes(res) and model.script == []
 
 
 def test_unparseable_report_is_invalid(tmp_path, monkeypatch):
@@ -2798,3 +2843,4 @@ def test_evidence_prompt_says_why_no_code_was_read():
     assert "did not finish" in timeout and "did not finish" not in failed and "could not import" in failed
     for text in (failed, timeout):
         assert "sweep.unpacked" in text and "SECURITY" in text and "source" in text
+

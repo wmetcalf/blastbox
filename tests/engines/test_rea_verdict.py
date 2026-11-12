@@ -6,7 +6,12 @@ import copy
 
 import pytest
 
-from blastbox.engines.rea.prompts import GEN_GROUNDS, GEN_RATIONALE, REPORT_RATIONALE
+from blastbox.engines.rea.prompts import (
+    CONCEALING_GROUNDS,
+    GEN_RATIONALE,
+    HOSTILE_GROUNDS,
+    REPORT_RATIONALE,
+)
 from blastbox.engines.rea.report import ReportInvalid, validate_report
 from blastbox.engines.rea.verdict import (
     CONCEALING,
@@ -178,8 +183,10 @@ def test_grounds_the_engine_cannot_check_are_dropped_and_counted():
 
 
 def test_grounds_that_are_not_a_list_are_no_grounds():
-    for raw in (None, "x", {"code": "destruction"}, 3):
+    for raw in (None, "x", 3, {}):
         assert model_grounds(raw, known=KNOWN, sources=()) == ([], 0)
+    # An object is read as the checklist: a key that is no ground code is dropped and counted.
+    assert model_grounds({"code": "destruction"}, known=KNOWN, sources=()) == ([], 1)
 
 
 def test_a_source_cite_counts_only_in_an_evidence_report_and_only_for_a_source_the_sweep_holds():
@@ -204,7 +211,46 @@ def test_one_ground_per_code_and_a_bounded_number_of_rows():
                               "covert_capture", "obfuscation")]
     grounds, dropped = model_grounds(many, known=KNOWN, sources=())
     # Every checked code counts towards the decision: a ground the model adds is never dropped.
-    assert len(many) > GEN_GROUNDS and len(grounds) == len(many) and dropped == 0
+    assert len(grounds) == len(many) == 6 and dropped == 0
+
+
+def _check(**cited):
+    """The checklist the report schema asks for: every code, each with one citation or none."""
+    return {c: ([{"address": cited[c]}] if c in cited else []) for c in (*HOSTILE_GROUNDS, *CONCEALING_GROUNDS)}
+
+
+def test_the_model_answers_every_ground_and_an_empty_answer_is_not_a_dropped_one():
+    grounds, dropped = model_grounds(_check(), known=KNOWN, sources=())
+    assert grounds == [] and dropped == 0
+    grounds, dropped = model_grounds(_check(remote_control="0x402000", obfuscation="0x401000"),
+                                     known=KNOWN, sources=())
+    assert [g.cite for g in grounds] == ["remote control (0x402000)", "obfuscation (0x401000)"] and dropped == 0
+    # The same answers as rows give the same grounds.
+    rows = [_row("obfuscation", "0x401000"), _row("remote_control", "0x402000")]
+    assert model_grounds(rows, known=KNOWN, sources=())[0] == grounds
+
+
+def test_a_checklist_answer_the_engine_cannot_check_is_dropped_and_counted():
+    raw = _check(remote_control="0x999999", destruction="0x401000")
+    raw["made_up_code"] = [{"address": "0x401000"}]
+    raw["credential_theft"] = "yes"           # not a citation
+    raw["covert_capture"] = None              # an unanswered code is not a dropped one
+    raw["anti_analysis"] = {"address": "0x402000"}  # one citation outside its list still counts
+    grounds, dropped = model_grounds(raw, known=KNOWN, sources=())
+    assert [g.code for g in grounds] == ["destruction", "anti_analysis"] and dropped == 3
+    # An evidence report cites sweep sources; an address there is dropped.
+    raw = {"remote_control": [{"source": "emulation"}], "obfuscation": [{"source": "vibes"}],
+           "destruction": [{"address": "0x401000"}]}
+    grounds, dropped = model_grounds(raw, known=set(), sources=["emulation"])
+    assert [g.cite for g in grounds] == ["remote control (emulation)"] and dropped == 2
+
+
+def test_a_flood_of_checklist_answers_is_bounded():
+    raw = _check()
+    raw["remote_control"] = [{"address": "0x999999"}] * 5000 + [{"address": "0x401000"}]
+    raw.update({f"junk{i}": [{"address": "0x401000"}] for i in range(5000)})
+    grounds, dropped = model_grounds(raw, known=KNOWN, sources=())
+    assert grounds == [] and dropped == 5000 + 5001
 
 
 def test_one_more_ground_from_the_model_never_lowers_the_verdict():
@@ -494,8 +540,20 @@ def test_a_report_without_a_verdict_object_is_left_alone():
         assert obj == before
 
 
+def test_an_overlong_rationale_is_cut_to_fit_not_a_lost_report():
+    """A model that wrote past the limit (the schema's maxLength is not enforced by every server)
+    cost the sample its whole report: three first-pass reports in 80 on the CAPE set."""
+    for n in (REPORT_RATIONALE + 1, 5000):
+        obj = _obj("malicious", [_row("remote_control")], rationale="w" * n)
+        d = apply(obj, sweep={}, known=KNOWN, sources=(), code_read=True)
+        text = obj["verdict"]["rationale"]
+        assert d is not None and len(text) <= REPORT_RATIONALE and text.endswith("…")
+        assert text.startswith(d.rule_line + "\nModel: www")
+        validate_report(obj, 1, KNOWN, sources=())
+
+
 def test_a_bad_rationale_is_still_rejected_by_the_validator():
-    for bad in (None, 7, "w" * (REPORT_RATIONALE + 1)):
+    for bad in (None, 7):
         obj = _obj("malicious", rationale=bad)
         d = apply(obj, sweep={}, known=KNOWN, sources=(), code_read=True)
         assert d is not None and obj["verdict"]["rationale"] == bad

@@ -1548,16 +1548,27 @@ class ReaAgentEngine:
                 kw["temperature"] = temperature
             if not p.final_thinking:
                 kw["chat_template_kwargs"] = {"thinking": False}
-            try:
-                resp = self._chat(model, p, tw, remaining, messages, [], tokens, **kw)
-            except ModelError as exc:
-                p.warnings.append(Warning(code="report_failed", message=f"report call failed: {exc}"[:2000]))
-                tw.write({"event": "report_failed", "message": str(exc)[:2000]})
-                return "failed"
-            parsed = _parse_message(resp)
-            content = parsed[0] if parsed is not None else None
-            tw.write({"event": "report_turn", "max_tokens": tokens, "content": (content or "")[:TRANSCRIPT_TEXT],
-                      **_response_info(resp)})
+            content: str | None = None
+            for retry in ("", "empty_at_length"):
+                try:
+                    resp = self._chat(model, p, tw, remaining, messages, [], tokens, **kw)
+                except ModelError as exc:
+                    p.warnings.append(Warning(code="report_failed", message=f"report call failed: {exc}"[:2000]))
+                    tw.write({"event": "report_failed", "message": str(exc)[:2000]})
+                    return "failed"
+                parsed = _parse_message(resp)
+                content = parsed[0] if parsed is not None else None
+                info = _response_info(resp)
+                tw.write({"event": "report_turn", "max_tokens": tokens,
+                          "content": (content or "")[:TRANSCRIPT_TEXT], **info, **({"retry": retry} if retry else {})})
+                # The whole output budget spent and nothing written (a host that reasons whatever
+                # the request says): the same call once more, while the time left still holds it.
+                if (content or "").strip() or info["finish_reason"] != "length":
+                    break
+                fit = int(max(0.0, remaining() - MIN_TURN_S) * self._measured_tps(p) / 1.25)
+                if fit < MIN_REPORT_TOKENS:
+                    break
+                tokens = min(p.report_tokens, fit)
             obj = _parse_json(content.strip()) if isinstance(content, str) else None
             salvaged = False
             if not isinstance(obj, dict):
@@ -1845,9 +1856,12 @@ def _retryable(message: str) -> bool:
 
 
 def _response_info(resp: Any) -> dict[str, Any]:
-    """``finish_reason`` and ``completion_tokens`` of a response for the transcript (None if absent)."""
-    finish = tokens = None
+    """``finish_reason`` and ``completion_tokens`` of a response for the transcript, and who served
+    it when the response says (a router's ``provider`` and the ``model`` it ran): None if absent."""
+    finish = tokens = provider = served = None
     if isinstance(resp, dict):
+        provider = resp["provider"][:64] if isinstance(resp.get("provider"), str) else None
+        served = resp["model"][:128] if isinstance(resp.get("model"), str) else None
         choices = resp.get("choices")
         if isinstance(choices, list) and choices and isinstance(choices[0], dict):
             fr = choices[0].get("finish_reason")
@@ -1855,7 +1869,7 @@ def _response_info(resp: Any) -> dict[str, Any]:
         usage = resp.get("usage")
         if isinstance(usage, dict) and isinstance(usage.get("completion_tokens"), int):
             tokens = usage["completion_tokens"]
-    return {"finish_reason": finish, "completion_tokens": tokens}
+    return {"finish_reason": finish, "completion_tokens": tokens, "provider": provider, "served_model": served}
 
 
 def _parse_message(resp: Any) -> tuple[str | None, list[dict[str, Any]]] | None:

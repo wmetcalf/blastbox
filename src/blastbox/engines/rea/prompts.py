@@ -120,8 +120,8 @@ REPORT_BASIS = "evidence"
 EVIDENCE_SOURCES = ("iocs", "unpacked", "installer_stub", "emulation", "dotnet_resources", "capabilities",
                     "api_hashes", "signatures", "decompiled")
 REPORT_ITEM = 128
-# Verdict grounds (``verdict.py``): behaviours the model may cite for its call, each with one
-# evidence row. The engine checks the citation, adds what the sweep itself shows and sets the
+# Verdict grounds (``verdict.py``): behaviours the model answers for one by one, each with one
+# citation or none. The engine checks the citation, adds what the sweep itself shows and sets the
 # label and confidence by rule; grounds never reach the wire except as the rationale's rule line.
 HOSTILE_GROUNDS: dict[str, str] = {
     "credential_theft": "reads credentials, cookies, tokens or wallets that belong to other applications",
@@ -140,7 +140,6 @@ CONCEALING_GROUNDS: dict[str, str] = {
     "anti_analysis": "looks for debuggers, virtual machines, sandboxes or analysis tools and changes course",
     "obfuscation": "strings, imports or control flow deliberately obscured",
 }
-GEN_GROUNDS = 4  # verdict grounds the model may cite
 GEN_RATIONALE = 400
 GEN_TITLE = 60
 GEN_FUNCTION = 64
@@ -183,8 +182,8 @@ def report_schema(sources: Sequence[str] | None = None) -> dict[str, Any]:
 
     With ``sources`` (an evidence-only report) evidence rows cite sweep evidence
     (``source``/``item``/``note``) instead of a function address. The verdict is the model's side
-    of the verdict rule (``verdict.py``): its own ``label``, the ``grounds`` it cites (one evidence
-    row each) and a rationale. It carries no confidence; the engine sets that, and the wire label.
+    of the verdict rule (``verdict.py``): its own ``label``, its answer for every ground (``grounds``:
+    each code with one citation, an address or an evidence source, or an empty list) and a rationale. It carries no confidence; the engine sets that, and the wire label.
     """
     if sources:
         row: dict[str, Any] = {
@@ -204,6 +203,13 @@ def report_schema(sources: Sequence[str] | None = None) -> dict[str, Any]:
                 "function": {"type": "string", "maxLength": GEN_FUNCTION},
                 "note": {"type": "string", "maxLength": GEN_NOTE},
             }}
+
+    # A ground's citation is the one field the engine checks, in a list of at most one so that
+    # "no" is an empty list (no nullable types: not every server's schema decoder has them).
+    field = "source" if sources else "address"
+    cite = {"type": "object", "additionalProperties": False, "required": [field],
+            "properties": {field: row["properties"][field]}}
+    codes = [*HOSTILE_GROUNDS, *CONCEALING_GROUNDS]
 
     def section(key: str) -> dict[str, Any]:
         text, evidence = GEN_SECTIONS[key]
@@ -227,12 +233,9 @@ def report_schema(sources: Sequence[str] | None = None) -> dict[str, Any]:
                 "required": ["label", "grounds", "rationale"],
                 "properties": {
                     "label": {"type": "string", "enum": list(REPORT_LABELS)},
-                    "grounds": {"type": "array", "maxItems": GEN_GROUNDS, "items": {
-                        "type": "object", "additionalProperties": False, "required": ["code", "evidence"],
-                        "properties": {
-                            "code": {"type": "string", "enum": [*HOSTILE_GROUNDS, *CONCEALING_GROUNDS]},
-                            "evidence": row,
-                        }}},
+                    "grounds": {
+                        "type": "object", "additionalProperties": False, "required": codes,
+                        "properties": {c: {"type": "array", "maxItems": 1, "items": cite} for c in codes}},
                     "rationale": {"type": "string", "maxLength": GEN_RATIONALE},
                 }},
             "sections": {
@@ -268,12 +271,16 @@ _VERDICT_RULE = (
     "applies a fixed rule. A hostile ground the engine found makes the verdict malicious; one you cite "
     "does so only when your own call is malicious too, and otherwise makes it suspicious. A concealing "
     "ground makes it at least suspicious, and a call with no ground the engine can check is held at low "
-    "confidence. So give no confidence, make the label your real conclusion, and cite every ground the "
-    "evidence supports. " + _GROUNDS_TEXT + " One entry per "
-    "behaviour, each with ONE evidence row for the place that shows it; a ground whose evidence the analysis "
-    "never saw is discarded. Cite a ground only when the cited evidence shows that behaviour: ordinary API "
-    "use (a socket, a registry write, a file read) is not a ground, and an empty list is the right answer "
-    "when nothing qualifies. In the rationale say what the call rests on and what stays hidden; do not "
+    "confidence. So give no confidence, make the label your real conclusion, and answer every ground. "
+    + _GROUNDS_TEXT + " \"grounds\" has every one of these codes, and you answer each on its own: a list "
+    "holding ONE citation of the place that shows the behaviour (the function's address; the evidence source "
+    "when this report is written from sweep evidence) when the evidence shows it, and an empty "
+    "list when the evidence does not show it or the analysis cannot tell. A citation of something the "
+    "analysis never saw is discarded. The answers must agree with your sections: a behaviour a section "
+    "reports as observed, with evidence, is answered here with that evidence, and a ground answered here "
+    "is described in a section. Answer a ground only when the cited place shows that behaviour: ordinary "
+    "API use (a socket, a registry write, a file read) is not a ground, and every list empty is the right "
+    "answer when nothing qualifies. In the rationale say what the call rests on and what stays hidden; do not "
     "repeat the label, and do not copy the line starting \"Rule:\" that the engine put at the head of a "
     "previous report's rationale.")
 _REPORT_VERDICT = (
