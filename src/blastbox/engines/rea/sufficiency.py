@@ -43,17 +43,6 @@ verify itself, and lists what is still missing (``gaps``):
   gap's ``targets``, which go to the front of the next pass's todo list; a lead with no target
   left is not a gap.
 
-- ``suspicious_concealment``: the verdict is ``suspicious`` while the sweep shows one of the
-  three concealments above (a hidden resource payload, a stage emulation saw hidden and did not
-  capture, an installer that hides what it runs), and the model's reading was not benign (then the
-  benign gaps above hold instead). A suspicious label on concealment says the sample hides
-  something, not what. Live, the same loaders read malicious/high on one run and
-  suspicious/medium on the next, by whether pass 1 happened to reach the code behind the
-  concealment; the suspicious run met the bar and no pass went looking. No targets; it holds until
-  the verdict changes or the chain stops (``stalled``: a pass that finds nothing new ends it;
-  ``pass_cap``). It costs passes on legitimately packed software, which is unmeasured: the scoring
-  set holds no benign programs;
-
 The three hidden-evidence gaps (``benign_hidden_payload``, ``benign_emulated_stage``,
 ``benign_installer_concealment``) also hold when the *model* read the sample as benign and the
 verdict rule (``verdict.py``) overrode it on that same concealment (``opinion``, carried in the
@@ -253,14 +242,6 @@ def assess(*, report: dict[str, Any] | None, sweep: dict[str, Any], explored: li
                                 (said + " but emulating the stub showed it concealing a stage ("
                                  + ", ".join(concealed) + "): the analysed code is a loader; explain what it "
                                  "decrypts and runs")[:MAX_DETAIL]))
-        elif label == "suspicious":
-            concealed_by = [what for what in ("; ".join(_hidden_payloads(sweep)), installer_concealment(sweep),
-                                              ", ".join(_concealment(sweep))) if what]
-            if concealed_by:
-                gaps.append(Gap("suspicious_concealment",
-                                ("the verdict is suspicious on concealment alone: " + "; ".join(concealed_by)
-                                 + ": find what the concealed part does (the stage it decrypts, loads or "
-                                   "runs) and cite it as a ground, or show that it is harmless")[:MAX_DETAIL]))
     if isinstance(report, dict):
         done = set(explored)
         leads: dict[str, Gap] = {}
