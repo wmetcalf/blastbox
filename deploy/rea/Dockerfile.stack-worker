@@ -26,6 +26,10 @@ ARG ENGINE_NAME=rea
 ARG REA_MODEL_URL=http://172.18.101.13:8888/v1
 ARG REA_MODEL_ID=deepseek-v4-flash
 ARG REA_MODEL_DIALECT=vllm
+# OpenRouter only, both off when empty: hold the model to named hosts, or to hosts that support
+# every parameter of a request (model.py).
+ARG REA_MODEL_PROVIDERS=
+ARG REA_MODEL_REQUIRE_PARAMETERS=
 
 # BLASTBOX_WORK_DIR=/tmp: the cold dispatcher gives the worker a read-only rootfs and one
 # writable tmpfs, /tmp (nosuid,noexec,512m; docker.py _DEFAULT_TMPFS). Ghidra + REA run fine on
@@ -43,6 +47,8 @@ ENV BLASTBOX_ENGINE=${ENGINE_CLASS} \
     REA_MODEL_URL=${REA_MODEL_URL} \
     REA_MODEL_ID=${REA_MODEL_ID} \
     REA_MODEL_DIALECT=${REA_MODEL_DIALECT} \
+    REA_MODEL_PROVIDERS=${REA_MODEL_PROVIDERS} \
+    REA_MODEL_REQUIRE_PARAMETERS=${REA_MODEL_REQUIRE_PARAMETERS} \
     REA_PASS_WALL_S=540 \
     REA_GHIDRA_SWEEP_S=420 \
     REA_MAX_STEPS=16

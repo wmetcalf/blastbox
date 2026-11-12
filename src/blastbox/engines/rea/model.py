@@ -17,6 +17,13 @@
   off" switch is spelled: ``vllm`` sends ``chat_template_kwargs``; ``openrouter`` sends
   ``reasoning: {"enabled": false}`` (OpenRouter ignores ``chat_template_kwargs``). Credentials
   for a hosted endpoint live in the operator's gateway, never here.
+- OpenRouter serves one model id from many hosts, and they differ: some write a schema's keys
+  in schema order and some alphabetically, and some ignore the thinking switch. Two image
+  settings, both off by default and both refused under ``vllm``, narrow the choice:
+  ``REA_MODEL_PROVIDERS`` (comma-separated host slugs, at most eight) sends
+  ``provider.only``, and ``REA_MODEL_REQUIRE_PARAMETERS=1`` sends
+  ``provider.require_parameters`` (only hosts that support every parameter of the request).
+  A setting that leaves no host fails the call as ``unavailable``; it is never widened here.
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ import http.client
 import os
 import json
 import logging
+import re
 import threading
 import time
 import urllib.error
@@ -42,6 +50,27 @@ ModelErrorKind = Literal["unavailable", "malformed"]
 
 
 DIALECTS = ("vllm", "openrouter")
+_MAX_PROVIDERS = 8
+_PROVIDER_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,47}")
+
+
+def _routing(dialect: str) -> dict[str, Any] | None:
+    """The OpenRouter ``provider`` object the image asked for, or None. Raises on a bad setting."""
+    raw_only = (os.environ.get("REA_MODEL_PROVIDERS") or "").strip()
+    raw_req = (os.environ.get("REA_MODEL_REQUIRE_PARAMETERS") or "").strip()
+    if raw_req not in ("", "0", "1"):
+        raise ValueError(f"REA_MODEL_REQUIRE_PARAMETERS must be 0 or 1: {raw_req!r}")
+    only = [part.strip() for part in raw_only.split(",") if part.strip()]
+    if len(only) > _MAX_PROVIDERS or not all(_PROVIDER_SLUG.fullmatch(slug) for slug in only):
+        raise ValueError(f"REA_MODEL_PROVIDERS must be at most {_MAX_PROVIDERS} comma-separated host slugs")
+    routing: dict[str, Any] = {}
+    if only:
+        routing["only"] = only
+    if raw_req == "1":
+        routing["require_parameters"] = True
+    if routing and dialect != "openrouter":
+        raise ValueError("REA_MODEL_PROVIDERS and REA_MODEL_REQUIRE_PARAMETERS need REA_MODEL_DIALECT=openrouter")
+    return routing or None
 
 
 class ModelError(Exception):
@@ -71,6 +100,7 @@ class ModelClient:
         self.dialect = dialect if dialect is not None else (os.environ.get("REA_MODEL_DIALECT") or "vllm")
         if self.dialect not in DIALECTS:
             raise ValueError(f"REA_MODEL_DIALECT must be one of {', '.join(DIALECTS)}: {self.dialect!r}")
+        self._routing = _routing(self.dialect)
         self.model = model
         self.timeout_s = timeout_s
         # Built per client (not at import) so the proxy env in force at job time applies.
@@ -96,6 +126,8 @@ class ModelClient:
             body["tool_choice"] = "auto"
         if response_format is not None:
             body["response_format"] = response_format
+        if self._routing is not None:
+            body["provider"] = self._routing
         # ensure_ascii: lone surrogates in hostile evidence survive as escapes, never break encoding.
         data = json.dumps(body, ensure_ascii=True).encode("ascii")
         req = urllib.request.Request(self.url, data=data, method="POST",

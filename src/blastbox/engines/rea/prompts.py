@@ -226,21 +226,24 @@ def report_schema(sources: Sequence[str] | None = None) -> dict[str, Any]:
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": ["verdict", "sections"],
+        # Order is the order of writing, and this call runs without thinking: the sections (what
+        # the evidence shows) first, then the verdict. Hosts that ignore schema order write keys
+        # alphabetically, so the verdict's keys are in an order that is both.
+        "required": ["sections", "verdict"],
         "properties": {
-            "verdict": {
-                "type": "object", "additionalProperties": False,
-                "required": ["label", "grounds", "rationale"],
-                "properties": {
-                    "label": {"type": "string", "enum": list(REPORT_LABELS)},
-                    "grounds": {
-                        "type": "object", "additionalProperties": False, "required": codes,
-                        "properties": {c: {"type": "array", "maxItems": 1, "items": cite} for c in codes}},
-                    "rationale": {"type": "string", "maxLength": GEN_RATIONALE},
-                }},
             "sections": {
                 "type": "object", "additionalProperties": False, "required": list(REPORT_KEYS),
                 "properties": {k: section(k) for k in REPORT_KEYS}},
+            "verdict": {
+                "type": "object", "additionalProperties": False,
+                "required": ["grounds", "label", "rationale"],
+                "properties": {
+                    "grounds": {
+                        "type": "object", "additionalProperties": False, "required": codes,
+                        "properties": {c: {"type": "array", "maxItems": 1, "items": cite} for c in codes}},
+                    "label": {"type": "string", "enum": list(REPORT_LABELS)},
+                    "rationale": {"type": "string", "maxLength": GEN_RATIONALE},
+                }},
         },
     }
 
@@ -284,8 +287,8 @@ _VERDICT_RULE = (
     "repeat the label, and do not copy the line starting \"Rule:\" that the engine put at the head of a "
     "previous report's rationale.")
 _REPORT_VERDICT = (
-    "verdict: your own call (benign, suspicious, malicious or unknown), the grounds for it, and a short "
-    "rationale. It is an opinion from the evidence above. Use \"unknown\" only when the analysis could not "
+    "verdict, written last, after the sections, and following from them: the grounds, your own call "
+    "(benign, suspicious, malicious or unknown) and a short rationale. It is an opinion from the evidence above. Use \"unknown\" only when the analysis could not "
     "see what the program's own code does. Code built to hide what it does (a packed or encrypted stage "
     "decrypted and loaded at run time, imports resolved by hash, obfuscated names over logic that was not "
     "read) is at least \"suspicious\" even when the hidden part was not recovered; say what is hidden in "

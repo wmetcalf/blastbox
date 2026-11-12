@@ -259,6 +259,12 @@ Agent images for it are built with `--build-arg REA_MODEL_URL=http://10.231.201.
 --build-arg REA_MODEL_ID=deepseek/deepseek-v4.1-flash --build-arg REA_MODEL_DIALECT=openrouter`
 (OpenRouter ignores `chat_template_kwargs`; the `openrouter` dialect sends `reasoning` instead).
 
+OpenRouter serves that one model id from many hosts (thirteen in one 20-sample run), and they
+do not behave alike. Two more build args narrow the choice, both empty by default:
+`REA_MODEL_PROVIDERS=<slug>,<slug>` (at most eight) sends `provider.only`, and
+`REA_MODEL_REQUIRE_PARAMETERS=1` sends `provider.require_parameters`. A setting that leaves no
+host fails the model call; the engine never widens it.
+
 The key file is one line, mode 0400, owned by the gateway's uid (1000), never committed
 (`model-gw/.gitignore`):
 

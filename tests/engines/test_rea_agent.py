@@ -1746,7 +1746,13 @@ def test_report_schema_is_the_interface_shape_and_fits_the_token_budget():
     v = sch["properties"]["verdict"]["properties"]
     assert v["label"]["enum"] == ["benign", "suspicious", "malicious", "unknown"]
     # The model gives its call and its grounds; label and confidence on the wire are the rule's.
-    assert sch["properties"]["verdict"]["required"] == ["label", "grounds", "rationale"] and "confidence" not in v
+    assert set(sch["properties"]["verdict"]["required"]) == {"label", "grounds", "rationale"} and "confidence" not in v
+    # The report call runs without thinking, so what the model writes first is what it decides
+    # first: the sections (what the evidence shows) come before the verdict. Some OpenRouter hosts
+    # write keys in schema order and some alphabetically (measured, cape17), so the order chosen
+    # is one both give: sections before verdict, and grounds, label, rationale inside it.
+    assert list(sch["properties"]) == sch["required"] == ["sections", "verdict"]
+    assert list(v) == sch["properties"]["verdict"]["required"] == ["grounds", "label", "rationale"]
     # Every ground is answered, one citation or none: a free list of "up to four" came back with
     # one ground in one run and four in the next over the same evidence, and the rule counts them.
     codes = [*p.HOSTILE_GROUNDS, *p.CONCEALING_GROUNDS]
@@ -2242,6 +2248,49 @@ def test_model_dialect_defaults_to_vllm_and_rejects_unknown(monkeypatch):
     assert ModelClient("http://m:1/v1", "x", 5).dialect == "vllm"
     monkeypatch.setenv("REA_MODEL_DIALECT", "anthropic")
     with pytest.raises(ValueError, match="REA_MODEL_DIALECT"):
+        ModelClient("http://m:1/v1", "x", 5)
+
+
+@pytest.mark.parametrize("env, want", [
+    ({}, None),
+    ({"REA_MODEL_PROVIDERS": "", "REA_MODEL_REQUIRE_PARAMETERS": ""}, None),
+    ({"REA_MODEL_PROVIDERS": "CoreWeave, Cohere"}, {"only": ["CoreWeave", "Cohere"]}),
+    ({"REA_MODEL_REQUIRE_PARAMETERS": "1"}, {"require_parameters": True}),
+    ({"REA_MODEL_REQUIRE_PARAMETERS": "0"}, None),
+    ({"REA_MODEL_PROVIDERS": "deepinfra/fp8", "REA_MODEL_REQUIRE_PARAMETERS": "1"},
+     {"only": ["deepinfra/fp8"], "require_parameters": True}),
+])
+def test_openrouter_routing_is_the_images_choice_and_off_by_default(monkeypatch, env, want):
+    # cape17: one benchmark rep was served by thirteen hosts. Some write the report's keys in schema
+    # order and some alphabetically, and one ignored "reasoning off" and spent the whole report
+    # budget thinking. The image may hold the report to hosts that honour every request parameter,
+    # or to named hosts.
+    monkeypatch.setenv("REA_MODEL_DIALECT", "openrouter")
+    for key in ("REA_MODEL_PROVIDERS", "REA_MODEL_REQUIRE_PARAMETERS"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    op = FakeOpener(json.dumps({"choices": [{"message": {"content": "{}"}}]}).encode())
+    ModelClient("http://gw:8080/api/v1", "deepseek/deepseek-v4.1-flash", 30, opener=op).chat(
+        [{"role": "user", "content": "hi"}], [], 512)
+    assert json.loads(op.requests[0].data).get("provider") == want
+
+
+@pytest.mark.parametrize("dialect, env", [
+    ("openrouter", {"REA_MODEL_PROVIDERS": "a,b,c,d,e,f,g,h,i"}),          # more than eight
+    ("openrouter", {"REA_MODEL_PROVIDERS": 'x"}, "order": ["evil'}),         # not a provider name
+    ("openrouter", {"REA_MODEL_PROVIDERS": "x" * 49}),
+    ("openrouter", {"REA_MODEL_REQUIRE_PARAMETERS": "yes"}),
+    ("vllm", {"REA_MODEL_PROVIDERS": "CoreWeave"}),                         # a vLLM server has no hosts to pick
+    ("vllm", {"REA_MODEL_REQUIRE_PARAMETERS": "1"}),
+])
+def test_a_bad_routing_setting_is_refused_at_start_not_sent(monkeypatch, dialect, env):
+    monkeypatch.setenv("REA_MODEL_DIALECT", dialect)
+    for key in ("REA_MODEL_PROVIDERS", "REA_MODEL_REQUIRE_PARAMETERS"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    with pytest.raises(ValueError, match="REA_MODEL_"):
         ModelClient("http://m:1/v1", "x", 5)
 
 
