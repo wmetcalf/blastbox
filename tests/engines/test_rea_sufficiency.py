@@ -92,8 +92,8 @@ def test_a_benign_verdict_does_not_stand_on_an_installer_that_hides_what_it_runs
     assert [g.code for g in s.gaps] == ["benign_installer_concealment"] and s.gaps[0].targets == []
     assert "System.dll" in s.gaps[0].detail and "heteroalbumose.ube 904637 bytes" in s.gaps[0].detail
     assert len(s.gaps[0].detail) <= 300
-    # Only a benign call carries the burden.
-    assert _codes(report=_rep("suspicious", "medium"), sweep={"installer_stub": stub}) == []
+    # A suspicious call owes what the concealment hides (not the benign burden): see below.
+    assert _codes(report=_rep("suspicious", "medium"), sweep={"installer_stub": stub}) == ["suspicious_concealment"]
     # An altered archive signature, on the payload's installer or a nested one, or on a stub.
     altered = {"packer": "nsis", "payload_member": "carved/item-2.bin", "signature": "altered"}
     assert _codes(report=_rep("benign", "high"), sweep={"unpacked": altered}) == ["benign_installer_concealment"]
@@ -144,7 +144,7 @@ def test_a_benign_reading_the_rule_overrode_still_owes_an_explanation_of_what_is
     concealment, so the label alone would meet the bar with the hidden part unexplained."""
     ruled = _rep("suspicious", "medium")
     hidden = {"dotnet_resources": {"hidden_payloads": [{"resource": "r", "size": 9, "entropy": 7.9}]}}
-    assert _codes(report=ruled, sweep=hidden) == []
+    assert _codes(report=ruled, sweep=hidden) == ["suspicious_concealment"]
     s = assess(report=ruled, sweep=hidden, explored=[], opinion="benign")
     assert [g.code for g in s.gaps] == ["benign_hidden_payload"]
     assert s.gaps[0].detail.startswith("the analysis reads the sample as benign but ")
@@ -154,8 +154,36 @@ def test_a_benign_reading_the_rule_overrode_still_owes_an_explanation_of_what_is
     assert _codes(report=ruled, sweep=emulated, opinion="benign") == ["benign_emulated_stage"]
     altered = {"unpacked": {"packer": "nsis", "signature": "altered"}}
     assert _codes(report=ruled, sweep=altered, opinion="benign") == ["benign_installer_concealment"]
-    # Any other reading, or none (the report is an earlier pass's), adds nothing.
+    # Any other reading, or none (the report is an earlier pass's), owes no benign explanation;
+    # a suspicious label over that concealment owes the one below instead.
     for opinion in ("suspicious", "malicious", "unknown", None):
-        assert _codes(report=ruled, sweep={**hidden, **emulated, **altered}, opinion=opinion) == []
+        assert _codes(report=ruled, sweep={**hidden, **emulated, **altered},
+                      opinion=opinion) == ["suspicious_concealment"]
     # Unread program code is a burden of the benign verdict itself, not of the reading.
     assert _codes(report=ruled, sweep={}, explored=[], program_functions=["0x10"], opinion="benign") == []
+
+
+def test_a_suspicious_call_that_rests_on_concealment_owes_what_the_concealed_part_does():
+    """Live, the same loader read malicious/high on one run and suspicious/medium on the next: the
+    verdict followed whether pass 1 happened to reach the hostile code behind the concealment, and
+    a suspicious label met the bar, so no pass went looking."""
+    hidden = {"dotnet_resources": {"hidden_payloads": [{"resource": "r", "size": 9, "entropy": 7.9}]}}
+    emulated = {"emulation": {"concealment": ["exec_alloc"]}}
+    altered = {"unpacked": {"packer": "nsis", "signature": "altered"}}
+    for sweep, what in ((hidden, "r: 9 bytes"), (emulated, "exec_alloc"), (altered, "archive signature")):
+        for conf in ("medium", "high"):
+            s = assess(report=_rep("suspicious", conf), sweep=sweep, explored=[])
+            assert [g.code for g in s.gaps] == ["suspicious_concealment"] and not s.met
+            assert s.gaps[0].targets == [] and what in s.gaps[0].detail
+            assert s.gaps[0].detail.startswith("the verdict is suspicious on concealment alone: ")
+    # A malicious call has established what the sample does; a benign one owes the benign gaps.
+    for label, codes in (("malicious", []), ("benign", ["benign_hidden_payload"])):
+        assert _codes(report=_rep(label, "high"), sweep=hidden) == codes
+    # Suspicious without concealment (the model's own reading of code) owes nothing more.
+    assert _codes(report=_rep("suspicious", "medium"), sweep={}) == []
+    # Stalling is not concealment, and a stage emulation captured is the code the report read.
+    for sweep in ({"emulation": {"concealment": ["delay_loop"]}},
+                  {"emulation": {"concealment": ["exec_alloc"], "payload_sha256": "ab" * 32}}):
+        assert _codes(report=_rep("suspicious", "medium"), sweep=sweep) == []
+    # Low confidence already has its gap; the concealment one joins it.
+    assert _codes(report=_rep("suspicious", "low"), sweep=hidden) == ["verdict_low", "suspicious_concealment"]
