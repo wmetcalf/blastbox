@@ -63,8 +63,13 @@ def _routing(dialect: str) -> dict[str, Any] | None:
     # Every entry is a host: a list that is set and names none ("," or a stray comma) is refused,
     # not read as "no restriction".
     only = [part.strip() for part in raw_only.split(",")] if raw_only else []
-    if len(only) > _MAX_PROVIDERS or not all(_PROVIDER_SLUG.fullmatch(slug) for slug in only):
+    if "" in only:
+        raise ValueError("REA_MODEL_PROVIDERS has an empty entry (a stray or trailing comma)")
+    if len(only) > _MAX_PROVIDERS:
         raise ValueError(f"REA_MODEL_PROVIDERS must be at most {_MAX_PROVIDERS} comma-separated host slugs")
+    if not all(_PROVIDER_SLUG.fullmatch(slug) for slug in only):
+        raise ValueError("REA_MODEL_PROVIDERS has an entry that is not a host slug "
+                         "(letters, digits and . _ / -, at most 48 characters)")
     routing: dict[str, Any] = {}
     if only:
         routing["only"] = only

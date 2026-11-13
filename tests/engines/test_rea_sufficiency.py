@@ -159,3 +159,12 @@ def test_a_benign_reading_the_rule_overrode_still_owes_an_explanation_of_what_is
         assert _codes(report=ruled, sweep={**hidden, **emulated, **altered}, opinion=opinion) == []
     # Unread program code is a burden of the benign verdict itself, not of the reading.
     assert _codes(report=ruled, sweep={}, explored=[], program_functions=["0x10"], opinion="benign") == []
+
+
+def test_a_report_without_the_models_call_never_meets_the_bar():
+    # A report cut off before the model's call has a verdict the rule set alone. Every other check
+    # can pass on the engine's grounds; the model's reading of the sample is still owed.
+    rep = _rep("suspicious", "medium")
+    assert assess(report=rep, sweep={}, explored=[]).met
+    got = assess(report=rep, sweep={}, explored=[], called=False)
+    assert [g.code for g in got.gaps] == ["no_report"] and "model's call" in got.gaps[0].detail

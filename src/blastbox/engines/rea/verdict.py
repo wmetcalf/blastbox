@@ -351,6 +351,14 @@ def model_called(obj: Any) -> bool:
     return isinstance(label, str) and label in REPORT_LABELS
 
 
+def has_checked_ground(obj: Any, *, known: set[str] | None, sources: Collection[str] | None) -> bool:
+    """Whether a model-written report (whole or cut off) cites a ground the engine could check
+    (:func:`model_grounds`)."""
+    verdict = obj.get("verdict") if isinstance(obj, dict) else None
+    grounds = verdict.get("grounds") if isinstance(verdict, dict) else None
+    return bool(model_grounds(grounds, known=known, sources=sources)[0])
+
+
 def apply(obj: Any, *, sweep: dict[str, Any], known: set[str] | None, sources: Collection[str] | None,
           code_read: bool, cut_off: bool = False) -> Decision | None:
     """Replace a model-written report's verdict (``label``/``grounds``/``rationale``) with the

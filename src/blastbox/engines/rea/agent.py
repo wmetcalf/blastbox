@@ -149,7 +149,7 @@ from blastbox.engines.rea.sweep import (
 )
 from blastbox.engines.rea.verdict import HOSTILE
 from blastbox.engines.rea.verdict import apply as apply_verdict_rule
-from blastbox.engines.rea.verdict import model_called
+from blastbox.engines.rea.verdict import has_checked_ground, model_called
 from blastbox.engines.rea.wellformed import well_formed
 from blastbox.limits import Limits
 from blastbox.worker.engine import DetonationResult
@@ -858,6 +858,7 @@ class _Pass:
     report: dict[str, Any] | None = None  # this pass's validated rea.analysis/1 report
     opinion: str | None = None  # the model's own call in that report, before the verdict rule
     prior_report: dict[str, Any] | None = None  # the continuation's (last valid) report
+    prior_called: bool = False  # ... which carries the model's own call (not one cut off before it)
     sweep: dict[str, Any] = field(default_factory=dict)
     program_functions: list[str] = field(default_factory=list)
     model_tokens: int = 0  # completion tokens of the calls that reported usage ...
@@ -940,6 +941,7 @@ class ReaAgentEngine:
                   final_thinking=os.environ.get("REA_FINAL_THINKING", "").strip().lower()
                   in ("1", "true", "yes", "on"),
                   report_tokens=report_tokens, prior_report=_sealed_report(state.analysis_report),
+                  prior_called=state.opinion is not None,
                   sweep=dict(state.sweep), program_functions=list(state.program_functions))
         transcript_path = outdir / "transcript.jsonl"
         tw = TranscriptWriter(transcript_path, min(MAX_TRANSCRIPT_BYTES, limits.max_artifact_bytes), self._clock)
@@ -1013,8 +1015,10 @@ class ReaAgentEngine:
             gaps=p.gaps if p.assessed else list(state.gaps),
             program_functions=p.program_functions[:MAX_PROGRAM_FUNCTIONS],
             opinion=p.opinion if p.report is not None else state.opinion,
-            code_read=p.code_read,
-            opened=p.opened[-MAX_EXPLORED:],
+            # What a pass read counts for later reports only with the answer it gave about it:
+            # a pass that lost its answer left nothing of that reading for a later report to rest on.
+            code_read=p.code_read if p.accepted else state.code_read,
+            opened=p.opened[-MAX_EXPLORED:] if p.accepted else list(state.opened),
         )
         transcript_reserve = min(MAX_TRANSCRIPT_BYTES, limits.max_artifact_bytes)
         if p.model_status == "ok" and p.assessed:
@@ -1523,8 +1527,10 @@ class ReaAgentEngine:
         at the measured rate; otherwise asks for ``min(REA_REPORT_MAX_TOKENS, what fits)``. A model
         error is ``report_failed``, a report that violates the schema ``report_invalid``; either
         way the rest of the pass seals unchanged. A cut-off report keeps its complete sections
-        (``report_salvaged``); one cut off before the model's call gets its verdict from the rule
-        alone, or, when the last pass left a report, is dropped for that one.
+        (``report_salvaged``); one the server cut off (``finish_reason: length``) before the
+        model's call gets its verdict from the rule alone (and never meets the bar), or, when the
+        last pass left a report with the model's call in it, is dropped for that one, unless that
+        one is benign or unknown and this one finished a ground the engine could check.
         """
         try:
             tps = self._measured_tps(p)
@@ -1589,10 +1595,18 @@ class ReaAgentEngine:
             # (a function pass) a code tool returned a function's code to this chain. An address
             # in ``explored`` is not that: a metadata call or the model's own list puts one there.
             code_read = sample_decompiled(p.sweep) or (not sources and p.code_read)
-            # A cut-off report loses the end of its verdict first (it is written last). One cut
-            # before the model's call keeps its finished sections under a verdict the rule sets
-            # without that call, unless the last pass left a whole report: that one stands.
-            cut_off = salvaged and (p.prior_report is None or model_called(obj))
+            # A report the server says ran out of output loses the end of its verdict first (it is
+            # written last). One cut before the model's call keeps its finished sections under a
+            # verdict the rule sets without that call, unless the last pass left a report with the
+            # model's call in it: that one stands, except a benign or unknown one against grounds
+            # this report finished and the engine could check (the pass that reads the hostile
+            # code writes the longest report). JSON broken any other way is not a cut.
+            called = model_called(obj)
+            length = info["finish_reason"] == "length"
+            stands = p.prior_report is not None and p.prior_called and not (
+                p.prior_report["verdict"]["label"] in ("benign", "unknown")
+                and has_checked_ground(obj, known=known, sources=sources or script))
+            cut_off = salvaged and length and (called or not stands)
             decision = apply_verdict_rule(obj, sweep=p.sweep, known=known, sources=sources or script,
                                           code_read=code_read, cut_off=cut_off)
             try:
@@ -1608,8 +1622,10 @@ class ReaAgentEngine:
                                           message=f"analysis report is {len(text)} chars, over {MAX_REPORT_JSON}"))
                 return "invalid"
             if salvaged:
-                p.warnings.append(Warning(code="report_salvaged",
-                                          message="analysis report was cut off; its complete sections were kept"))
+                p.warnings.append(Warning(
+                    code="report_salvaged",
+                    message=("analysis report was cut off; its complete sections were kept" if length else
+                             "analysis report was not plain JSON; the object in it was read")))
             if v.dropped:
                 p.warnings.append(Warning(
                     code="report_evidence_dropped",
@@ -1617,8 +1633,8 @@ class ReaAgentEngine:
                             + (f"; downgraded to not_analysed: {', '.join(v.downgraded)}" if v.downgraded else "")))
             p.report = v.report
             if decision is not None:
-                p.opinion = decision.opinion
-                tw.write({"event": "verdict_rule", "opinion": decision.opinion, "label": decision.label,
+                p.opinion = decision.opinion if called else None
+                tw.write({"event": "verdict_rule", "opinion": p.opinion, "label": decision.label,
                           "confidence": decision.confidence, "dropped": decision.dropped,
                           "grounds": [{"code": g.code, "tier": "hostile" if g.tier == HOSTILE else "concealing",
                                        "engine": g.engine, "cite": g.cite} for g in decision.grounds]})
@@ -1731,11 +1747,12 @@ class ReaAgentEngine:
         """
         report = p.report if p.report is not None else p.prior_report
         # A pass that wrote no report is measured on the carried one, with the call behind it,
-        # and does not meet the bar: that report was written before what this pass read.
+        # and does not meet the bar: that report was written before what this pass read. Nor does
+        # a report cut off before the model's call: its verdict is the rule's alone.
         suff = assess(report=report, sweep=p.sweep, explored=p.explored, opened=p.opened,
                       program_functions=p.program_functions,
                       opinion=p.opinion if p.report is not None else state.opinion,
-                      carried=p.report is None)
+                      carried=p.report is None, called=p.report is None or p.opinion is not None)
         known = set(state.facts)
         before = set(state.opened)
         fresh = [a for a in p.opened if a not in before]  # code first read this pass is progress too

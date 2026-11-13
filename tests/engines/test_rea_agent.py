@@ -133,6 +133,13 @@ def answer(obj):
                                      "reasoning_content": "secret chain of thought"}}]}
 
 
+def cut_answer(text):
+    """An answer the server says ran out of output part-way (``finish_reason: length``)."""
+    resp = answer(text)
+    resp["choices"][0]["finish_reason"] = "length"
+    return resp
+
+
 class FakeModel:
     def __init__(self, script, on_chat=None):
         self.script = list(script)
@@ -1719,11 +1726,11 @@ def _with_usage(resp, tokens):
 
 
 def _report_run(tmp_path, monkeypatch, report_resp, *, prior=None, clock=time.monotonic, on_chat=None,
-                tokens=None, tool_turn=None, sweep=None):
+                tokens=None, tool_turn=None, sweep=None, opinion=None):
     monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
     if tokens is not None:
         monkeypatch.setenv("REA_REPORT_MAX_TOKENS", str(tokens))
-    cont = make_continuation(tmp_path, analysis_report=prior,
+    cont = make_continuation(tmp_path, analysis_report=prior, opinion=opinion,
                              sweep={"kind": "pe", "iocs": [{"type": "domain", "value": "sweep.example",
                                                             "source": "ghidra:0x1"}], **(sweep or {})})
     script = [tool_turn or tc(("procedure_pseudo_code", {"procedure": FN_MAIN}, "a")), answer(FINAL_OK)]
@@ -2140,7 +2147,7 @@ def test_cut_off_report_keeps_its_complete_sections(tmp_path, monkeypatch):
     text = json.dumps(_report())
     assert text.index('"sections"') < text.index('"verdict"')
     cut = text[:text.index('"capabilities"') + 30]
-    res, out, _m = _report_run(tmp_path, monkeypatch, answer(cut))
+    res, out, _m = _report_run(tmp_path, monkeypatch, cut_answer(cut))
     rep = json.loads(res.payload.fields["analysis_report"])
     secs = {s["key"]: s for s in rep["sections"]}
     assert len(rep["sections"]) == 8
@@ -2149,7 +2156,7 @@ def test_cut_off_report_keeps_its_complete_sections(tmp_path, monkeypatch):
     assert rep["verdict"] == {"label": "unknown", "confidence": "low",
                               "rationale": "Rule: unknown/low; the report was cut off before the model's call."}
     assert "report_salvaged" in _codes(res) and "report_invalid" not in _codes(res)
-    assert [e["opinion"] for e in _events(out, "verdict_rule")] == ["unknown"]
+    assert [e["opinion"] for e in _events(out, "verdict_rule")] == [None]  # the model made no call
 
 
 def test_report_cut_off_inside_its_verdict_keeps_the_grounds_it_finished(tmp_path, monkeypatch):
@@ -2157,7 +2164,7 @@ def test_report_cut_off_inside_its_verdict_keeps_the_grounds_it_finished(tmp_pat
     obj["verdict"]["grounds"]["remote_control"] = [{"address": FN_MAIN}]
     text = json.dumps(obj)
     cut = text[:text.rindex('"label"') + 12]  # inside the label's value
-    res, _o, _m = _report_run(tmp_path, monkeypatch, answer(cut))
+    res, _o, _m = _report_run(tmp_path, monkeypatch, cut_answer(cut))
     verdict = json.loads(res.payload.fields["analysis_report"])["verdict"]
     assert (verdict["label"], verdict["confidence"]) == ("suspicious", "low")
     assert verdict["rationale"].startswith(
@@ -2169,7 +2176,7 @@ def test_report_cut_off_inside_its_verdict_keeps_the_grounds_it_finished(tmp_pat
 def test_report_cut_off_inside_its_rationale_keeps_the_models_call(tmp_path, monkeypatch, prior):
     text = json.dumps(_report())
     cut = text[:text.rindex('"rationale"') + 20]
-    res, _o, _m = _report_run(tmp_path, monkeypatch, answer(cut), prior=prior)
+    res, _o, _m = _report_run(tmp_path, monkeypatch, cut_answer(cut), prior=prior)
     rep = json.loads(res.payload.fields["analysis_report"])
     assert rep["verdict"] == {"label": "benign", "confidence": "medium", "rationale": BENIGN_RULE}
     assert "report_salvaged" in _codes(res)
@@ -2180,7 +2187,7 @@ def test_report_cut_off_before_its_verdict_does_not_replace_a_complete_one(tmp_p
     # of the model's is not an improvement on it.
     text = json.dumps(_report())
     cut = text[:text.index('"capabilities"') + 30]
-    res, out, _m = _report_run(tmp_path, monkeypatch, answer(cut), prior=PRIOR_REPORT)
+    res, out, _m = _report_run(tmp_path, monkeypatch, cut_answer(cut), prior=PRIOR_REPORT, opinion="unknown")
     assert "analysis_report" not in res.payload.fields and "report_invalid" in _codes(res)
     assert next_state(out).analysis_report["verdict"] == PRIOR_REPORT["verdict"]
 
@@ -2190,6 +2197,80 @@ def test_a_whole_report_without_a_verdict_is_still_invalid(tmp_path, monkeypatch
     del obj["verdict"]
     res, _o, _m = _report_run(tmp_path, monkeypatch, answer(obj))
     assert "analysis_report" not in res.payload.fields and "report_invalid" in _codes(res)
+
+
+def test_a_later_cut_off_report_replaces_one_that_was_itself_cut_off_before_its_call(tmp_path, monkeypatch):
+    # A sample whose report outruns the output budget does so every pass. The first cut-off report
+    # (two sections, no call of the model's) is not a whole report to stand on: a later one that
+    # finished more replaces it.
+    text = json.dumps(_report())
+    first = tmp_path / "p1"
+    first.mkdir()
+    res, out, _m = _report_run(first, monkeypatch, cut_answer(text[:text.index('"capabilities"') + 30]))
+    rep1 = json.loads(res.payload.fields["analysis_report"])
+    assert next_state(out).opinion is None  # no call of the model's is carried
+    nxt = tmp_path / "p2"
+    nxt.mkdir()
+    model = FakeModel([tc(("procedure_pseudo_code", {"procedure": FN_MAIN}, "a")), answer(FINAL_OK),
+                       cut_answer(text[:text.index('"verdict"') + 12])])
+    res2, _o = run(nxt, out / "continuation.tar.gz", model,
+                   McpRig(nxt, {"procedure_pseudo_code": {"text": DECOMP}}))
+    rep2 = json.loads(res2.payload.fields["analysis_report"])
+    seen = [sum(s["status"] != "not_analysed" for s in r["sections"]) for r in (rep1, rep2)]
+    assert rep2["pass"] == 2 and seen[1] > seen[0]
+    assert "report_salvaged" in _codes(res2) and "report_invalid" not in _codes(res2)
+
+
+@pytest.mark.parametrize("damage", ["text_after", "stray_brace_bad_label"])
+def test_a_whole_report_the_server_finished_is_not_a_cut_off_one(tmp_path, monkeypatch, damage):
+    # Broken JSON is not a cut: the model finished (no ``finish_reason: length``), so a report with
+    # no usable call is invalid as it always was, not published as "cut off before the model's call".
+    obj = _report()
+    if damage == "text_after":
+        del obj["verdict"]
+        content = json.dumps(obj) + "\nDone."
+    else:
+        obj["verdict"]["label"] = "clean"
+        content = json.dumps(obj) + "}"
+    res, _o, _m = _report_run(tmp_path, monkeypatch, answer(content))
+    assert "analysis_report" not in res.payload.fields and "report_invalid" in _codes(res)
+
+
+HIDDEN_PAYLOAD = {"dotnet_resources": {"hidden_payloads": [{"resource": "Payload.bin", "size": 300000,
+                                                           "entropy": 7.98}],
+                                       "loader_refs": ["Assembly.Load", "CreateDecryptor"]}}
+API_HASHES = {"api_hashes": {"algorithm": "ror13", "hits": [{"api": "VirtualAlloc", "hash": "0x91afca54"}]}}
+
+
+@pytest.mark.parametrize("sweep", [HIDDEN_PAYLOAD, API_HASHES], ids=["hidden_payload", "api_hashing"])
+def test_a_report_cut_off_before_the_models_call_never_meets_the_bar(tmp_path, monkeypatch, sweep):
+    # The engine's own grounds give a cut-off report a verdict that passes every other check
+    # (suspicious/medium, a behaviour section observed). The model has still made no call: the
+    # chain goes on to get one.
+    text = json.dumps(_report())
+    res, _o, _m = _report_run(tmp_path, monkeypatch, cut_answer(text[:text.index('"capabilities"') + 30]),
+                              sweep=sweep)
+    f = res.payload.fields
+    verdict = json.loads(f["analysis_report"])["verdict"]
+    assert (verdict["label"], verdict["confidence"]) == ("suspicious", "medium")
+    assert f["gaps"] == ["no_report"] and f["bar_met"] is False and f["more_pending"] is True
+
+
+@pytest.mark.parametrize("wrap", ["fence", "text_after"])
+def test_a_whole_report_that_needed_unwrapping_is_not_called_cut_off(tmp_path, monkeypatch, wrap):
+    text = json.dumps(_report())
+    content = "```json\n" + text + "\n```" if wrap == "fence" else text + "\nDone."
+    res, _o, _m = _report_run(tmp_path, monkeypatch, answer(content))
+    assert json.loads(res.payload.fields["analysis_report"])["verdict"]["label"] == "benign"
+    assert [w.message for w in res.warnings if w.code == "report_salvaged"] == [
+        "analysis report was not plain JSON; the object in it was read"]
+
+
+def test_a_cut_off_report_says_it_was_cut_off(tmp_path, monkeypatch):
+    text = json.dumps(_report())
+    res, _o, _m = _report_run(tmp_path, monkeypatch, cut_answer(text[:text.rindex('"rationale"') + 20]))
+    assert [w.message for w in res.warnings if w.code == "report_salvaged"] == [
+        "analysis report was cut off; its complete sections were kept"]
 
 
 def test_report_skipped_when_the_wall_cannot_hold_it(tmp_path, monkeypatch):
@@ -2340,6 +2421,17 @@ def test_a_bad_routing_setting_is_refused_at_start_not_sent(monkeypatch, dialect
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     with pytest.raises(ValueError, match="REA_MODEL_"):
+        ModelClient("http://m:1/v1", "x", 5)
+
+
+@pytest.mark.parametrize("value, why", [
+    ("deepinfra,novita,", "empty entry"), ("a,,b", "empty entry"), (",", "empty entry"),
+    ("a,b,c,d,e,f,g,h,i", "at most 8"), ("x" * 49, "not a host slug")])
+def test_a_refused_host_list_says_what_is_wrong_with_it(monkeypatch, value, why):
+    monkeypatch.setenv("REA_MODEL_DIALECT", "openrouter")
+    monkeypatch.delenv("REA_MODEL_REQUIRE_PARAMETERS", raising=False)
+    monkeypatch.setenv("REA_MODEL_PROVIDERS", value)
+    with pytest.raises(ValueError, match=f"REA_MODEL_PROVIDERS.*{why}"):
         ModelClient("http://m:1/v1", "x", 5)
 
 
@@ -2497,6 +2589,117 @@ def test_code_read_by_a_pass_that_loses_its_report_does_not_meet_the_bar_on_the_
     assert "analysis_report" not in f2
     assert f2["bar_met"] is False and f2["stop_reason"] == "" and f2["gaps"] == ["no_report"]
     assert f2["more_pending"] is True and next_state(out2).opened == ["0x402000", "0x403000"]
+
+
+def _stealer_pass_two(tmp_path, out, last, *, opened="0x403000"):
+    """Pass 2 of the Go decoy: reads the function pass 1 left, then answers with ``last``."""
+    final = {"summary": "Steals cookies.", "functions": [
+        {"address": "0x403000", "name": "main.stealCookies", "claim": "reads browser cookies", "evidence": []}],
+        "iocs": [], "todo": [], "done": True}
+    model = FakeModel([tc(("procedure_pseudo_code", {"procedure": opened}, "a")), answer(final), *last])
+    return run(tmp_path, out / "continuation.tar.gz", model,
+               McpRig(tmp_path, {"procedure_pseudo_code": {"text": DECOMP}}))
+
+
+def _stealer_report():
+    sections = {k: _section() for k in prompts.REPORT_KEYS}
+    sections["overview"] = _section("observed", "A board game that also steals browser cookies.", [], "Overview")
+    sections["host_activity"] = _section("observed", "Reads browser cookie stores.", [
+        {"address": "0x403000", "function": "main.stealCookies", "note": "opens the cookie db"}])
+    grounds = {c: [] for c in (*prompts.HOSTILE_GROUNDS, *prompts.CONCEALING_GROUNDS)}
+    grounds["credential_theft"] = [{"address": "0x403000"}]
+    grounds["data_exfiltration"] = [{"address": "0x403000"}]
+    return json.dumps({"sections": sections, "verdict": {"grounds": grounds, "label": "malicious",
+                                                         "rationale": "steals cookies and posts them"}})
+
+
+@pytest.mark.parametrize("cut", ["in_label", "in_grounds"])
+def test_a_cut_off_report_whose_finished_grounds_contradict_a_benign_one_replaces_it(tmp_path, monkeypatch, cut):
+    """Pass 1 called a Go decoy benign. Pass 2 read the function that steals cookies and its
+    report was cut off after the grounds that say so: those grounds are checked evidence against
+    the benign verdict, which does not stay the chain's report."""
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    first = tmp_path / "p1"
+    first.mkdir()
+    got, _f, out = _go_benign_pass(first, [tc(("procedure_pseudo_code", {"procedure": "0x402000"}, "a"))])
+    assert got == ("benign", "medium")
+    nxt = tmp_path / "p2"
+    nxt.mkdir()
+    text = _stealer_report()
+    body = text[:text.rindex('"label"') + 12] if cut == "in_label" else text[:text.index('"obfuscation"') + 20]
+    res, out2 = _stealer_pass_two(nxt, out, [cut_answer(body)])
+    f = res.payload.fields
+    rep = json.loads(f["analysis_report"])
+    assert rep["pass"] == 2 and (rep["verdict"]["label"], rep["verdict"]["confidence"]) == ("suspicious", "low")
+    assert "credential theft (0x403000)" in rep["verdict"]["rationale"]
+    assert "report_salvaged" in _codes(res) and "report_invalid" not in _codes(res)
+    assert "no_report" in f["gaps"] and f["bar_met"] is False  # the model's call is still owed
+    assert next_state(out2).opinion is None
+
+
+def test_a_cut_off_report_with_no_checked_ground_does_not_replace_a_benign_one(tmp_path, monkeypatch):
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    first = tmp_path / "p1"
+    first.mkdir()
+    _got, _f, out = _go_benign_pass(first, [tc(("procedure_pseudo_code", {"procedure": "0x402000"}, "a"))])
+    nxt = tmp_path / "p2"
+    nxt.mkdir()
+    # The grounds cite a function no tool returned to this chain: nothing the engine could check.
+    text = _stealer_report().replace("0x403000", "0x40f000")
+    res, out2 = _stealer_pass_two(nxt, out, [cut_answer(text[:text.rindex('"label"') + 12])])
+    assert "analysis_report" not in res.payload.fields and "report_invalid" in _codes(res)
+    assert next_state(out2).analysis_report["verdict"]["label"] == "benign"
+
+
+def test_a_cut_off_report_with_grounds_does_not_replace_a_called_hostile_one(tmp_path, monkeypatch):
+    # The rule without the model's call can say no more than suspicious/low on the model's own
+    # grounds: that never takes the place of a verdict the model called and the rule kept hostile.
+    prior = {**PRIOR_REPORT, "verdict": {"label": "malicious", "confidence": "high", "rationale": "Rule: x"}}
+    obj = _report()
+    obj["verdict"]["grounds"]["remote_control"] = [{"address": FN_MAIN}]
+    text = json.dumps(obj)
+    res, out, _m = _report_run(tmp_path, monkeypatch, cut_answer(text[:text.rindex('"label"') + 12]),
+                               prior=prior, opinion="malicious")
+    assert "analysis_report" not in res.payload.fields and "report_invalid" in _codes(res)
+    assert next_state(out).analysis_report["verdict"]["label"] == "malicious"
+
+
+def test_code_opened_by_a_pass_that_lost_its_answer_is_not_read_by_the_next_report(tmp_path, monkeypatch):
+    """Pass 2 opens the function pass 1 left unread, then loses its final answer: its findings are
+    dropped whole. Pass 3 opens nothing and calls the program benign. Nothing that report rests on
+    saw the function, so it is still unread."""
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    first = tmp_path / "p1"
+    first.mkdir()
+    _got, _f, out1 = _go_benign_pass(first, [tc(("procedure_pseudo_code", {"procedure": "0x402000"}, "a"))])
+    p2 = tmp_path / "p2"
+    p2.mkdir()
+    m2 = FakeModel([tc(("procedure_pseudo_code", {"procedure": "0x403000"}, "a")),
+                    ModelError("malformed", "x"), ModelError("malformed", "x")])
+    res2, out2 = run(p2, out1 / "continuation.tar.gz", m2, McpRig(p2, {"procedure_pseudo_code": {"text": DECOMP}}))
+    assert res2.payload.fields["model_status"] == "budget"
+    assert next_state(out2).opened == ["0x402000"]
+    p3 = tmp_path / "p3"
+    p3.mkdir()
+    sections = {k: _section() for k in prompts.REPORT_KEYS}
+    sections["overview"] = _section("observed", "A board game.", [], "Overview")
+    sections["execution_flow"] = _section("observed", "main runs the game.", [
+        {"address": "0x402000", "function": "main.main", "note": "start"}])
+    report = {"sections": sections, "verdict": {"grounds": {}, "label": "benign", "rationale": "a game"}}
+    final = {"summary": "A board game.", "functions": [], "iocs": [], "todo": [], "done": True}
+    res3, _out3 = run(p3, out2 / "continuation.tar.gz", FakeModel([answer(final), answer(report)]),
+                      McpRig(p3, {"procedure_pseudo_code": {"text": DECOMP}}))
+    f3 = res3.payload.fields
+    assert json.loads(f3["analysis_report"])["verdict"]["label"] == "benign"
+    assert f3["gaps"] == ["benign_unexplored"] and f3["bar_met"] is False
+
+
+def test_a_pass_that_lost_its_answer_does_not_record_code_as_read(tmp_path):
+    cont = make_continuation(tmp_path, todo=["0x140001420"], code_read=False)
+    model = FakeModel([tc(("procedure_pseudo_code", {"procedure": "0x140001420"}, "a")),
+                       ModelError("malformed", "x"), ModelError("malformed", "x")])
+    res, out = run(tmp_path, cont, model, McpRig(tmp_path, {"procedure_pseudo_code": {"text": DECOMP}}))
+    assert res.payload.fields["model_status"] == "budget" and next_state(out).code_read is False
 
 
 def test_a_failed_code_tool_opens_nothing(tmp_path):

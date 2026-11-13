@@ -150,8 +150,8 @@ Three things in the plan's Step 2 cannot work as written. Each was found live:
    largest pass used 1816 + 1601), so 1.25 x 4096 / 30 = 171 s of the 540 s wall. The report is cut to what
    the time left holds at the pass's measured tokens/s, or skipped under 1024 tokens
    (`report_skipped_deadline`). A failed or invalid report (`report_failed`, `report_invalid`)
-   never costs the pass its findings; a cut-off one keeps its complete sections (`report_salvaged`); cut off before the model's call, a
-   first report gets its verdict from the rule alone and a later one leaves the last pass's report standing.
+   never costs the pass its findings; a cut-off one keeps its complete sections (`report_salvaged`); cut off (the server reports `length`) before the model's call, a
+   report gets its verdict from the rule alone and the chain goes on (gap `no_report`), unless the last pass left a report with the model's call in it: that one stands, except a benign or unknown one when the cut-off report finished a ground the engine could check. A pass that loses its final answer does not count the code it opened as read.
    To change a knob, add it to the agent
    image's `ENV` in `Dockerfile.stack-worker` (all `REA_*` keys are reserved).
    The sweep's `rea.report/1` carries an optional `chain_stop` (`not_native`, `ghidra_failed`,
