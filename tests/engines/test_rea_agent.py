@@ -1005,15 +1005,17 @@ def test_steps_exhausted_then_final_fails_is_budget_and_requeues_what_it_explore
 
 def test_a_pass_that_lost_its_answer_queues_what_it_opened_off_the_todo_list(tmp_path, monkeypatch):
     # A function the pass found and opened itself is not forgotten with the answer: it joins the
-    # back of the todo list. One an earlier answer already covered stays explored and is not queued.
+    # back of the todo list. One an earlier answer already covered stays explored and is not queued,
+    # and neither is an address it only passed to a tool that reads no code (a data address).
     monkeypatch.setenv("REA_MAX_STEPS", "1")
     cont = make_continuation(tmp_path, todo=["0x140001420", "0x140001500"], explored=["0x140001000"])
     rig = McpRig(tmp_path, {"procedure_pseudo_code": {"text": DECOMP}})
     model = FakeModel([tc(("procedure_pseudo_code", {"procedure": "0x140001600"}, "a"),
-                          ("procedure_pseudo_code", {"procedure": "0x140001000"}, "b")),
+                          ("procedure_pseudo_code", {"procedure": "0x140001000"}, "b"),
+                          ("read_bytes", {"address": "0x140005000"}, "c")),
                        ModelError("unavailable", "TimeoutError"), ModelError("unavailable", "TimeoutError")])
     res, out = run(tmp_path, cont, model, rig)
-    assert res.payload.fields["model_status"] == "budget"
+    assert res.payload.fields["model_status"] == "budget" and res.payload.fields["tool_calls"] == 3
     st = next_state(out)
     assert st.explored == ["0x140001000"]
     assert st.todo == ["0x140001420", "0x140001500", "0x140001600"]

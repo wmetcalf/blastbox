@@ -998,12 +998,13 @@ class ReaAgentEngine:
             # A pass that lost its final answer hands on the lists it started on (a first pass,
             # its seeds). No answer covers what it explored, so none of that closes a lead or
             # leaves the todo list: it goes to the back, and the next pass starts on what this one
-            # did not reach. What it opened off the todo list joins the back too, unless an
-            # earlier answer already covered it.
+            # did not reach. Code it opened off the todo list joins the back too, unless an
+            # earlier answer already covered it (an address it only gave a tool that reads no
+            # code is not a function to queue).
             lost, covered = set(p.touched), set(state.explored) | set(p.given)
             p.explored = list(state.explored)
             p.todo = ([a for a in p.given if a not in lost] + [a for a in p.given if a in lost]
-                      + [a for a in p.touched if a not in covered])
+                      + [a for a in p.opened if a not in covered])
         facts = list(state.facts)
         if p.model_status == "ok" and p.accepted and p.report_tokens > 0:
             # With the report call off (REA_REPORT_MAX_TOKENS=0) there is no verdict to measure,
