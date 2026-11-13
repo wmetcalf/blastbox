@@ -135,6 +135,7 @@ from blastbox.engines.rea.prompts import (
     evidence_sources,
     final_response_format,
     report_response_format,
+    script_sources,
 )
 from blastbox.engines.rea.report import ReportInvalid, complete_sections, report_addresses, validate_report
 from blastbox.engines.rea.runner import classify, ghidra_profile, rea_env, run_ghidra_analysis
@@ -1534,6 +1535,9 @@ class ReaAgentEngine:
                 tw.write({"event": "report_skipped", "fit_tokens": fit, "tokens_per_s": round(tps, 2)})
                 return "skipped"
             tokens = min(p.report_tokens, fit)
+            # A function pass over a file an installer carried may cite the install script for a
+            # ground: what the installer does is there, and a script has no address.
+            script = [] if sources else script_sources(p.sweep)
             if sources:
                 messages = framer.evidence_report_messages(pass_no=p.pass_no, sample_name=sample_name,
                                                            sweep=p.sweep, sources=sources,
@@ -1541,8 +1545,8 @@ class ReaAgentEngine:
             else:
                 messages = framer.report_messages(pass_no=p.pass_no, sample_name=sample_name, summary=p.summary,
                                                   functions=p.functions, iocs=p.iocs, sweep=p.sweep,
-                                                  prior_report=p.prior_report)
-            kw: dict[str, Any] = {"response_format": report_response_format(sources)}
+                                                  prior_report=p.prior_report, script_sources=script)
+            kw: dict[str, Any] = {"response_format": report_response_format(sources, script_sources=script)}
             temperature = _report_temperature()
             if temperature is not None:  # the report is a reading of evidence, not a draw
                 kw["temperature"] = temperature
@@ -1583,7 +1587,7 @@ class ReaAgentEngine:
             # (a function pass) a code tool returned a function's code to this chain. An address
             # in ``explored`` is not that: a metadata call or the model's own list puts one there.
             code_read = sample_decompiled(p.sweep) or (not sources and p.code_read)
-            decision = apply_verdict_rule(obj, sweep=p.sweep, known=known, sources=sources or (),
+            decision = apply_verdict_rule(obj, sweep=p.sweep, known=known, sources=sources or script,
                                           code_read=code_read)
             try:
                 v = validate_report(obj, p.pass_no, known, sources=sources or (),

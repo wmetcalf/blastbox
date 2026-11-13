@@ -2893,3 +2893,85 @@ def test_evidence_prompt_says_why_no_code_was_read():
     for text in (failed, timeout):
         assert "sweep.unpacked" in text and "SECURITY" in text and "source" in text
 
+
+
+# ------------------------------------------------- installer script grounds in a code pass
+# What an installer does is in its script, and a script has no function address. A code pass that
+# could cite only addresses left the model no checkable ground for it: an adware installer whose
+# script downloads and runs an offer sealed suspicious/low, deepened, and a later pass judged the
+# stock DLL it carried and called the sample benign (cape18).
+INNO_SWEEP = {"unpacked": {"packer": "inno", "members": 3, "payload_member": "app/tool.dll",
+                           "script_strings": ["https://cdn.example/offer.exe", "WinHttp.WinHttpRequest.5.1"],
+                           "script_imports": ["DownloadTemporaryFile", "Exec"]}}
+
+
+def _ground_cites(schema):
+    return schema["properties"]["verdict"]["properties"]["grounds"]["properties"]
+
+
+def _script_ground():
+    obj = _report()
+    obj["verdict"].update(label="suspicious", rationale="the install script downloads and runs an offer")
+    obj["verdict"]["grounds"]["download_execute"] = [{"source": "unpacked"}]
+    obj["verdict"]["grounds"]["remote_control"] = [{"source": "iocs"}]  # not installer script evidence
+    return obj
+
+
+def test_script_sources_are_the_installer_evidence_that_holds_a_script():
+    assert prompts.script_sources(INNO_SWEEP) == ["unpacked"]
+    stub = {"installer_stub": {"packer": "nsis", "script_strings": ["$TEMP\\a.bin"], "plugins": ["System.dll"]}}
+    assert prompts.script_sources({**INNO_SWEEP, **stub}) == ["unpacked", "installer_stub"]
+    assert prompts.script_sources({"unpacked": {"packer": "nsis", "script_imports": ["Exec"]}}) == ["unpacked"]
+    # A script read from an inner layer is under ``unpacked`` too.
+    assert prompts.script_sources({"unpacked": {"packer": "upx", "inner": [INNO_SWEEP["unpacked"]]}}) == ["unpacked"]
+    # No script read, no source: a packer, an installer whose script was not read, junk.
+    for sweep in ({}, {"unpacked": "inno"}, {"unpacked": {"packer": "upx"}},
+                  {"unpacked": {"packer": "inno", "members": 3}},
+                  {"unpacked": {"packer": "inno", "script_strings": [], "script_imports": []}},
+                  {"unpacked": {"packer": "inno", "script_strings": "x", "inner": "y"}},
+                  {"installer_stub": {"packer": "nsis", "plugins": ["System.dll"]}},
+                  {"installer_stub": ["script_strings"]}):
+        assert prompts.script_sources(sweep) == [], sweep
+
+
+def test_a_code_pass_schema_lets_a_ground_cite_the_installer_script():
+    plain = prompts.report_schema()
+    sch = prompts.report_schema(script_sources=["unpacked", "installer_stub"])
+    address = _ground_cites(plain)["remote_control"]["items"]
+    assert address["required"] == ["address"]
+    for answer_schema in _ground_cites(sch).values():
+        assert answer_schema["type"] == "array" and answer_schema["maxItems"] == 1
+        assert answer_schema["items"] == {"anyOf": [address, {
+            "type": "object", "additionalProperties": False, "required": ["source"],
+            "properties": {"source": {"type": "string", "enum": ["unpacked", "installer_stub"]}}}]}
+    # Section evidence still cites functions, and without a script the schema is the one measured.
+    assert sch["properties"]["sections"] == plain["properties"]["sections"]
+    assert prompts.report_schema(script_sources=[]) == plain
+    assert prompts.report_response_format(script_sources=["unpacked"])["json_schema"]["schema"] == (
+        prompts.report_schema(script_sources=["unpacked"]))
+
+
+def test_an_installer_script_ground_counts_in_a_code_pass(tmp_path, monkeypatch):
+    res, _out, model = _report_run(tmp_path, monkeypatch, answer(_script_ground()), sweep=INNO_SWEEP)
+    verdict = json.loads(res.payload.fields["analysis_report"])["verdict"]
+    assert (verdict["label"], verdict["confidence"]) == ("suspicious", "medium")
+    rule = verdict["rationale"].splitlines()[0]
+    assert rule.startswith("Rule: suspicious/medium") and "download execute (unpacked)" in rule
+    assert "remote control" not in rule  # only the script's own sources are added to a code pass
+    call = model.calls[-1]
+    cite = _ground_cites(call["response_format"]["json_schema"]["schema"])["download_execute"]["items"]
+    assert [list(c["properties"]) for c in cite["anyOf"]] == [["address"], ["source"]]
+    assert cite["anyOf"][1]["properties"]["source"]["enum"] == ["unpacked"]
+    # The report call says how such a ground is cited.
+    lead = call["messages"][-1]["content"].split("\n", 1)[0]
+    assert '{"source": "unpacked"}' in lead and "install script" in lead
+
+
+def test_a_source_ground_stays_dropped_in_a_code_pass_without_an_installer_script(tmp_path, monkeypatch):
+    sweep = {"unpacked": {"packer": "inno", "members": 3}}
+    res, _out, model = _report_run(tmp_path, monkeypatch, answer(_script_ground()), sweep=sweep)
+    verdict = json.loads(res.payload.fields["analysis_report"])["verdict"]
+    assert (verdict["label"], verdict["confidence"]) == ("suspicious", "low")
+    call = model.calls[-1]
+    assert call["response_format"] == prompts.report_response_format()
+    assert '{"source"' not in call["messages"][-1]["content"].split("\n", 1)[0]

@@ -179,8 +179,10 @@ def model_grounds(raw: Any, *, known: set[str] | None,
     """The model's grounds the engine could check, and how many it dropped.
 
     ``known`` and ``sources`` are those of ``report.validate_report``: ``None`` skips that check; a
-    pass that read functions passes ``sources=()`` (only addresses count) and an evidence-only one
-    ``known=set()`` (only sources count). One ground per code (its lowest citation), hostile
+    pass that read functions passes ``sources=()`` (only addresses count), or the installer
+    sources whose script the sweep read (``prompts.script_sources``: an installer's behaviour is in
+    its script, which has no address), and an evidence-only one ``known=set()`` (only sources
+    count). One ground per code (its lowest citation), hostile
     codes first and each tier in vocabulary order: the same rows in any order give the same
     grounds, and one more row never takes a ground away.
 
