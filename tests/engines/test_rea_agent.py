@@ -987,7 +987,9 @@ def test_final_failure_after_good_turns_is_budget(tmp_path, final):
     assert f["model_status"] == "budget" and f["more_pending"] is True and f["summary"] == "prior summary"
 
 
-def test_steps_exhausted_then_final_fails_is_budget_and_saves_explored(tmp_path, monkeypatch):
+def test_steps_exhausted_then_final_fails_is_budget_and_requeues_what_it_explored(tmp_path, monkeypatch):
+    # No answer covers the function this pass opened: it is not explored, and goes to the back of
+    # the todo list so the next pass starts on what this one did not reach.
     monkeypatch.setenv("REA_MAX_STEPS", "1")
     cont = make_continuation(tmp_path, todo=["0x140001420", "0x140001500"], explored=["0x140001000"])
     rig = McpRig(tmp_path, {"procedure_pseudo_code": {"text": DECOMP}})
@@ -997,8 +999,8 @@ def test_steps_exhausted_then_final_fails_is_budget_and_saves_explored(tmp_path,
     f = res.payload.fields
     assert f["model_status"] == "budget" and f["more_pending"] is True and f["steps"] == 1
     st = next_state(out)
-    assert st.explored == ["0x140001000", "0x140001420"]
-    assert st.todo == ["0x140001500"]
+    assert st.explored == ["0x140001000"]
+    assert st.todo == ["0x140001500", "0x140001420"]
 
 
 def test_only_refused_calls_then_failure_is_budget(tmp_path):
@@ -2662,6 +2664,99 @@ def test_a_cut_off_report_with_grounds_does_not_replace_a_called_hostile_one(tmp
                                prior=prior, opinion="malicious")
     assert "analysis_report" not in res.payload.fields and "report_invalid" in _codes(res)
     assert next_state(out).analysis_report["verdict"]["label"] == "malicious"
+
+
+def test_a_cut_off_report_with_no_checked_ground_does_not_replace_a_cut_off_one_that_had_one(tmp_path, monkeypatch):
+    """Pass 2 is cut off before the model's call, after a ground the engine could check. Pass 3 is
+    cut off inside its sections. The second cut finished less than the first, so the first stands."""
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    first = tmp_path / "p1"
+    first.mkdir()
+    _got, _f, out1 = _go_benign_pass(first, [tc(("procedure_pseudo_code", {"procedure": "0x402000"}, "a"))])
+    p2 = tmp_path / "p2"
+    p2.mkdir()
+    text = _stealer_report()
+    _res2, out2 = _stealer_pass_two(p2, out1, [cut_answer(text[:text.rindex('"label"') + 12])])
+    second = next_state(out2)
+    assert second.analysis_report["verdict"]["label"] == "suspicious" and second.opinion is None
+    p3 = tmp_path / "p3"
+    p3.mkdir()
+    res3, out3 = _stealer_pass_two(p3, out2, [cut_answer(text[:text.index('"host_activity"') + 5])])
+    f = res3.payload.fields
+    assert "analysis_report" not in f and "report_invalid" in _codes(res3)
+    assert "no_report" in f["gaps"] and f["bar_met"] is False
+
+
+def test_a_pass_that_lost_its_answer_keeps_the_function_it_opened_on_the_todo_list(tmp_path, monkeypatch):
+    """The lost pass opened the function the bar sent it to. No answer covers that reading, so the
+    function stays on the todo list for a later pass."""
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    first = tmp_path / "p1"
+    first.mkdir()
+    _got, _f, out1 = _go_benign_pass(first, [tc(("procedure_pseudo_code", {"procedure": "0x402000"}, "a"))])
+    p2 = tmp_path / "p2"
+    p2.mkdir()
+    model = FakeModel([tc(("procedure_pseudo_code", {"procedure": "0x403000"}, "a")),
+                       ModelError("malformed", "x"), ModelError("malformed", "x")])
+    res, out2 = run(p2, out1 / "continuation.tar.gz", model,
+                    McpRig(p2, {"procedure_pseudo_code": {"text": DECOMP}}))
+    assert res.payload.fields["model_status"] == "budget"
+    assert "0x403000" in next_state(out2).todo
+
+
+LEAD_FN = "0x140001500"
+LEAD_SWEEP = {"kind": "pe", "iocs": [], "capabilities": [
+    {"rule": "send HTTP request", "namespace": "communication/http/client", "attack": ["T1071"],
+     "mbc": [], "functions": [LEAD_FN]}]}
+
+
+def test_a_pass_that_lost_its_answer_does_not_close_a_lead(tmp_path, monkeypatch):
+    """capa points the network section at one function. Only a pass that lost its answer opened
+    it, so a later benign report that leaves the section not analysed still has the lead open."""
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    sections = {k: _section() for k in prompts.REPORT_KEYS}
+    sections["overview"] = _section("observed", "Prints a greeting.", [], "Overview")
+    sections["execution_flow"] = _section("observed", "entry prints.", [
+        {"address": FN_MAIN, "function": "entry", "note": "start"}])
+    report = {"sections": sections, "verdict": {"grounds": {}, "label": "benign", "rationale": "prints"}}
+    p1 = tmp_path / "p1"
+    p1.mkdir()
+    m1 = FakeModel([tc(("procedure_pseudo_code", {"procedure": FN_MAIN}, "a")), answer(FINAL_OK), answer(report)])
+    res1, out1 = run(p1, make_continuation(p1, sweep=LEAD_SWEEP), m1,
+                     McpRig(p1, {"procedure_pseudo_code": {"text": DECOMP}}))
+    assert res1.payload.fields["gaps"] == ["lead:network"]
+    p2 = tmp_path / "p2"
+    p2.mkdir()
+    m2 = FakeModel([tc(("procedure_pseudo_code", {"procedure": LEAD_FN}, "a")),
+                    ModelError("malformed", "x"), ModelError("malformed", "x")])
+    res2, out2 = run(p2, out1 / "continuation.tar.gz", m2, McpRig(p2, {"procedure_pseudo_code": {"text": DECOMP}}))
+    assert res2.payload.fields["model_status"] == "budget"
+    p3 = tmp_path / "p3"
+    p3.mkdir()
+    final = {"summary": "Prints a greeting.", "functions": [], "iocs": [], "todo": [], "done": True}
+    res3, _out3 = run(p3, out2 / "continuation.tar.gz", FakeModel([answer(final), answer(report)]),
+                      McpRig(p3, {"procedure_pseudo_code": {"text": DECOMP}}))
+    f = res3.payload.fields
+    assert f["gaps"] == ["lead:network"] and f["bar_met"] is False
+
+
+@pytest.mark.parametrize("finish", [None, "stop"])
+def test_a_report_with_the_models_call_is_kept_when_only_its_rationale_was_lost(tmp_path, monkeypatch, finish):
+    """The answer breaks off inside the rationale, and the server does not say it ran out of
+    output. The model's call and every ground are whole: the report is sealed on them."""
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    first = tmp_path / "p1"
+    first.mkdir()
+    _got, _f, out = _go_benign_pass(first, [tc(("procedure_pseudo_code", {"procedure": "0x402000"}, "a"))])
+    nxt = tmp_path / "p2"
+    nxt.mkdir()
+    text = _stealer_report()
+    resp = answer(text[:text.rindex('"rationale"') + 20])
+    resp["choices"][0]["finish_reason"] = finish
+    res, _out2 = _stealer_pass_two(nxt, out, [resp])
+    f = res.payload.fields
+    assert json.loads(f["analysis_report"])["verdict"]["label"] == "malicious"
+    assert "report_salvaged" in _codes(res) and "report_invalid" not in _codes(res)
 
 
 def test_code_opened_by_a_pass_that_lost_its_answer_is_not_read_by_the_next_report(tmp_path, monkeypatch):

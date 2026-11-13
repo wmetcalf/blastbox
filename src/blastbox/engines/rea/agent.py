@@ -847,6 +847,7 @@ class _Pass:
     explored: list[str] = field(default_factory=list)
     code_read: bool = False  # a CODE_TOOLS call returned code, this pass or an earlier one
     opened: list[str] = field(default_factory=list)  # the addresses those calls asked for
+    touched: list[str] = field(default_factory=list)  # what this pass's own tool loop explored
     done: bool = False
     final_reserve_s: float = 0.0
     wall_s: float = 0.0
@@ -991,6 +992,13 @@ class ReaAgentEngine:
             # else: the final answer was fully accepted before the failure (e.g. MCP close):
             # it is sealed as the ok pass it is.
 
+        if not p.accepted:
+            # A pass that lost its final answer hands on the lists it was given. No answer covers
+            # what it explored, so none of that closes a lead or leaves the todo list: it goes to
+            # the back, and the next pass starts on what this one did not reach.
+            lost = set(p.touched)
+            p.explored = list(state.explored)
+            p.todo = [a for a in state.todo if a not in lost] + [a for a in state.todo if a in lost]
         facts = list(state.facts)
         if p.model_status == "ok" and p.accepted and p.report_tokens > 0:
             # With the report call off (REA_REPORT_MAX_TOKENS=0) there is no verdict to measure,
@@ -1277,7 +1285,9 @@ class ReaAgentEngine:
         try:
             self._loop_body(mcp, listed, sample, state, p, tw, remaining, max_steps, max_tokens, explored_now)
         finally:
-            # Every exit (ok, budget, failure) keeps what this pass explored and prunes the todo.
+            # Every exit (ok, budget, failure) records what this pass explored and prunes the todo;
+            # run() puts both lists back for a pass that lost its final answer.
+            p.touched = _dedup(explored_now)
             p.explored = _dedup(p.explored + explored_now)
             done = set(p.explored)
             p.todo = [a for a in p.todo if a not in done]
@@ -1597,16 +1607,20 @@ class ReaAgentEngine:
             code_read = sample_decompiled(p.sweep) or (not sources and p.code_read)
             # A report the server says ran out of output loses the end of its verdict first (it is
             # written last). One cut before the model's call keeps its finished sections under a
-            # verdict the rule sets without that call, unless the last pass left a report with the
-            # model's call in it: that one stands, except a benign or unknown one against grounds
-            # this report finished and the engine could check (the pass that reads the hostile
-            # code writes the longest report). JSON broken any other way is not a cut.
+            # verdict the rule sets without that call, unless the last pass left a report that
+            # stands: one that is hostile or has the model's call in it. With both it always
+            # stands; with one, until this report finishes a ground the engine could check (the
+            # pass that reads the hostile code writes the longest report). JSON broken any other
+            # way is not a cut, but a report read out of it with the model's call whole is kept
+            # without its rationale.
             called = model_called(obj)
             length = info["finish_reason"] == "length"
-            stands = p.prior_report is not None and p.prior_called and not (
-                p.prior_report["verdict"]["label"] in ("benign", "unknown")
-                and has_checked_ground(obj, known=known, sources=sources or script))
-            cut_off = salvaged and length and (called or not stands)
+            stands = False
+            if p.prior_report is not None:
+                hostile = p.prior_report["verdict"]["label"] not in ("benign", "unknown")
+                grounded = has_checked_ground(obj, known=known, sources=sources or script)
+                stands = (hostile and p.prior_called) or (not grounded and (hostile or p.prior_called))
+            cut_off = salvaged and (called or (length and not stands))
             decision = apply_verdict_rule(obj, sweep=p.sweep, known=known, sources=sources or script,
                                           code_read=code_read, cut_off=cut_off)
             try:
