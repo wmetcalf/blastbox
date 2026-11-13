@@ -848,6 +848,7 @@ class _Pass:
     code_read: bool = False  # a CODE_TOOLS call returned code, this pass or an earlier one
     opened: list[str] = field(default_factory=list)  # the addresses those calls asked for
     touched: list[str] = field(default_factory=list)  # what this pass's own tool loop explored
+    given: list[str] = field(default_factory=list)  # the todo list it started on (the state's, or its seeds)
     done: bool = False
     final_reserve_s: float = 0.0
     wall_s: float = 0.0
@@ -935,7 +936,8 @@ class ReaAgentEngine:
             return self._rejected("bad_continuation", "bad program_name in state.json")
 
         p = _Pass(pass_no=state.pass_no + 1, model_id=model_id, summary=state.summary,
-                  todo=list(state.todo), explored=list(state.explored), code_read=state.code_read,
+                  todo=list(state.todo), given=list(state.todo), explored=list(state.explored),
+                  code_read=state.code_read,
                   opened=list(state.opened),
                   final_reserve_s=final_reserve(wall, reserve_tokens, tokens_per_s), wall_s=wall,
                   turn_tokens=turn_tokens, tokens_per_s=tokens_per_s,
@@ -993,12 +995,15 @@ class ReaAgentEngine:
             # it is sealed as the ok pass it is.
 
         if not p.accepted:
-            # A pass that lost its final answer hands on the lists it was given. No answer covers
-            # what it explored, so none of that closes a lead or leaves the todo list: it goes to
-            # the back, and the next pass starts on what this one did not reach.
-            lost = set(p.touched)
+            # A pass that lost its final answer hands on the lists it started on (a first pass,
+            # its seeds). No answer covers what it explored, so none of that closes a lead or
+            # leaves the todo list: it goes to the back, and the next pass starts on what this one
+            # did not reach. What it opened off the todo list joins the back too, unless an
+            # earlier answer already covered it.
+            lost, covered = set(p.touched), set(state.explored) | set(p.given)
             p.explored = list(state.explored)
-            p.todo = [a for a in state.todo if a not in lost] + [a for a in state.todo if a in lost]
+            p.todo = ([a for a in p.given if a not in lost] + [a for a in p.given if a in lost]
+                      + [a for a in p.touched if a not in covered])
         facts = list(state.facts)
         if p.model_status == "ok" and p.accepted and p.report_tokens > 0:
             # With the report call off (REA_REPORT_MAX_TOKENS=0) there is no verdict to measure,
@@ -1311,6 +1316,7 @@ class ReaAgentEngine:
             seeds = self._seed(mcp, ev, tw, explore_left, capa_functions=capa_functions(state.sweep),
                                hash_sites=hash_sites(state.sweep), program=p.program_functions)
             p.todo = [s["address"] for s in seeds]
+            p.given = list(p.todo)
             todo_view = seeds
             seed_note = "The todo list was seeded by the engine from the entry point and the procedure list."
         else:

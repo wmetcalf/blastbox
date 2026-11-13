@@ -1003,6 +1003,22 @@ def test_steps_exhausted_then_final_fails_is_budget_and_requeues_what_it_explore
     assert st.todo == ["0x140001500", "0x140001420"]
 
 
+def test_a_pass_that_lost_its_answer_queues_what_it_opened_off_the_todo_list(tmp_path, monkeypatch):
+    # A function the pass found and opened itself is not forgotten with the answer: it joins the
+    # back of the todo list. One an earlier answer already covered stays explored and is not queued.
+    monkeypatch.setenv("REA_MAX_STEPS", "1")
+    cont = make_continuation(tmp_path, todo=["0x140001420", "0x140001500"], explored=["0x140001000"])
+    rig = McpRig(tmp_path, {"procedure_pseudo_code": {"text": DECOMP}})
+    model = FakeModel([tc(("procedure_pseudo_code", {"procedure": "0x140001600"}, "a"),
+                          ("procedure_pseudo_code", {"procedure": "0x140001000"}, "b")),
+                       ModelError("unavailable", "TimeoutError"), ModelError("unavailable", "TimeoutError")])
+    res, out = run(tmp_path, cont, model, rig)
+    assert res.payload.fields["model_status"] == "budget"
+    st = next_state(out)
+    assert st.explored == ["0x140001000"]
+    assert st.todo == ["0x140001420", "0x140001500", "0x140001600"]
+
+
 def test_only_refused_calls_then_failure_is_budget(tmp_path):
     cont = make_continuation(tmp_path)
     model = FakeModel([tc(("annotate_native_function", {"procedure": "main"}, "a")),
@@ -2702,6 +2718,27 @@ def test_a_pass_that_lost_its_answer_keeps_the_function_it_opened_on_the_todo_li
                     McpRig(p2, {"procedure_pseudo_code": {"text": DECOMP}}))
     assert res.payload.fields["model_status"] == "budget"
     assert "0x403000" in next_state(out2).todo
+
+
+def test_a_first_pass_that_lost_its_answer_keeps_the_engines_seeds(tmp_path):
+    """Pass 1 is given an empty todo list and seeds it. Losing its answer does not lose the seeds:
+    the next pass gets them, with the one this pass opened at the back."""
+    rows = [{"address": a, "value": n, "symbol": {"external": False, "source": "imported"},
+             "procedure": {"external": False, "thunk": False}}
+            for a, n in [("0x401000", "runtime::runtime.mallocgc"), ("0x4d0000", "main::main.helper"),
+                         ("0x4d2180", "main::main.main")]]
+    responses = {"procedure_info": {"text": json.dumps({"normalized_result": {"name": "_rt0",
+                                                                               "entrypoint": "0x46eca0"}})},
+                 "list_procedures": {"text": json.dumps({"normalized_result": rows})},
+                 "procedure_pseudo_code": {"text": DECOMP}}
+    cont = make_continuation(tmp_path, todo=[], explored=[], sweep={"kind": "pe"})
+    model = FakeModel([tc(("procedure_pseudo_code", {"procedure": "0x46eca0"}, "a")),
+                       ModelError("malformed", "x"), ModelError("malformed", "x")])
+    res, out = run(tmp_path, cont, model, McpRig(tmp_path, responses))
+    assert res.payload.fields["model_status"] == "budget"
+    st = next_state(out)
+    assert set(st.todo) >= {"0x46eca0", "0x4d2180", "0x4d0000"} and st.todo[-1] == "0x46eca0"
+    assert st.explored == []
 
 
 LEAD_FN = "0x140001500"
