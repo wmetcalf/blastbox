@@ -4,7 +4,10 @@ The model's own ``done`` flag is a self-assessment and decides nothing. After ea
 the engine checks the latest analysis report and the pass's findings against evidence it can
 verify itself, and lists what is still missing (``gaps``):
 
-- ``no_report``: no valid ``rea.analysis/1`` report exists yet;
+- ``no_report``: no valid ``rea.analysis/1`` report exists yet, or the pass wrote none and the
+  one measured is carried from an earlier pass (``carried``). That report was written before what
+  this pass read, so the pass never meets the bar: live a benign verdict would otherwise close
+  the chain once a later pass read the program's remaining functions and lost its report;
 - ``verdict_unknown`` / ``verdict_low``: the verdict is ``unknown``, or its confidence is ``low``;
 - ``no_behaviour``: no behaviour section (``BEHAVIOUR_KEYS``) is ``observed``;
 - ``code_unread``: the report was written from the sweep's evidence alone (``basis``
@@ -191,14 +194,18 @@ def facts_of(report: dict[str, Any] | None, functions: list[dict[str, Any]],
 
 def assess(*, report: dict[str, Any] | None, sweep: dict[str, Any], explored: list[str],
            program_functions: list[str] | None = None, opinion: str | None = None,
-           opened: list[str] | None = None) -> Sufficiency:
+           opened: list[str] | None = None, carried: bool = False) -> Sufficiency:
     """``opinion``: the model's own call behind ``report``, before the verdict rule (``verdict.py``).
-    ``opened``: the addresses a code tool was asked for and returned (``agent.CODE_TOOLS``)."""
+    ``opened``: the addresses a code tool was asked for and returned (``agent.CODE_TOOLS``).
+    ``carried``: the pass wrote no report and ``report`` is an earlier pass's."""
     gaps: list[Gap] = []
     if not isinstance(report, dict):
         gaps.append(Gap("no_report", "no valid analysis report has been written yet"))
         statuses: dict[str, str] = {}
     else:
+        if carried:
+            gaps.append(Gap("no_report", "the latest pass wrote no report: the one carried forward was "
+                                         "written before what that pass read"))
         raw = report.get("verdict")
         verdict: dict[str, Any] = raw if isinstance(raw, dict) else {}
         label, conf = verdict.get("label"), verdict.get("confidence")

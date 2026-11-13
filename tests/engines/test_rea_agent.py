@@ -1698,9 +1698,10 @@ def _report(**over):
     sections["network"] = _section("not_observed", "No sockets.", [{"address": FN_MAIN, "function": "", "note": ""}],
                                    "network")
     sections.update(over.pop("sections", {}))
-    obj = {"verdict": {"label": "benign", "rationale": "prints and exits",
-                       "grounds": {c: [] for c in (*prompts.HOSTILE_GROUNDS, *prompts.CONCEALING_GROUNDS)}},
-           "sections": sections}
+    # In the order the schema makes the model write them: the sections, then the verdict.
+    obj = {"sections": sections,
+           "verdict": {"grounds": {c: [] for c in (*prompts.HOSTILE_GROUNDS, *prompts.CONCEALING_GROUNDS)},
+                       "label": "benign", "rationale": "prints and exits"}}
     obj.update(over)
     return obj
 
@@ -2134,15 +2135,61 @@ def test_report_model_error_is_report_failed(tmp_path, monkeypatch):
 
 
 def test_cut_off_report_keeps_its_complete_sections(tmp_path, monkeypatch):
+    # The verdict is written last, so a report cut off in its sections has none: the sections that
+    # were finished are kept, and the rule sets the verdict from what the engine can check.
     text = json.dumps(_report())
+    assert text.index('"sections"') < text.index('"verdict"')
     cut = text[:text.index('"capabilities"') + 30]
-    res, _o, _m = _report_run(tmp_path, monkeypatch, answer(cut))
+    res, out, _m = _report_run(tmp_path, monkeypatch, answer(cut))
     rep = json.loads(res.payload.fields["analysis_report"])
     secs = {s["key"]: s for s in rep["sections"]}
     assert len(rep["sections"]) == 8
     assert secs["execution_flow"]["status"] == "observed"
     assert secs["capabilities"]["status"] == "not_analysed" and secs["unknowns"]["status"] == "not_analysed"
+    assert rep["verdict"] == {"label": "unknown", "confidence": "low",
+                              "rationale": "Rule: unknown/low; the report was cut off before the model's call."}
+    assert "report_salvaged" in _codes(res) and "report_invalid" not in _codes(res)
+    assert [e["opinion"] for e in _events(out, "verdict_rule")] == ["unknown"]
+
+
+def test_report_cut_off_inside_its_verdict_keeps_the_grounds_it_finished(tmp_path, monkeypatch):
+    obj = _report()
+    obj["verdict"]["grounds"]["remote_control"] = [{"address": FN_MAIN}]
+    text = json.dumps(obj)
+    cut = text[:text.rindex('"label"') + 12]  # inside the label's value
+    res, _o, _m = _report_run(tmp_path, monkeypatch, answer(cut))
+    verdict = json.loads(res.payload.fields["analysis_report"])["verdict"]
+    assert (verdict["label"], verdict["confidence"]) == ("suspicious", "low")
+    assert verdict["rationale"].startswith(
+        "Rule: suspicious/low, not malicious (the model's call was cut off and no engine ground is hostile), on ")
+    assert "remote control (" in verdict["rationale"] and "report_salvaged" in _codes(res)
+
+
+@pytest.mark.parametrize("prior", [None, PRIOR_REPORT])
+def test_report_cut_off_inside_its_rationale_keeps_the_models_call(tmp_path, monkeypatch, prior):
+    text = json.dumps(_report())
+    cut = text[:text.rindex('"rationale"') + 20]
+    res, _o, _m = _report_run(tmp_path, monkeypatch, answer(cut), prior=prior)
+    rep = json.loads(res.payload.fields["analysis_report"])
+    assert rep["verdict"] == {"label": "benign", "confidence": "medium", "rationale": BENIGN_RULE}
     assert "report_salvaged" in _codes(res)
+
+
+def test_report_cut_off_before_its_verdict_does_not_replace_a_complete_one(tmp_path, monkeypatch):
+    # A later pass has the last pass's whole report, verdict included: half a report with no call
+    # of the model's is not an improvement on it.
+    text = json.dumps(_report())
+    cut = text[:text.index('"capabilities"') + 30]
+    res, out, _m = _report_run(tmp_path, monkeypatch, answer(cut), prior=PRIOR_REPORT)
+    assert "analysis_report" not in res.payload.fields and "report_invalid" in _codes(res)
+    assert next_state(out).analysis_report["verdict"] == PRIOR_REPORT["verdict"]
+
+
+def test_a_whole_report_without_a_verdict_is_still_invalid(tmp_path, monkeypatch):
+    obj = _report()
+    del obj["verdict"]
+    res, _o, _m = _report_run(tmp_path, monkeypatch, answer(obj))
+    assert "analysis_report" not in res.payload.fields and "report_invalid" in _codes(res)
 
 
 def test_report_skipped_when_the_wall_cannot_hold_it(tmp_path, monkeypatch):
@@ -2280,6 +2327,8 @@ def test_openrouter_routing_is_the_images_choice_and_off_by_default(monkeypatch,
     ("openrouter", {"REA_MODEL_PROVIDERS": "a,b,c,d,e,f,g,h,i"}),          # more than eight
     ("openrouter", {"REA_MODEL_PROVIDERS": 'x"}, "order": ["evil'}),         # not a provider name
     ("openrouter", {"REA_MODEL_PROVIDERS": "x" * 49}),
+    ("openrouter", {"REA_MODEL_PROVIDERS": ","}),                            # set, and names no host
+    ("openrouter", {"REA_MODEL_PROVIDERS": "a,,b"}),
     ("openrouter", {"REA_MODEL_REQUIRE_PARAMETERS": "yes"}),
     ("vllm", {"REA_MODEL_PROVIDERS": "CoreWeave"}),                         # a vLLM server has no hosts to pick
     ("vllm", {"REA_MODEL_REQUIRE_PARAMETERS": "1"}),
@@ -2419,6 +2468,35 @@ def test_functions_opened_by_an_earlier_pass_stay_opened(tmp_path, monkeypatch):
         tmp_path, [tc(("procedure_pseudo_code", {"procedure": "0x403000"}, "a"))], code_read=True,
         explored=["0x402000"], opened=["0x402000"], program_functions=["0x402000", "0x403000"])
     assert got == ("benign", "medium") and f["gaps"] == [] and f["bar_met"] is True
+
+
+@pytest.mark.parametrize("second", ["failed", "cut_off"])
+def test_code_read_by_a_pass_that_loses_its_report_does_not_meet_the_bar_on_the_carried_verdict(
+        tmp_path, monkeypatch, second):
+    """Pass 1 called a Go program benign with one of its functions unread. Pass 2 reads that
+    function and loses its report: the benign verdict carried forward was written before the
+    function was read, so it cannot close the chain as bar_met."""
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    first = tmp_path / "p1"
+    first.mkdir()
+    _got, f, out = _go_benign_pass(first, [tc(("procedure_pseudo_code", {"procedure": "0x402000"}, "a"))])
+    assert f["gaps"] == ["benign_unexplored"]
+    nxt = tmp_path / "p2"
+    nxt.mkdir()
+    final = {"summary": "Reads browser cookies.", "functions": [
+        {"address": "0x403000", "name": "main.stealCookies", "claim": "reads browser cookies", "evidence": []}],
+        "iocs": [], "todo": [], "done": True}
+    lost = {"failed": ModelError("malformed", "invalid_json"),
+            "cut_off": {"choices": [{"finish_reason": "length", "message": {
+                "role": "assistant", "content": '{"sections": {"overview": {"title": "Overview", "status": "obs'}}],
+                "usage": {"completion_tokens": 3500}}}[second]
+    model = FakeModel([tc(("procedure_pseudo_code", {"procedure": "0x403000"}, "a")), answer(final), lost])
+    res, out2 = run(nxt, out / "continuation.tar.gz", model,
+                    McpRig(nxt, {"procedure_pseudo_code": {"text": DECOMP}}))
+    f2 = res.payload.fields
+    assert "analysis_report" not in f2
+    assert f2["bar_met"] is False and f2["stop_reason"] == "" and f2["gaps"] == ["no_report"]
+    assert f2["more_pending"] is True and next_state(out2).opened == ["0x402000", "0x403000"]
 
 
 def test_a_failed_code_tool_opens_nothing(tmp_path):
@@ -2917,6 +2995,14 @@ def _script_ground():
     return obj
 
 
+def test_both_report_prompts_ask_for_the_grounds_before_the_call():
+    # The report call runs without thinking, so the schema has the grounds written before the label
+    # in both kinds of pass; the instructions name them in that order too.
+    for text in (prompts._REPORT_VERDICT, prompts._EVIDENCE_VERDICT):
+        assert "written last, after the sections" in text
+        assert text.index("the grounds") < text.index("your own call")
+
+
 def test_script_sources_are_the_installer_evidence_that_holds_a_script():
     assert prompts.script_sources(INNO_SWEEP) == ["unpacked"]
     stub = {"installer_stub": {"packer": "nsis", "script_strings": ["$TEMP\\a.bin"], "plugins": ["System.dll"]}}
@@ -2965,6 +3051,10 @@ def test_an_installer_script_ground_counts_in_a_code_pass(tmp_path, monkeypatch)
     # The report call says how such a ground is cited.
     lead = call["messages"][-1]["content"].split("\n", 1)[0]
     assert '{"source": "unpacked"}' in lead and "install script" in lead
+    # Its examples are grounds as the vocabulary defines them, not what any installer does
+    # (fetching its own files, a login entry under its own name).
+    assert "runs it unasked" in lead and "covertly" in lead and "imitates" in lead
+    assert "not grounds" in lead
 
 
 def test_a_source_ground_stays_dropped_in_a_code_pass_without_an_installer_script(tmp_path, monkeypatch):

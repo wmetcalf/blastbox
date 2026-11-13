@@ -60,7 +60,9 @@ def _routing(dialect: str) -> dict[str, Any] | None:
     raw_req = (os.environ.get("REA_MODEL_REQUIRE_PARAMETERS") or "").strip()
     if raw_req not in ("", "0", "1"):
         raise ValueError(f"REA_MODEL_REQUIRE_PARAMETERS must be 0 or 1: {raw_req!r}")
-    only = [part.strip() for part in raw_only.split(",") if part.strip()]
+    # Every entry is a host: a list that is set and names none ("," or a stray comma) is refused,
+    # not read as "no restriction".
+    only = [part.strip() for part in raw_only.split(",")] if raw_only else []
     if len(only) > _MAX_PROVIDERS or not all(_PROVIDER_SLUG.fullmatch(slug) for slug in only):
         raise ValueError(f"REA_MODEL_PROVIDERS must be at most {_MAX_PROVIDERS} comma-separated host slugs")
     routing: dict[str, Any] = {}

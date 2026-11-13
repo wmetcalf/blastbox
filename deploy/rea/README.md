@@ -133,8 +133,10 @@ Three things in the plan's Step 2 cannot work as written. Each was found live:
    `rea.analysis/1` object describing what the program does (overview, execution flow,
    capabilities, network, persistence, host activity, anti-analysis, unknowns), each section
    `observed`/`not_observed`/`not_analysed` with function-address evidence, plus a verdict. The
-   model gives its own call and up to four grounds from a fixed vocabulary, each with one
-   evidence row; the engine keeps the grounds whose evidence it holds, adds the ones the sweep
+   model writes the sections first and the verdict last: an answer for every ground in a fixed
+   vocabulary (one citation, or none: a function address, an evidence source in an evidence-only
+   pass, or the install script of the installer that carried the file), then its own call and a
+   rationale; the engine keeps the grounds whose evidence it holds, adds the ones the sweep
    shows (family signature, hidden payload, emulated concealment, installer concealment, API
    hashing) and sets label and confidence by rule (`verdict.py`). The rule's line leads the
    rationale (`Rule: ...`); the model's text follows. The call is sampled at
@@ -148,7 +150,8 @@ Three things in the plan's Step 2 cannot work as written. Each was found live:
    largest pass used 1816 + 1601), so 1.25 x 4096 / 30 = 171 s of the 540 s wall. The report is cut to what
    the time left holds at the pass's measured tokens/s, or skipped under 1024 tokens
    (`report_skipped_deadline`). A failed or invalid report (`report_failed`, `report_invalid`)
-   never costs the pass its findings; a cut-off one keeps its complete sections (`report_salvaged`).
+   never costs the pass its findings; a cut-off one keeps its complete sections (`report_salvaged`); cut off before the model's call, a
+   first report gets its verdict from the rule alone and a later one leaves the last pass's report standing.
    To change a knob, add it to the agent
    image's `ENV` in `Dockerfile.stack-worker` (all `REA_*` keys are reserved).
    The sweep's `rea.report/1` carries an optional `chain_stop` (`not_native`, `ghidra_failed`,

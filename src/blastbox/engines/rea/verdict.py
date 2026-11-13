@@ -184,7 +184,9 @@ def model_grounds(raw: Any, *, known: set[str] | None,
     its script, which has no address), and an evidence-only one ``known=set()`` (only sources
     count). One ground per code (its lowest citation), hostile
     codes first and each tier in vocabulary order: the same rows in any order give the same
-    grounds, and one more row never takes a ground away.
+    grounds, and one more row never takes a ground away. That holds for the rows looked at: a
+    code's citations past ``PER_CODE`` (the schema allows one) and list rows past ``MAX_ROWS``
+    are dropped unread, so there the order decides which are checked.
 
     ``raw`` is the checklist the report schema asks for, ``{code: [citation] or []}`` with every
     code answered (an empty or missing answer is "no", not a dropped ground), or a list of
@@ -268,14 +270,17 @@ def resources_unread(sweep: dict[str, Any]) -> str:
     return ""
 
 
-def decide(opinion: str, grounds: list[Ground], *, code_read: bool, resources_unread: str = "") -> Decision:
+def decide(opinion: str, grounds: list[Ground], *, code_read: bool, resources_unread: str = "",
+           called: bool = True) -> Decision:
     """The verdict for the model's call and the checked grounds.
 
     ``code_read``: the pass read the program's code (functions, or the sample's own decompiled
     C#), which a benign verdict needs. ``resources_unread``: what the .NET resource scan did not
     read (:func:`resources_unread`), any of which may hide an executable; a benign verdict needs
-    it empty.
+    it empty. ``called=False``: the report was cut off before the model's call, so ``opinion`` is
+    ``unknown`` in its place and the rule line says so.
     """
+    call = opinion if called else "cut off"
     hostile = {g.code for g in grounds if g.tier == HOSTILE}
     concealing = [g for g in grounds if g.tier == CONCEALING]
     codes = {g.code for g in grounds}
@@ -294,7 +299,7 @@ def decide(opinion: str, grounds: list[Ground], *, code_read: bool, resources_un
                   or (bool(hostile) and opinion == "suspicious"))
         confidence = "medium" if strong else "low"
         if hostile:
-            held = f", not malicious (the model's call was {opinion} and no engine ground is hostile),"
+            held = f", not malicious (the model's call was {call} and no engine ground is hostile),"
     elif opinion in ("malicious", "suspicious"):
         label, confidence = "suspicious", "low"
         why = f"the model's call ({opinion}) cites no ground the engine could check."
@@ -307,10 +312,10 @@ def decide(opinion: str, grounds: list[Ground], *, code_read: bool, resources_un
                f"a benign call needs the .NET resources read, and {resources_unread}.")
     else:
         label, confidence = "unknown", "low"
-        why = "no ground either way."
+        why = "no ground either way." if called else "the report was cut off before the model's call."
     if grounds:
         line = _line(f"{RULE_LINE}{label}/{confidence}{held} on ", cites,
-                     f" Model's call: {opinion}." if opinion != label and not held else "")
+                     f" Model's call: {call}." if (opinion != label or not called) and not held else "")
     else:
         line = f"{RULE_LINE}{label}/{confidence}; {why}"
     return Decision(label=label, confidence=confidence, grounds=list(grounds), opinion=opinion, rule_line=line)
@@ -339,8 +344,15 @@ def _rationale(rule_line: str, text: str) -> str:
     return f"{rule_line}\n{MODEL_LINE}{own}"
 
 
+def model_called(obj: Any) -> bool:
+    """Whether a model-written report carries the model's own call: a verdict label in the enum."""
+    verdict = obj.get("verdict") if isinstance(obj, dict) else None
+    label = verdict.get("label") if isinstance(verdict, dict) else None
+    return isinstance(label, str) and label in REPORT_LABELS
+
+
 def apply(obj: Any, *, sweep: dict[str, Any], known: set[str] | None, sources: Collection[str] | None,
-          code_read: bool) -> Decision | None:
+          code_read: bool, cut_off: bool = False) -> Decision | None:
     """Replace a model-written report's verdict (``label``/``grounds``/``rationale``) with the
     rule's, in the wire shape, and return the decision.
 
@@ -349,17 +361,26 @@ def apply(obj: Any, *, sweep: dict[str, Any], known: set[str] | None, sources: C
     not a string, which is left as it is. A rationale of any length is cut to fit beside the rule
     line: the generation schema's ``maxLength`` is not enforced by every server, and a model that
     wrote past ``REPORT_RATIONALE`` cost the sample its whole report.
+
+    ``cut_off``: ``obj`` is what was left of a report that ran out of output. The verdict is
+    written last, so the cut takes its end first. Without the rationale the rule line stands
+    alone; without the label the rule decides with no call of the model's (``unknown`` in its
+    place), on the engine's grounds and any the model finished.
     """
-    verdict = obj.get("verdict") if isinstance(obj, dict) else None
-    if not isinstance(verdict, dict):
+    if not isinstance(obj, dict):
         return None
-    opinion = verdict.get("label")
-    if not isinstance(opinion, str) or opinion not in REPORT_LABELS:
+    called = model_called(obj)
+    if not called and not cut_off:
         return None
+    raw = obj.get("verdict")
+    verdict: dict[str, Any] = raw if isinstance(raw, dict) else {}
+    opinion: str = verdict["label"] if called else "unknown"
     cited, dropped = model_grounds(verdict.get("grounds"), known=known, sources=sources)
     decision = replace(decide(opinion, engine_grounds(sweep) + cited, code_read=code_read,
-                              resources_unread=resources_unread(sweep)), dropped=dropped)
+                              resources_unread=resources_unread(sweep), called=called), dropped=dropped)
     rationale = verdict.get("rationale")
+    if cut_off and not (called and isinstance(rationale, str)):
+        rationale = ""
     if isinstance(rationale, str):
         rationale = _rationale(decision.rule_line, rationale[:_RATIONALE_READ])
     obj["verdict"] = {"label": decision.label, "confidence": decision.confidence, "rationale": rationale}

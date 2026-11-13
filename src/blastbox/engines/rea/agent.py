@@ -149,6 +149,7 @@ from blastbox.engines.rea.sweep import (
 )
 from blastbox.engines.rea.verdict import HOSTILE
 from blastbox.engines.rea.verdict import apply as apply_verdict_rule
+from blastbox.engines.rea.verdict import model_called
 from blastbox.engines.rea.wellformed import well_formed
 from blastbox.limits import Limits
 from blastbox.worker.engine import DetonationResult
@@ -1522,7 +1523,8 @@ class ReaAgentEngine:
         at the measured rate; otherwise asks for ``min(REA_REPORT_MAX_TOKENS, what fits)``. A model
         error is ``report_failed``, a report that violates the schema ``report_invalid``; either
         way the rest of the pass seals unchanged. A cut-off report keeps its complete sections
-        (``report_salvaged``).
+        (``report_salvaged``); one cut off before the model's call gets its verdict from the rule
+        alone, or, when the last pass left a report, is dropped for that one.
         """
         try:
             tps = self._measured_tps(p)
@@ -1587,8 +1589,12 @@ class ReaAgentEngine:
             # (a function pass) a code tool returned a function's code to this chain. An address
             # in ``explored`` is not that: a metadata call or the model's own list puts one there.
             code_read = sample_decompiled(p.sweep) or (not sources and p.code_read)
+            # A cut-off report loses the end of its verdict first (it is written last). One cut
+            # before the model's call keeps its finished sections under a verdict the rule sets
+            # without that call, unless the last pass left a whole report: that one stands.
+            cut_off = salvaged and (p.prior_report is None or model_called(obj))
             decision = apply_verdict_rule(obj, sweep=p.sweep, known=known, sources=sources or script,
-                                          code_read=code_read)
+                                          code_read=code_read, cut_off=cut_off)
             try:
                 v = validate_report(obj, p.pass_no, known, sources=sources or (),
                                     basis=REPORT_BASIS if sources else None)
@@ -1724,10 +1730,12 @@ class ReaAgentEngine:
         front of the todo list. The model's ``done`` flag is recorded but decides nothing.
         """
         report = p.report if p.report is not None else p.prior_report
-        # A pass that wrote no report is measured on the carried one, with the call behind it.
+        # A pass that wrote no report is measured on the carried one, with the call behind it,
+        # and does not meet the bar: that report was written before what this pass read.
         suff = assess(report=report, sweep=p.sweep, explored=p.explored, opened=p.opened,
                       program_functions=p.program_functions,
-                      opinion=p.opinion if p.report is not None else state.opinion)
+                      opinion=p.opinion if p.report is not None else state.opinion,
+                      carried=p.report is None)
         known = set(state.facts)
         before = set(state.opened)
         fresh = [a for a in p.opened if a not in before]  # code first read this pass is progress too

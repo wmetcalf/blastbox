@@ -320,9 +320,11 @@ _VERDICT_RULE = (
 _SCRIPT_GROUNDS = (
     " The submitted file is an installer and the sweep read its install script ({keys}: script_strings, "
     "script_imports). The verdict is about the submitted installer, not only the file it carried: a ground "
-    "the install script itself shows (it downloads a file and runs it, sends data to a server, writes a "
-    "startup entry) is answered with {cites} in place of a function address. A ground a function shows is "
-    "answered with that function's address as usual.")
+    "the install script itself shows (it fetches further code and runs it unasked, sends the user's data "
+    "out covertly, starts itself at login under a name that imitates something else) is answered with "
+    "{cites} in place of a function address. The grounds keep their meaning: installing its own program, "
+    "starting it at login under its own name and fetching its own files are what an installer does and "
+    "are not grounds. A ground a function shows is answered with that function's address as usual.")
 _REPORT_VERDICT = (
     "verdict, written last, after the sections, and following from them: the grounds, your own call "
     "(benign, suspicious, malicious or unknown) and a short rationale. It is an opinion from the evidence above. Use \"unknown\" only when the analysis could not "
@@ -373,8 +375,8 @@ Sections, each exactly once, in this order: {keys}.
 A string or IOC in the sample's bytes shows the program carries that value, not that it uses it: write "contains", not "connects to", unless emulation or decompiled code shows the use. A capability rule or signature match is a pattern over the bytes: name the rule and say what it indicates. not_observed and not_analysed sections get one short sentence and no evidence. The unknowns section must say which code was not read and what that leaves unexplained. Plain prose, no markdown headings, no lists."""
 
 _EVIDENCE_VERDICT = (
-    "verdict: your own call (benign, suspicious, malicious or unknown), the grounds for it, and a short "
-    "rationale. It is an opinion from the evidence above. A recovered concealed stage, a signature match "
+    "verdict, written last, after the sections, and following from them: the grounds, your own call "
+    "(benign, suspicious, malicious or unknown) and a short rationale. It is an opinion from the evidence above. A recovered concealed stage, a signature match "
     "that names a malware family, hostile behaviour seen in emulation or in decompiled code can each carry "
     "a suspicious or malicious call; say which one it rests on. Code built to hide what it does (a packed "
     "or encrypted stage decrypted and loaded at run time, a payload hidden in resources or image pixels, an "
