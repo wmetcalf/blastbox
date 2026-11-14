@@ -268,6 +268,12 @@ do not behave alike. Two more build args narrow the choice, both empty by defaul
 `REA_MODEL_REQUIRE_PARAMETERS=1` sends `provider.require_parameters`. A setting that leaves no
 host fails the model call; the engine never widens it.
 
+Every request also sends `provider.zdr: true` and `provider.data_collection: "deny"`, and no
+setting turns that off: only hosts that neither retain nor train on prompts are used. In one
+control run, three of the eighteen hosts serving the model (Alibaba, Baidu, StreamLake) refuse zero
+retention. A model that no such host serves fails with HTTP 404 ("No endpoints found matching your
+data policy").
+
 The key file is one line, mode 0400, owned by the gateway's uid (1000), never committed
 (`model-gw/.gitignore`):
 

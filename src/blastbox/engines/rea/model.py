@@ -24,6 +24,8 @@
   ``provider.only``, and ``REA_MODEL_REQUIRE_PARAMETERS=1`` sends
   ``provider.require_parameters`` (only hosts that support every parameter of the request).
   A setting that leaves no host fails the call as ``unavailable``; it is never widened here.
+  Every OpenRouter request also sends ``provider.zdr`` and ``provider.data_collection: deny``
+  (``DATA_POLICY``), whatever the settings: no host that retains or trains on prompts is used.
 """
 
 from __future__ import annotations
@@ -54,6 +56,10 @@ _MAX_PROVIDERS = 8
 _PROVIDER_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,47}")
 
 
+#: Sent on every OpenRouter request: zero data retention and no training on prompts.
+DATA_POLICY: dict[str, Any] = {"zdr": True, "data_collection": "deny"}
+
+
 def _routing(dialect: str) -> dict[str, Any] | None:
     """The OpenRouter ``provider`` object the image asked for, or None. Raises on a bad setting."""
     raw_only = (os.environ.get("REA_MODEL_PROVIDERS") or "").strip()
@@ -71,11 +77,15 @@ def _routing(dialect: str) -> dict[str, Any] | None:
         raise ValueError("REA_MODEL_PROVIDERS has an entry that is not a host slug "
                          "(letters, digits and . _ / -, at most 48 characters)")
     routing: dict[str, Any] = {}
+    if dialect == "openrouter":
+        # Not a setting: an OpenRouter request always forbids retention and training, so a
+        # model no such host serves fails the call rather than reaching one that keeps prompts.
+        routing.update(DATA_POLICY)
     if only:
         routing["only"] = only
     if raw_req == "1":
         routing["require_parameters"] = True
-    if routing and dialect != "openrouter":
+    if (only or raw_req == "1") and dialect != "openrouter":
         raise ValueError("REA_MODEL_PROVIDERS and REA_MODEL_REQUIRE_PARAMETERS need REA_MODEL_DIALECT=openrouter")
     return routing or None
 

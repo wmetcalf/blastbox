@@ -2421,7 +2421,33 @@ def test_openrouter_routing_is_the_images_choice_and_off_by_default(monkeypatch,
     op = FakeOpener(json.dumps({"choices": [{"message": {"content": "{}"}}]}).encode())
     ModelClient("http://gw:8080/api/v1", "deepseek/deepseek-v4.1-flash", 30, opener=op).chat(
         [{"role": "user", "content": "hi"}], [], 512)
-    assert json.loads(op.requests[0].data).get("provider") == want
+    # Every OpenRouter request also carries the data policy (zero retention, no training).
+    assert json.loads(op.requests[0].data).get("provider") == {**DATA_POLICY, **(want or {})}
+
+
+DATA_POLICY = {"zdr": True, "data_collection": "deny"}
+
+
+def test_every_openrouter_request_forbids_retention_and_training(monkeypatch):
+    # 2026-11-14: unpinned, one control run was served by 18 hosts, three of which (Alibaba, Baidu,
+    # StreamLake) refuse zero data retention. The policy is not an image setting: there is no way
+    # to send an OpenRouter request without it, and a model no compliant host serves fails the call.
+    monkeypatch.setenv("REA_MODEL_DIALECT", "openrouter")
+    monkeypatch.setenv("REA_MODEL_PROVIDERS", "Alibaba")
+    op = FakeOpener(json.dumps({"choices": [{"message": {"content": "{}"}}]}).encode())
+    ModelClient("http://gw:8080/api/v1", "deepseek/deepseek-v4.1-flash", 30, opener=op).chat(
+        [{"role": "user", "content": "hi"}], [], 512)
+    sent = json.loads(op.requests[0].data)["provider"]
+    assert sent["zdr"] is True and sent["data_collection"] == "deny"
+
+
+def test_a_vllm_request_carries_no_provider_object(monkeypatch):
+    monkeypatch.setenv("REA_MODEL_DIALECT", "vllm")
+    for key in ("REA_MODEL_PROVIDERS", "REA_MODEL_REQUIRE_PARAMETERS"):
+        monkeypatch.delenv(key, raising=False)
+    op = FakeOpener(json.dumps({"choices": [{"message": {"content": "{}"}}]}).encode())
+    ModelClient("http://m:1/v1", "x", 30, opener=op).chat([{"role": "user", "content": "hi"}], [], 512)
+    assert "provider" not in json.loads(op.requests[0].data)
 
 
 @pytest.mark.parametrize("dialect, env", [
