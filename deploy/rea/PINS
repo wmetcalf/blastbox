@@ -6,10 +6,10 @@
 # release (rea-agents 6.8.0) lacks the existing-project reuse mode
 # (REA_GHIDRA_PROJECT_PATH / REA_GHIDRA_PROGRAM_NAME). The build self-reports
 # "6.8.0", so it is identified by commit, tarball digest and catalog digest.
-REA_COMMIT=cd878ad57d3e27e835d0db533c9603b24ae8607a
-REA_TARBALL_URL=https://codeload.github.com/morluto/rea/tar.gz/cd878ad57d3e27e835d0db533c9603b24ae8607a
-REA_TARBALL_SHA256=44cec1b6be85a8ccf1576ca397594cdab2aacfbfc316cc817e5f568f7b7ad766
-REA_TOOLS_SHA256=c819d694c65bd1482a0e780ff1848542f2046fe50a6b68fc366066b593d7e58f
+REA_COMMIT=d74549e495c58eb4a560279fd9f05508401ea0a0
+REA_TARBALL_URL=https://codeload.github.com/morluto/rea/tar.gz/d74549e495c58eb4a560279fd9f05508401ea0a0
+REA_TARBALL_SHA256=325bd045b0f065ef8d78477a8570f3c180e74f640ca9d91fc8b6df6573798cd9
+REA_TOOLS_SHA256=b3054fab57a222a4690d93cdba88805d7cbd2e6c0279dd596eecf213030c3797
 
 # Node: REA requires ^22.23.4 || ^24.22.1 || >=26.12.1.
 NODE_VERSION=v22.23.4
