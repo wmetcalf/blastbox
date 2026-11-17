@@ -43,6 +43,8 @@ The rule (:func:`decide`):
 ```text
 any hostile ground      malicious   high: the pixel-hidden executable, two hostile grounds, or an
                                     engine ground beside any second ground; else medium
+  ... a family          suspicious  medium, when the model's own call was not malicious: a YARA
+  signature alone                   rule can match an unrelated file
   ... all of them the   suspicious  when the model's own call was not malicious. medium: its call
   model's                           was suspicious, or as for concealing grounds; else low
 concealing grounds only suspicious  medium: an engine ground, or two model grounds; else low
@@ -286,7 +288,15 @@ def decide(opinion: str, grounds: list[Ground], *, code_read: bool, resources_un
     codes = {g.code for g in grounds}
     cites = [g.cite for g in sorted(grounds, key=lambda g: -g.tier)]  # hostile first; stable within a tier
     held = ""
-    if hostile and (opinion == "malicious" or any(g.engine for g in grounds if g.tier == HOSTILE)):
+    # A YARA rule can match an unrelated file: a family signature with nothing else beside it
+    # flags the sample but does not outrank the model's call (live: Krita and rclone read
+    # malicious on one WinosStager / EternalRomanceExploit match each, over a model that read the
+    # code and called them suspicious and unknown).
+    lone_family = codes == {"family_signature"} and opinion != "malicious"
+    if lone_family:
+        label, confidence = "suspicious", "medium"
+        held = f", not malicious (a family signature alone and the model's call was {call}),"
+    elif hostile and (opinion == "malicious" or any(g.engine for g in grounds if g.tier == HOSTILE)):
         label = "malicious"
         strong = (CONCLUSIVE in hostile or len(hostile) >= 2
                   or (any(g.engine for g in grounds) and len(codes) >= 2))

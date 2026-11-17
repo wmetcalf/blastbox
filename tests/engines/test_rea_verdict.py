@@ -291,7 +291,13 @@ def test_a_sealed_reports_unknown_addresses_are_not_checked():
 
 @pytest.mark.parametrize(("opinion", "grounds", "code_read", "want"), [
     # hostile grounds: malicious whatever the model called it
-    ("benign", [_g("family_signature", engine=True)], True, ("malicious", "medium")),
+    ("malicious", [_g("family_signature", engine=True)], True, ("malicious", "medium")),
+    # ... except a family signature that nothing else backs: YARA rules match unrelated files
+    ("benign", [_g("family_signature", engine=True)], True, ("suspicious", "medium")),
+    ("suspicious", [_g("family_signature", engine=True)], True, ("suspicious", "medium")),
+    ("unknown", [_g("family_signature", engine=True)], False, ("suspicious", "medium")),
+    ("benign", [_g("family_signature", engine=True), _g("dual_use_signature", CONCEALING, True)], True,
+     ("malicious", "high")),
     ("malicious", [_g("process_injection")], True, ("malicious", "medium")),
     ("malicious", [_g("process_injection"), _g("remote_control")], True, ("malicious", "high")),
     ("unknown", [_g("pixel_hidden_executable", engine=True)], False, ("malicious", "high")),
@@ -335,8 +341,8 @@ def test_the_rule(opinion, grounds, code_read, want):
 
 
 def test_the_rule_line_names_the_grounds_and_a_differing_call():
-    d = decide("benign", [_g("family_signature", engine=True)], code_read=True)
-    assert d.rule_line == "Rule: malicious/medium on family_signature. Model's call: benign."
+    d = decide("benign", [_g("family_signature", engine=True), _g("process_injection")], code_read=True)
+    assert d.rule_line == "Rule: malicious/high on family_signature; process_injection. Model's call: benign."
     d = decide("malicious", [_g("process_injection")], code_read=True)
     assert d.rule_line == "Rule: malicious/medium on process_injection."
     d = decide("malicious", [], code_read=True)
@@ -366,6 +372,27 @@ def test_the_rule_line_says_when_the_models_own_call_held_the_label_down():
     grounds = [Ground(code=f"c{i}", tier=HOSTILE, engine=False, cite="x" * 60 + str(i)) for i in range(8)]
     line = decide("suspicious", grounds, code_read=True).rule_line
     assert len(line) <= 199 and "no engine ground is hostile" in line and line.endswith(".")
+
+
+def test_a_family_signature_alone_does_not_outrank_the_models_call():
+    # Live (benign control, 46 vendor programs): Krita matched a WinosStager rule and rclone an
+    # EternalRomanceExploit rule; the model read the code and called them suspicious and unknown,
+    # and nothing else in either sweep was hostile or concealing, yet both read malicious/medium.
+    # A rule can match an unrelated file, so a lone match flags the sample, it does not convict it.
+    for call in ("suspicious", "unknown", "benign"):
+        d = decide(call, [_g("family_signature", engine=True)], code_read=True)
+        assert (d.label, d.confidence) == ("suspicious", "medium")
+        assert d.rule_line == (f"Rule: suspicious/medium, not malicious (a family signature alone and the "
+                               f"model's call was {call}), on family_signature.")
+    # The model's own malicious call over the match stands, and so does any second ground beside it
+    # (the Salat stealer: the match plus the model's credential theft at a real address).
+    assert decide("malicious", [_g("family_signature", engine=True)], code_read=True).label == "malicious"
+    d = decide("suspicious", [_g("family_signature", engine=True), _g("credential_theft")], code_read=True)
+    assert (d.label, d.confidence) == ("malicious", "high")
+    obj = _obj("suspicious")
+    apply(obj, sweep={"signatures": SIG}, known=KNOWN, sources=(), code_read=True)
+    assert (obj["verdict"]["label"], obj["verdict"]["confidence"]) == ("suspicious", "medium")
+    assert obj["verdict"]["rationale"].startswith("Rule: suspicious/medium, not malicious (a family signature")
 
 
 def test_a_benign_call_needs_every_resource_read():
