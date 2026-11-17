@@ -283,6 +283,8 @@ COPY --from=rea-fixtures-build /out/ /
 FROM ${JDK_IMAGE}
 # REA's MCP tool-catalog digest for the pinned commit (see deploy/rea/PINS).
 ARG REA_TOOLS_SHA256=b3054fab57a222a4690d93cdba88805d7cbd2e6c0279dd596eecf213030c3797
+# The REA build, named again here so the agent can record it in each pass transcript (the ledger).
+ARG REA_COMMIT=d74549e495c58eb4a560279fd9f05508401ea0a0
 # The sweep upx -d-s UPX-marked samples (a static decompressor; the sample never runs).
 ARG UPX_VERSION=4.2.4-1.1build1
 # The sweep unwraps NSIS installers with 7-Zip (7z x -tNsis; a static decompressor, the installer
@@ -334,7 +336,9 @@ ENV PATH=/opt/blastbox/bin:/opt/node/bin:$PATH \
     GHIDRA_INSTALL_DIR=/opt/ghidra \
     REA_BIN=/opt/rea/bin/rea \
     REA_GHIDRA_SCRIPTS=/opt/rea/ghidra_scripts \
-    REA_ANALYSIS_PROVIDER=ghidra
+    REA_ANALYSIS_PROVIDER=ghidra \
+    REA_COMMIT=${REA_COMMIT} \
+    REA_TOOLS_SHA256=${REA_TOOLS_SHA256}
 
 USER 10001:10001
 

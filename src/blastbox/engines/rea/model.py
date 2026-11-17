@@ -12,7 +12,8 @@
   can therefore not stretch a call past the pass budget (Ruling Q).
 - Transport and HTTP failures raise ``ModelError("unavailable")``; an oversized, non-JSON or
   non-object body raises ``ModelError("malformed")``. Interpreting ``choices`` is the
-  caller's job (the agent parses it defensively); ``reasoning_content`` is never used.
+  caller's job (the agent parses it defensively). Reasoning in the reply is never sent back:
+  the agent writes it to the pass transcript only (``agent._reasoning``, ``reasoning_policy``).
 - ``REA_MODEL_DIALECT`` (baked into the agent image; default ``vllm``) says how the "thinking
   off" switch is spelled: ``vllm`` sends ``chat_template_kwargs``; ``openrouter`` sends
   ``reasoning: {"enabled": false}`` (OpenRouter ignores ``chat_template_kwargs``). Credentials

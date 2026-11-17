@@ -108,6 +108,7 @@ model was not consulted because no Ghidra project or MCP session could be had.
 from __future__ import annotations
 
 import bisect
+import hashlib
 import json
 import logging
 import mmap
@@ -127,6 +128,7 @@ from blastbox.engines.rea.continuation import ContinuationError, GhidraStatus, S
 from blastbox.engines.rea.gostrings import clip_overruns, exact_iocs, go_strings
 from blastbox.engines.rea.mcp_client import McpError, McpStdioClient
 from blastbox.engines.rea.model import ModelClient, ModelError
+from blastbox.engines.rea.reasoning_policy import capture_allowed
 from blastbox.engines.rea.policy import ADDRESS_RE, TOOL_ALLOWLIST, CallRefused, check_call, model_tool_specs, safe_name
 from blastbox.engines.rea.prompts import (
     IOC_TYPES,
@@ -191,6 +193,12 @@ MAX_ADDRESSES = 500_000
 MAX_RESULT_IOCS = 20_000
 
 MAX_TRANSCRIPT_BYTES = 4 * 1024 * 1024
+# A pass that keeps the model's reasoning may grow to this; MAX_TRANSCRIPT_BYTES of it stays
+# reserved for everything else (TranscriptWriter drops reasoning first).
+MAX_TRANSCRIPT_REASONING_BYTES = 16 * 1024 * 1024
+_OFF = ("0", "false", "no", "off")
+# The instructions in force: a digest of the prompts module as shipped (the ledger's `start`).
+_PROMPT_SHA256 = hashlib.sha256(Path(__file__).with_name("prompts.py").read_bytes()).hexdigest()
 TRANSCRIPT_TEXT = 64 * 1024
 
 MAX_SUMMARY = 8000
@@ -450,8 +458,12 @@ class TranscriptWriter:
 
     _MARKER = json.dumps({"event": "truncated", "reason": "transcript cap reached"}) + "\n"
 
-    def __init__(self, path: Path, cap: int, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, path: Path, cap: int, clock: Callable[[], float] = time.monotonic,
+                 reasoning_reserve: int = 0) -> None:
         self.path = path
+        # Bytes kept free of reasoning: a line whose reasoning would eat into them is written
+        # without it (``reasoning_dropped``), so evidence outlives the model's thoughts.
+        self.reasoning_reserve = max(0, reasoning_reserve)
         self._clock = clock
         self._t0 = clock()
         self.cap = max(len(self._MARKER), cap)
@@ -464,6 +476,11 @@ class TranscriptWriter:
             return False
         stamped = {"t": round(self._clock() - self._t0, 2), **obj}
         line = json.dumps(stamped, ensure_ascii=True, default=str) + "\n"
+        if ("reasoning" in stamped
+                and self.size + len(line) + len(self._MARKER) > self.cap - self.reasoning_reserve):
+            stamped = {k: v for k, v in stamped.items() if k != "reasoning"}
+            stamped["reasoning_dropped"] = True
+            line = json.dumps(stamped, ensure_ascii=True, default=str) + "\n"
         if self.size + len(line) + len(self._MARKER) > self.cap:
             self._f.write(self._MARKER)
             self.size += len(self._MARKER)
@@ -855,6 +872,7 @@ class _Pass:
     turn_tokens: int = DEFAULT_TURN_MAX_TOKENS
     tokens_per_s: float = DEFAULT_TOKENS_PER_S
     final_thinking: bool = False  # REA_FINAL_THINKING: keep the model's reasoning on for the final answer
+    retain_reasoning: bool = False  # write the model's reasoning to the transcript (never sent back)
     good_turns: int = 0  # model responses that parsed (with or without tool calls)
     report_tokens: int = DEFAULT_REPORT_TOKENS
     report: dict[str, Any] | None = None  # this pass's validated rea.analysis/1 report
@@ -922,6 +940,8 @@ class ReaAgentEngine:
         reserve_tokens = min(max_tokens + report_tokens,
                              _env_int("REA_RESERVE_TOKENS", DEFAULT_RESERVE_TOKENS, 256, 262144))
         model_id = os.environ.get("REA_MODEL_ID") or DEFAULT_MODEL_ID
+        retain = (os.environ.get("REA_RETAIN_REASONING", "").strip().lower() not in _OFF
+                  and capture_allowed(model_id))
 
         # 1. unpack + integrity
         unpack_cap = min(_env_int("REA_MAX_UNPACK_BYTES", DEFAULT_MAX_UNPACK_BYTES, 1 << 20, 1 << 40),
@@ -943,14 +963,23 @@ class ReaAgentEngine:
                   turn_tokens=turn_tokens, tokens_per_s=tokens_per_s,
                   final_thinking=os.environ.get("REA_FINAL_THINKING", "").strip().lower()
                   in ("1", "true", "yes", "on"),
+                  retain_reasoning=retain,
                   report_tokens=report_tokens, prior_report=_sealed_report(state.analysis_report),
                   prior_called=state.opinion is not None,
                   sweep=dict(state.sweep), program_functions=list(state.program_functions))
         transcript_path = outdir / "transcript.jsonl"
-        tw = TranscriptWriter(transcript_path, min(MAX_TRANSCRIPT_BYTES, limits.max_artifact_bytes), self._clock)
+        base_cap = min(MAX_TRANSCRIPT_BYTES, limits.max_artifact_bytes)
+        if p.retain_reasoning:
+            tw = TranscriptWriter(transcript_path, min(MAX_TRANSCRIPT_REASONING_BYTES, limits.max_artifact_bytes),
+                                  self._clock, reasoning_reserve=base_cap)
+        else:
+            tw = TranscriptWriter(transcript_path, base_cap, self._clock)
         tw.write({"event": "start", "pass_no": p.pass_no, "model": model_id, "wall_budget_s": round(wall, 1),
                   "max_steps": max_steps, "max_tokens": max_tokens, "turn_tokens": turn_tokens,
-                  "report_tokens": report_tokens, "final_reserve_s": round(p.final_reserve_s, 1)})
+                  "report_tokens": report_tokens, "final_reserve_s": round(p.final_reserve_s, 1),
+                  "rea_build": os.environ.get("REA_COMMIT", ""),
+                  "tools_sha256": os.environ.get("REA_TOOLS_SHA256", ""),
+                  "prompt_sha256": _PROMPT_SHA256, "retain_reasoning": p.retain_reasoning})
 
         ghidra_status: GhidraStatus = state.ghidra_status
         program_name = state.program_name
@@ -1034,7 +1063,7 @@ class ReaAgentEngine:
             code_read=p.code_read if p.accepted else state.code_read,
             opened=p.opened[-MAX_EXPLORED:] if p.accepted else list(state.opened),
         )
-        transcript_reserve = min(MAX_TRANSCRIPT_BYTES, limits.max_artifact_bytes)
+        transcript_reserve = tw.cap
         if p.model_status == "ok" and p.assessed:
             more = not p.stop_reason
         elif p.model_status == "ok":
@@ -1369,7 +1398,7 @@ class ReaAgentEngine:
             p.good_turns += 1
             content, calls = parsed
             tw.write({"event": "model_turn", "step": p.steps, "content": (content or "")[:TRANSCRIPT_TEXT],
-                      **_response_info(resp),
+                      **_response_info(resp), **_reasoning_fields(resp, p.retain_reasoning),
                       "tool_calls": [{"id": c["id"], "name": c["name"], "arguments": c["raw"][:2048]}
                                      for c in calls]})
             if not calls:
@@ -1475,7 +1504,7 @@ class ReaAgentEngine:
             content = parsed[0] if parsed is not None else None
             info = _response_info(resp)
             tw.write({"event": "final_turn", "attempt": attempt + 1, "content": (content or "")[:TRANSCRIPT_TEXT],
-                      **info})
+                      **info, **_reasoning_fields(resp, p.retain_reasoning)})
             answer = parse_final(content)
             if answer is not None:
                 return answer
@@ -1589,7 +1618,8 @@ class ReaAgentEngine:
                 content = parsed[0] if parsed is not None else None
                 info = _response_info(resp)
                 tw.write({"event": "report_turn", "max_tokens": tokens,
-                          "content": (content or "")[:TRANSCRIPT_TEXT], **info, **({"retry": retry} if retry else {})})
+                          "content": (content or "")[:TRANSCRIPT_TEXT], **info,
+                          **_reasoning_fields(resp, p.retain_reasoning), **({"retry": retry} if retry else {})})
                 # The whole output budget spent and nothing written (a host that reasons whatever
                 # the request says): the same call once more, while the time left still holds it.
                 if (content or "").strip() or info["finish_reason"] != "length":
@@ -1922,11 +1952,53 @@ def _response_info(resp: Any) -> dict[str, Any]:
     return {"finish_reason": finish, "completion_tokens": tokens, "provider": provider, "served_model": served}
 
 
+def _reasoning(resp: Any) -> str | None:
+    """The model's reasoning text from a chat-completions response, or None.
+
+    ``message.reasoning`` (OpenRouter), else ``reasoning_content`` (vLLM), else the text of the
+    ``reasoning.text`` / ``reasoning.summary`` items of ``reasoning_details``. Encrypted
+    reasoning is no text and gives None. It is kept in the transcript only, never sent back.
+    """
+    if not isinstance(resp, dict):
+        return None
+    choices = resp.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return None
+    msg = choices[0].get("message")
+    if not isinstance(msg, dict):
+        return None
+    for key in ("reasoning", "reasoning_content"):
+        text = msg.get(key)
+        if isinstance(text, str) and text:
+            return text
+    details = msg.get("reasoning_details")
+    if not isinstance(details, list):
+        return None
+    parts = []
+    for d in details:
+        if not isinstance(d, dict):
+            continue
+        text = (d.get("text") if d.get("type") == "reasoning.text"
+                else d.get("summary") if d.get("type") == "reasoning.summary" else None)
+        if isinstance(text, str) and text:
+            parts.append(text)
+    return "\n".join(parts) or None
+
+
+def _reasoning_fields(resp: Any, keep: bool) -> dict[str, Any]:
+    """The transcript fields for a reply's reasoning: none unless ``keep`` and there is some."""
+    text = _reasoning(resp) if keep else None
+    if text is None:
+        return {}
+    return {"reasoning": text[:TRANSCRIPT_TEXT], "reasoning_chars": len(text)}
+
+
 def _parse_message(resp: Any) -> tuple[str | None, list[dict[str, Any]]] | None:
     """(content, tool calls) from a chat-completions response, or None when it is malformed.
 
     Each call is ``{"id", "name", "raw", "args"}``; ``args`` is None when the arguments are not
-    a JSON object (that call is refused, not the whole response). ``reasoning_content`` is ignored.
+    a JSON object (that call is refused, not the whole response). Reasoning is not part of the
+    message: :func:`_reasoning` reads it for the transcript only.
     """
     if not isinstance(resp, dict):
         return None
