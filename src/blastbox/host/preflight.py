@@ -1094,7 +1094,8 @@ def run_preflight(host: HostView, tiers: Sequence[str], *, explicit: bool = True
         out.append(_check_kvm(host))
         out.append(_check_firecracker(host))
         out.append(_check_fc_guest(host))
-    if t & {"gvisor", "firecracker"}:
+    # Snapshot age matters only where warm bases are restored: gVisor always, FC with snapshots.
+    if "gvisor" in t or ("firecracker" in t and _warm_snapshot(host.env)):
         out.append(_check_snapshot_age(host))
     if t & {"docker", "gvisor", "firecracker"}:
         roles: set[str] = set()

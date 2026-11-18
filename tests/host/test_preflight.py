@@ -1213,3 +1213,11 @@ def test_a_skipped_overflow_tier_downgrades_all_its_fails():
     by = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env)))
     assert by["firecracker"].status is Status.WARN
     assert by["kvm"].status is Status.WARN      # moot: the whole tier is skipped
+
+
+def test_snapshot_age_only_matters_for_warm_snapshot_tiers():
+    env = {"BLASTBOX_SNAPSHOT_MAX_AGE_S": "43200"}
+    assert "snapshot-age" not in _by_name(pf.run_preflight(_healthy(env=env), ["firecracker"]))
+    env["BLASTBOX_POOL_WARM_SNAPSHOT"] = "1"
+    assert _by_name(pf.run_preflight(_healthy(env=env), ["firecracker"]))["snapshot-age"].status \
+        is Status.WARN
