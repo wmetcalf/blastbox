@@ -2312,6 +2312,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pdoc.set_defaults(func=_doctor_cmd)
 
+    ppf = sub.add_parser(
+        "preflight",
+        help="read-only host preparation check (KVM, runsc, AppArmor/userns, clock, CPU "
+        "flags, scratch) per tier; never modifies the host. See docs/HOST-PREP.md",
+    )
+    ppf.add_argument(
+        "--tier",
+        action="append",
+        default=[],
+        metavar="TIER",
+        help="tier to check: docker, gvisor, firecracker, remote, or all. Repeatable. "
+        "Default: BLASTBOX_POOL_RUNTIME's tier(s), plus the cold docker tier unless the pool "
+        "is remote-only or BLASTBOX_DISPATCH_WARM_ONLY is set; every local tier when unset",
+    )
+    ppf.add_argument("--json", action="store_true", help="emit one JSON object")
+    ppf.add_argument(
+        "--strict", action="store_true", help="exit 1 on any WARN as well as on FAIL"
+    )
+    ppf.add_argument(
+        "--ack", action="append", default=[], metavar="CHECK",
+        help="with --strict, do not fail on this check's WARN (reviewed and accepted, e.g. "
+        "cpu-flags once JVM engines run with -XX:-UseBASE64Intrinsics). Repeatable; never "
+        "acknowledges a FAIL",
+    )
+    ppf.set_defaults(func=_preflight_cmd)
+
     pst = sub.add_parser(
         "stamp",
         help="emit docker build flags recording provenance, or read an image's stamp",
@@ -2845,6 +2871,24 @@ def _pins_cmd(args: argparse.Namespace) -> int:
     print("host tier, a Dockerfile ARG for the worker, a hashed lock for the")
     print("dispatcher image). They drift independently unless something checks.")
     return 1
+
+
+def _preflight_cmd(args: argparse.Namespace) -> int:
+    """Read-only host preparation report; exit 1 on FAIL (or WARN with --strict)."""
+    from blastbox.host import preflight as pf  # noqa: PLC0415 -- CLI-only
+
+    host = pf.RealHost()
+    try:
+        tiers = pf.resolve_tiers(args.tier, host.env)
+    except ValueError as exc:
+        print(f"preflight: {exc}", file=sys.stderr)
+        return 2
+    checks = pf.run_preflight(host, tiers, explicit=bool(args.tier))
+    if args.json:
+        print(pf.render_json(checks, tiers, strict=bool(args.strict), ack=set(args.ack)))
+    else:
+        print(pf.render_text(checks, tiers), end="")
+    return pf.exit_code(checks, strict=bool(args.strict), ack=set(args.ack))
 
 
 def _doctor_cmd(args: argparse.Namespace) -> int:

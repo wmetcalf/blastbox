@@ -130,7 +130,9 @@ for what a receipt does and does not prove). Consumers verify receipts with
 The defaults run a secure single-host deployment — you set almost nothing. For the warm-pool /
 runtime / sandbox tiers, **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** is the tier-decision guide
 (incl. the per-tier capability matrix) and **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** is the
-full `BLASTBOX_*` reference.
+full `BLASTBOX_*` reference. Before starting a dispatcher on a new host, follow
+**[docs/HOST-PREP.md](docs/HOST-PREP.md)** (KVM, runsc, AppArmor/userns, clock, CPU flags, scratch)
+and check it with the read-only `blastbox preflight`.
 
 ## Testing
 

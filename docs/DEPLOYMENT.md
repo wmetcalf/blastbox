@@ -2,6 +2,8 @@
 
 How to choose a deployment shape, which knobs each needs, and the per-tier capability
 constraints. For the full knob list see **[CONFIGURATION.md](CONFIGURATION.md)**.
+To prepare a host for the tier you pick (KVM, runsc, AppArmor/userns, clock, CPU flags, scratch)
+see **[HOST-PREP.md](HOST-PREP.md)** and run `blastbox preflight`.
 
 ## The two axes
 
