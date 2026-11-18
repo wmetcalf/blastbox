@@ -35,7 +35,8 @@ checks, `static` / `aws-*` members map to `remote`). The cold docker tier is add
 (file-handshake) dispatcher that is not `BLASTBOX_DISPATCH_WARM_ONLY`: network-endpoint pools have
 no cold path. The `pool-runtime` check FAILs a pool name or cascade spec the dispatcher refuses
 (unknown or set-but-empty name, unknown cascade primary, missing/zero capacity, a mix of local and
-remote tiers, `BLASTBOX_DISPATCH_WARM_ONLY` without a pool) and WARNs on an unknown overflow member,
+remote tiers, worker-mTLS and public-TLS tiers mixed under `BLASTBOX_DISPATCH_TLS_CA`,
+`BLASTBOX_DISPATCH_WARM_ONLY` without a pool) and WARNs on an unknown overflow member,
 which the dispatcher skips at startup.
 
 `blastbox preflight` checks the **host**; `blastbox doctor` checks what is **running** on it
@@ -218,9 +219,10 @@ Use the **scoped per-binary profiles** in [`deploy/apparmor/`](../deploy/apparmo
 **not** set `kernel.apparmor_restrict_unprivileged_userns=0`: that lowers a host-wide
 attack-surface control for every process. Preflight's `userns` check warns only when the
 environment actually configures something that needs a user namespace on a tier being checked
-(`BLASTBOX_SANDBOX=bwrap|nsjail` or `BLASTBOX_WORKER_RUNTIME=runc`, both only on the cold docker
-tier, the only one whose inner sandbox runs on the host kernel; `BLASTBOX_GVISOR_ROOTLESS` is the
-`gvisor-rootless` check's concern), and passes when the scoped profiles
+(cold docker workers running plain runc, forced by `BLASTBOX_WORKER_RUNTIME=runc` or the
+`BLASTBOX_ALLOW_RUNC` fallback when runsc is not registered: the only case where an inner
+nsjail/bwrap runs on the host kernel; under runsc, gVisor's Sentry implements namespaces itself;
+`BLASTBOX_GVISOR_ROOTLESS` is the `gvisor-rootless` check's concern), and passes when the scoped profiles
 are visibly loaded (securityfs is root-only; run preflight as root to confirm). `max_user_namespaces=0`
 or `unprivileged_userns_clone=0` switches user namespaces off outright: a FAIL only when something
 configured needs one, otherwise a fine hardening choice (PASS).
@@ -256,8 +258,8 @@ sudo grep -E '^(bwrap|unpriv_bwrap) ' /sys/kernel/security/apparmor/profiles   #
 
 The symlink keeps it from loading at boot or on a policy reload; `-R` removes the loaded copy.
 Preflight reports `PASS` when it is absent or disabled-and-unloaded, or active on a host where
-nothing runs host bwrap; it reports `WARN` when it is active and `BLASTBOX_SANDBOX=bwrap` or
-`BLASTBOX_WORKER_RUNTIME=runc` on the docker tier (inner sandbox not nsjail) is set, or disabled but still
+nothing runs host bwrap; it reports `WARN` when it is active and cold docker workers run plain runc
+with an inner sandbox other than nsjail, or disabled but still
 loaded. The profile attaches to bwrap only, so nsjail and rootless runsc don't trigger it. Reverse with `sudo rm /etc/apparmor.d/disable/bwrap-userns-restrict &&
 sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict`.
 

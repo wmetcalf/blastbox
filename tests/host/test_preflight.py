@@ -140,6 +140,8 @@ def _by_name(checks: list[pf.Check]) -> dict[str, pf.Check]:
 
 
 ALL = ["docker", "gvisor", "firecracker"]
+#: Cold workers on plain runc (consented): the only case with a host-kernel inner sandbox.
+_RUNC = {"BLASTBOX_WORKER_RUNTIME": "runc", "BLASTBOX_ALLOW_RUNC": "1"}
 
 
 # --- tier resolution --------------------------------------------------------------------
@@ -276,7 +278,7 @@ def test_no_docker_cli_fails():
 # --- AppArmor / userns ------------------------------------------------------------------
 
 def test_stock_bwrap_profile_present_warns_with_a_doc_pointer():
-    host = _healthy(env={"BLASTBOX_SANDBOX": "bwrap"},
+    host = _healthy(env={"BLASTBOX_SANDBOX": "bwrap", **_RUNC},
                     files={"/etc/apparmor.d/bwrap-userns-restrict": "profile bwrap ..."})
     c = _by_name(pf.run_preflight(host, ["docker"]))["bwrap-userns-restrict"]
     assert c.status is Status.WARN
@@ -318,7 +320,7 @@ def test_restricted_userns_is_fine_for_rootful_runsc_and_firecracker():
 
 
 def test_restricted_userns_warns_when_an_inner_namespace_sandbox_is_configured():
-    host = _healthy(env={"BLASTBOX_SANDBOX": "nsjail"})
+    host = _healthy(env={"BLASTBOX_SANDBOX": "nsjail", **_RUNC})
     c = _by_name(pf.run_preflight(host, ["docker"]))["userns"]
     assert c.status is Status.WARN and "deploy/apparmor" in c.detail
 
@@ -332,7 +334,7 @@ def test_restricted_userns_passes_when_the_scoped_profiles_are_loaded():
 
 
 def test_user_namespaces_switched_off_fails_when_one_is_needed():
-    host = _healthy(env={"BLASTBOX_SANDBOX": "bwrap"},
+    host = _healthy(env={"BLASTBOX_SANDBOX": "bwrap", **_RUNC},
                     files={"/proc/sys/user/max_user_namespaces": "0\n"})
     c = _by_name(pf.run_preflight(host, ["docker"]))["userns"]
     assert c.status is Status.FAIL
@@ -711,7 +713,7 @@ def test_runsc_without_checkpoint_restore_fails_the_gvisor_tier():
 
 
 def test_scoped_profile_attached_to_another_path_than_the_binary_warns():
-    host = _healthy(env={"BLASTBOX_SANDBOX": "nsjail"},
+    host = _healthy(env={"BLASTBOX_SANDBOX": "nsjail", **_RUNC},
                     executables={"nsjail": "/usr/bin/nsjail", "docker": "/usr/bin/docker",
                                  "runsc": "/usr/bin/runsc", "firecracker":
                                  "/usr/local/bin/firecracker", "timedatectl": "/usr/bin/timedatectl"},
@@ -821,7 +823,7 @@ def test_fc_slot_scratch_on_a_tmpfs_tmp_warns():
 
 
 def test_profile_attachment_compares_the_resolved_binary_only():
-    host = _healthy(env={"BLASTBOX_SANDBOX": "nsjail"},
+    host = _healthy(env={"BLASTBOX_SANDBOX": "nsjail", **_RUNC},
                     executables={"nsjail": "/usr/local/bin/nsjail", "docker": "/usr/bin/docker"},
                     links={"/usr/local/bin/nsjail": "/opt/nsjail/bin/nsjail"},
                     files={"/sys/kernel/security/apparmor/profiles":
@@ -844,7 +846,7 @@ def test_stock_bwrap_profile_only_warns_when_something_nests_bwrap():
                            "/var/lib/blastbox/fc/rootfs.ext4"})
     assert _by_name(pf.run_preflight(host, ["firecracker"]))["bwrap-userns-restrict"].status \
         is Status.PASS
-    host.env["BLASTBOX_SANDBOX"] = "bwrap"
+    host.env.update({"BLASTBOX_SANDBOX": "bwrap", **_RUNC})
     assert _by_name(pf.run_preflight(host, ["docker"]))["bwrap-userns-restrict"].status \
         is Status.WARN
 
@@ -1230,3 +1232,40 @@ def test_fc_overflow_skipped_for_unset_guest_knobs_downgrades_kvm():
     checks = pf.run_preflight(host, pf.resolve_tiers([], host.env))
     assert _by_name(checks)["kvm"].status is Status.WARN
     assert pf.exit_code(checks) == 0
+
+
+# --- final sweep 2 on #208 -----------------------------------------------------------------
+
+_NO_RUNSC = {("/usr/bin/docker", "info", "--format", "{{json .Runtimes}}"): (0, '{"runc":{}}', "")}
+
+
+def test_fallback_runc_counts_like_forced_runc():
+    host = _healthy(env={"BLASTBOX_ALLOW_RUNC": "1", "BLASTBOX_SANDBOX": "bwrap"}, commands=_NO_RUNSC,
+                    files={"/proc/sys/user/max_user_namespaces": "0"})
+    assert _by_name(pf.run_preflight(host, ["docker"]))["userns"].status is Status.FAIL
+
+
+def test_sandbox_knob_under_runsc_needs_no_host_userns():
+    host = _healthy(env={"BLASTBOX_SANDBOX": "nsjail"},
+                    files={"/proc/sys/user/max_user_namespaces": "0"})
+    assert _by_name(pf.run_preflight(host, ["docker"]))["userns"].status is Status.PASS
+    host2 = _healthy(env={"BLASTBOX_SANDBOX": "bwrap"},
+                     files={"/etc/apparmor.d/bwrap-userns-restrict": "profile bwrap"})
+    assert _by_name(pf.run_preflight(host2, ["docker"]))["bwrap-userns-restrict"].status \
+        is Status.PASS
+
+
+def test_cascade_mixing_mtls_and_public_tls_tiers_fails():
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "static:4,aws-lambda-microvm:16",
+           "BLASTBOX_DISPATCH_TLS_CA": "/etc/blastbox/ca.pem"}
+    assert _by_name(pf.run_preflight(_healthy(env=env), ["remote"]))["pool-runtime"].status \
+        is Status.FAIL
+    del env["BLASTBOX_DISPATCH_TLS_CA"]
+    assert _by_name(pf.run_preflight(_healthy(env=env), ["remote"]))["pool-runtime"].status \
+        is Status.PASS
+
+
+def test_text_output_survives_non_utf8_env_bytes():
+    checks = [pf.Check("scratch", Status.WARN, "BLASTBOX_JOB_ROOT=/var/lib/x\\udcff")]
+    checks[0] = pf.Check("scratch", Status.WARN, "BLASTBOX_JOB_ROOT=/var/lib/x" + chr(0xDCFF))
+    pf.render_text(checks, ["remote"]).encode("utf-8")

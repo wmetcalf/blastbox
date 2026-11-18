@@ -326,16 +326,10 @@ def _check_docker_runsc(host: HostView) -> Check:
     missing = Status.WARN if runc_allowed and forced != "runsc" else Status.FAIL
     fix = ("install it with `sudo runsc install` then `sudo systemctl reload docker` "
            "(SIGHUP -- never restart, which stops every running container)")
-    docker = host.which("docker")
-    proc = host.run([docker, "info", "--format", "{{json .Runtimes}}"]) if docker else None
-    if proc is None or proc.returncode != 0:
+    names = _docker_runtimes(host)
+    if names is None:
         return Check("docker-runsc-runtime", missing,
                      "could not read docker's runtimes (docker unreachable?)", doc)
-    try:
-        parsed = json.loads(proc.stdout.strip() or "{}")
-    except json.JSONDecodeError:
-        parsed = {}
-    names = {str(k).strip().lower() for k in (parsed if isinstance(parsed, (dict, list)) else [])}
     if "runsc" in names:
         return Check("docker-runsc-runtime", Status.PASS, "runsc is a registered docker runtime")
     extra = " (runc explicitly consented, degraded mode)" if runc_allowed else \
@@ -423,13 +417,22 @@ def _check_pool_runtime(host: HostView) -> Check | None:
             return Check("pool-runtime", Status.FAIL,
                          "BLASTBOX_POOL_TIERS mixes file-handshake (firecracker/gvisor) and "
                          "network-endpoint (static/aws-*) tiers; the dispatcher refuses a mixed "
-                         "cascade", doc)
+                         "cascade (it starts only if the odd tier is an overflow member that is "
+                         "unavailable at startup and gets skipped)", doc)
         if dropped:
             # build_cascade_runtime skips an unavailable overflow tier at startup and boots
             # on the rest -- a typo there silently shrinks the pool.
             return Check("pool-runtime", Status.WARN,
                          f"BLASTBOX_POOL_TIERS overflow member(s) {', '.join(dropped)} are unknown; "
                          f"the dispatcher skips them and runs on {', '.join(members)}", doc)
+        mtls = {m for m in members if m in ("static", "aws-ec2", "aws-ec2-hibernate")}
+        public = {m for m in members if m.startswith("aws-lambda")}
+        if host.env.get("BLASTBOX_DISPATCH_TLS_CA", "").strip() and mtls and public:
+            # CascadingRuntime.ssl_context refuses worker-mTLS and public-TLS tiers together.
+            return Check("pool-runtime", Status.FAIL,
+                         f"with BLASTBOX_DISPATCH_TLS_CA set, {', '.join(sorted(mtls))} use worker "
+                         f"mTLS but {', '.join(sorted(public))} public TLS: the dispatcher refuses "
+                         "the mixed cascade (use separate pools)", doc)
         return Check("pool-runtime", Status.PASS, f"cascade of {', '.join(members)}")
     return Check("pool-runtime", Status.PASS, f"BLASTBOX_POOL_RUNTIME={pool}")
 
@@ -604,17 +607,46 @@ def _check_snapshot_age(host: HostView) -> Check:
                  f"warm bases refresh after {value:g}s" + ("" if raw else " (default)"))
 
 
-def _needs_userns(env: Mapping[str, str], tiers: Collection[str] = ("docker",)) -> list[str]:
-    why = []
+def _docker_runtimes(host: HostView) -> set[str] | None:
+    docker = host.which("docker")
+    proc = host.run([docker, "info", "--format", "{{json .Runtimes}}"]) if docker else None
+    if proc is None or proc.returncode != 0:
+        return None
+    try:
+        parsed = json.loads(proc.stdout.strip() or "{}")
+    except json.JSONDecodeError:
+        parsed = {}
+    return {str(k).strip().lower() for k in (parsed if isinstance(parsed, (dict, list)) else [])}
+
+
+def _cold_runs_runc(host: HostView) -> bool:
+    """What runtime/docker.select_worker_runtime picks for cold workers: a forced runtime, else
+    runsc when registered, else runc (only with BLASTBOX_ALLOW_RUNC consent)."""
+    env = host.env
+    forced = env.get("BLASTBOX_WORKER_RUNTIME", "").strip().lower()
+    if forced in ("runc", "runsc"):
+        return forced == "runc"
+    runtimes = _docker_runtimes(host)
+    if runtimes is None or "runsc" in runtimes:
+        return False
+    return (_docker_flag(env.get("BLASTBOX_ALLOW_RUNC"))
+            and not _docker_flag(env.get("BLASTBOX_REQUIRE_SECURE_RUNTIME")))
+
+
+def _needs_userns(env: Mapping[str, str], tiers: Collection[str] = ("docker",), *,
+                  cold_runc: bool | None = None) -> list[str]:
+    why: list[str] = []
+    if cold_runc is None:
+        cold_runc = env.get("BLASTBOX_WORKER_RUNTIME", "").strip().lower() == "runc"
+    # A host-kernel inner sandbox exists only for cold docker workers under plain runc: under
+    # runsc the Sentry implements namespaces itself, FC guests have their own kernel, and a
+    # remote-only dispatcher runs no worker here.
+    if "docker" not in tiers or not cold_runc:
+        return why
     sandbox = env.get("BLASTBOX_SANDBOX", "").strip().lower()
-    # A remote-only dispatcher runs no worker here: its sandbox knob is the remote host's concern.
-    # The host-kernel inner sandbox runs only on the cold docker tier (FC guests have their own
-    # kernel, gVisor's Sentry implements namespaces itself; remote runs elsewhere).
-    if sandbox in ("bwrap", "nsjail") and "docker" in tiers:
+    if sandbox in ("bwrap", "nsjail"):
         why.append(f"BLASTBOX_SANDBOX={sandbox}")
-    # Only the cold docker path reads BLASTBOX_WORKER_RUNTIME (runtime/docker.py).
-    if "docker" in tiers and env.get("BLASTBOX_WORKER_RUNTIME", "").strip().lower() == "runc":
-        why.append("BLASTBOX_WORKER_RUNTIME=runc (inner nsjail/bwrap)")
+    why.append("cold workers run plain runc (inner nsjail/bwrap on the host kernel)")
     # BLASTBOX_GVISOR_ROOTLESS is not counted: the warm gVisor tier refuses it outright
     # (gvisor-rootless FAIL), and it needs blastbox-runsc, not the bwrap/nsjail profiles.
     return why
@@ -645,7 +677,7 @@ def _check_userns(host: HostView, tiers: Collection[str] = ("docker",)) -> Check
         ("apparmor_restrict_unprivileged_userns", restrict),
         ("max_user_namespaces", max_ns),
         ("unprivileged_userns_clone", clone)) if v is not None) or "no userns sysctls readable"
-    needs = _needs_userns(host.env, tiers)
+    needs = _needs_userns(host.env, tiers, cold_runc="docker" in tiers and _cold_runs_runc(host))
     if max_ns == "0" or clone == "0":
         status = Status.FAIL if needs else Status.PASS
         return Check("userns", status,
@@ -709,11 +741,9 @@ def _check_bwrap_stock_profile(host: HostView, tiers: Collection[str] = ("docker
     # The stock profile attaches to bwrap only: nsjail and rootless runsc are unaffected.
     env = host.env
     needs = []
-    if "docker" in tiers and env.get("BLASTBOX_SANDBOX", "").strip().lower() == "bwrap":
-        needs.append("BLASTBOX_SANDBOX=bwrap")
-    if ("docker" in tiers and env.get("BLASTBOX_WORKER_RUNTIME", "").strip().lower() == "runc"
-            and env.get("BLASTBOX_SANDBOX", "").strip().lower() != "nsjail"):
-        needs.append("BLASTBOX_WORKER_RUNTIME=runc (inner bwrap)")
+    if ("docker" in tiers and env.get("BLASTBOX_SANDBOX", "").strip().lower() != "nsjail"
+            and _cold_runs_runc(host)):
+        needs.append("cold workers run plain runc (inner bwrap on the host kernel)")
     if not needs:
         return Check("bwrap-userns-restrict", Status.PASS,
                      "stock profile active (irrelevant here: nothing configured runs host bwrap; "
@@ -1154,7 +1184,8 @@ def render_text(checks: Sequence[Check], tiers: Sequence[str]) -> str:
             lines.append(f"      {'':<{width}}  -> see {c.doc}")
     n = _counts(checks)
     lines.append(f"summary: {n['PASS']} pass, {n['WARN']} warn, {n['FAIL']} fail")
-    return "\n".join(lines) + "\n"
+    # Details echo env values and paths, which may carry surrogate-escaped non-UTF-8 bytes.
+    return ("\n".join(lines) + "\n").encode("utf-8", "backslashreplace").decode("utf-8")
 
 
 def render_json(checks: Sequence[Check], tiers: Sequence[str], *, strict: bool = False,
