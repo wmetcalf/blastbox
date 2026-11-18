@@ -987,3 +987,18 @@ id = "manifest"'''))
     data = _sealed_dict(_outdir(tmp_path), _result())
     data["artifacts"].append({"id": "x", "path": path, "kind": "file", "sha256": "0" * 64, "bytes": 1})
     assert "unsealable" in {v.code for v in check_envelope(load_contract(contract_path), data)}
+
+
+def test_check_envelope_refuses_ids_the_reseal_rejects(contract_path: Path, tmp_path: Path) -> None:
+    contract_path.write_text(CONTRACT.replace('''[[artifacts]]
+id = "manifest"''', '''[[artifacts]]
+id = "*"
+path = "*"
+kind = "file"
+max_count = 0
+
+[[artifacts]]
+id = "manifest"'''))
+    data = _sealed_dict(_outdir(tmp_path), _result())
+    data["artifacts"].append({"id": "bad/id", "path": "x.bin", "kind": "file", "sha256": "0" * 64, "bytes": 1})
+    assert "unsealable" in {v.code for v in check_envelope(load_contract(contract_path), data)}

@@ -374,7 +374,14 @@ def check_envelope(contract: EngineContract, envelope: Any, *, limits: Any = Non
         if parts and (parts[0] == "metadata.json" or parts[0].startswith(".metadata.json.")):
             caps.append(Violation("reserved_path", f"{a.id} at {a.path}: the seal refuses the "
                                   "reserved root metadata.json"))
+    from .envelope import DeclaredArtifact
+
     for a in env.artifacts:
+        try:   # the host re-seal rebuilds each entry as a DeclaredArtifact
+            DeclaredArtifact(id=a.id, path=a.path, kind=a.kind)
+        except ValidationError as exc:
+            caps.append(Violation("unsealable", f"artifact {a.id!r}: the host re-seal rejects it: "
+                                  f"{exc.errors()[0].get('msg', exc)}"))
         pp = PurePosixPath(a.path)
         if pp.is_absolute() or ".." in pp.parts:
             caps.append(Violation("unsealable", f"{a.id} at {a.path}: not confined to outdir (the "
