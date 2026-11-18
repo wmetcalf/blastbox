@@ -1221,3 +1221,12 @@ def test_snapshot_age_only_matters_for_warm_snapshot_tiers():
     env["BLASTBOX_POOL_WARM_SNAPSHOT"] = "1"
     assert _by_name(pf.run_preflight(_healthy(env=env), ["firecracker"]))["snapshot-age"].status \
         is Status.WARN
+
+
+def test_fc_overflow_skipped_for_unset_guest_knobs_downgrades_kvm():
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2"}
+    host = _healthy(env=env, rw=set())
+    del host.env["BLASTBOX_FC_KERNEL"], host.env["BLASTBOX_FC_ROOTFS"]
+    checks = pf.run_preflight(host, pf.resolve_tiers([], host.env))
+    assert _by_name(checks)["kvm"].status is Status.WARN
+    assert pf.exit_code(checks) == 0

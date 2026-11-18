@@ -1035,6 +1035,11 @@ def _downgrade_overflow(checks: list[Check], env: Mapping[str, str]) -> list[Che
     # A tier any of whose startup gates FAILs is skipped whole, so its other FAILs are moot too.
     skipped = {names[c.name] for c in checks
                if c.name in names and c.status is Status.FAIL and _is_startup_gate(c)}
+    # FCConfig.from_env refuses blank guest knobs, so the FC overflow tier is skipped then too
+    # (fc-guest already reports that as a WARN, not a FAIL).
+    if ("firecracker" in overflow and not env.get("BLASTBOX_FC_KERNEL", "").strip()
+            and not env.get("BLASTBOX_FC_ROOTFS", "").strip()):
+        skipped.add("firecracker")
     warm = {"gvisor"} | ({"firecracker"} if _warm_snapshot(env) else set())
     out = []
     for c in checks:
