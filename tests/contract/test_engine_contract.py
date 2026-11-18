@@ -551,3 +551,11 @@ def test_non_ok_record_allowance_is_root_only(tmp_path: Path) -> None:
     for status in ("rejected", "engine_error"):
         r = DetonationResult(payload=root, artifacts=[], detected=DET, status=status)  # type: ignore[arg-type]
         assert [v.code for v in check_result(c, r)] == ["undeclared_node_type"], status
+
+
+def test_find_contract_skips_an_unparseable_contract_when_a_match_exists_above(tmp_path: Path) -> None:
+    (tmp_path / CONTRACT_FILENAME).write_text(CONTRACT)  # demo
+    child = tmp_path / "other"
+    child.mkdir()
+    (child / CONTRACT_FILENAME).write_text('[engine]\nname = "other"\nformats = [\n')
+    assert find_contract(child, "demo") == tmp_path / CONTRACT_FILENAME

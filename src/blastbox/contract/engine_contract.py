@@ -371,8 +371,10 @@ def find_contract(start: str | Path, engine: str | None = None) -> Path | None:
 
     With ``engine``, each directory (nearest first) offers its ``blastbox-engine.<engine>.toml``,
     then its plain ``blastbox-engine.toml`` only when that file's ``[engine].name`` is
-    ``engine``: it never silently returns another engine's contract."""
+    ``engine``: it never silently returns another engine's contract. An unparseable plain
+    contract is returned only if no matching contract exists further up."""
     here = Path(start).resolve()
+    broken: Path | None = None
     for d in (here, *here.parents):
         if engine:
             candidate = d / f"blastbox-engine.{engine}.toml"
@@ -383,9 +385,13 @@ def find_contract(start: str | Path, engine: str | None = None) -> Path | None:
             if engine is None:
                 return candidate
             name = _contract_engine_name(candidate)
-            if name is _UNPARSEABLE or name == engine:
+            if name == engine:
                 return candidate
-    return None
+            if name is _UNPARSEABLE and broken is None:
+                broken = candidate    # whose it is can't be told; keep looking first
+    # No matching contract anywhere: hand back the nearest unparseable one so load_contract
+    # reports its real error instead of a None TypeError.
+    return broken
 
 
 _USAGE = """usage: python -m blastbox.contract.engine_contract validate CONTRACT
