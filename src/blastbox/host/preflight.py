@@ -419,12 +419,6 @@ def _check_pool_runtime(host: HostView) -> Check | None:
                          "network-endpoint (static/aws-*) tiers; the dispatcher refuses a mixed "
                          "cascade (it starts only if the odd tier is an overflow member that is "
                          "unavailable at startup and gets skipped)", doc)
-        if dropped:
-            # build_cascade_runtime skips an unavailable overflow tier at startup and boots
-            # on the rest -- a typo there silently shrinks the pool.
-            return Check("pool-runtime", Status.WARN,
-                         f"BLASTBOX_POOL_TIERS overflow member(s) {', '.join(dropped)} are unknown; "
-                         f"the dispatcher skips them and runs on {', '.join(members)}", doc)
         mtls = {m for m in members if m in ("static", "aws-ec2", "aws-ec2-hibernate")}
         public = {m for m in members if m.startswith("aws-lambda")}
         if host.env.get("BLASTBOX_DISPATCH_TLS_CA", "").strip() and mtls and public:
@@ -433,6 +427,12 @@ def _check_pool_runtime(host: HostView) -> Check | None:
                          f"with BLASTBOX_DISPATCH_TLS_CA set, {', '.join(sorted(mtls))} use worker "
                          f"mTLS but {', '.join(sorted(public))} public TLS: the dispatcher refuses "
                          "the mixed cascade (use separate pools)", doc)
+        if dropped:
+            # build_cascade_runtime skips an unavailable overflow tier at startup and boots
+            # on the rest -- a typo there silently shrinks the pool.
+            return Check("pool-runtime", Status.WARN,
+                         f"BLASTBOX_POOL_TIERS overflow member(s) {', '.join(dropped)} are unknown; "
+                         f"the dispatcher skips them and runs on {', '.join(members)}", doc)
         return Check("pool-runtime", Status.PASS, f"cascade of {', '.join(members)}")
     return Check("pool-runtime", Status.PASS, f"BLASTBOX_POOL_RUNTIME={pool}")
 
@@ -644,6 +644,8 @@ def _needs_userns(env: Mapping[str, str], tiers: Collection[str] = ("docker",), 
     if "docker" not in tiers or not cold_runc:
         return why
     sandbox = env.get("BLASTBOX_SANDBOX", "").strip().lower()
+    if sandbox in ("container", "nono"):
+        return why          # no user namespace: the OCI boundary itself / Landlock
     if sandbox in ("bwrap", "nsjail"):
         why.append(f"BLASTBOX_SANDBOX={sandbox}")
     why.append("cold workers run plain runc (inner nsjail/bwrap on the host kernel)")
@@ -741,7 +743,8 @@ def _check_bwrap_stock_profile(host: HostView, tiers: Collection[str] = ("docker
     # The stock profile attaches to bwrap only: nsjail and rootless runsc are unaffected.
     env = host.env
     needs = []
-    if ("docker" in tiers and env.get("BLASTBOX_SANDBOX", "").strip().lower() != "nsjail"
+    if ("docker" in tiers
+            and env.get("BLASTBOX_SANDBOX", "").strip().lower() not in ("nsjail", "container", "nono")
             and _cold_runs_runc(host)):
         needs.append("cold workers run plain runc (inner bwrap on the host kernel)")
     if not needs:

@@ -1276,3 +1276,18 @@ def test_unwritable_job_root_warns():
     host.rw.discard("/var/lib/blastbox/jobs")
     c = _by_name(pf.run_preflight(host, ["docker"]))["scratch"]
     assert c.status is Status.WARN and "not writable" in c.detail
+
+
+def test_tls_mix_is_checked_before_the_overflow_typo_warn():
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade",
+           "BLASTBOX_POOL_TIERS": "static:4,aws-lambda-microvm:16,unknown:1",
+           "BLASTBOX_DISPATCH_TLS_CA": "/etc/blastbox/ca.pem"}
+    assert _by_name(pf.run_preflight(_healthy(env=env), ["remote"]))["pool-runtime"].status \
+        is Status.FAIL
+
+
+@pytest.mark.parametrize("backend", ["container", "nono"])
+def test_runc_with_a_non_namespace_backend_needs_no_userns(backend):
+    host = _healthy(env={**_RUNC, "BLASTBOX_SANDBOX": backend},
+                    files={"/proc/sys/user/max_user_namespaces": "0"})
+    assert _by_name(pf.run_preflight(host, ["docker"]))["userns"].status is Status.PASS
