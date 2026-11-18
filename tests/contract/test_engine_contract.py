@@ -559,3 +559,38 @@ def test_find_contract_skips_an_unparseable_contract_when_a_match_exists_above(t
     child.mkdir()
     (child / CONTRACT_FILENAME).write_text('[engine]\nname = "other"\nformats = [\n')
     assert find_contract(child, "demo") == tmp_path / CONTRACT_FILENAME
+
+
+# --- marla round 3 (Claude lens) ----------------------------------------------------------
+
+def test_nul_byte_artifact_path_is_a_violation_not_a_crash(contract_path: Path, tmp_path: Path) -> None:
+    out = _outdir(tmp_path)
+    extra = [DeclaredArtifact(id="a", path="a\x00b", kind="file")]
+    codes = {v.code for v in check_result(load_contract(contract_path), _result(extra=extra), out)}
+    assert {"unsealable", "artifact_file_missing"} <= codes
+
+
+def test_cyclic_payload_fails_fast_with_outdir(contract_path: Path, tmp_path: Path) -> None:
+    from blastbox.contract import EmbeddedResource
+    root = EmbeddedResource(embedded_path="", content_type="t", depth=0)
+    root.children.append(root)
+    r = DetonationResult(payload=root, artifacts=[], detected=DET)
+    with pytest.raises(ValueError, match="depth"):
+        check_result(load_contract(contract_path), r, _outdir(tmp_path))
+
+
+def test_warnings_none_is_unsealable_like_the_harness(contract_path: Path, tmp_path: Path) -> None:
+    out = _outdir(tmp_path)
+    r = _result()
+    r.warnings = None  # type: ignore[assignment]
+    assert "unsealable" in {v.code for v in check_result(load_contract(contract_path), r, out)}
+
+
+@pytest.mark.parametrize("spelling", ["./metadata.json", "metadata.json/", ".//metadata.json"])
+def test_reserved_metadata_json_any_spelling_is_refused(tmp_path: Path, spelling: str) -> None:
+    out = _outdir(tmp_path)
+    (out / "metadata.json").write_text("{}")
+    with pytest.raises(ValueError, match="reserved"):
+        seal_envelope(engine="demo", outdir=out, input_sha256="0" * 64, detected=DET,
+                      declared=[DeclaredArtifact(id="raw", path=spelling, kind="file")],
+                      warnings=[], payload=Record())

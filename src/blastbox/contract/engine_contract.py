@@ -306,12 +306,18 @@ def check_result(contract: EngineContract, result: Any, outdir: str | Path | Non
         # parent, an absolute or `..` path, the reserved metadata.json, a duplicate id, a dangling
         # ArtifactRef) turns every real job into engine_error; say so rather than re-implement it.
         from .envelope import seal_envelope
+        from .leaf import Detection
 
+        _payload_nodes(result.payload)  # depth cap first: the seal's ref walk has none
+        # Seal exactly as the harness does (warnings verbatim). detected: the harness may use
+        # engine.detect()'s answer instead of result.detected, so a missing one is not judged.
+        detected = result.detected if result.detected is not None else Detection(
+            label="contract-check", mime="application/octet-stream", confidence=0.0,
+            source="contract-check")
         try:
             seal_envelope(engine=contract.engine.name, outdir=Path(outdir), input_sha256="0" * 64,
-                          detected=result.detected, declared=list(result.artifacts),
-                          warnings=list(getattr(result, "warnings", None) or []),
-                          payload=result.payload, status=result.status)
+                          detected=detected, declared=list(result.artifacts),
+                          warnings=result.warnings, payload=result.payload, status=result.status)
         except (ValueError, OSError) as exc:
             unsealable.append(Violation("unsealable", f"seal_envelope would refuse this result: {exc}"))
     for a in result.artifacts:
@@ -319,7 +325,7 @@ def check_result(contract: EngineContract, result: Any, outdir: str | Path | Non
         if outdir is not None:
             try:
                 st = os.lstat(Path(outdir) / a.path)
-            except OSError:
+            except (OSError, ValueError):   # ValueError: an embedded NUL
                 st = None
             if st is not None and stat.S_ISREG(st.st_mode):
                 size = st.st_size
