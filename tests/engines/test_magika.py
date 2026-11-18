@@ -7,13 +7,16 @@ from pathlib import Path
 import pytest
 
 from blastbox.engines.magika import MagikaEngine, MagikaUnavailable, identify
+from blastbox.contract.engine_contract import assert_conforms, builtin_contract
 from blastbox.limits import Limits
 
 
 def _run(tmp_path: Path, data: bytes, **kw):
     f = tmp_path / "input.bin"
     f.write_bytes(data)
-    return MagikaEngine(**kw).detonate(f, tmp_path, Limits())
+    result = MagikaEngine(**kw).detonate(f, tmp_path, Limits())
+    assert_conforms(builtin_contract("magika"), result, tmp_path)
+    return result
 
 
 def _fake(**over):

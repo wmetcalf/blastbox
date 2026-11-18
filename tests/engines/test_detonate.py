@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from blastbox.engines.detonate import DetonateEngine
+from blastbox.contract.engine_contract import assert_conforms, builtin_contract
 from blastbox.limits import Limits
 from blastbox.worker.harness import run_detonation
 
@@ -35,6 +36,7 @@ def _run(
         engine, input_path=inp, output_dir=outdir, limits=limits or Limits()
     )
     meta = json.loads((outdir / "metadata.json").read_text())
+    assert_conforms(builtin_contract("detonate"), meta, check_name=False)
     return rc, meta, outdir
 
 

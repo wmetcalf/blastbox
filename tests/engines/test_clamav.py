@@ -33,6 +33,7 @@ import clamd
 import pytest
 
 from blastbox.engines.clamav import ClamAVEngine, ClamdUnavailable, ping, scan_stream
+from blastbox.contract.engine_contract import assert_conforms, builtin_contract
 from blastbox.limits import Limits
 
 EICAR = rb"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
@@ -77,7 +78,9 @@ def _run(tmp_path: Path, data: bytes, *, stream=True, monkeypatch=None, **kw):
     if stream:
         os.environ["BLASTBOX_CLAMD_FORCE_STREAM"] = "1"
     try:
-        return ClamAVEngine(**kw).detonate(p, tmp_path, Limits(timeout_s=60))
+        result = ClamAVEngine(**kw).detonate(p, tmp_path, Limits(timeout_s=60))
+        assert_conforms(builtin_contract("clamav"), result, tmp_path)
+        return result
     finally:
         if stream:
             os.environ.pop("BLASTBOX_CLAMD_FORCE_STREAM", None)

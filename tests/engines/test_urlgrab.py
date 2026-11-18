@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from blastbox.engines.urlgrab import FetchError, FetchResult, UrlGrabEngine, _CappedRedirect
+from blastbox.contract.engine_contract import assert_conforms, builtin_contract
 from blastbox.limits import Limits
 from blastbox.worker.harness import run_detonation
 
@@ -64,6 +65,7 @@ def _run(tmp_path: Path, engine: UrlGrabEngine, url_text: bytes,
     inp.write_bytes(url_text)
     rc = run_detonation(engine, input_path=inp, output_dir=outdir, limits=limits or Limits())
     meta = json.loads((outdir / "metadata.json").read_text())
+    assert_conforms(builtin_contract("urlgrab"), meta, check_name=False)
     return rc, meta, outdir
 
 
