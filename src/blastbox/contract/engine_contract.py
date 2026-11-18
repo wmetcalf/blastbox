@@ -322,7 +322,8 @@ def check_result(contract: EngineContract, result: Any, outdir: str | Path | Non
             env = seal_envelope(engine=contract.engine.name, outdir=Path(outdir),
                                 input_sha256="0" * 64, detected=result.detected,
                                 declared=list(result.artifacts), warnings=result.warnings,
-                                payload=result.payload, status=result.status)
+                                payload=result.payload, status=result.status,
+                                max_artifact_bytes=getattr(limits, "max_artifact_bytes", None))
             # The worker harness writes metadata.json uncapped; the host gate caps it at
             # limits.max_metadata_bytes, so only judge the size when the caller says which host.
             cap = getattr(limits, "max_metadata_bytes", None) or sys.maxsize
@@ -331,6 +332,11 @@ def check_result(contract: EngineContract, result: Any, outdir: str | Path | Non
             if max_artifacts is not None and len(env.artifacts) > max_artifacts:
                 raise ValueError(f"{len(env.artifacts)} artifacts exceed the host's max_artifacts "
                                  f"{max_artifacts}")
+            max_total = getattr(limits, "max_total_artifact_bytes", None)
+            total = sum(a.bytes for a in env.artifacts)
+            if max_total is not None and total > max_total:
+                raise ValueError(f"{total} artifact bytes exceed the host's "
+                                 f"max_total_artifact_bytes {max_total}")
         except (ValueError, OSError) as exc:
             note = (" (detected is None: the harness accepts that only when engine.detect() "
                     "supplies one at pre-detection)" if result.detected is None else "")
@@ -344,10 +350,11 @@ def check_result(contract: EngineContract, result: Any, outdir: str | Path | Non
                 unsealable.append(Violation("reserved_path",
                                             f"{a.id} at {a.path}: the host trust gate refuses {parts[0]}"))
         meta = Path(outdir) / "metadata.json"
-        if os.path.lexists(meta) and not (meta.is_file() and not meta.is_symlink()):
+        # The harness's atomic rename replaces a symlink/FIFO there; only a directory breaks it.
+        if meta.is_dir() and not meta.is_symlink():
             unsealable.append(Violation(
-                "reserved_path", "outdir/metadata.json exists and is not a regular file: the "
-                "harness cannot write the sealed envelope there and every job fails"))
+                "reserved_path", "outdir/metadata.json is a directory: the harness cannot write "
+                "the sealed envelope there and every job fails"))
     for a in result.artifacts:
         size = None
         if outdir is not None:

@@ -758,3 +758,40 @@ def test_assert_conforms_passes_limits_through(contract_path: Path, tmp_path: Pa
     assert_conforms(c, big, out)
     with pytest.raises(AssertionError, match="unsealable"):
         assert_conforms(c, big, out, limits=Limits(max_metadata_bytes=1_000_000))
+
+
+# --- marla round 7 (Claude lens) ----------------------------------------------------------
+
+def test_symlinked_or_fifo_metadata_json_is_not_flagged(contract_path: Path, tmp_path: Path) -> None:
+    out = _outdir(tmp_path)
+    (out / "metadata.json").symlink_to(out / "manifest.json")
+    assert "reserved_path" not in {v.code for v in check_result(load_contract(contract_path), _result(), out)}
+
+
+def test_limits_apply_every_host_output_cap(contract_path: Path, tmp_path: Path) -> None:
+    from blastbox.limits import Limits
+    c = load_contract(contract_path)
+    out = _outdir(tmp_path, pages=2)
+    r = _result(pages=2)
+    assert check_result(c, r, out, limits=Limits()) == []
+    for lim in (Limits(max_artifacts=1), Limits(max_artifact_bytes=4),
+                Limits(max_total_artifact_bytes=10)):
+        assert "unsealable" in {v.code for v in check_result(c, r, out, limits=lim)}, lim
+
+
+def test_walker_descends_frozensets_of_nodes() -> None:
+    from typing import Literal
+    from pydantic import ConfigDict, Field
+    from blastbox.contract.engine_contract import _payload_nodes
+    from blastbox.contract.nodes import _Node
+
+    class Tag(_Node):
+        model_config = ConfigDict(frozen=True, populate_by_name=True)
+        type: Literal["tag_t"] = Field(default="tag_t", alias="_type")
+
+    class Holder(_Node):
+        type: Literal["holder_fs"] = Field(default="holder_fs", alias="_type")
+        tags: frozenset[Tag] = frozenset()
+
+    assert [getattr(n, "type") for n in _payload_nodes(Holder(tags=frozenset({Tag()})))] == [
+        "holder_fs", "tag_t"]
