@@ -18,10 +18,6 @@ severity = "high"
 source = "payload.fields.signatures[] (signature_count is the true total; warning signatures_truncated when capped)"
 description = "One ClamAV signature name per hit."
 
-[[gaps]]
-id = "truncated-scan-not-clean"
-description = "A scan that hit MaxScanSize/MaxFiles/MaxRecursion reports detected=undetermined plus a warning; consumers must not read infected=false as clean."
-
 [[consumers]]
 name = "loadout"
 engine = "clamav"

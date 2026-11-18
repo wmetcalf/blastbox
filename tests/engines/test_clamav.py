@@ -735,3 +735,27 @@ def test_a_dead_daemon_does_not_kill_the_slot_at_warmup(monkeypatch):
 
     monkeypatch.setattr(clamav, "ping", lambda t=1.0: False)
     clamav.ClamAVEngine().warmup()  # must not raise
+
+
+@pytest.mark.parametrize("hits", [
+    ["Heuristics.Limits.Exceeded.MaxScanSize"],
+    ["Heuristics.Encrypted.Zip"],
+    ["Heuristics.Limits.Exceeded.MaxFiles", "Heuristics.Encrypted.Zip"],
+    ["Eicar-Test-Signature", "Heuristics.Limits.Exceeded.MaxRecursion"],
+])
+def test_no_incomplete_scan_ever_seals_ok_and_uninfected(tmp_path, hits):
+    """The invariant that retired the contract gap `truncated-scan-not-clean`.
+
+    That gap told consumers "do not read infected=false as clean after a limit hit".
+    The engine makes that reading impossible instead: an incomplete scan that found
+    nothing seals `signature_scan_unavailable` (no `infected` field) at `engine_error`,
+    and one that found something seals `infected: true`. Either way the result conforms
+    to the shipped contract, and `status=ok` + `infected=false` never occurs."""
+    res = _detonate(_stub_engine(path_scan_fn=lambda p, timeout=None: list(hits),
+                                 scan_fn=lambda d, timeout=None: list(hits)),
+                    tmp_path, 16)
+    assert_conforms(builtin_contract("clamav"), res, tmp_path / "out")
+    assert not (res.status == "ok" and res.payload.fields.get("infected") is False)
+    assert res.detected.label != "clean"
+    assert {g.id for g in builtin_contract("clamav").gaps}.isdisjoint(
+        {"truncated-scan-not-clean"})
