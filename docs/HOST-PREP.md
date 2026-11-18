@@ -213,8 +213,9 @@ Ubuntu 24.04+ sets `kernel.apparmor_restrict_unprivileged_userns=1`. What that m
 Use the **scoped per-binary profiles** in [`deploy/apparmor/`](../deploy/apparmor/README.md). Do
 **not** set `kernel.apparmor_restrict_unprivileged_userns=0`: that lowers a host-wide
 attack-surface control for every process. Preflight's `userns` check warns only when the
-environment actually configures something that needs a user namespace (`BLASTBOX_SANDBOX=bwrap|nsjail`,
-`BLASTBOX_WORKER_RUNTIME=runc`, `BLASTBOX_GVISOR_ROOTLESS`), and passes when the scoped profiles
+environment actually configures something that needs a user namespace on a tier being checked
+(`BLASTBOX_SANDBOX=bwrap|nsjail`; `BLASTBOX_WORKER_RUNTIME=runc` on the cold docker tier, the only
+one that reads it; `BLASTBOX_GVISOR_ROOTLESS` on the gvisor tier), and passes when the scoped profiles
 are visibly loaded (securityfs is root-only; run preflight as root to confirm). `max_user_namespaces=0`
 or `unprivileged_userns_clone=0` switches user namespaces off outright.
 
@@ -250,7 +251,7 @@ sudo grep -E '^(bwrap|unpriv_bwrap) ' /sys/kernel/security/apparmor/profiles   #
 The symlink keeps it from loading at boot or on a policy reload; `-R` removes the loaded copy.
 Preflight reports `PASS` when it is absent or disabled-and-unloaded, or active on a host where
 nothing runs host bwrap; it reports `WARN` when it is active and `BLASTBOX_SANDBOX=bwrap` or
-`BLASTBOX_WORKER_RUNTIME=runc` (whose inner sandbox may be bwrap) is set, or disabled but still
+`BLASTBOX_WORKER_RUNTIME=runc` on the docker tier (inner sandbox not nsjail) is set, or disabled but still
 loaded. The profile attaches to bwrap only, so nsjail and rootless runsc don't trigger it. Reverse with `sudo rm /etc/apparmor.d/disable/bwrap-userns-restrict &&
 sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict`.
 
@@ -294,8 +295,12 @@ Preflight reads `/proc/cpuinfo` and warns on flags with operational consequences
   disks, sockets, and the warm base unless `BLASTBOX_SNAPSHOT_MEM_DIR` moves it. Preflight's
   `fc-scratch` check warns when `/tmp` is a tmpfs on a Firecracker host; since there is no knob,
   `--ack fc-scratch` once the RAM budget is understood.
-- `BLASTBOX_JOB_ROOT` is read unstripped by the dispatcher: set-but-empty means its working
-  directory. Preflight warns on an empty or padded value.
+- `BLASTBOX_JOB_ROOT` (dispatcher) and `BLASTBOX_GVISOR_ROOT` (warm gVisor tier) are read
+  unstripped: set-but-empty means the process's working directory. Preflight warns on an empty or
+  padded value.
+- A local tier that a cascade lists only as an **overflow** member is skipped by the dispatcher
+  when unavailable at startup, so its FAILs (`kvm`, `firecracker`, `fc-guest`, `runsc`,
+  `gvisor-rootfs`, `gvisor-rootless`) are reported as WARNs saying so.
 - `BLASTBOX_JOB_ROOT` must be the same path for serve, dispatch and the worker mount, and must
   **not** be shared between a container dispatcher and a network-tier (aws/static) dispatcher
   (CONFIGURATION *Core*).

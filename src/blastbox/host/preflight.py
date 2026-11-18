@@ -592,7 +592,8 @@ def _needs_userns(env: Mapping[str, str], tiers: Collection[str] = ("docker",)) 
     # Only the cold docker path reads BLASTBOX_WORKER_RUNTIME (runtime/docker.py).
     if "docker" in tiers and env.get("BLASTBOX_WORKER_RUNTIME", "").strip().lower() == "runc":
         why.append("BLASTBOX_WORKER_RUNTIME=runc (inner nsjail/bwrap)")
-    if _truthy(env.get("BLASTBOX_GVISOR_ROOTLESS")):
+    # Only the warm gVisor tier reads it (gvisor_snapshot_runtime); the docker runsc path never does.
+    if "gvisor" in tiers and _truthy(env.get("BLASTBOX_GVISOR_ROOTLESS")):
         why.append("BLASTBOX_GVISOR_ROOTLESS")
     return why
 
@@ -684,7 +685,8 @@ def _check_bwrap_stock_profile(host: HostView, tiers: Collection[str] = ("docker
     needs = []
     if env.get("BLASTBOX_SANDBOX", "").strip().lower() == "bwrap":
         needs.append("BLASTBOX_SANDBOX=bwrap")
-    if "docker" in tiers and env.get("BLASTBOX_WORKER_RUNTIME", "").strip().lower() == "runc":
+    if ("docker" in tiers and env.get("BLASTBOX_WORKER_RUNTIME", "").strip().lower() == "runc"
+            and env.get("BLASTBOX_SANDBOX", "").strip().lower() != "nsjail"):
         needs.append("BLASTBOX_WORKER_RUNTIME=runc (inner bwrap)")
     if not needs:
         return Check("bwrap-userns-restrict", Status.PASS,
@@ -755,10 +757,14 @@ def _check_scratch(host: HostView, tiers: Sequence[str]) -> Check:
     if "gvisor" in tiers and raw_gv is not None and (not raw_gv.strip() or raw_gv != raw_gv.strip()):
         problems.append(f"BLASTBOX_GVISOR_ROOT={raw_gv!r} is empty or padded: the gVisor runtime "
                         "uses it unstripped (empty = its working directory)")
+    knobs = []
     if "firecracker" in tiers or "gvisor" in tiers:
-        for knob in ("BLASTBOX_SNAPSHOT_MEM_DIR", "BLASTBOX_GVISOR_ROOT"):
-            if env.get(knob, "").strip():
-                dirs.append((knob, env[knob].strip()))
+        knobs.append("BLASTBOX_SNAPSHOT_MEM_DIR")
+    if "gvisor" in tiers:
+        knobs.append("BLASTBOX_GVISOR_ROOT")   # only the warm gVisor tier reads it
+    for knob in knobs:
+        if env.get(knob, "").strip():
+            dirs.append((knob, env[knob].strip()))
     on_tmp = [f"{k}={v}" for k, v in dirs if _under_tmp(v)]
     if on_tmp:
         problems.append("under /tmp (tmpfiles cleanup / tmpfs size / reboot loses sealed "
@@ -887,6 +893,11 @@ def _jailed(p: _Proc) -> bool | None:
     return "--start-time-us" in p.argv
 
 
+def _apparmor_on(host: HostView) -> bool:
+    raw = host.read("/sys/module/apparmor/parameters/enabled")
+    return raw is not None and raw.strip().upper().startswith("Y")
+
+
 def _apparmor_shaped(label: str) -> bool:
     text = label.strip()
     return text == "unconfined" or (text.endswith(")") and " (" in text)
@@ -919,6 +930,9 @@ def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc]) -> Check:
             if label is not None and not _apparmor_shaped(label):
                 foreign.append(p)   # another LSM's label: no AppArmor label exists to check
                 label = ""
+        if label is None and not _apparmor_on(host):
+            foreign.append(p)       # AppArmor is off: there is no label to read, as root or not
+            label = ""
         if label is None:
             unknown.append(p)
         elif label == "":
@@ -954,6 +968,37 @@ def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc]) -> Check:
                  f"{len(procs)} process(es) confined" + (
                      " (firecracker jailed)" if any(p.role == "firecracker" for p in procs)
                      else ""))
+
+
+_TIER_CHECKS = {
+    "firecracker": ("kvm", "firecracker", "fc-guest"),
+    "gvisor": ("runsc", "gvisor-rootfs", "gvisor-rootless"),
+}
+
+
+def _overflow_only_tiers(env: Mapping[str, str]) -> set[str]:
+    """Local tiers this env's cascade lists only as OVERFLOW members: build_cascade_runtime
+    skips an overflow tier that is unavailable at startup and boots on the rest."""
+    if env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower() != "cascade":
+        return set()
+    members = _cascade_members(env)
+    if not members:
+        return set()
+    return {m for m in members[1:] if m in _TIER_CHECKS and m != members[0]}
+
+
+def _downgrade_overflow(checks: list[Check], env: Mapping[str, str]) -> list[Check]:
+    overflow = _overflow_only_tiers(env)
+    names = {n: tier for tier in overflow for n in _TIER_CHECKS[tier]}
+    out = []
+    for c in checks:
+        tier = names.get(c.name)
+        if tier and c.status is Status.FAIL:
+            c = Check(c.name, Status.WARN,
+                      f"{c.detail} -- {tier} is an overflow tier of this cascade, so the "
+                      "dispatcher skips it at startup and runs without it", c.doc)
+        out.append(c)
+    return out
 
 
 def run_preflight(host: HostView, tiers: Sequence[str]) -> list[Check]:
@@ -998,7 +1043,7 @@ def run_preflight(host: HostView, tiers: Sequence[str]) -> list[Check]:
     out.append(_check_scratch(host, tiers))
     if "firecracker" in t:
         out.append(_check_fc_scratch(host))
-    return out
+    return _downgrade_overflow(out, host.env)
 
 
 # --- output -----------------------------------------------------------------------------

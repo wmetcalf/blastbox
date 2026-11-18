@@ -1020,3 +1020,49 @@ def test_gvisor_rootfs_missing_fails_when_this_env_selects_gvisor():
         is Status.WARN
     ok = _healthy(env=env, paths={"/var/lib/blastbox/gvisor-rootfs/bin/sh", "/var/lib/blastbox/jobs"})
     assert _by_name(pf.run_preflight(ok, ["gvisor"]))["gvisor-rootfs"].status is Status.PASS
+
+
+# --- marla round 4 on #208 -----------------------------------------------------------------
+
+def test_rootless_gvisor_knob_is_a_userns_need_only_on_the_gvisor_tier():
+    env = {"BLASTBOX_POOL_RUNTIME": "firecracker", "BLASTBOX_DISPATCH_WARM_ONLY": "1",
+           "BLASTBOX_GVISOR_ROOTLESS": "1"}
+    host = _healthy(env=env, files={"/proc/sys/user/max_user_namespaces": "0"})
+    assert _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env)))["userns"].status \
+        is not Status.FAIL
+
+
+@pytest.mark.parametrize("drop", [("BLASTBOX_FC_ROOTFS",), ()])
+def test_fc_overflow_problems_warn_because_the_dispatcher_skips_the_tier(drop):
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2",
+           "BLASTBOX_POOL_WARM_SNAPSHOT": "1"}
+    host = _healthy(env=env, kernels={"/var/lib/blastbox/fc/vmlinux": (5, 10)}, rw=set())
+    for k in drop:
+        del host.env[k]
+    by = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env)))
+    for name in ("fc-guest", "kvm"):
+        assert by[name].status is Status.WARN, (name, by[name])
+        assert "skips" in by[name].detail
+
+
+def test_apparmor_off_without_another_lsm_is_named():
+    host = _with_procs(_proc(200, ["runsc-sandbox", "boot"], uid_map=_REMAPPED, aa=None), euid=0)
+    host.files["/sys/module/apparmor/parameters/enabled"] = "N\n"
+    c = _by_name(pf.run_preflight(host, ["gvisor"]))["sandbox-confinement"]
+    assert "run as root" not in c.detail and "AppArmor" in c.detail
+
+
+def test_gvisor_root_under_tmp_matters_only_on_the_gvisor_tier():
+    env = {"BLASTBOX_POOL_RUNTIME": "firecracker", "BLASTBOX_DISPATCH_WARM_ONLY": "1",
+           "BLASTBOX_GVISOR_ROOT": "/tmp/gv-root"}
+    host = _healthy(env=env)
+    assert _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env)))["scratch"].status \
+        is Status.PASS
+
+
+def test_runc_with_nsjail_inner_sandbox_ignores_the_stock_bwrap_profile():
+    host = _healthy(env={"BLASTBOX_WORKER_RUNTIME": "runc", "BLASTBOX_ALLOW_RUNC": "1",
+                         "BLASTBOX_SANDBOX": "nsjail"},
+                    files={"/etc/apparmor.d/bwrap-userns-restrict": "profile bwrap ..."})
+    assert _by_name(pf.run_preflight(host, ["docker"]))["bwrap-userns-restrict"].status \
+        is Status.PASS
