@@ -1,0 +1,25 @@
+schema = "blastbox-engine-contract/1"
+
+[engine]
+name = "clamav"
+formats = ["*"]
+network = ["none"]
+
+[payload]
+root = "record"
+node_types = ["record"]
+schema_field = "schema"
+schema_version = "signature_scan"
+required_root_fields = ["infected", "signatures", "signature_count", "db_version", "first_hit_only", "bytes_scanned"]
+
+[[detections]]
+code = "clamav.signature"
+severity = "high"
+source = "payload.fields.signatures[] (signature_count is the true total; warning signatures_truncated when capped)"
+description = "One ClamAV signature name per hit."
+
+[[consumers]]
+name = "loadout"
+engine = "clamav"
+mapper = "backend/loadout/engines.py:clamav_status_to_detections"
+emits = ["detection"]

@@ -1,0 +1,22 @@
+schema = "blastbox-engine-contract/1"
+
+[engine]
+name = "urlgrab"
+formats = ["*"]
+network = ["direct", "tor", "socks", "httpproxy", "wireguard", "openvpn", "inetsim"]
+
+[[artifacts]]
+id = "body"
+path = "body.bin"
+kind = "raw"
+role = "http_body"
+description = "Response body, capped at limits.max_artifact_bytes (warning body_truncated). Absent when the fetch failed."
+
+[payload]
+root = "record"
+node_types = ["record"]
+required_root_fields = ["url", "fetched"]
+
+[[gaps]]
+id = "fetch-failure-is-ok"
+description = "An unreachable or sinkholed URL is status ok with fetched=false and error set, not engine_error."

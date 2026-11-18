@@ -5,7 +5,7 @@ import hashlib
 import os
 import stat as _stat
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -320,7 +320,12 @@ def seal_envelope(*, engine: str, outdir: Path, input_sha256: str,
         # Match the relative PATH, not the basename: a NESTED metadata.json (e.g. an engine's
         # rmeta/metadata.json — RedTusk's canonical rmeta doc) is a normal artifact the host
         # never clobbers, so it must remain declarable (and thus trust-gated on serve).
-        if d.path == "metadata.json" or d.path.startswith(".metadata.json."):
+        # Compared on the path's PARTS, the way the confined open walks it: "./metadata.json",
+        # "metadata.json/" and ".//metadata.json" all open the root file.
+        # The whole root name is reserved, nested paths included: an artifact under a root
+        # directory called metadata.json would make the harness's metadata write hit EISDIR.
+        _parts = PurePosixPath(d.path).parts
+        if _parts and (_parts[0] == "metadata.json" or _parts[0].startswith(".metadata.json.")):
             raise ValueError(f"reserved output path may not be a declared artifact: {d.path}")
         # TOCTOU-safe open: confines under outdir AND rejects symlink/.. components + special
         # files in one walk (no separate resolve()/is_file()/open() the worker could race on a

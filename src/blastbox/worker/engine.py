@@ -34,9 +34,10 @@ class DetonationResult:
     # _Node, not ChildNode: ChildNode is the STATIC four-member union, but
     # contract.register_node_type() exists precisely so an engine can add its own payload
     # node, and Envelope.payload's annotation is rebuilt at registration. Annotating the
-    # narrow union made every engine that uses the documented mechanism fail mypy, which
-    # pushed authors back to stuffing typed data into Record.fields -- the thing the registry
-    # exists to avoid.
+    # narrow union made every engine that uses the mechanism fail mypy. Note the host trust
+    # gate never imports engine modules and cannot parse a registered type on the wire, so a
+    # registered node is for in-engine validation; seal it as a Record (engines/magika.py
+    # _sealed, and engine_contract's host_unknown_node_type check).
     payload: _Node
     """The typed payload node tree (Page, Record, EmbeddedResource, …)."""
 

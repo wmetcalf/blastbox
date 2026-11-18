@@ -1,0 +1,23 @@
+schema = "blastbox-engine-contract/1"
+
+[engine]
+name = "magika"
+formats = ["*"]
+network = ["none"]
+
+[payload]
+root = "record"
+node_types = ["record"]
+schema_field = "schema"
+schema_version = "content_type_identification"
+required_root_fields = ["label", "model_label", "score", "bytes_read", "file_size"]
+
+[[gaps]]
+id = "overwrite-confidence"
+description = "On a Magika overwrite the envelope detection confidence is 0.0 (no calibrated value); the raw model score stays in the payload."
+
+[[consumers]]
+name = "loadout"
+engine = "magika"
+mapper = "backend/loadout/engines.py:magika_status_to_detections"
+emits = ["detection"]

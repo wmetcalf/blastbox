@@ -1,0 +1,18 @@
+schema = "blastbox-engine-contract/1"
+
+[engine]
+name = "detonate"
+formats = ["*"]
+network = ["none"]
+
+[[artifacts]]
+id = "stdout"
+path = "stdout.bin"
+kind = "raw"
+role = "tool_stdout"
+description = "The tool's stdout, capped (warning output_truncated)."
+
+[payload]
+root = "record"
+node_types = ["record"]
+required_root_fields = ["tool", "exit_code", "killed", "stdout_sha256", "stdout_len", "stderr_len", "truncated"]
