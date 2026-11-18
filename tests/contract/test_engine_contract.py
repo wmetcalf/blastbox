@@ -902,3 +902,12 @@ engine = "demo"
 ''').replace('formats = ["ics"]', 'formats = ["ics"')
     (tmp_path / CONTRACT_FILENAME).write_text(broken)
     assert find_contract(tmp_path / "tests", "demo") == tmp_path / CONTRACT_FILENAME
+
+
+def test_textual_name_with_a_commented_engine_header(tmp_path: Path) -> None:
+    (tmp_path / CONTRACT_FILENAME).write_text(CONTRACT)
+    child = tmp_path / "e"
+    (child / "tests").mkdir(parents=True)
+    (child / CONTRACT_FILENAME).write_text(CONTRACT.replace("[engine]", "[engine] # local engine")
+                                           .replace('formats = ["ics"]', 'formats = ["ics"'))
+    assert find_contract(child / "tests", "demo") == child / CONTRACT_FILENAME

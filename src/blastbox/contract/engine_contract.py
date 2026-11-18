@@ -483,7 +483,8 @@ def _textual_engine_name(path: Path) -> str | None:
     except OSError:
         return None
     # Only inside the [engine] table: [[consumers]] also has a name.
-    table = re.search(r'^\s*\[engine\]\s*$(.*?)(?=^\s*\[)', text + "\n[", re.MULTILINE | re.DOTALL)
+    table = re.search(r'^\s*\[engine\]\s*(?:#[^\n]*)?$(.*?)(?=^\s*\[)', text + "\n[",
+                      re.MULTILINE | re.DOTALL)
     if table is None:
         return None
     m = re.search(r'^\s*name\s*=\s*["\']([^"\']+)["\']', table.group(1), re.MULTILINE)
