@@ -171,6 +171,13 @@ def test_find_contract(contract_path: Path) -> None:
     assert find_contract(nested) == contract_path
 
 
+def test_max_count_zero_is_uncapped(tmp_path: Path) -> None:
+    p = tmp_path / CONTRACT_FILENAME
+    p.write_text(CONTRACT.replace("max_count = 2", "max_count = 0"))
+    out = _outdir(tmp_path, pages=5)
+    assert check_result(load_contract(p), _result(pages=5), out) == []
+
+
 def test_find_contract_multi_engine(tmp_path: Path) -> None:
     (tmp_path / "blastbox-engine.email-render.toml").write_text(CONTRACT)
     nested = tmp_path / "src"

@@ -23,7 +23,8 @@ At the engine repo root; a repo with several engines uses `blastbox-engine.<engi
 ```text
 [engine]        name, formats, network (exit drivers allowed: none drop direct inetsim tor
                 socks httpproxy wireguard openvpn), max_input_bytes, statuses
-[[artifacts]]   id + path (fnmatch globs), kind, required, max_count, max_bytes, role,
+[[artifacts]]   id + path (fnmatch globs), kind, required, max_count (default 1; 0 =
+                uncapped), max_bytes, role,
                 description — every artifact family the engine can declare
 [payload]       root node type, node_types allowed anywhere in the tree,
                 required_root_fields, schema_version (+ schema_field, default

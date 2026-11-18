@@ -63,7 +63,7 @@ class ArtifactSpec(_Strict):
     path: str = Field(min_length=1, max_length=4096)
     kind: str = Field(min_length=1, max_length=64)
     required: bool = False
-    max_count: int = Field(default=1, ge=1)
+    max_count: int = Field(default=1, ge=0, description="0 = uncapped (the engine enforces no count)")
     max_bytes: int | None = Field(default=None, gt=0)
     role: str = Field(default="", max_length=64)
     description: str = ""
@@ -166,7 +166,7 @@ def _check(contract: EngineContract, *, engine: str | None, status: str,
             out.append(Violation("artifact_too_large", f"{ident} is {size} bytes, contract max {spec.max_bytes}"))
     for key, spec in enumerate(contract.artifacts):
         n = counts.get(key, 0)
-        if n > spec.max_count:
+        if spec.max_count and n > spec.max_count:
             out.append(Violation("artifact_count", f"{spec.id}: {n} artifacts, contract max {spec.max_count}"))
         if spec.required and status == "ok" and n == 0:
             out.append(Violation("missing_artifact", f"required artifact {spec.id} ({spec.kind}) absent"))
