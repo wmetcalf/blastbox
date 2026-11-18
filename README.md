@@ -60,6 +60,10 @@ RedTusk, …) live in their own repos and plug in via `BLASTBOX_ENGINE=module:Cl
 
 ## Writing an engine
 
+Every engine also ships an output contract (`blastbox-engine.toml`) and asserts conformance in its
+tests: see [docs/ENGINE-REQUIREMENTS.md](docs/ENGINE-REQUIREMENTS.md) and
+[examples/minimal-engine](examples/minimal-engine/).
+
 ```python
 from pathlib import Path
 from blastbox import Engine, DetonationResult, run_detonation

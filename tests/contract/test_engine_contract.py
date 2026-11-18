@@ -674,3 +674,75 @@ def test_walker_descends_other_collections() -> None:
 
     h = Holder(q=deque([Record(fields={"a": 1})]), s=frozenset({"x"}))
     assert [getattr(n, "type") for n in _payload_nodes(h)] == ["holder_t", "record"]
+
+
+# --- full-PR sweep ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name", ["attestation.json", "attestation.withheld.json", "attestation.json/x"])
+def test_host_reserved_names_are_unsealable(contract_path: Path, tmp_path: Path, name: str) -> None:
+    contract_path.write_text(CONTRACT.replace('''[[artifacts]]
+id = "manifest"''', '''[[artifacts]]
+id = "att"
+path = "*"
+kind = "file"
+max_count = 0
+
+[[artifacts]]
+id = "manifest"'''))
+    out = _outdir(tmp_path)
+    (out / name).parent.mkdir(parents=True, exist_ok=True)
+    (out / name).write_text("{}")
+    extra = [DeclaredArtifact(id="att", path=name, kind="file")]
+    codes = {v.code for v in check_result(load_contract(contract_path), _result(extra=extra), out)}
+    assert "reserved_path" in codes
+
+
+def test_reserved_names_match_the_host() -> None:
+    pytest.importorskip("cryptography")
+    from blastbox.contract.engine_contract import _HOST_RESERVED_NAMES
+    from blastbox.host.attest import RESERVED_NAMES
+    assert set(_HOST_RESERVED_NAMES) == set(RESERVED_NAMES)
+
+
+def test_undeclared_metadata_json_directory_is_flagged(contract_path: Path, tmp_path: Path) -> None:
+    out = _outdir(tmp_path)
+    (out / "metadata.json").mkdir()
+    codes = {v.code for v in check_result(load_contract(contract_path), _result(), out)}
+    assert "reserved_path" in codes
+
+
+def test_host_metadata_cap_follows_limits(contract_path: Path, tmp_path: Path) -> None:
+    from blastbox.limits import Limits
+    out = _outdir(tmp_path)
+    big = _result()
+    big.payload = Record(fields={"schema_version": "demo/1", "blob": "x" * 5_000_000})
+    c = load_contract(contract_path)
+    assert check_result(c, big, out) == []           # the harness has no cap
+    small = Limits(max_metadata_bytes=1_000_000)
+    assert "unsealable" in {v.code for v in check_result(c, big, out, limits=small)}
+
+
+def test_temp_prefix_of_root_metadata_is_reserved(tmp_path: Path) -> None:
+    out = _outdir(tmp_path)
+    (out / ".metadata.json.tmp1").write_text("x")
+    with pytest.raises(ValueError, match="reserved"):
+        seal_envelope(engine="demo", outdir=out, input_sha256="0" * 64, detected=DET,
+                      declared=[DeclaredArtifact(id="t", path=".metadata.json.tmp1", kind="file")],
+                      warnings=[], payload=Record())
+
+
+def test_minimal_engine_example_ships_a_conforming_contract(tmp_path: Path) -> None:
+    import importlib.util
+    root = Path(__file__).resolve().parents[2] / "examples" / "minimal-engine"
+    c = load_contract(root / CONTRACT_FILENAME)
+    spec = importlib.util.spec_from_file_location("echo_engine", root / "echo_engine.py")
+    mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    sample = tmp_path / "s.bin"
+    sample.write_bytes(b"hello")
+    out = tmp_path / "out"
+    out.mkdir()
+    from blastbox.limits import Limits
+    r = mod.EchoEngine().detonate(sample, out, Limits())
+    assert check_result(c, r, out) == []
+    assert c.engine.name == mod.EchoEngine.name

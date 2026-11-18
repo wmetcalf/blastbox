@@ -22,7 +22,7 @@ import stat
 import sys
 import tomllib
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -172,6 +172,11 @@ _HOST_ARTIFACTS: frozenset[tuple[str, str, str]] = frozenset({
 
 _NO_CAPTURE_NETWORKS = frozenset({"none", "drop"})
 
+# Root names the host trust gate refuses as artifacts, nested paths included (host/attest.py
+# RESERVED_NAMES: the signed receipt and its withheld marker). Mirrored here because host/attest
+# needs the host extra (cryptography); a test pins the two equal.
+_HOST_RESERVED_NAMES = ("attestation.json", "attestation.withheld.json")
+
 # The payload root the worker harness itself seals for an engine that raised or a precheck
 # refusal (``harness.py``: engine_error / rejected): a Record, whatever the engine's root is.
 _HARNESS_ERROR_NODE = "record"
@@ -297,7 +302,8 @@ def check_envelope(contract: EngineContract, envelope: Any) -> list[Violation]:
     return _check(contract, engine=env.engine, status=env.status, artifacts=arts, payload=env.payload)
 
 
-def check_result(contract: EngineContract, result: Any, outdir: str | Path | None = None) -> list[Violation]:
+def check_result(contract: EngineContract, result: Any, outdir: str | Path | None = None, *,
+                 limits: Any = None) -> list[Violation]:
     """Check an unsealed ``DetonationResult`` (what an engine's own tests hold). With ``outdir``,
     byte caps are checked from the files on disk."""
     arts: list[tuple[str, str, str, int | None]] = []
@@ -317,12 +323,31 @@ def check_result(contract: EngineContract, result: Any, outdir: str | Path | Non
                                 input_sha256="0" * 64, detected=result.detected,
                                 declared=list(result.artifacts), warnings=result.warnings,
                                 payload=result.payload, status=result.status)
-            envelope_from_json(env.model_dump_json(by_alias=True).encode())
+            # The worker harness writes metadata.json uncapped; the host gate caps it at
+            # limits.max_metadata_bytes, so only judge the size when the caller says which host.
+            cap = getattr(limits, "max_metadata_bytes", None) or sys.maxsize
+            envelope_from_json(env.model_dump_json(by_alias=True).encode(), max_bytes=cap)
+            max_artifacts = getattr(limits, "max_artifacts", None)
+            if max_artifacts is not None and len(env.artifacts) > max_artifacts:
+                raise ValueError(f"{len(env.artifacts)} artifacts exceed the host's max_artifacts "
+                                 f"{max_artifacts}")
         except (ValueError, OSError) as exc:
             note = (" (detected is None: the harness accepts that only when engine.detect() "
                     "supplies one at pre-detection)" if result.detected is None else "")
             unsealable.append(Violation(
                 "unsealable", f"the harness seal or host trust gate would refuse this result{note}: {exc}"))
+    if outdir is not None:
+        for a in result.artifacts:
+            parts = PurePosixPath(a.path).parts
+            parts = parts[1:] if parts and parts[0] == "/" else parts
+            if parts and parts[0] in _HOST_RESERVED_NAMES:
+                unsealable.append(Violation("reserved_path",
+                                            f"{a.id} at {a.path}: the host trust gate refuses {parts[0]}"))
+        meta = Path(outdir) / "metadata.json"
+        if os.path.lexists(meta) and not (meta.is_file() and not meta.is_symlink()):
+            unsealable.append(Violation(
+                "reserved_path", "outdir/metadata.json exists and is not a regular file: the "
+                "harness cannot write the sealed envelope there and every job fails"))
     for a in result.artifacts:
         size = None
         if outdir is not None:

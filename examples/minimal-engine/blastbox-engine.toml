@@ -1,0 +1,21 @@
+# The engine output contract for EchoEngine (docs/ENGINE-REQUIREMENTS.md): what it promises to
+# emit. Validate with `python -m blastbox.contract.engine_contract validate blastbox-engine.toml`;
+# assert it in the engine's tests with blastbox.contract.engine_contract.assert_conforms.
+schema = "blastbox-engine-contract/1"
+
+[engine]
+name = "echo"
+formats = ["*"]
+network = ["none"]
+
+[[artifacts]]
+id = "copy"
+path = "copy.bin"
+kind = "file"
+required = true
+description = "A byte-for-byte copy of the input."
+
+[payload]
+root = "record"
+node_types = ["record"]
+required_root_fields = ["kind", "filename", "size", "sha256"]

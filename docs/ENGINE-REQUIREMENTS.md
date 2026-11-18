@@ -8,8 +8,10 @@ contract makes the second checkable.
 
 - `name`, `formats`, `detonate(input, outdir, limits) -> DetonationResult`
   (`src/blastbox/worker/engine.py`); optional `detect`, `warmup`, `precheck`.
-- Every file written under `outdir` is declared (`DeclaredArtifact` id/path/kind). The SDK seals
-  sha256/bytes and confines paths; `host/trust` re-validates. Engines never hash or path-check.
+- Every file a consumer should see is declared (`DeclaredArtifact` id/path/kind); an undeclared
+  file is never served. The SDK seals sha256/bytes and confines paths; `host/trust` re-validates.
+  Engines never hash or path-check. `metadata.json`, `.metadata.json.*`, `attestation.json` and
+  `attestation.withheld.json` at the root (and anything under them) are reserved.
 - The payload is a typed tree from the shared node library (`Record`, `Page`,
   `EmbeddedResource`, `ExtractedText`) or a `register_node_type` subtype. Files are referenced by
   `ArtifactRef`, never inlined.
@@ -57,8 +59,10 @@ assert_conforms(CONTRACT, result, outdir)     # DetonationResult, Envelope, or m
 ```
 
 An artifact the contract does not list (or one declared but never written), a result the
-harness's seal would refuse (`unsealable`: a path escaping `outdir`, the reserved `metadata.json`,
-a duplicate id; checked when `outdir` is given), a required artifact missing on `ok`, a node type
+harness's seal or the host trust gate would refuse (`unsealable` / `reserved_path`: a path escaping
+`outdir`, a reserved root name, a duplicate id, a payload nested deeper than the host parses;
+checked when `outdir` is given; pass `limits=` to also apply that host's metadata-size and
+artifact-count caps), a required artifact missing on `ok`, a node type
 the contract does not allow (on any status; on `rejected`/`engine_error` the harness's own bare
 Record root is allowed, nodes below it are still checked), a wrong root on `ok`, or a missing root field on `ok`
 fails the test. An artifact counts toward the first family it matches but must satisfy the

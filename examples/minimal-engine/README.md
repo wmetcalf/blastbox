@@ -37,3 +37,10 @@ The same engine plugs into the host orchestrator — point `serve` + `dispatch` 
 job store and register the engine (see the repo README's *Run (host)* section). The host
 then gives it ingress, a hardened disposable worker per job, output-trust validation, artifact
 serving, optional warm pooling, metrics, and a CLI — without changing a line of the engine.
+
+## Its output contract
+
+`blastbox-engine.toml` next to the engine declares what it emits (the `copy` artifact and a
+`record` payload with `kind`, `filename`, `size`, `sha256`). Check a result against it with
+`blastbox.contract.engine_contract.assert_conforms(load_contract(find_contract(__file__)), result, outdir)`.
+See [docs/ENGINE-REQUIREMENTS.md](../../docs/ENGINE-REQUIREMENTS.md).
