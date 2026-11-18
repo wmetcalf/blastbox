@@ -936,7 +936,7 @@ def test_non_apparmor_label_is_unknown_not_confined():
     host = _with_procs(_proc(200, ["runsc-sandbox", "boot"], uid_map=_REMAPPED,
                              aa="unconfined_u:unconfined_r:unconfined_t:s0\n"))
     c = _by_name(pf.run_preflight(host, ["gvisor"]))["sandbox-confinement"]
-    assert c.status is Status.WARN and "unknown" in c.detail
+    assert c.status is Status.WARN and "cannot be verified" in c.detail
 
 
 def test_apparmor_specific_attr_is_preferred():
@@ -965,3 +965,47 @@ def test_stock_bwrap_profile_is_irrelevant_to_nsjail_only():
                     files={"/etc/apparmor.d/bwrap-userns-restrict": "profile bwrap ..."})
     assert _by_name(pf.run_preflight(host, ["docker"]))["bwrap-userns-restrict"].status \
         is Status.PASS
+
+
+# --- marla round 3 Claude lens on #208 -----------------------------------------------------
+
+def test_cascade_member_names_are_case_sensitive_like_the_dispatcher():
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "firecracker:2,AWS-EC2:1"}
+    assert pf.resolve_tiers([], env) == ["docker", "firecracker"]
+
+
+def test_cascade_primary_skips_empty_items_like_the_parser():
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": ",firecracker:2"}
+    host = _healthy(env=env)
+    del host.env["BLASTBOX_FC_KERNEL"], host.env["BLASTBOX_FC_ROOTFS"]
+    assert _by_name(pf.run_preflight(host, ["firecracker"]))["fc-guest"].status is Status.FAIL
+
+
+def test_fc_overflow_without_guest_knobs_says_the_dispatcher_drops_it():
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2"}
+    host = _healthy(env=env)
+    del host.env["BLASTBOX_FC_KERNEL"], host.env["BLASTBOX_FC_ROOTFS"]
+    c = _by_name(pf.run_preflight(host, ["gvisor", "firecracker"]))["fc-guest"]
+    assert c.status is Status.WARN and "skips" in c.detail
+
+
+def test_runc_userns_needs_only_count_on_the_docker_tier():
+    env = {"BLASTBOX_POOL_RUNTIME": "gvisor", "BLASTBOX_DISPATCH_WARM_ONLY": "1",
+           "BLASTBOX_WORKER_RUNTIME": "runc", "BLASTBOX_ALLOW_RUNC": "1"}
+    host = _healthy(env=env, files={"/proc/sys/user/max_user_namespaces": "0"})
+    by = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env)))
+    assert by["userns"].status is not Status.FAIL
+
+
+def test_non_apparmor_label_says_no_apparmor_label_not_run_as_root():
+    host = _with_procs(_proc(200, ["runsc-sandbox", "boot"], uid_map=_REMAPPED,
+                             aa="system_u:system_r:container_runtime_t:s0\n"))
+    c = _by_name(pf.run_preflight(host, ["gvisor"]))["sandbox-confinement"]
+    assert c.status is Status.WARN and "no AppArmor label" in c.detail
+    assert "run as root" not in c.detail
+
+
+@pytest.mark.parametrize("value", ["", " /var/lib/blastbox/gvisor-root"])
+def test_empty_or_padded_gvisor_root_warns(value):
+    c = _by_name(pf.run_preflight(_healthy(env={"BLASTBOX_GVISOR_ROOT": value}), ["gvisor"]))
+    assert c["scratch"].status is Status.WARN

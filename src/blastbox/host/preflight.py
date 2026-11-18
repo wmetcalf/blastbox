@@ -216,7 +216,9 @@ def resolve_tiers(requested: Sequence[str], env: Mapping[str, str]) -> list[str]
             if pool == "cascade":
                 # A cascade's members are whatever BLASTBOX_POOL_TIERS lists ("firecracker:2,
                 # aws-ec2:4"), and local members need their local checks.
-                members = [item.partition(":")[0].strip().lower()
+                # Names as given: the dispatcher matches them case-sensitively and skips an
+                # overflow member it cannot select, so a mis-cased one adds no tier.
+                members = [item.partition(":")[0].strip()
                            for item in env.get("BLASTBOX_POOL_TIERS", "").split(",")
                            if item.strip()]
             for member in members:
@@ -485,9 +487,15 @@ def _check_firecracker(host: HostView) -> Check:
 def _primary_pool(env: Mapping[str, str]) -> str:
     pool = env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower()
     if pool == "cascade":
-        first = env.get("BLASTBOX_POOL_TIERS", "").split(",")[0]
-        pool = first.partition(":")[0].strip().lower()
+        members = _cascade_members(env)
+        pool = members[0] if members else ""
     return pool
+
+
+def _cascade_members(env: Mapping[str, str]) -> list[str]:
+    """Member names as the dispatcher's parser sees them (empty items skipped, case kept)."""
+    return [item.partition(":")[0].strip()
+            for item in env.get("BLASTBOX_POOL_TIERS", "").split(",") if item.strip()]
 
 
 def _check_fc_guest(host: HostView) -> Check:
@@ -500,6 +508,12 @@ def _check_fc_guest(host: HostView) -> Check:
             return Check("fc-guest", Status.FAIL,
                          "BLASTBOX_POOL_RUNTIME selects Firecracker but BLASTBOX_FC_KERNEL/"
                          "BLASTBOX_FC_ROOTFS are unset; the dispatcher refuses to start", doc)
+        if (host.env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower() == "cascade"
+                and "firecracker" in _cascade_members(host.env)[1:]):
+            return Check("fc-guest", Status.WARN,
+                         "this cascade lists firecracker as an overflow tier but "
+                         "BLASTBOX_FC_KERNEL/BLASTBOX_FC_ROOTFS are unset: the dispatcher skips "
+                         "that tier at startup", doc)
         return Check("fc-guest", Status.WARN,
                      "BLASTBOX_FC_KERNEL/BLASTBOX_FC_ROOTFS unset here (check from the FC "
                      "dispatcher's environment to verify the guest artifacts)", doc)
@@ -555,12 +569,13 @@ def _check_snapshot_age(host: HostView) -> Check:
                  f"warm bases refresh after {value:g}s" + ("" if raw else " (default)"))
 
 
-def _needs_userns(env: Mapping[str, str]) -> list[str]:
+def _needs_userns(env: Mapping[str, str], tiers: Collection[str] = ("docker",)) -> list[str]:
     why = []
     sandbox = env.get("BLASTBOX_SANDBOX", "").strip().lower()
     if sandbox in ("bwrap", "nsjail"):
         why.append(f"BLASTBOX_SANDBOX={sandbox}")
-    if env.get("BLASTBOX_WORKER_RUNTIME", "").strip().lower() == "runc":
+    # Only the cold docker path reads BLASTBOX_WORKER_RUNTIME (runtime/docker.py).
+    if "docker" in tiers and env.get("BLASTBOX_WORKER_RUNTIME", "").strip().lower() == "runc":
         why.append("BLASTBOX_WORKER_RUNTIME=runc (inner nsjail/bwrap)")
     if _truthy(env.get("BLASTBOX_GVISOR_ROOTLESS")):
         why.append("BLASTBOX_GVISOR_ROOTLESS")
@@ -581,7 +596,7 @@ def _profile_attachment_mismatches(host: HostView) -> list[str]:
     return out
 
 
-def _check_userns(host: HostView) -> Check:
+def _check_userns(host: HostView, tiers: Collection[str] = ("docker",)) -> Check:
     doc = f"{DOC}#apparmor-and-user-namespaces"
     restrict = _sysctl(host, "/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
     max_ns = _sysctl(host, "/proc/sys/user/max_user_namespaces")
@@ -590,7 +605,7 @@ def _check_userns(host: HostView) -> Check:
         ("apparmor_restrict_unprivileged_userns", restrict),
         ("max_user_namespaces", max_ns),
         ("unprivileged_userns_clone", clone)) if v is not None) or "no userns sysctls readable"
-    needs = _needs_userns(host.env)
+    needs = _needs_userns(host.env, tiers)
     if max_ns == "0" or clone == "0":
         status = Status.FAIL if needs else Status.WARN
         return Check("userns", status,
@@ -633,7 +648,7 @@ def _check_apparmor(host: HostView) -> Check:
                  "and no child profile can be attached", doc)
 
 
-def _check_bwrap_stock_profile(host: HostView) -> Check:
+def _check_bwrap_stock_profile(host: HostView, tiers: Collection[str] = ("docker",)) -> Check:
     doc = f"{DOC}#the-stock-bwrap-userns-restrict-profile"
     path = "/etc/apparmor.d/bwrap-userns-restrict"
     disabled = host.exists("/etc/apparmor.d/disable/bwrap-userns-restrict")
@@ -654,7 +669,7 @@ def _check_bwrap_stock_profile(host: HostView) -> Check:
     needs = []
     if env.get("BLASTBOX_SANDBOX", "").strip().lower() == "bwrap":
         needs.append("BLASTBOX_SANDBOX=bwrap")
-    if env.get("BLASTBOX_WORKER_RUNTIME", "").strip().lower() == "runc":
+    if "docker" in tiers and env.get("BLASTBOX_WORKER_RUNTIME", "").strip().lower() == "runc":
         needs.append("BLASTBOX_WORKER_RUNTIME=runc (inner bwrap)")
     if not needs:
         return Check("bwrap-userns-restrict", Status.PASS,
@@ -721,6 +736,10 @@ def _check_scratch(host: HostView, tiers: Sequence[str]) -> Check:
                         "it unstripped (empty = its working directory)")
     job_root = (raw_root or "").strip() or _DEFAULT_JOB_ROOT
     dirs = [("BLASTBOX_JOB_ROOT", job_root)]
+    raw_gv = env.get("BLASTBOX_GVISOR_ROOT")
+    if "gvisor" in tiers and raw_gv is not None and (not raw_gv.strip() or raw_gv != raw_gv.strip()):
+        problems.append(f"BLASTBOX_GVISOR_ROOT={raw_gv!r} is empty or padded: the gVisor runtime "
+                        "uses it unstripped (empty = its working directory)")
     if "firecracker" in tiers or "gvisor" in tiers:
         for knob in ("BLASTBOX_SNAPSHOT_MEM_DIR", "BLASTBOX_GVISOR_ROOT"):
             if env.get(knob, "").strip():
@@ -874,6 +893,7 @@ def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc]) -> Check:
     unconfined: list[_Proc] = []
     unjailed: list[_Proc] = []
     unknown: list[_Proc] = []
+    foreign: list[_Proc] = []
     for p in procs:
         # attr/apparmor/current is AppArmor's own label under LSM stacking; attr/current is the
         # display LSM's (an SELinux context on a non-AppArmor host), so only trust an
@@ -882,9 +902,12 @@ def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc]) -> Check:
         if label is None:
             label = host.read(f"/proc/{p.pid}/attr/current")
             if label is not None and not _apparmor_shaped(label):
-                label = None
+                foreign.append(p)   # another LSM's label: no AppArmor label exists to check
+                label = ""
         if label is None:
             unknown.append(p)
+        elif label == "":
+            pass
         elif _is_unconfined(label):
             unconfined.append(p)
         if p.role == "firecracker":
@@ -904,6 +927,10 @@ def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc]) -> Check:
                      "; ".join(problems) + ". Slots share one scratch tree (other slots' "
                      "disks and API/vsock sockets); run firecracker under the jailer with a "
                      "per-slot AppArmor profile so one VMM cannot reach another slot", doc)
+    if foreign:
+        return Check("sandbox-confinement", Status.WARN,
+                     f"no AppArmor label on {_pids(foreign)} (another LSM is active, or "
+                     "AppArmor is off): AppArmor confinement cannot be verified", doc)
     if unknown:
         return Check("sandbox-confinement", Status.WARN,
                      f"{_UNKNOWN}: cannot read the AppArmor label or argv of {_pids(unknown)}",
@@ -948,8 +975,8 @@ def run_preflight(host: HostView, tiers: Sequence[str]) -> list[Check]:
             out.append(_check_runsc_host_root(host, procs))
         out.append(_check_sandbox_confinement(host, procs))
     out.append(_check_apparmor(host))
-    out.append(_check_bwrap_stock_profile(host))
-    out.append(_check_userns(host))
+    out.append(_check_bwrap_stock_profile(host, t))
+    out.append(_check_userns(host, t))
     out.append(_check_clock(host))
     out.append(_check_cpu_flags(host))
     out.append(_check_scratch(host, tiers))

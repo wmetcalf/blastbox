@@ -44,7 +44,7 @@ which the dispatcher skips at startup.
 |---|---|---|
 | **docker** (cold) | docker daemon, `runsc` registered as a docker runtime (fail-closed without it) | `docker`, `docker-runsc-runtime`, `runsc-host-root`, `sandbox-confinement` |
 | **gvisor** (warm C/R) | the `runsc` binary with checkpoint/restore (driven directly, no docker; root) | `runsc`, `gvisor-rootless`, `snapshot-age`, `runsc-host-root`, `sandbox-confinement` |
-| **firecracker** (warm/cold) | `/dev/kvm` read/write, `firecracker` ≥ 1.15.1, guest kernel + rootfs | `kvm`, `firecracker`, `fc-guest`, `snapshot-age`, `sandbox-confinement` |
+| **firecracker** (warm/cold) | `/dev/kvm` read/write, `firecracker` ≥ 1.15.1, guest kernel + rootfs | `kvm`, `firecracker`, `fc-guest`, `snapshot-age`, `sandbox-confinement`, `fc-scratch` |
 | **remote** (static / AWS) | nothing runtime-specific locally; the remote box runs the worker image under its own runsc | common checks only (no docker: no cold path) |
 | every tier | a pool the dispatcher accepts, AppArmor state known, synced clock, CPU flags reviewed, scratch off `/tmp` | `pool-runtime`, `apparmor`, `bwrap-userns-restrict`, `userns`, `clock`, `cpu-flags`, `scratch` |
 
@@ -190,8 +190,9 @@ if it is compromised. Recommended:
 - attach a **per-slot AppArmor profile** that allows only that slot's files.
 
 Preflight's `sandbox-confinement` check warns when a firecracker or runsc process is not confined
-by AppArmor (`/proc/<pid>/attr/current` is `unconfined`, or a profile in `(unconfined)` or
-`(complain)` mode) or a firecracker was not started by the jailer (the jailer always passes
+by AppArmor (its AppArmor label, `/proc/<pid>/attr/apparmor/current` or else an AppArmor-shaped
+`attr/current`, is `unconfined`, or a profile in `(unconfined)` or `(complain)` mode; another LSM's
+label means AppArmor confinement cannot be verified) or a firecracker was not started by the jailer (the jailer always passes
 `--start-time-us`; a non-`/` root proves nothing, a container has one too). When it cannot read
 those it reports `unknown (run as root)` and does not fail. A firecracker inside a docker
 container shows the container's profile (e.g. `docker-default (enforce)`), which counts as
