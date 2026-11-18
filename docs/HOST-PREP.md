@@ -316,7 +316,7 @@ Preflight reads `/proc/cpuinfo` and warns on flags with operational consequences
   missing gVisor rootfs is not a startup gate: a warm overflow tier is admitted but its base never
   builds, so the cascade runs without it (WARN); a cold Firecracker overflow tier really spawns
   there and every spawn fails (FAIL). With `--tier <that tier>` its prerequisites gate as usual.
-- `gvisor-rootfs` also applies the runtime's rootfs stamp check: a tree stamped for another release,
+- `gvisor-rootfs` and `fc-guest` also apply the runtime's rootfs stamp check: a tree stamped for another release,
   architecture or runtime FAILs; an unstamped legacy tree is allowed.
 - `BLASTBOX_JOB_ROOT` must be the same path for serve, dispatch and the worker mount, and must
   **not** be shared between a container dispatcher and a network-tier (aws/static) dispatcher

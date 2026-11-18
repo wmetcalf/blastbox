@@ -582,6 +582,11 @@ def _check_fc_guest(host: HostView) -> Check:
                      f"BLASTBOX_POOL_WARM_SNAPSHOT is on but guest kernel {kernel} is "
                      f"{kver[0]}.{kver[1]}; the snapshot tier needs >= {need} (VMGenID reseeds "
                      "the CRNG on restore) and refuses to start", doc)
+    # The runtime's own stamp gate (firecracker_available -> rootfs_guest_problem): a rootfs
+    # stamped for another release/arch/runtime is refused; an unstamped legacy one is allowed.
+    problem = host.guest_problem(rootfs, "firecracker")
+    if problem:
+        return Check("fc-guest", Status.FAIL, f"rootfs {rootfs}: {problem}", doc)
     return Check("fc-guest", Status.PASS, f"kernel {kernel}, rootfs {rootfs}")
 
 

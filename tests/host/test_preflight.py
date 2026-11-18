@@ -1321,3 +1321,10 @@ def test_gvisor_rootfs_with_an_incompatible_stamp_fails():
     host.guest_problems = {"/var/lib/blastbox/gvisor-rootfs": "stamped for blastbox 0.1.10"}
     c = _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-rootfs"]
     assert c.status is Status.FAIL and "0.1.10" in c.detail
+
+
+def test_fc_rootfs_with_an_incompatible_stamp_fails():
+    host = _healthy(env={"BLASTBOX_POOL_RUNTIME": "firecracker"})
+    host.guest_problems = {"/var/lib/blastbox/fc/rootfs.ext4": "stamped for aarch64"}
+    c = _by_name(pf.run_preflight(host, ["firecracker"]))["fc-guest"]
+    assert c.status is Status.FAIL and "aarch64" in c.detail
