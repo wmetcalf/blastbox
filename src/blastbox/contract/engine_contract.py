@@ -365,9 +365,24 @@ def check_envelope(contract: EngineContract, envelope: Any, *, limits: Any = Non
     caps = [Violation("host_limit", p) for p in _host_cap_problems(env, limits)]
     caps += [Violation("reserved_path", f"{a.id} at {a.path}: the host trust gate refuses {r}")
              for a in env.artifacts for r in [_host_reserved(a.path)] if r]
-    try:
-        from .envelope import envelope_from_json
+    # What the trust gate's re-seal (seal_envelope) refuses: the reserved root metadata.json,
+    # duplicate ids, ArtifactRefs to undeclared ids; plus its JSON depth/schema parse.
+    from .envelope import _collect_refs, envelope_from_json
 
+    for a in env.artifacts:
+        parts = PurePosixPath(a.path).parts
+        if parts and (parts[0] == "metadata.json" or parts[0].startswith(".metadata.json.")):
+            caps.append(Violation("reserved_path", f"{a.id} at {a.path}: the seal refuses the "
+                                  "reserved root metadata.json"))
+    ids = [a.id for a in env.artifacts]
+    dups = sorted({i for i in ids if ids.count(i) > 1})
+    if dups:
+        caps.append(Violation("unsealable", f"duplicate artifact id(s) {dups}: the host re-seal refuses them"))
+    unresolved = sorted(_collect_refs(env.payload) - set(ids))
+    if unresolved:
+        caps.append(Violation("unsealable", f"payload has unresolved ArtifactRef(s) {unresolved}: "
+                              "the host re-seal refuses them"))
+    try:
         envelope_from_json(env.model_dump_json(by_alias=True).encode(), max_bytes=sys.maxsize)
     except ValueError as exc:
         caps.append(Violation("unsealable", f"the host trust gate would refuse this envelope: {exc}"))

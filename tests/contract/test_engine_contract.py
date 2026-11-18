@@ -937,3 +937,37 @@ def test_total_cap_message_names_undeclared_bytes(contract_path: Path, tmp_path:
     v = check_result(load_contract(contract_path), _result(), out,
                      limits=Limits(max_total_artifact_bytes=4000))
     assert any("undeclared" in x.detail for x in v)
+
+
+# --- bot review on the final head ------------------------------------------------------------
+
+def _sealed_dict(out: Path, r: DetonationResult) -> dict:
+    env = seal_envelope(engine="demo", outdir=out, input_sha256="0" * 64, detected=DET,
+                        declared=r.artifacts, warnings=[], payload=r.payload)
+    return json.loads(env.model_dump_json(by_alias=True))
+
+
+def test_check_envelope_refuses_reserved_metadata_paths(contract_path: Path, tmp_path: Path) -> None:
+    contract_path.write_text(CONTRACT.replace('''[[artifacts]]
+id = "manifest"''', '''[[artifacts]]
+id = "x"
+path = "*"
+kind = "file"
+max_count = 0
+
+[[artifacts]]
+id = "manifest"'''))
+    data = _sealed_dict(_outdir(tmp_path), _result())
+    data["artifacts"].append({"id": "x", "path": "./metadata.json", "kind": "file",
+                              "sha256": "0" * 64, "bytes": 1})
+    assert "reserved_path" in {v.code for v in check_envelope(load_contract(contract_path), data)}
+
+
+def test_check_envelope_refuses_unresolved_refs_and_duplicate_ids(contract_path: Path, tmp_path: Path) -> None:
+    c = load_contract(contract_path)
+    data = _sealed_dict(_outdir(tmp_path), _result(schema="page-root"))
+    data["artifacts"] = [a for a in data["artifacts"] if a["id"] != "page-0"]
+    assert "unsealable" in {v.code for v in check_envelope(c, data)}
+    data2 = _sealed_dict(_outdir(tmp_path / "b"), _result())
+    data2["artifacts"].append(dict(data2["artifacts"][0]))
+    assert "unsealable" in {v.code for v in check_envelope(c, data2)}
