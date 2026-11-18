@@ -172,6 +172,11 @@ _HOST_ARTIFACTS: frozenset[tuple[str, str, str]] = frozenset({
 
 _NO_CAPTURE_NETWORKS = frozenset({"none", "drop"})
 
+# The node types every host can parse. register_node_type registers into the process that
+# imports the engine; the dispatcher's trust gate never imports engine modules, so any other
+# type fails its schema validation (magika._sealed records it live) -- seal it as a Record.
+_HOST_NODE_TYPES = frozenset({"page", "embedded_resource", "extracted_text", "record"})
+
 # Root names the host trust gate refuses as artifacts, nested paths included (host/attest.py
 # RESERVED_NAMES: the signed receipt and its withheld marker). Mirrored here because host/attest
 # needs the host extra (cryptography); a test pins the two equal.
@@ -265,6 +270,11 @@ def _check(contract: EngineContract, *, engine: str | None, status: str,
     seen = {t for t in (_node_type(n) for n in nodes) if t is not None}
     for t in sorted(seen - allowed):
         out.append(Violation("undeclared_node_type", f"payload contains {t!r}, not in contract node_types"))
+    for t in sorted(seen - _HOST_NODE_TYPES):
+        out.append(Violation("host_unknown_node_type",
+                             f"payload contains {t!r}: the host trust gate never imports engine "
+                             "modules, so it cannot parse a register_node_type type; seal it as "
+                             "a Record (see engines/magika.py _sealed)"))
 
     if status == "ok":
         root_type = _node_type(payload)
@@ -313,6 +323,12 @@ def _host_cap_problems(env: Any, limits: Any, extra_bytes: int = 0) -> list[str]
     return out
 
 
+def _host_reserved(path: str) -> str | None:
+    parts = PurePosixPath(path).parts
+    parts = parts[1:] if parts and parts[0] == "/" else parts
+    return parts[0] if parts and parts[0] in _HOST_RESERVED_NAMES else None
+
+
 def _undeclared_bytes(outdir: Path, env: Any) -> int:
     """Bytes of regular files under ``outdir`` that are not declared artifacts (nor the harness's
     metadata.json): the cold/warm dispatcher's output cap counts every file in the tree."""
@@ -345,6 +361,14 @@ def check_envelope(contract: EngineContract, envelope: Any, *, limits: Any = Non
         (a.id, a.path, a.kind, a.bytes) for a in env.artifacts
         if not (captures and (a.id, a.kind, a.path) in _HOST_ARTIFACTS)]
     caps = [Violation("host_limit", p) for p in _host_cap_problems(env, limits)]
+    caps += [Violation("reserved_path", f"{a.id} at {a.path}: the host trust gate refuses {r}")
+             for a in env.artifacts for r in [_host_reserved(a.path)] if r]
+    try:
+        from .envelope import envelope_from_json
+
+        envelope_from_json(env.model_dump_json(by_alias=True).encode(), max_bytes=sys.maxsize)
+    except ValueError as exc:
+        caps.append(Violation("unsealable", f"the host trust gate would refuse this envelope: {exc}"))
     return caps + _check(contract, engine=env.engine, status=env.status, artifacts=arts,
                          payload=env.payload)
 
@@ -353,6 +377,9 @@ def check_result(contract: EngineContract, result: Any, outdir: str | Path | Non
                  limits: Any = None) -> list[Violation]:
     """Check an unsealed ``DetonationResult`` (what an engine's own tests hold). With ``outdir``,
     byte caps are checked from the files on disk."""
+    if limits is not None and outdir is None:
+        raise TypeError("check_result(limits=...) needs outdir: the host caps are judged on the "
+                        "sealed output")
     arts: list[tuple[str, str, str, int | None]] = []
     missing: set[str] = set()
     unsealable: list[Violation] = []
@@ -386,11 +413,10 @@ def check_result(contract: EngineContract, result: Any, outdir: str | Path | Non
                 "unsealable", f"the harness seal or host trust gate would refuse this result{note}: {exc}"))
     if outdir is not None:
         for a in result.artifacts:
-            parts = PurePosixPath(a.path).parts
-            parts = parts[1:] if parts and parts[0] == "/" else parts
-            if parts and parts[0] in _HOST_RESERVED_NAMES:
+            reserved = _host_reserved(a.path)
+            if reserved:
                 unsealable.append(Violation("reserved_path",
-                                            f"{a.id} at {a.path}: the host trust gate refuses {parts[0]}"))
+                                            f"{a.id} at {a.path}: the host trust gate refuses {reserved}"))
         meta = Path(outdir) / "metadata.json"
         # The harness's atomic rename replaces a symlink/FIFO there; only a directory breaks it.
         if meta.is_dir() and not meta.is_symlink():
@@ -451,12 +477,16 @@ def _contract_engine_name(path: Path) -> object:
 
 
 def _textual_engine_name(path: Path) -> str | None:
-    """The first ``name = "..."`` in a contract that does not parse (best effort)."""
+    """The ``[engine]`` table's ``name = "..."`` in a contract that does not parse (best effort)."""
     try:
         text = path.read_bytes()[:65536].decode("utf-8", errors="replace")
     except OSError:
         return None
-    m = re.search(r'^\s*name\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
+    # Only inside the [engine] table: [[consumers]] also has a name.
+    table = re.search(r'^\s*\[engine\]\s*$(.*?)(?=^\s*\[)', text + "\n[", re.MULTILINE | re.DOTALL)
+    if table is None:
+        return None
+    m = re.search(r'^\s*name\s*=\s*["\']([^"\']+)["\']', table.group(1), re.MULTILINE)
     return m.group(1) if m else None
 
 

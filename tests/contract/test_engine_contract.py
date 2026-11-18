@@ -269,7 +269,9 @@ def test_cli_imports_registration_modules(tmp_path: Path, monkeypatch: pytest.Mo
     env_json.write_text(json.dumps(data))
     monkeypatch.syspath_prepend(str(tmp_path))
     try:
-        assert main(["check", "--import", "demo_nodes_mod", str(contract), str(env_json)]) == 0
+        # Parseable once imported -- but the host dispatcher never imports engine modules, so
+        # the result is still reported as a node type the trust gate refuses.
+        assert main(["check", "--import", "demo_nodes_mod", str(contract), str(env_json)]) == 1
         assert main(["check", "--import", "no_such_module_xyz", str(contract), str(env_json)]) == 1
     finally:
         from blastbox.contract import nodes
@@ -845,3 +847,58 @@ def test_total_cap_counts_undeclared_files_in_outdir(contract_path: Path, tmp_pa
     (out / "scratch.bin").write_bytes(b"x" * 5000)
     lim = Limits(max_total_artifact_bytes=4000)
     assert "unsealable" in {v.code for v in check_result(load_contract(contract_path), _result(), out, limits=lim)}
+
+
+# --- final sweep 2 ---------------------------------------------------------------------------
+
+def test_registered_node_types_are_refused_like_the_host(tmp_path: Path) -> None:
+    from typing import Literal
+    from pydantic import Field
+    from blastbox.contract.nodes import _Node
+
+    class Verdict(_Node):
+        type: Literal["demo_verdict_t"] = Field(default="demo_verdict_t", alias="_type")
+
+    p = tmp_path / CONTRACT_FILENAME
+    p.write_text(CONTRACT.replace('root = "record"', 'root = "demo_verdict_t"')
+                 .replace('node_types = ["record", "page"]', 'node_types = ["demo_verdict_t"]')
+                 .replace('required_root_fields = ["schema_version"]\nschema_version = "demo/1"\n', '')
+                 .replace("required = true", "required = false"))
+    r = DetonationResult(payload=Verdict(), artifacts=[], detected=DET)
+    assert "host_unknown_node_type" in {v.code for v in check_result(load_contract(p), r)}
+
+
+def test_sealed_dict_gets_host_parity_checks(contract_path: Path, tmp_path: Path) -> None:
+    contract_path.write_text(CONTRACT.replace('''[[artifacts]]
+id = "manifest"''', '''[[artifacts]]
+id = "att"
+path = "*"
+kind = "file"
+max_count = 0
+
+[[artifacts]]
+id = "manifest"'''))
+    out = _outdir(tmp_path)
+    (out / "attestation.json").write_text("{}")
+    r = _result(extra=[DeclaredArtifact(id="att", path="attestation.json", kind="file")])
+    env = seal_envelope(engine="demo", outdir=out, input_sha256="0" * 64, detected=DET,
+                        declared=r.artifacts, warnings=[], payload=r.payload)
+    data = json.loads(env.model_dump_json(by_alias=True))
+    assert "reserved_path" in {v.code for v in check_envelope(load_contract(contract_path), data)}
+
+
+def test_limits_without_outdir_is_an_error(contract_path: Path) -> None:
+    from blastbox.limits import Limits
+    with pytest.raises(TypeError, match="outdir"):
+        check_result(load_contract(contract_path), _result(), limits=Limits())
+
+
+def test_textual_name_is_read_from_the_engine_table(tmp_path: Path) -> None:
+    (tmp_path / "tests").mkdir()
+    broken = (CONTRACT.replace('name = "demo"', 'nmae = "demo"') + '''
+[[consumers]]
+name = "loadout"
+engine = "demo"
+''').replace('formats = ["ics"]', 'formats = ["ics"')
+    (tmp_path / CONTRACT_FILENAME).write_text(broken)
+    assert find_contract(tmp_path / "tests", "demo") == tmp_path / CONTRACT_FILENAME

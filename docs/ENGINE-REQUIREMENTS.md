@@ -13,8 +13,10 @@ contract makes the second checkable.
   Engines never hash or path-check. `metadata.json`, `.metadata.json.*`, `attestation.json` and
   `attestation.withheld.json` at the root (and anything under them) are reserved.
 - The payload is a typed tree from the shared node library (`Record`, `Page`,
-  `EmbeddedResource`, `ExtractedText`) or a `register_node_type` subtype. Files are referenced by
-  `ArtifactRef`, never inlined.
+  `EmbeddedResource`, `ExtractedText`). A `register_node_type` subtype is useful for validating
+  inside the engine, but the host's trust gate never imports engine modules and refuses it on the
+  wire: seal it as a `Record` (see `engines/magika.py` `_sealed`); the checker reports it as
+  `host_unknown_node_type`. Files are referenced by `ArtifactRef`, never inlined.
 - Network is whatever the resolved netpolicy grants; default `none`.
 
 ## 2. The contract (`blastbox-engine.toml`, checked by your tests)
@@ -44,8 +46,9 @@ At the engine repo root; a repo with several engines uses `blastbox-engine.<engi
 
 Validate: `python -m blastbox.contract.engine_contract validate blastbox-engine.toml`.
 Check a real result: `python -m blastbox.contract.engine_contract check blastbox-engine.toml metadata.json`.
-An engine with `register_node_type` payload nodes passes the module that registers them:
-`... check --import my_engine.nodes blastbox-engine.toml metadata.json` (repeatable).
+`--import MODULE` (repeatable) imports a module that registers custom node types so an envelope
+carrying them can be parsed at all; the check still reports them, since the host cannot parse them.
+Checking a sealed `metadata.json` also applies the host's reserved names and JSON depth bound.
 
 ## 3. Conformance in the engine's own tests
 
