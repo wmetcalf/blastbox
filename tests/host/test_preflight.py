@@ -35,6 +35,8 @@ class FakeHost(pf.HostView):
         links: dict[str, str] | None = None,
         special: set[str] | None = None,
         kernels: dict[str, tuple[int, int]] | None = None,
+        euid: int = 1000,
+        mounts: str = "",
     ) -> None:
         self.env = dict(env or {})
         self.files = dict(files or {})
@@ -46,6 +48,9 @@ class FakeHost(pf.HostView):
         self.links = dict(links or {})
         self.special = set(special or ())      # exists, but not a regular file (dir/dangling)
         self.kernels = dict(kernels or {})
+        self.euid = euid
+        if mounts:
+            self.files["/proc/mounts"] = mounts
 
     def read(self, path: str) -> str | None:
         return self.files.get(path)
@@ -146,8 +151,7 @@ def test_tiers_default_to_every_local_tier_when_nothing_is_configured():
 def test_tiers_follow_the_pool_runtime_plus_the_cold_dispatcher():
     assert pf.resolve_tiers([], {"BLASTBOX_POOL_RUNTIME": "firecracker"}) == [
         "docker", "firecracker"]
-    assert pf.resolve_tiers([], {"BLASTBOX_POOL_RUNTIME": "aws-ec2"}) == ["docker", "remote"]
-    assert pf.resolve_tiers([], {"BLASTBOX_POOL_RUNTIME": "static"}) == ["docker", "remote"]
+    assert pf.resolve_tiers([], {"BLASTBOX_POOL_RUNTIME": "none"}) == ["docker"]
 
 
 def test_explicit_tiers_win_and_are_deduplicated_in_canonical_order():
@@ -272,7 +276,8 @@ def test_no_docker_cli_fails():
 # --- AppArmor / userns ------------------------------------------------------------------
 
 def test_stock_bwrap_profile_present_warns_with_a_doc_pointer():
-    host = _healthy(files={"/etc/apparmor.d/bwrap-userns-restrict": "profile bwrap ..."})
+    host = _healthy(env={"BLASTBOX_SANDBOX": "bwrap"},
+                    files={"/etc/apparmor.d/bwrap-userns-restrict": "profile bwrap ..."})
     c = _by_name(pf.run_preflight(host, ["docker"]))["bwrap-userns-restrict"]
     assert c.status is Status.WARN
     assert c.doc.startswith("docs/HOST-PREP.md#")
@@ -404,8 +409,13 @@ def test_every_command_preflight_runs_is_on_the_read_only_allowlist():
     ["apparmor_parser", "-R", "/etc/apparmor.d/bwrap-userns-restrict"],
     ["timedatectl", "set-ntp", "true"],
 ])
-def test_mutating_commands_are_refused_by_the_real_runner(argv):
+def test_mutating_commands_are_refused_by_the_real_runner(argv, monkeypatch):
     assert not pf.is_read_only(argv)
+
+    def never(*a, **k):  # a regressed guard must not mutate the host running the tests
+        raise AssertionError(f"preflight spawned {a!r}")
+
+    monkeypatch.setattr(pf.subprocess, "run", never)
     with pytest.raises(pf.NotReadOnly):
         pf.RealHost().run(argv)
 
@@ -580,7 +590,7 @@ def test_firecracker_without_the_jailer_warns():
         links={"/proc/300/root": "/"})
     c = _by_name(pf.run_preflight(host, ["firecracker"]))["sandbox-confinement"]
     assert c.status is Status.WARN
-    assert "without the jailer" in c.detail and "warm-" in c.detail
+    assert "without the jailer" in c.detail and "API/vsock sockets" in c.detail
 
 
 def test_jailed_and_confined_firecracker_passes():
@@ -625,9 +635,7 @@ def test_cascade_tiers_resolve_to_their_local_members():
     env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "firecracker:2,gvisor:2"}
     assert pf.resolve_tiers([], env) == ["docker", "gvisor", "firecracker"]
     env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "static:4,aws-ec2:16"}
-    assert pf.resolve_tiers([], env) == ["docker", "remote"]
-    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "firecracker:2, aws-ec2:4"}
-    assert pf.resolve_tiers([], env) == ["docker", "firecracker", "remote"]
+    assert pf.resolve_tiers([], env) == ["remote"]
 
 
 @pytest.mark.parametrize("env", [
@@ -700,7 +708,6 @@ def test_runsc_without_checkpoint_restore_fails_the_gvisor_tier():
     c = _by_name(pf.run_preflight(host, ["gvisor"]))["runsc"]
     assert c.status is Status.FAIL and "checkpoint" in c.detail
     assert pf.is_read_only(["/usr/bin/runsc", "help"])
-    assert not pf.is_read_only(["/usr/bin/docker", "help"])
 
 
 def test_scoped_profile_attached_to_another_path_than_the_binary_warns():
@@ -743,3 +750,105 @@ def test_scoped_profile_matching_the_resolved_binary_passes():
                            "/etc/apparmor.d/blastbox-nsjail":
                            "profile blastbox-nsjail /usr/local/bin/nsjail flags=(unconfined) {\n}\n"})
     assert _by_name(pf.run_preflight(host, ["docker"]))["userns"].status is Status.PASS
+
+
+# --- marla round 1 Claude lens on #208 -----------------------------------------------------
+
+@pytest.mark.parametrize("env", [
+    {"BLASTBOX_POOL_RUNTIME": "aws-ec2"},
+    {"BLASTBOX_POOL_RUNTIME": "static"},
+    {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "static:4,aws-ec2:16"},
+])
+def test_remote_only_dispatchers_have_no_cold_docker_tier(env):
+    assert pf.resolve_tiers([], env) == ["remote"]
+
+
+def test_warm_only_local_dispatchers_have_no_cold_docker_tier():
+    env = {"BLASTBOX_POOL_RUNTIME": "firecracker", "BLASTBOX_DISPATCH_WARM_ONLY": "1"}
+    assert pf.resolve_tiers([], env) == ["firecracker"]
+
+
+@pytest.mark.parametrize("label", ["blastbox-runsc (unconfined)\n", "docker-default (complain)\n",
+                                   "unconfined\n"])
+def test_unconfined_or_complain_mode_profiles_are_not_confinement(label):
+    host = _with_procs(_proc(200, ["runsc-sandbox", "boot"], uid_map=_REMAPPED, aa=label))
+    c = _by_name(pf.run_preflight(host, ["gvisor"]))["sandbox-confinement"]
+    assert c.status is Status.WARN and "200" in c.detail
+
+
+@pytest.mark.parametrize("result", [None, (0, "no version here\n", "")])
+def test_firecracker_whose_version_cannot_be_read_fails(result):
+    host = _healthy()
+    if result is None:
+        del host.commands[("/usr/local/bin/firecracker", "--version")]
+    else:
+        host.commands[("/usr/local/bin/firecracker", "--version")] = result
+    assert _by_name(pf.run_preflight(host, ["firecracker"]))["firecracker"].status is Status.FAIL
+
+
+def test_renamed_runsc_binary_can_be_probed_for_checkpoint_restore():
+    assert pf.is_read_only(["/opt/gvisor/bin/gvisor-runsc", "help"])
+
+
+@pytest.mark.parametrize("value", ["", " /usr/bin/runsc"])
+def test_set_but_empty_or_padded_runsc_knob_fails_like_the_runtime(value):
+    host = _healthy(env={"BLASTBOX_GVISOR_RUNSC": value})
+    assert _by_name(pf.run_preflight(host, ["gvisor"]))["runsc"].status is Status.FAIL
+
+
+@pytest.mark.parametrize("value,status", [("0", Status.WARN), ("0.0", Status.WARN),
+                                          ("00", Status.WARN), ("6h", Status.WARN),
+                                          ("-5", Status.WARN), ("3600", Status.PASS)])
+def test_snapshot_age_parses_like_the_runtime(value, status):
+    host = _healthy(env={"BLASTBOX_SNAPSHOT_MAX_AGE_S": value})
+    assert _by_name(pf.run_preflight(host, ["gvisor"]))["snapshot-age"].status is status
+
+
+@pytest.mark.parametrize("tiers", ["firecracker:2,aws-ec2:4", "firecracker", "firecracker:0",
+                                   "Firecracker:2"])
+def test_cascade_specs_the_dispatcher_refuses_fail(tiers):
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": tiers}
+    assert _by_name(pf.run_preflight(_healthy(env=env), ["remote"]))["pool-runtime"].status \
+        is Status.FAIL
+
+
+def test_fc_slot_scratch_on_a_tmpfs_tmp_warns():
+    host = _healthy(mounts="tmpfs /tmp tmpfs rw,nosuid 0 0\n/dev/sda1 / ext4 rw 0 0\n")
+    c = _by_name(pf.run_preflight(host, ["firecracker"]))["scratch"]
+    assert c.status is Status.WARN and "/tmp/blastbox-fc-slots" in c.detail
+    disk = _healthy(mounts="/dev/sda1 / ext4 rw 0 0\n")
+    assert _by_name(pf.run_preflight(disk, ["firecracker"]))["scratch"].status is Status.PASS
+
+
+def test_profile_attachment_compares_the_resolved_binary_only():
+    host = _healthy(env={"BLASTBOX_SANDBOX": "nsjail"},
+                    executables={"nsjail": "/usr/local/bin/nsjail", "docker": "/usr/bin/docker"},
+                    links={"/usr/local/bin/nsjail": "/opt/nsjail/bin/nsjail"},
+                    files={"/sys/kernel/security/apparmor/profiles":
+                           "blastbox-bwrap (unconfined)\nblastbox-nsjail (unconfined)\n",
+                           "/etc/apparmor.d/blastbox-nsjail":
+                           "profile blastbox-nsjail /usr/local/bin/nsjail flags=(unconfined) {\n}\n"})
+    assert _by_name(pf.run_preflight(host, ["docker"]))["userns"].status is Status.WARN
+
+
+def test_acknowledged_warnings_do_not_fail_strict():
+    checks = [pf.Check("cpu-flags", Status.WARN, "x"), pf.Check("clock", Status.PASS, "")]
+    assert pf.exit_code(checks, strict=True) == 1
+    assert pf.exit_code(checks, strict=True, ack={"cpu-flags"}) == 0
+    assert json.loads(pf.render_json(checks, ["docker"], strict=True, ack={"cpu-flags"}))["ok"]
+
+
+def test_stock_bwrap_profile_only_warns_when_something_nests_bwrap():
+    host = _healthy(paths={"/etc/apparmor.d/bwrap-userns-restrict", "/dev/kvm",
+                           "/var/lib/blastbox/jobs", "/var/lib/blastbox/fc/vmlinux",
+                           "/var/lib/blastbox/fc/rootfs.ext4"})
+    assert _by_name(pf.run_preflight(host, ["firecracker"]))["bwrap-userns-restrict"].status \
+        is Status.PASS
+    host.env["BLASTBOX_SANDBOX"] = "bwrap"
+    assert _by_name(pf.run_preflight(host, ["docker"]))["bwrap-userns-restrict"].status \
+        is Status.WARN
+
+
+def test_kvm_as_root_says_the_dispatcher_user_is_unverified():
+    c = _by_name(pf.run_preflight(_healthy(euid=0), ["firecracker"]))["kvm"]
+    assert c.status is Status.PASS and "dispatcher user" in c.detail

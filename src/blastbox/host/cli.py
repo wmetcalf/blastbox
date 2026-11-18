@@ -2330,6 +2330,12 @@ def build_parser() -> argparse.ArgumentParser:
     ppf.add_argument(
         "--strict", action="store_true", help="exit 1 on any WARN as well as on FAIL"
     )
+    ppf.add_argument(
+        "--ack", action="append", default=[], metavar="CHECK",
+        help="with --strict, do not fail on this check's WARN (reviewed and accepted, e.g. "
+        "cpu-flags once JVM engines run with -XX:-UseBASE64Intrinsics). Repeatable; never "
+        "acknowledges a FAIL",
+    )
     ppf.set_defaults(func=_preflight_cmd)
 
     pst = sub.add_parser(
@@ -2879,10 +2885,10 @@ def _preflight_cmd(args: argparse.Namespace) -> int:
         return 2
     checks = pf.run_preflight(host, tiers)
     if args.json:
-        print(pf.render_json(checks, tiers, strict=bool(args.strict)))
+        print(pf.render_json(checks, tiers, strict=bool(args.strict), ack=set(args.ack)))
     else:
         print(pf.render_text(checks, tiers), end="")
-    return pf.exit_code(checks, strict=bool(args.strict))
+    return pf.exit_code(checks, strict=bool(args.strict), ack=set(args.ack))
 
 
 def _doctor_cmd(args: argparse.Namespace) -> int:

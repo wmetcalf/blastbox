@@ -21,7 +21,7 @@ import os
 import re
 import shutil
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
@@ -45,7 +45,7 @@ _READ_ONLY_ARGV: frozenset[tuple[str, ...]] = frozenset({
     ("info", "--format", "{{json .Runtimes}}"),             # docker
     ("show", "-p", "NTPSynchronized", "--value"),           # timedatectl
     ("-n", "tracking"),                                     # chronyc
-    ("help",),                                              # runsc (lists checkpoint/restore)
+    ("help",),                                              # runsc C/R probe
 })
 _READ_ONLY_BINARIES = frozenset({"docker", "runsc", "firecracker", "timedatectl", "chronyc"})
 
@@ -79,18 +79,18 @@ def is_read_only(argv: Sequence[str]) -> bool:
         return False
     if tuple(argv[1:]) not in _READ_ONLY_ARGV:
         return False
-    # --version is allowed for any configured binary (BLASTBOX_FC_BIN may be renamed);
-    # the subcommand forms only for the tool they belong to.
     base = os.path.basename(argv[0])
-    if tuple(argv[1:]) == ("help",):
-        return base == "runsc" or base.startswith("runsc")
-    return tuple(argv[1:]) == ("--version",) or base in _READ_ONLY_BINARIES
+    # --version and help (the runsc C/R probe) are allowed for any configured binary: the
+    # path comes from an operator knob (BLASTBOX_FC_BIN / BLASTBOX_GVISOR_RUNSC) and may be
+    # renamed; the subcommand forms only for the tool they belong to.
+    return tuple(argv[1:]) in (("--version",), ("help",)) or base in _READ_ONLY_BINARIES
 
 
 class HostView:
     """Everything preflight reads from the host. Subclassed by tests with a fake."""
 
     env: Mapping[str, str]
+    euid: int
 
     def read(self, path: str) -> str | None:
         raise NotImplementedError
@@ -129,6 +129,7 @@ class HostView:
 class RealHost(HostView):
     def __init__(self) -> None:
         self.env = os.environ
+        self.euid = os.geteuid()
 
     def read(self, path: str) -> str | None:
         # Chunked: a /proc/sys handler fails ONE large read() with ENOMEM (a 4 MiB read of
@@ -208,7 +209,6 @@ def resolve_tiers(requested: Sequence[str], env: Mapping[str, str]) -> list[str]
         if not pool:
             chosen.update(_LOCAL_TIERS)
         else:
-            chosen.add("docker")
             members = [pool]
             if pool == "cascade":
                 # A cascade's members are whatever BLASTBOX_POOL_TIERS lists ("firecracker:2,
@@ -221,6 +221,12 @@ def resolve_tiers(requested: Sequence[str], env: Mapping[str, str]) -> list[str]
                     chosen.add(member)
                 elif member in _REMOTE_POOL_RUNTIMES:
                     chosen.add("remote")
+            # The cold docker path exists only on a file-handshake (local) dispatcher that is not
+            # warm-only; network-endpoint pools requeue instead (dispatch.py, "no cold path").
+            warm_only = env.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower() in (
+                "1", "true", "yes", "on")
+            if not (chosen & {"remote"}) and not warm_only:
+                chosen.add("docker")
     return [t for t in TIERS if t in chosen]
 
 
@@ -254,6 +260,14 @@ def _loaded_profiles(host: HostView) -> set[str] | None:
 def _sysctl(host: HostView, path: str) -> str | None:
     raw = host.read(path)
     return raw.strip() if raw is not None else None
+
+
+def _tmpfs(host: HostView, mountpoint: str) -> bool:
+    for line in (host.read("/proc/mounts") or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] == mountpoint:
+            return parts[2] == "tmpfs"
+    return False
 
 
 def _under_tmp(path: str) -> bool:
@@ -320,8 +334,10 @@ def _check_docker_runsc(host: HostView) -> Check:
 
 def _check_runsc_binary(host: HostView) -> Check:
     doc = f"{DOC}#gvisor-runsc"
-    name = host.env.get("BLASTBOX_GVISOR_RUNSC", "").strip() or "runsc"
-    path = host.which(name)
+    # Exactly as gvisor_snapshot_runtime reads it: no strip, and set-but-empty is NOT "runsc"
+    # (a compose ${BLASTBOX_GVISOR_RUNSC:-} passes ""), so mirror that instead of masking it.
+    name = host.env.get("BLASTBOX_GVISOR_RUNSC", "runsc")
+    path = host.which(name) if name and name == name.strip() else None
     if path is None:
         return Check("runsc", Status.FAIL, f"runsc binary {name!r} not found/executable", doc)
     proc = host.run([path, "--version"])
@@ -358,8 +374,14 @@ def _check_pool_runtime(host: HostView) -> Check | None:
                      f"BLASTBOX_POOL_RUNTIME={pool!r} is not a known runtime "
                      f"({', '.join(sorted(_KNOWN_POOL_RUNTIMES))})", doc)
     if pool == "cascade":
-        members = [item.partition(":")[0].strip().lower()
-                   for item in host.env.get("BLASTBOX_POOL_TIERS", "").split(",") if item.strip()]
+        from blastbox.host.runtime.cascade import _parse_tiers  # noqa: PLC0415
+
+        try:
+            # The dispatcher's own parser: 'backend:capacity', capacity >= 1, names as given
+            # (select_runtime_by_name is case-sensitive).
+            members = [name for name, _cap in _parse_tiers(host.env.get("BLASTBOX_POOL_TIERS", ""))]
+        except Exception as exc:  # noqa: BLE001 -- CascadeMisconfigured; report, never raise
+            return Check("pool-runtime", Status.FAIL, f"BLASTBOX_POOL_TIERS: {exc}", doc)
         if not members:
             return Check("pool-runtime", Status.FAIL,
                          "BLASTBOX_POOL_RUNTIME=cascade but BLASTBOX_POOL_TIERS is empty", doc)
@@ -368,6 +390,12 @@ def _check_pool_runtime(host: HostView) -> Check | None:
             return Check("pool-runtime", Status.FAIL,
                          f"BLASTBOX_POOL_TIERS has unknown/invalid member(s): {', '.join(bad)}",
                          doc)
+        local = {m for m in members if m in ("firecracker", "gvisor")}
+        if local and len(local) != len(set(members)):
+            return Check("pool-runtime", Status.FAIL,
+                         "BLASTBOX_POOL_TIERS mixes file-handshake (firecracker/gvisor) and "
+                         "network-endpoint (static/aws-*) tiers; the dispatcher refuses a mixed "
+                         "cascade", doc)
         return Check("pool-runtime", Status.PASS, f"cascade of {', '.join(members)}")
     return Check("pool-runtime", Status.PASS, f"BLASTBOX_POOL_RUNTIME={pool}")
 
@@ -394,6 +422,10 @@ def _check_kvm(host: HostView) -> Check:
         return Check("kvm", Status.FAIL,
                      f"/dev/kvm not read/write for uid {os.getuid()}: add the dispatcher user "
                      "to the kvm group (or pass --device /dev/kvm to its container)", doc)
+    if host.euid == 0:
+        return Check("kvm", Status.PASS,
+                     "/dev/kvm present (running as root, so the dispatcher user's access is "
+                     "NOT verified: it must be in the kvm group)", doc)
     return Check("kvm", Status.PASS, "/dev/kvm present and read/write")
 
 
@@ -411,8 +443,11 @@ def _check_firecracker(host: HostView) -> Check:
     m = re.search(r"\bv?(\d+)\.(\d+)\.(\d+)", text)
     minimum = ".".join(map(str, _MIN_FC_VERSION))
     if not m:
-        return Check("firecracker", Status.WARN,
-                     f"{path}: could not parse a version (need >= {minimum})", doc)
+        # firecracker_available() treats an unknown version as unusable: the tier is refused.
+        why = "did not run" if proc is None else f"printed no version (rc={proc.returncode})"
+        return Check("firecracker", Status.FAIL,
+                     f"{path} --version {why}; the runtime refuses a firecracker whose version "
+                     f"it cannot read (need >= {minimum})", doc)
     ver = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
     shown = ".".join(map(str, ver))
     if ver < _MIN_FC_VERSION:
@@ -452,16 +487,32 @@ def _check_fc_guest(host: HostView) -> Check:
     return Check("fc-guest", Status.PASS, f"kernel {kernel}, rootfs {rootfs}")
 
 
+def _float_or_none(raw: str) -> float | None:
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
 def _check_snapshot_age(host: HostView) -> Check:
     doc = f"{DOC}#clock-and-aged-warm-checkpoints"
+    from blastbox.host.runtime.env_knobs import max_age_env  # noqa: PLC0415
+    from blastbox.host.runtime.fc_snapshot import DEFAULT_SNAPSHOT_MAX_AGE_S  # noqa: PLC0415
+
     raw = host.env.get("BLASTBOX_SNAPSHOT_MAX_AGE_S", "").strip()
-    if raw == "0":
+    default = DEFAULT_SNAPSHOT_MAX_AGE_S
+    value = max_age_env({"v": raw}, "v", default)   # the runtime's own parse
+    if value <= 0:
         return Check("snapshot-age", Status.WARN,
-                     "BLASTBOX_SNAPSHOT_MAX_AGE_S=0 disables warm-base refresh: a checkpoint "
+                     f"BLASTBOX_SNAPSHOT_MAX_AGE_S={raw} disables warm-base refresh: a checkpoint "
                      "restored long after it was taken sees its monotonic clock jump and "
                      "every job hangs (the ~24h warm outage)", doc)
+    if raw and value == default and _float_or_none(raw) != default:
+        return Check("snapshot-age", Status.WARN,
+                     f"BLASTBOX_SNAPSHOT_MAX_AGE_S={raw!r} is invalid; the runtime ignores it "
+                     f"and uses {default:g}s", doc)
     return Check("snapshot-age", Status.PASS,
-                 f"warm bases refresh after {raw or '21600 (default)'}s")
+                 f"warm bases refresh after {value:g}s" + ("" if raw else " (default)"))
 
 
 def _needs_userns(env: Mapping[str, str]) -> list[str]:
@@ -484,8 +535,9 @@ def _profile_attachment_mismatches(host: HostView) -> list[str]:
         raw = host.read(f"/etc/apparmor.d/blastbox-{tool}")
         m = re.search(rf"^\s*profile\s+blastbox-{tool}\s+(/\S+)", raw or "", re.MULTILINE)
         binary = host.which(tool)
-        if m and binary and host.realpath(binary) != m.group(1) and binary != m.group(1):
-            out.append(f"blastbox-{tool} attaches {m.group(1)}, {tool} is {binary}")
+        if m and binary and host.realpath(binary) != m.group(1):
+            out.append(f"blastbox-{tool} attaches {m.group(1)}, {tool} is {binary} "
+                       f"(resolves to {host.realpath(binary)})")
     return out
 
 
@@ -557,10 +609,14 @@ def _check_bwrap_stock_profile(host: HostView) -> Check:
                          f"sudo apparmor_parser -R {path}", doc)
         suffix = "" if loaded is not None else " (load state unverifiable without root)"
         return Check("bwrap-userns-restrict", Status.PASS, "stock profile disabled" + suffix)
+    if host.env.get("BLASTBOX_SANDBOX", "").strip().lower() != "bwrap":
+        return Check("bwrap-userns-restrict", Status.PASS,
+                     "stock profile active (irrelevant here: nothing configured runs host bwrap; "
+                     "see the guide if an engine nests bwrap outside runsc/Firecracker)")
     return Check("bwrap-userns-restrict", Status.WARN,
-                 "Ubuntu's stock bwrap-userns-restrict profile is active: it confines what "
-                 "bwrap-based engines can do inside their namespace; see the guide for when to "
-                 "disable it", doc)
+                 "Ubuntu's stock bwrap-userns-restrict profile is active and BLASTBOX_SANDBOX="
+                 "bwrap: it confines what bwrap-based engines can do inside their namespace; "
+                 "see the guide for when to disable it", doc)
 
 
 def _check_clock(host: HostView) -> Check:
@@ -614,6 +670,13 @@ def _check_scratch(host: HostView, tiers: Sequence[str]) -> Check:
         for knob in ("BLASTBOX_SNAPSHOT_MEM_DIR", "BLASTBOX_GVISOR_ROOT"):
             if env.get(knob, "").strip():
                 dirs.append((knob, env[knob].strip()))
+    if "firecracker" in tiers and _tmpfs(host, "/tmp"):
+        # FCConfig.scratch_root is hard-wired to /tmp/blastbox-fc-slots (no knob): every slot's
+        # outdisk/in/sockets, and warm-*.mem unless BLASTBOX_SNAPSHOT_MEM_DIR moves it.
+        return Check("scratch", Status.WARN,
+                     "/tmp is tmpfs and the Firecracker slot scratch is hard-wired to "
+                     "/tmp/blastbox-fc-slots (slot disks, and warm-*.mem unless "
+                     "BLASTBOX_SNAPSHOT_MEM_DIR is set): RAM-backed and capped", doc)
     on_tmp = [f"{k}={v}" for k, v in dirs if _under_tmp(v)]
     if on_tmp:
         return Check("scratch", Status.WARN,
@@ -729,6 +792,14 @@ def _jailed(p: _Proc) -> bool | None:
     return "--start-time-us" in p.argv
 
 
+def _is_unconfined(label: str) -> bool:
+    """``unconfined``, or a profile in ``(unconfined)`` / ``(complain)`` mode: the name alone
+    says nothing -- the shipped deploy/apparmor profiles are all flags=(unconfined), and
+    complain mode only logs (the same name-vs-mode mistake docker.py fixed in #159)."""
+    name, _, mode = label.strip().partition(" (")
+    return name == "unconfined" or mode.rstrip(")").strip() in ("unconfined", "complain")
+
+
 def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc]) -> Check:
     doc = f"{DOC}#confining-firecracker-and-runsc-processes"
     if not procs:
@@ -741,7 +812,7 @@ def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc]) -> Check:
         label = host.read(f"/proc/{p.pid}/attr/current")
         if label is None:
             unknown.append(p)
-        elif label.strip().split(" (", 1)[0] == "unconfined":
+        elif _is_unconfined(label):
             unconfined.append(p)
         if p.role == "firecracker":
             jailed = _jailed(p)
@@ -751,17 +822,18 @@ def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc]) -> Check:
                 unjailed.append(p)
     problems = []
     if unconfined:
-        problems.append(f"unconfined by AppArmor: {_pids(unconfined)}")
+        problems.append(f"not confined by AppArmor (unconfined, or a profile in unconfined/"
+                        f"complain mode): {_pids(unconfined)}")
     if unjailed:
         problems.append(f"firecracker without the jailer: {_pids(unjailed)}")
     if problems:
         return Check("sandbox-confinement", Status.WARN,
-                     "; ".join(problems) + ". The shared slot dir holds other jobs' warm-*.mem "
-                     "snapshot files; run firecracker under the jailer with a per-slot AppArmor "
-                     "profile so one VMM cannot read another job's memory", doc)
+                     "; ".join(problems) + ". Slots share one scratch tree (other slots' "
+                     "disks and API/vsock sockets); run firecracker under the jailer with a "
+                     "per-slot AppArmor profile so one VMM cannot reach another slot", doc)
     if unknown:
         return Check("sandbox-confinement", Status.WARN,
-                     f"{_UNKNOWN}: cannot read AppArmor label or jail root of {_pids(unknown)}",
+                     f"{_UNKNOWN}: cannot read the AppArmor label or argv of {_pids(unknown)}",
                      doc)
     return Check("sandbox-confinement", Status.PASS,
                  f"{len(procs)} process(es) confined" + (
@@ -811,10 +883,14 @@ def run_preflight(host: HostView, tiers: Sequence[str]) -> list[Check]:
 
 # --- output -----------------------------------------------------------------------------
 
-def exit_code(checks: Sequence[Check], *, strict: bool = False) -> int:
+def exit_code(checks: Sequence[Check], *, strict: bool = False,
+              ack: Collection[str] = ()) -> int:
+    """1 on any FAIL; under ``strict`` also on any WARN whose check name is not in ``ack``
+    (``--ack NAME``: a WARN the operator has reviewed, e.g. cpu-flags once JVM engines run
+    with -XX:-UseBASE64Intrinsics). A FAIL can never be acknowledged."""
     if any(c.status is Status.FAIL for c in checks):
         return 1
-    if strict and any(c.status is Status.WARN for c in checks):
+    if strict and any(c.status is Status.WARN and c.name not in ack for c in checks):
         return 1
     return 0
 
@@ -835,11 +911,13 @@ def render_text(checks: Sequence[Check], tiers: Sequence[str]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_json(checks: Sequence[Check], tiers: Sequence[str], *, strict: bool = False) -> str:
+def render_json(checks: Sequence[Check], tiers: Sequence[str], *, strict: bool = False,
+                ack: Collection[str] = ()) -> str:
     return json.dumps({
         "tiers": list(tiers),
         "strict": strict,
-        "ok": exit_code(checks, strict=strict) == 0,
+        "acknowledged": sorted(ack),
+        "ok": exit_code(checks, strict=strict, ack=ack) == 0,
         "counts": _counts(checks),
         "checks": [{"name": c.name, "status": c.status.value, "detail": c.detail,
                     "doc": c.doc} for c in checks],

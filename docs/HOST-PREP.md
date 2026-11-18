@@ -12,9 +12,11 @@ blastbox preflight                      # cold docker tier + BLASTBOX_POOL_RUNTI
 blastbox preflight --tier all           # docker, gvisor, firecracker, remote
 blastbox preflight --tier firecracker --json
 blastbox preflight --strict             # exit 1 on WARN too (CI / provisioning gates)
+blastbox preflight --strict --ack cpu-flags   # ...except a WARN you have reviewed and accepted
 ```
 
-Exit code: `0` = no FAIL, `1` = at least one FAIL (or a WARN under `--strict`), `2` = bad usage.
+Exit code: `0` = no FAIL, `1` = at least one FAIL (or an un-`--ack`ed WARN under `--strict`),
+`2` = bad usage. `--ack CHECK` never acknowledges a FAIL.
 Tiers:
 
 ```
@@ -24,9 +26,12 @@ firecracker  the Firecracker warm/cold microVM tier
 remote       static / aws-*: the worker runs elsewhere; this host only dispatches
 ```
 
-Without `--tier`, preflight checks the cold docker tier plus whatever `BLASTBOX_POOL_RUNTIME`
-selects; for `cascade` that is each member named in `BLASTBOX_POOL_TIERS` (local `firecracker` /
-`gvisor` members get their local checks, `static` / `aws-*` members map to `remote`).
+Without `--tier`, preflight checks whatever `BLASTBOX_POOL_RUNTIME` selects; for `cascade` that is
+each member named in `BLASTBOX_POOL_TIERS` (local `firecracker` / `gvisor` members get their local
+checks, `static` / `aws-*` members map to `remote`). The cold docker tier is added only for a local
+(file-handshake) dispatcher that is not `BLASTBOX_DISPATCH_WARM_ONLY`: network-endpoint pools have
+no cold path. The `pool-runtime` check FAILs a pool name or cascade spec the dispatcher refuses
+(unknown name, missing/zero capacity, a mix of local and remote tiers).
 
 `blastbox preflight` checks the **host**; `blastbox doctor` checks what is **running** on it
 (container and rootfs versions). Run both after an upgrade.
@@ -38,7 +43,7 @@ selects; for `cascade` that is each member named in `BLASTBOX_POOL_TIERS` (local
 | **docker** (cold) | docker daemon, `runsc` registered as a docker runtime (fail-closed without it) | `docker`, `docker-runsc-runtime` |
 | **gvisor** (warm C/R) | the above + the `runsc` binary (driven directly; root) | + `runsc`, `snapshot-age` |
 | **firecracker** (warm/cold) | `/dev/kvm` read/write, `firecracker` ≥ 1.15.1, guest kernel + rootfs | `kvm`, `firecracker`, `fc-guest`, `snapshot-age` |
-| **remote** (static / AWS) | nothing runtime-specific locally; the remote box runs the worker image under its own runsc | common checks only |
+| **remote** (static / AWS) | nothing runtime-specific locally; the remote box runs the worker image under its own runsc | common checks only (no docker: no cold path) |
 | every tier | AppArmor state known, synced clock, CPU flags reviewed, scratch off `/tmp` | `apparmor`, `bwrap-userns-restrict`, `userns`, `clock`, `cpu-flags`, `scratch` |
 
 Prefer the **warm Firecracker** tier where KVM exists: it is the stronger boundary and, with
@@ -118,8 +123,12 @@ root-equivalent, persistent grant.
 What the sandbox sees:
 
 - **AppArmor is not enforced inside the sandbox.** gVisor's Sentry implements the guest kernel;
-  host LSMs never see guest syscalls. Docker's `docker-default` profile applies to the **runsc
-  processes on the host** (Sentry/gofer), which is where it belongs.
+  host LSMs never see guest syscalls. Docker asks for its `docker-default` profile on the **runsc
+  processes on the host** (Sentry/gofer), which is where confinement belongs. But a path-attached
+  profile wins: once `deploy/apparmor/blastbox-runsc` (for rootless runsc, `flags=(unconfined)`)
+  is loaded it attaches to `/usr/bin/runsc` and rootful docker's runsc processes run under
+  `blastbox-runsc (unconfined)` instead. Don't load it on a rootful host; preflight's
+  `sandbox-confinement` check reports it.
 - **Nested sandboxes don't work under gVisor.** Engines that wrap their own work in bwrap or
   nsjail must use their container / no-nested-sandbox mode inside runsc (and inside Firecracker):
   e.g. ClippyShot sets `CLIPPYSHOT_SANDBOX=container` (passed via `BLASTBOX_GVISOR_EXTRA_ENV` on
@@ -167,19 +176,24 @@ firecracker --version               # >= v1.15.1 (older: virtio-rng entropy DoS)
 
 ### Confining firecracker and runsc processes
 
-Warm Firecracker slots share one slot directory, and it holds every job's `warm-*.mem` snapshot
-file. A firecracker process that is not jailed and not confined by AppArmor can read another
-job's guest memory if the VMM is compromised. Recommended:
+Warm Firecracker slots share one scratch tree (`/tmp/blastbox-fc-slots`): the base's `warm-*.mem`
+snapshot (written before any job runs; slots restore it copy-on-write, so job memory itself never
+lands there) and, per slot, `outdisk.ext4`, `in/`, and the slot's `fc-api.sock` / `vsock.sock`. A
+firecracker process that is not jailed and not confined by AppArmor, sharing a uid with the others,
+can read another slot's input and output disks or drive another slot's VMM through its API socket
+if it is compromised. Recommended:
 
 - start firecracker through the **jailer** (chroot, its own uid/gid, cgroup and namespaces), so a
   slot's VMM only sees its own files;
 - attach a **per-slot AppArmor profile** that allows only that slot's files.
 
-Preflight's `sandbox-confinement` check warns when a firecracker or runsc process is
-`unconfined` (`/proc/<pid>/attr/current`) or a firecracker was not started by the jailer (no
-`--start-time-us` in its argv and a root of `/`). Without privileges to read those it reports
-`unknown (run as root)` and does not fail. A firecracker inside a docker container shows the
-container's profile (e.g. `docker-default`), which counts as confined, but it is not jailed.
+Preflight's `sandbox-confinement` check warns when a firecracker or runsc process is not confined
+by AppArmor (`/proc/<pid>/attr/current` is `unconfined`, or a profile in `(unconfined)` or
+`(complain)` mode) or a firecracker was not started by the jailer (the jailer always passes
+`--start-time-us`; a non-`/` root proves nothing, a container has one too). When it cannot read
+those it reports `unknown (run as root)` and does not fail. A firecracker inside a docker
+container shows the container's profile (e.g. `docker-default (enforce)`), which counts as
+confined, but it is not jailed.
 
 ## AppArmor and user namespaces
 
@@ -271,6 +285,9 @@ Preflight reads `/proc/cpuinfo` and warns on flags with operational consequences
   it at a fraction of RAM, and a reboot loses sealed results that may be the only copy. Preflight
   warns when `BLASTBOX_JOB_ROOT` (default `/var/lib/blastbox/jobs`), `BLASTBOX_SNAPSHOT_MEM_DIR` or
   `BLASTBOX_GVISOR_ROOT` sits under them.
+- The Firecracker slot scratch is hard-wired to `/tmp/blastbox-fc-slots` (no knob today): slot
+  disks, sockets, and the warm base unless `BLASTBOX_SNAPSHOT_MEM_DIR` moves it. Preflight warns
+  when `/tmp` is a tmpfs on a Firecracker host.
 - `BLASTBOX_JOB_ROOT` must be the same path for serve, dispatch and the worker mount, and must
   **not** be shared between a container dispatcher and a network-tier (aws/static) dispatcher
   (CONFIGURATION *Core*).
