@@ -124,6 +124,8 @@ What the sandbox sees:
   nsjail must use their container / no-nested-sandbox mode inside runsc (and inside Firecracker):
   e.g. ClippyShot sets `CLIPPYSHOT_SANDBOX=container` (passed via `BLASTBOX_GVISOR_EXTRA_ENV` on
   the warm tier). Landlock (nono) is also unavailable: the Sentry returns `ENOSYS`.
+- **The warm tier needs C/R.** `runsc help` must list `checkpoint` and `restore` (the tier's own
+  capability probe); preflight's `runsc` check FAILs a build without them.
 - **Rootful only for the warm tier.** gVisor cannot `restore` rootless, so the tier refuses
   `BLASTBOX_GVISOR_ROOTLESS` (preflight's `gvisor-rootless` FAIL). Rootless runsc (no current
   tier uses it) needs `deploy/apparmor/blastbox-runsc` on Ubuntu 24.04+.
@@ -154,6 +156,8 @@ firecracker --version               # >= v1.15.1 (older: virtio-rng entropy DoS)
 
 - `/dev/kvm` missing = no hardware virtualisation: enable VT-x/AMD-V, load `kvm_intel`/`kvm_amd`,
   or enable nested virt if the host is itself a VM. No KVM → use the gVisor tier.
+- The warm snapshot tier (`BLASTBOX_POOL_WARM_SNAPSHOT=1`) needs a guest kernel >= 5.18 (VMGenID
+  reseeds the CRNG on restore); `fc-guest` FAILs a detectably older vmlinux. Cold FC does not care.
 - Set `BLASTBOX_FC_BIN`, `BLASTBOX_FC_KERNEL`, `BLASTBOX_FC_ROOTFS`. Run preflight in the FC
   dispatcher's environment so `fc-guest` can confirm the artifacts exist; build the rootfs per
   [WARM-ROOTFS.md](WARM-ROOTFS.md) and confirm it with `blastbox doctor --rootfs`.

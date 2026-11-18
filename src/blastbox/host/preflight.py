@@ -45,6 +45,7 @@ _READ_ONLY_ARGV: frozenset[tuple[str, ...]] = frozenset({
     ("info", "--format", "{{json .Runtimes}}"),             # docker
     ("show", "-p", "NTPSynchronized", "--value"),           # timedatectl
     ("-n", "tracking"),                                     # chronyc
+    ("help",),                                              # runsc (lists checkpoint/restore)
 })
 _READ_ONLY_BINARIES = frozenset({"docker", "runsc", "firecracker", "timedatectl", "chronyc"})
 
@@ -81,6 +82,8 @@ def is_read_only(argv: Sequence[str]) -> bool:
     # --version is allowed for any configured binary (BLASTBOX_FC_BIN may be renamed);
     # the subcommand forms only for the tool they belong to.
     base = os.path.basename(argv[0])
+    if tuple(argv[1:]) == ("help",):
+        return base == "runsc" or base.startswith("runsc")
     return tuple(argv[1:]) == ("--version",) or base in _READ_ONLY_BINARIES
 
 
@@ -106,9 +109,16 @@ class HostView:
         """Entry names of a directory; None if it cannot be listed."""
         raise NotImplementedError
 
-    def readlink(self, path: str) -> str | None:
-        """A symlink's target; None if it is not a link or cannot be read (another user's
-        ``/proc/<pid>/root`` needs privileges)."""
+    def realpath(self, path: str) -> str:
+        """``path`` with symlinks resolved (AppArmor attaches to the resolved executable)."""
+        raise NotImplementedError
+
+    def is_file(self, path: str) -> bool:
+        """True for a regular file (following symlinks; a dangling link or directory is not)."""
+        raise NotImplementedError
+
+    def guest_kernel_version(self, path: str) -> tuple[int, int] | None:
+        """``(major, minor)`` from a vmlinux banner; None when unknown."""
         raise NotImplementedError
 
     def run(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str] | None:
@@ -154,11 +164,16 @@ class RealHost(HostView):
         except OSError:
             return None
 
-    def readlink(self, path: str) -> str | None:
-        try:
-            return os.readlink(path)
-        except OSError:
-            return None
+    def realpath(self, path: str) -> str:
+        return os.path.realpath(path)
+
+    def is_file(self, path: str) -> bool:
+        return os.path.isfile(path)
+
+    def guest_kernel_version(self, path: str) -> tuple[int, int] | None:
+        from blastbox.host.runtime.firecracker import guest_kernel_version  # noqa: PLC0415
+
+        return guest_kernel_version(path)
 
     def run(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str] | None:
         if not is_read_only(argv):
@@ -317,7 +332,44 @@ def _check_runsc_binary(host: HostView) -> Check:
         why = _first_line(proc.stderr) or _first_line(proc.stdout) or f"rc={proc.returncode}"
         return Check("runsc", Status.FAIL, f"{path} --version failed: {why}", doc)
     ver = _first_line(proc.stdout) or "version unknown"
-    return Check("runsc", Status.PASS, f"{path}: {ver}")
+    # The warm tier's own capability probe (gvisor_snapshot._default_cr_capable): `runsc help`
+    # must list both checkpoint and restore, else the tier is refused.
+    helped = host.run([path, "help"])
+    text = (helped.stdout + helped.stderr) if helped is not None else ""
+    if "checkpoint" not in text or "restore" not in text:
+        return Check("runsc", Status.FAIL,
+                     f"{path} ({ver}) does not list checkpoint/restore in `runsc help`; the "
+                     "gVisor warm tier needs both and refuses this build", doc)
+    return Check("runsc", Status.PASS, f"{path}: {ver} (checkpoint/restore available)")
+
+
+_KNOWN_POOL_RUNTIMES = {"none", "firecracker", "gvisor", "cascade", *_REMOTE_POOL_RUNTIMES}
+
+
+def _check_pool_runtime(host: HostView) -> Check | None:
+    """An unknown BLASTBOX_POOL_RUNTIME (or cascade member) is refused by the dispatcher; the
+    tier preflight would have checked for it is unknowable, so say so instead of passing."""
+    doc = f"{DOC}#what-each-tier-needs"
+    pool = host.env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower()
+    if not pool:
+        return None
+    if pool not in _KNOWN_POOL_RUNTIMES:
+        return Check("pool-runtime", Status.FAIL,
+                     f"BLASTBOX_POOL_RUNTIME={pool!r} is not a known runtime "
+                     f"({', '.join(sorted(_KNOWN_POOL_RUNTIMES))})", doc)
+    if pool == "cascade":
+        members = [item.partition(":")[0].strip().lower()
+                   for item in host.env.get("BLASTBOX_POOL_TIERS", "").split(",") if item.strip()]
+        if not members:
+            return Check("pool-runtime", Status.FAIL,
+                         "BLASTBOX_POOL_RUNTIME=cascade but BLASTBOX_POOL_TIERS is empty", doc)
+        bad = [m for m in members if m in ("cascade", "none") or m not in _KNOWN_POOL_RUNTIMES]
+        if bad:
+            return Check("pool-runtime", Status.FAIL,
+                         f"BLASTBOX_POOL_TIERS has unknown/invalid member(s): {', '.join(bad)}",
+                         doc)
+        return Check("pool-runtime", Status.PASS, f"cascade of {', '.join(members)}")
+    return Check("pool-runtime", Status.PASS, f"BLASTBOX_POOL_RUNTIME={pool}")
 
 
 def _check_gvisor_rootless(host: HostView) -> Check | None:
@@ -380,10 +432,23 @@ def _check_fc_guest(host: HostView) -> Check:
                      "dispatcher's environment to verify the guest artifacts)", doc)
     missing = [f"{k}={v or '<unset>'}" for k, v in
                (("BLASTBOX_FC_KERNEL", kernel), ("BLASTBOX_FC_ROOTFS", rootfs))
-               if not v or not host.exists(v)]
+               if not v or not host.is_file(v)]
     if missing:
-        return Check("fc-guest", Status.FAIL, "missing guest artifact: " + ", ".join(missing),
-                     doc)
+        return Check("fc-guest", Status.FAIL,
+                     "missing guest artifact (not a regular file): " + ", ".join(missing), doc)
+    from blastbox.host.runtime.firecracker import _MIN_SNAPSHOT_KERNEL  # noqa: PLC0415
+
+    # The warm snapshot tier (BLASTBOX_POOL_WARM_SNAPSHOT, read as pool_config._bool does)
+    # refuses a detectably pre-5.18 guest: restored clones would share CRNG state.
+    raw = host.env.get("BLASTBOX_POOL_WARM_SNAPSHOT", "").strip().lower()
+    warm = bool(raw) and raw not in ("0", "false", "no", "off")
+    kver = host.guest_kernel_version(kernel) if warm else None
+    if kver is not None and kver < _MIN_SNAPSHOT_KERNEL:
+        need = ".".join(map(str, _MIN_SNAPSHOT_KERNEL))
+        return Check("fc-guest", Status.FAIL,
+                     f"BLASTBOX_POOL_WARM_SNAPSHOT is on but guest kernel {kernel} is "
+                     f"{kver[0]}.{kver[1]}; the snapshot tier needs >= {need} (VMGenID reseeds "
+                     "the CRNG on restore) and refuses to start", doc)
     return Check("fc-guest", Status.PASS, f"kernel {kernel}, rootfs {rootfs}")
 
 
@@ -411,6 +476,19 @@ def _needs_userns(env: Mapping[str, str]) -> list[str]:
     return why
 
 
+def _profile_attachment_mismatches(host: HostView) -> list[str]:
+    """For each installed scoped profile, the binary it attaches to vs the one PATH resolves.
+    A profile attached to /usr/local/bin/nsjail confers nothing on /usr/bin/nsjail."""
+    out = []
+    for tool in ("bwrap", "nsjail"):
+        raw = host.read(f"/etc/apparmor.d/blastbox-{tool}")
+        m = re.search(rf"^\s*profile\s+blastbox-{tool}\s+(/\S+)", raw or "", re.MULTILINE)
+        binary = host.which(tool)
+        if m and binary and host.realpath(binary) != m.group(1) and binary != m.group(1):
+            out.append(f"blastbox-{tool} attaches {m.group(1)}, {tool} is {binary}")
+    return out
+
+
 def _check_userns(host: HostView) -> Check:
     doc = f"{DOC}#apparmor-and-user-namespaces"
     restrict = _sysctl(host, "/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
@@ -431,6 +509,13 @@ def _check_userns(host: HostView) -> Check:
         loaded = _loaded_profiles(host)
         wanted = {"blastbox-bwrap", "blastbox-nsjail"}
         if loaded is not None and wanted <= loaded:
+            mismatched = _profile_attachment_mismatches(host)
+            if mismatched:
+                return Check("userns", Status.WARN,
+                             f"{shown}; scoped profiles are loaded but attach to another path "
+                             f"than the binary in use: {'; '.join(mismatched)} (the kernel still "
+                             "denies its user namespace; edit the profile's attachment path)",
+                             doc)
             return Check("userns", Status.PASS,
                          f"{shown}; scoped blastbox-bwrap/blastbox-nsjail profiles loaded")
         state = "not loaded" if loaded is not None else "unverifiable (securityfs is root-only)"
@@ -635,16 +720,13 @@ def _check_runsc_host_root(host: HostView, procs: Sequence[_Proc]) -> Check:
                  f"{len(runsc)} runsc process(es), none real host root")
 
 
-def _jailed(host: HostView, p: _Proc) -> bool | None:
-    """True when firecracker was started by the jailer: the jailer always passes
-    ``--start-time-us`` to the firecracker it execs, and chroots it (``/proc/<pid>/root`` is
-    not ``/``, readable only with privileges). None when it cannot be told."""
-    if "--start-time-us" in p.argv:
-        return True
-    root = host.readlink(f"/proc/{p.pid}/root")
-    if root is None:
+def _jailed(p: _Proc) -> bool | None:
+    """True when firecracker was started by the jailer, which always passes ``--start-time-us``
+    to the firecracker it execs. A non-``/`` root proves nothing (a docker container has one
+    too). None when the argv could not be read."""
+    if not p.argv:
         return None
-    return root != "/"
+    return "--start-time-us" in p.argv
 
 
 def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc]) -> Check:
@@ -662,7 +744,7 @@ def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc]) -> Check:
         elif label.strip().split(" (", 1)[0] == "unconfined":
             unconfined.append(p)
         if p.role == "firecracker":
-            jailed = _jailed(host, p)
+            jailed = _jailed(p)
             if jailed is None and p not in unknown:
                 unknown.append(p)
             elif jailed is False:
@@ -691,6 +773,9 @@ def run_preflight(host: HostView, tiers: Sequence[str]) -> list[Check]:
     """Run every check relevant to ``tiers``. Pure reads; never raises on host state."""
     t = set(tiers)
     out: list[Check] = []
+    pool = _check_pool_runtime(host)
+    if pool is not None:
+        out.append(pool)
     if t & {"docker", "gvisor"}:
         out.append(_check_docker(host))
         out.append(_check_docker_runsc(host))
@@ -750,10 +835,11 @@ def render_text(checks: Sequence[Check], tiers: Sequence[str]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_json(checks: Sequence[Check], tiers: Sequence[str]) -> str:
+def render_json(checks: Sequence[Check], tiers: Sequence[str], *, strict: bool = False) -> str:
     return json.dumps({
         "tiers": list(tiers),
-        "ok": exit_code(checks) == 0,
+        "strict": strict,
+        "ok": exit_code(checks, strict=strict) == 0,
         "counts": _counts(checks),
         "checks": [{"name": c.name, "status": c.status.value, "detail": c.detail,
                     "doc": c.doc} for c in checks],

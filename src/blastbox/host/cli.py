@@ -2879,7 +2879,7 @@ def _preflight_cmd(args: argparse.Namespace) -> int:
         return 2
     checks = pf.run_preflight(host, tiers)
     if args.json:
-        print(pf.render_json(checks, tiers))
+        print(pf.render_json(checks, tiers, strict=bool(args.strict)))
     else:
         print(pf.render_text(checks, tiers), end="")
     return pf.exit_code(checks, strict=bool(args.strict))

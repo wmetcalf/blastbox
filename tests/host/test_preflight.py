@@ -33,6 +33,8 @@ class FakeHost(pf.HostView):
         executables: dict[str, str] | None = None,
         commands: dict[tuple[str, ...], tuple[int, str, str]] | None = None,
         links: dict[str, str] | None = None,
+        special: set[str] | None = None,
+        kernels: dict[str, tuple[int, int]] | None = None,
     ) -> None:
         self.env = dict(env or {})
         self.files = dict(files or {})
@@ -42,6 +44,8 @@ class FakeHost(pf.HostView):
         self.commands = dict(commands or {})
         self.ran: list[tuple[str, ...]] = []
         self.links = dict(links or {})
+        self.special = set(special or ())      # exists, but not a regular file (dir/dangling)
+        self.kernels = dict(kernels or {})
 
     def read(self, path: str) -> str | None:
         return self.files.get(path)
@@ -56,6 +60,15 @@ class FakeHost(pf.HostView):
         if name.startswith("/"):
             return name if name in self.executables.values() else None
         return self.executables.get(name)
+
+    def is_file(self, path: str) -> bool:
+        return path in self.paths and path not in self.special
+
+    def realpath(self, path: str) -> str:
+        return self.links.get(path, path)
+
+    def guest_kernel_version(self, path: str) -> tuple[int, int] | None:
+        return self.kernels.get(path)
 
     def listdir(self, path: str) -> list[str] | None:
         prefix = path.rstrip("/") + "/"
@@ -101,6 +114,7 @@ def _healthy(**over) -> FakeHost:
             ("/usr/bin/docker", "info", "--format", "{{json .Runtimes}}"):
                 (0, _RUNTIMES_JSON + "\n", ""),
             ("/usr/bin/runsc", "--version"): (0, "runsc version release-20251110.0\n", ""),
+            ("/usr/bin/runsc", "help"): (0, "Subcommands:\n  checkpoint\n  restore\n  run\n", ""),
             ("/usr/local/bin/firecracker", "--version"): (0, "Firecracker v1.16.0\n", ""),
             ("/usr/bin/timedatectl", "show", "-p", "NTPSynchronized", "--value"):
                 (0, "yes\n", ""),
@@ -570,15 +584,20 @@ def test_firecracker_without_the_jailer_warns():
 
 
 def test_jailed_and_confined_firecracker_passes():
-    jailed_by_argv = _proc(300, ["firecracker", "--id", "a", "--start-time-us", "1",
-                                 "--start-time-cpu-us", "2"], uid=10001,
-                           aa="blastbox-fc-slot-3 (enforce)\n")
-    jailed_by_root = _proc(301, ["firecracker", "--api-sock", "/run/fc.sock"], uid=10001,
-                           aa="blastbox-fc-slot-4 (enforce)\n")
-    host = _with_procs(jailed_by_argv, jailed_by_root,
-                       links={"/proc/301/root": "/srv/jailer/firecracker/b/root"})
-    c = _by_name(pf.run_preflight(host, ["firecracker"]))["sandbox-confinement"]
+    jailed = _proc(300, ["firecracker", "--id", "a", "--start-time-us", "1",
+                         "--start-time-cpu-us", "2"], uid=10001,
+                   aa="blastbox-fc-slot-3 (enforce)\n")
+    c = _by_name(pf.run_preflight(_with_procs(jailed), ["firecracker"]))["sandbox-confinement"]
     assert c.status is Status.PASS, c.detail
+
+
+def test_a_chrooted_or_containerised_firecracker_is_not_taken_for_jailed():
+    """A firecracker in a docker container (or any non-/ root) is not the jailer: only the
+    jailer's own --start-time-us argument counts."""
+    host = _with_procs(_proc(301, ["firecracker", "--api-sock", "/run/fc.sock"], uid=10001),
+                       links={"/proc/301/root": "/var/lib/docker/overlay2/x/merged"})
+    c = _by_name(pf.run_preflight(host, ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.WARN and "without the jailer" in c.detail
 
 
 def test_process_checks_only_inspect_processes_for_the_selected_tiers():
@@ -590,13 +609,14 @@ def test_process_checks_only_inspect_processes_for_the_selected_tiers():
     assert "sandbox-confinement" not in {c.name for c in pf.run_preflight(host, ["remote"])}
 
 
-def test_real_host_listdir_and_readlink_degrade_to_none(tmp_path):
+def test_real_host_listdir_and_is_file(tmp_path):
     h = pf.RealHost()
     assert h.listdir(str(tmp_path / "missing")) is None
-    assert h.readlink(str(tmp_path / "missing")) is None
-    (tmp_path / "l").symlink_to("/")
-    assert h.readlink(str(tmp_path / "l")) == "/"
-    assert "l" in (h.listdir(str(tmp_path)) or [])
+    (tmp_path / "f").write_text("x")
+    (tmp_path / "dangling").symlink_to(tmp_path / "gone")
+    assert set(h.listdir(str(tmp_path)) or []) == {"f", "dangling"}
+    assert h.is_file(str(tmp_path / "f"))
+    assert not h.is_file(str(tmp_path / "dangling")) and not h.is_file(str(tmp_path))
 
 
 # --- upstream review (codex) on #208 ------------------------------------------------------
@@ -653,3 +673,73 @@ def test_forced_runsc_missing_fails_even_with_runc_consent():
                               (0, '{"runc":{}}', "")})
     assert _by_name(pf.run_preflight(host, ["docker"]))["docker-runsc-runtime"].status \
         is Status.FAIL
+
+
+# --- marla round 1 on #208 ----------------------------------------------------------------
+
+def test_fc_guest_artifact_that_is_not_a_regular_file_fails():
+    host = _healthy(special={"/var/lib/blastbox/fc/rootfs.ext4"})
+    c = _by_name(pf.run_preflight(host, ["firecracker"]))["fc-guest"]
+    assert c.status is Status.FAIL and "BLASTBOX_FC_ROOTFS" in c.detail
+
+
+def test_warm_fc_with_a_pre_5_18_guest_kernel_fails_but_cold_fc_passes():
+    old = {"/var/lib/blastbox/fc/vmlinux": (5, 10)}
+    warm = _healthy(env={"BLASTBOX_POOL_WARM_SNAPSHOT": "1"}, kernels=old)
+    c = _by_name(pf.run_preflight(warm, ["firecracker"]))["fc-guest"]
+    assert c.status is Status.FAIL and "5.18" in c.detail
+    assert _by_name(pf.run_preflight(_healthy(kernels=old), ["firecracker"]))["fc-guest"].status \
+        is Status.PASS
+    new = _healthy(env={"BLASTBOX_POOL_WARM_SNAPSHOT": "1"},
+                   kernels={"/var/lib/blastbox/fc/vmlinux": (6, 1)})
+    assert _by_name(pf.run_preflight(new, ["firecracker"]))["fc-guest"].status is Status.PASS
+
+
+def test_runsc_without_checkpoint_restore_fails_the_gvisor_tier():
+    host = _healthy(commands={("/usr/bin/runsc", "help"): (0, "Subcommands:\n  run\n  create\n", "")})
+    c = _by_name(pf.run_preflight(host, ["gvisor"]))["runsc"]
+    assert c.status is Status.FAIL and "checkpoint" in c.detail
+    assert pf.is_read_only(["/usr/bin/runsc", "help"])
+    assert not pf.is_read_only(["/usr/bin/docker", "help"])
+
+
+def test_scoped_profile_attached_to_another_path_than_the_binary_warns():
+    host = _healthy(env={"BLASTBOX_SANDBOX": "nsjail"},
+                    executables={"nsjail": "/usr/bin/nsjail", "docker": "/usr/bin/docker",
+                                 "runsc": "/usr/bin/runsc", "firecracker":
+                                 "/usr/local/bin/firecracker", "timedatectl": "/usr/bin/timedatectl"},
+                    files={"/sys/kernel/security/apparmor/profiles":
+                           "blastbox-bwrap (unconfined)\nblastbox-nsjail (unconfined)\n",
+                           "/etc/apparmor.d/blastbox-nsjail":
+                           "abi <abi/4.0>,\nprofile blastbox-nsjail /usr/local/bin/nsjail flags=(unconfined) {\n}\n"})
+    c = _by_name(pf.run_preflight(host, ["docker"]))["userns"]
+    assert c.status is Status.WARN
+    assert "/usr/local/bin/nsjail" in c.detail and "/usr/bin/nsjail" in c.detail
+
+
+def test_unknown_pool_runtime_fails():
+    for env in ({"BLASTBOX_POOL_RUNTIME": "firecrakcer"},
+                {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "firecracker:2,gvsior:1"},
+                {"BLASTBOX_POOL_RUNTIME": "cascade"}):
+        c = _by_name(pf.run_preflight(_healthy(env=env), ["docker"]))["pool-runtime"]
+        assert c.status is Status.FAIL, env
+    assert "pool-runtime" not in _by_name(pf.run_preflight(_healthy(), ["docker"]))
+    ok = _healthy(env={"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "static:4,aws-ec2:8"})
+    assert _by_name(pf.run_preflight(ok, ["remote"]))["pool-runtime"].status is Status.PASS
+
+
+def test_json_ok_honours_strict():
+    checks = [pf.Check("clock", Status.WARN, "x")]
+    assert json.loads(pf.render_json(checks, ["docker"]))["ok"] is True
+    assert json.loads(pf.render_json(checks, ["docker"], strict=True))["ok"] is False
+
+
+def test_scoped_profile_matching_the_resolved_binary_passes():
+    host = _healthy(env={"BLASTBOX_SANDBOX": "nsjail"},
+                    executables={"nsjail": "/usr/bin/nsjail", "docker": "/usr/bin/docker"},
+                    links={"/usr/bin/nsjail": "/usr/local/bin/nsjail"},
+                    files={"/sys/kernel/security/apparmor/profiles":
+                           "blastbox-bwrap (unconfined)\nblastbox-nsjail (unconfined)\n",
+                           "/etc/apparmor.d/blastbox-nsjail":
+                           "profile blastbox-nsjail /usr/local/bin/nsjail flags=(unconfined) {\n}\n"})
+    assert _by_name(pf.run_preflight(host, ["docker"]))["userns"].status is Status.PASS
