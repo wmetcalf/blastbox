@@ -5,9 +5,14 @@ on:
     branches: [main, master]
   pull_request:
 
+# Runners are pinned to ubuntu-24.04: `ubuntu-latest` moved to 26.04 (Nov 2026), whose
+# uutils coreutils (/usr/bin/echo -> /usr/lib/cargo/bin/coreutils/...) break the appsandbox
+# path-confinement tests and whose AppArmor/userns policy fails the sandbox job's bwrap
+# --unshare-all probe ("loopback: Failed RTM_NEWADDR"). Move to 26.04 deliberately, as
+# its own change, once those are handled.
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -32,7 +37,7 @@ jobs:
     # worker images). That block therefore ran NOWHERE: a regression in the sandbox argv, the
     # seccomp policy wiring or the insecurity reasons would have shipped green. Same reasoning
     # as pg-search below: provide the dependencies and run them for real.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install bubblewrap and the seccomp binding
@@ -212,7 +217,7 @@ jobs:
     # it asserted on `inspect.getsource()` substrings rather than running anything. This
     # job removes the control, one arm at a time, and requires the enforcement matrix to
     # go RED each time. A control the tests cannot notice the absence of is not tested.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -245,7 +250,7 @@ jobs:
     # missing — it must print a gate line that `egress.GATE_OK_PATTERN` ACCEPTS when the
     # overlay is fine. Both existing assertions were negative, so the single string the
     # dispatcher's health gate keys on was never produced or matched anywhere in CI.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Build the forwarder image
@@ -303,7 +308,7 @@ jobs:
     # Perceptual-hash search is Postgres + pg_bktree only — there is no SQLite
     # search path — so its tests skip in the plain `test` job. Build a Postgres
     # image with the extension compiled in and run them against it for real.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -346,7 +351,7 @@ jobs:
     # soffice/strace/nono (so they're invisible in the plain `test` job) — here we give it
     # those tools so the gate actually RUNS and catches a dependency bump widening the
     # syscall/network surface.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
