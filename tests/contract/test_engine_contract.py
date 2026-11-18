@@ -795,3 +795,45 @@ def test_walker_descends_frozensets_of_nodes() -> None:
 
     assert [getattr(n, "type") for n in _payload_nodes(Holder(tags=frozenset({Tag()})))] == [
         "holder_fs", "tag_t"]
+
+
+# --- marla round 8 (Claude lens) ----------------------------------------------------------
+
+def test_sealed_envelope_checks_honour_limits(contract_path: Path, tmp_path: Path) -> None:
+    from blastbox.contract.engine_contract import assert_conforms
+    from blastbox.limits import Limits
+    out = _outdir(tmp_path, pages=2)
+    r = _result(pages=2)
+    env = seal_envelope(engine="demo", outdir=out, input_sha256="0" * 64, detected=DET,
+                        declared=r.artifacts, warnings=[], payload=r.payload)
+    c = load_contract(contract_path)
+    assert check_envelope(c, env, limits=Limits()) == []
+    for lim in (Limits(max_artifacts=1), Limits(max_artifact_bytes=4),
+                Limits(max_total_artifact_bytes=10), Limits(max_metadata_bytes=100)):
+        assert "host_limit" in {v.code for v in check_envelope(c, env, limits=lim)}, lim
+        with pytest.raises(AssertionError):
+            assert_conforms(c, json.loads(env.model_dump_json(by_alias=True)), limits=lim)
+
+
+def test_total_cap_counts_metadata_json_like_the_cold_dispatcher(contract_path: Path, tmp_path: Path) -> None:
+    from blastbox.limits import Limits
+    out = _outdir(tmp_path)
+    r = _result()
+    declared_total = 2 + 8   # manifest.json "{}" + one 8-byte page
+    lim = Limits(max_total_artifact_bytes=declared_total + 10)
+    assert "unsealable" in {v.code for v in check_result(load_contract(contract_path), r, out, limits=lim)}
+
+
+@pytest.mark.parametrize("kind", ["fifo", "dangling", "dir_symlink"])
+def test_metadata_json_the_harness_can_replace_is_not_flagged(contract_path: Path, tmp_path: Path, kind: str) -> None:
+    import os
+    out = _outdir(tmp_path)
+    meta = out / "metadata.json"
+    if kind == "fifo":
+        os.mkfifo(meta)
+    elif kind == "dangling":
+        meta.symlink_to(out / "gone")
+    else:
+        (out / "d").mkdir()
+        meta.symlink_to(out / "d", target_is_directory=True)
+    assert "reserved_path" not in {v.code for v in check_result(load_contract(contract_path), _result(), out)}

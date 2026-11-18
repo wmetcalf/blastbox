@@ -287,8 +287,35 @@ def _check(contract: EngineContract, *, engine: str | None, status: str,
     return out
 
 
-def check_envelope(contract: EngineContract, envelope: Any) -> list[Violation]:
-    """Check a sealed ``Envelope`` (or its parsed JSON) against the contract. Empty list = conforms."""
+def _host_cap_problems(env: Any, limits: Any) -> list[str]:
+    """The host's output caps (``Limits``) applied to a sealed envelope: metadata size, artifact
+    count, per-artifact and total bytes. The total includes metadata.json itself, as the cold and
+    warm dispatchers count it (``Dispatcher._enforce_output_size_cap``), the stricter host path."""
+    if limits is None:
+        return []
+    out: list[str] = []
+    meta_len = len(env.model_dump_json(by_alias=True).encode())
+    cap = getattr(limits, "max_metadata_bytes", None)
+    if cap is not None and meta_len > cap:
+        out.append(f"metadata.json {meta_len} bytes exceeds the host's max_metadata_bytes {cap}")
+    n = getattr(limits, "max_artifacts", None)
+    if n is not None and len(env.artifacts) > n:
+        out.append(f"{len(env.artifacts)} artifacts exceed the host's max_artifacts {n}")
+    per = getattr(limits, "max_artifact_bytes", None)
+    for a in env.artifacts:
+        if per is not None and a.bytes > per:
+            out.append(f"artifact {a.id} is {a.bytes} bytes, over the host's max_artifact_bytes {per}")
+    total_cap = getattr(limits, "max_total_artifact_bytes", None)
+    total = sum(a.bytes for a in env.artifacts) + meta_len
+    if total_cap is not None and total > total_cap:
+        out.append(f"{total} output bytes (artifacts + metadata.json) exceed the host's "
+                   f"max_total_artifact_bytes {total_cap}")
+    return out
+
+
+def check_envelope(contract: EngineContract, envelope: Any, *, limits: Any = None) -> list[Violation]:
+    """Check a sealed ``Envelope`` (or its parsed JSON) against the contract. Empty list = conforms.
+    With ``limits`` (a host's ``Limits``), also report its output caps as ``host_limit``."""
     from .envelope import Envelope
 
     env = envelope if isinstance(envelope, Envelope) else Envelope.model_validate(envelope)
@@ -299,7 +326,9 @@ def check_envelope(contract: EngineContract, envelope: Any) -> list[Violation]:
     arts: list[tuple[str, str, str, int | None]] = [
         (a.id, a.path, a.kind, a.bytes) for a in env.artifacts
         if not (captures and (a.id, a.kind, a.path) in _HOST_ARTIFACTS)]
-    return _check(contract, engine=env.engine, status=env.status, artifacts=arts, payload=env.payload)
+    caps = [Violation("host_limit", p) for p in _host_cap_problems(env, limits)]
+    return caps + _check(contract, engine=env.engine, status=env.status, artifacts=arts,
+                         payload=env.payload)
 
 
 def check_result(contract: EngineContract, result: Any, outdir: str | Path | None = None, *,
@@ -328,15 +357,9 @@ def check_result(contract: EngineContract, result: Any, outdir: str | Path | Non
             # limits.max_metadata_bytes, so only judge the size when the caller says which host.
             cap = getattr(limits, "max_metadata_bytes", None) or sys.maxsize
             envelope_from_json(env.model_dump_json(by_alias=True).encode(), max_bytes=cap)
-            max_artifacts = getattr(limits, "max_artifacts", None)
-            if max_artifacts is not None and len(env.artifacts) > max_artifacts:
-                raise ValueError(f"{len(env.artifacts)} artifacts exceed the host's max_artifacts "
-                                 f"{max_artifacts}")
-            max_total = getattr(limits, "max_total_artifact_bytes", None)
-            total = sum(a.bytes for a in env.artifacts)
-            if max_total is not None and total > max_total:
-                raise ValueError(f"{total} artifact bytes exceed the host's "
-                                 f"max_total_artifact_bytes {max_total}")
+            problems = _host_cap_problems(env, limits)
+            if problems:
+                raise ValueError("; ".join(problems))
         except (ValueError, OSError) as exc:
             note = (" (detected is None: the harness accepts that only when engine.detect() "
                     "supplies one at pre-detection)" if result.detected is None else "")
@@ -384,7 +407,7 @@ def assert_conforms(contract: EngineContract, result: Any, outdir: str | Path | 
     if hasattr(result, "artifacts") and not hasattr(result, "input_sha256") and not isinstance(result, dict):
         problems = check_result(contract, result, outdir, limits=limits)
     else:
-        problems = check_envelope(contract, result)
+        problems = check_envelope(contract, result, limits=limits)
     if not check_name:
         problems = [p for p in problems if p.code != "engine_name"]
     if problems:
