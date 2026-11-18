@@ -63,7 +63,7 @@ harness's seal or the host trust gate would refuse (`unsealable` / `reserved_pat
 `outdir`, a reserved root name, a duplicate id, a payload nested deeper than the host parses;
 checked when `outdir` is given; pass `limits=` (to `check_result`, `check_envelope` or `assert_conforms`) to also apply that
 host's output caps: metadata size, artifact count, per-artifact bytes, and total bytes including
-metadata.json, as the cold/warm dispatchers count it), a required artifact missing on `ok`, a node type
+metadata.json and any undeclared file left in `outdir`, as the cold/warm dispatchers count it), a required artifact missing on `ok`, a node type
 the contract does not allow (on any status; on `rejected`/`engine_error` the harness's own bare
 Record root is allowed, nodes below it are still checked), a wrong root on `ok`, or a missing root field on `ok`
 fails the test. An artifact counts toward the first family it matches but must satisfy the

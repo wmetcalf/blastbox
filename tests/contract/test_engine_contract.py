@@ -837,3 +837,11 @@ def test_metadata_json_the_harness_can_replace_is_not_flagged(contract_path: Pat
         (out / "d").mkdir()
         meta.symlink_to(out / "d", target_is_directory=True)
     assert "reserved_path" not in {v.code for v in check_result(load_contract(contract_path), _result(), out)}
+
+
+def test_total_cap_counts_undeclared_files_in_outdir(contract_path: Path, tmp_path: Path) -> None:
+    from blastbox.limits import Limits
+    out = _outdir(tmp_path)
+    (out / "scratch.bin").write_bytes(b"x" * 5000)
+    lim = Limits(max_total_artifact_bytes=4000)
+    assert "unsealable" in {v.code for v in check_result(load_contract(contract_path), _result(), out, limits=lim)}

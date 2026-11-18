@@ -287,7 +287,7 @@ def _check(contract: EngineContract, *, engine: str | None, status: str,
     return out
 
 
-def _host_cap_problems(env: Any, limits: Any) -> list[str]:
+def _host_cap_problems(env: Any, limits: Any, extra_bytes: int = 0) -> list[str]:
     """The host's output caps (``Limits``) applied to a sealed envelope: metadata size, artifact
     count, per-artifact and total bytes. The total includes metadata.json itself, as the cold and
     warm dispatchers count it (``Dispatcher._enforce_output_size_cap``), the stricter host path."""
@@ -306,11 +306,29 @@ def _host_cap_problems(env: Any, limits: Any) -> list[str]:
         if per is not None and a.bytes > per:
             out.append(f"artifact {a.id} is {a.bytes} bytes, over the host's max_artifact_bytes {per}")
     total_cap = getattr(limits, "max_total_artifact_bytes", None)
-    total = sum(a.bytes for a in env.artifacts) + meta_len
+    total = sum(a.bytes for a in env.artifacts) + meta_len + extra_bytes
     if total_cap is not None and total > total_cap:
         out.append(f"{total} output bytes (artifacts + metadata.json) exceed the host's "
                    f"max_total_artifact_bytes {total_cap}")
     return out
+
+
+def _undeclared_bytes(outdir: Path, env: Any) -> int:
+    """Bytes of regular files under ``outdir`` that are not declared artifacts (nor the harness's
+    metadata.json): the cold/warm dispatcher's output cap counts every file in the tree."""
+    declared = {PurePosixPath(a.path).as_posix() for a in env.artifacts} | {"metadata.json"}
+    total = 0
+    for root, _dirs, files in os.walk(outdir):
+        for name in files:
+            p = Path(root) / name
+            rel = p.relative_to(outdir).as_posix()
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode) and rel not in declared:
+                total += st.st_size
+    return total
 
 
 def check_envelope(contract: EngineContract, envelope: Any, *, limits: Any = None) -> list[Violation]:
@@ -357,7 +375,8 @@ def check_result(contract: EngineContract, result: Any, outdir: str | Path | Non
             # limits.max_metadata_bytes, so only judge the size when the caller says which host.
             cap = getattr(limits, "max_metadata_bytes", None) or sys.maxsize
             envelope_from_json(env.model_dump_json(by_alias=True).encode(), max_bytes=cap)
-            problems = _host_cap_problems(env, limits)
+            problems = _host_cap_problems(env, limits, _undeclared_bytes(Path(outdir), env)
+                                          if limits is not None else 0)
             if problems:
                 raise ValueError("; ".join(problems))
         except (ValueError, OSError) as exc:
