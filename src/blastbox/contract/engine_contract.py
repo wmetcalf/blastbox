@@ -11,6 +11,7 @@ output mapper and should check they reference an engine that ships a contract.
 """
 from __future__ import annotations
 
+import dataclasses
 import fnmatch
 import importlib
 import json
@@ -158,7 +159,9 @@ _MAX_WALK_DEPTH = 256
 # Artifacts the HOST appends to a sealed envelope after validating the worker's output (the netd
 # capture and its TLS-decrypted/mixed derivatives, ``host/dispatch.py``). They are not the
 # engine's output, so an engine contract never lists them; matched on the exact
-# (id, kind, path) the host writes so an engine cannot hide an undeclared file behind the id.
+# (id, kind, path) the host writes. Known residual: the host does not reserve that triple, so a
+# worker that declares it exactly is indistinguishable in a sealed envelope; check_result (the
+# engine's own tests) never applies the exemption and catches it there.
 _HOST_ARTIFACTS: frozenset[tuple[str, str, str]] = frozenset({
     ("network.capture.pcap", "network_capture", "capture/dump.pcap"),
     ("network.capture.decrypted.pcap", "network_capture_decrypted", "capture/decrypted.pcap"),
@@ -167,8 +170,8 @@ _HOST_ARTIFACTS: frozenset[tuple[str, str, str]] = frozenset({
 
 _NO_CAPTURE_NETWORKS = frozenset({"none", "drop"})
 
-# The payload the worker harness itself seals for an engine that raised (``harness.py``
-# ``_engine_error_envelope``): a Record, whatever the engine's own root type is.
+# The payload root the worker harness itself seals for an engine that raised or a precheck
+# refusal (``harness.py``: engine_error / rejected): a Record, whatever the engine's root is.
 _HARNESS_ERROR_NODE = "record"
 
 
@@ -187,6 +190,9 @@ def _payload_nodes(root: object) -> list[object]:
             if isinstance(value, _Node):
                 found.append(value)
             items: list[object] = [getattr(value, name, None) for name in type(value).model_fields]
+            items.extend((getattr(value, "__pydantic_extra__", None) or {}).values())
+        elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+            items = [getattr(value, f.name, None) for f in dataclasses.fields(value)]
         elif isinstance(value, dict):
             items = list(value.values())
         elif isinstance(value, (list, tuple)):
@@ -194,7 +200,8 @@ def _payload_nodes(root: object) -> list[object]:
         else:
             continue
         stack.extend((item, depth + 1) for item in reversed(items)
-                     if isinstance(item, (BaseModel, dict, list, tuple)))
+                     if isinstance(item, (BaseModel, dict, list, tuple))
+                     or (dataclasses.is_dataclass(item) and not isinstance(item, type)))
     return found
 
 
@@ -223,6 +230,7 @@ def _check(contract: EngineContract, *, engine: str | None, status: str,
             continue
         key = contract.artifacts.index(spec)
         counts[key] = counts.get(key, 0) + 1
+        too_large = False
         # Counts go to the first matching family; presence and byte caps apply for every family
         # it matches, so an earlier catch-all glob can neither make a later required family look
         # absent nor carry an artifact past that family's max_bytes.
@@ -230,9 +238,10 @@ def _check(contract: EngineContract, *, engine: str | None, status: str,
             if not _matches(other, ident, path, kind):
                 continue
             present.add(i)
-            if other.max_bytes is not None and size is not None and size > other.max_bytes:
+            if (other.max_bytes is not None and size is not None and size > other.max_bytes
+                    and not too_large):
+                too_large = True
                 out.append(Violation("artifact_too_large", f"{ident} is {size} bytes, contract max {other.max_bytes}"))
-                break
     for key, spec in enumerate(contract.artifacts):
         n = counts.get(key, 0)
         if spec.max_count and n > spec.max_count:
@@ -241,9 +250,12 @@ def _check(contract: EngineContract, *, engine: str | None, status: str,
             out.append(Violation("missing_artifact", f"required artifact {spec.id} ({spec.kind}) absent"))
 
     allowed = set(contract.payload.node_types)
-    if status != "ok":
-        allowed.add(_HARNESS_ERROR_NODE)
-    seen = {t for t in (_node_type(n) for n in _payload_nodes(payload)) if t is not None}
+    nodes = _payload_nodes(payload)
+    if status != "ok" and _node_type(payload) == _HARNESS_ERROR_NODE:
+        # The harness seals a bare Record ROOT for engine_error and for a precheck refusal
+        # (status rejected); anything below the root is still the engine's and is checked.
+        nodes = nodes[1:]
+    seen = {t for t in (_node_type(n) for n in nodes) if t is not None}
     for t in sorted(seen - allowed):
         out.append(Violation("undeclared_node_type", f"payload contains {t!r}, not in contract node_types"))
 
@@ -288,6 +300,20 @@ def check_result(contract: EngineContract, result: Any, outdir: str | Path | Non
     byte caps are checked from the files on disk."""
     arts: list[tuple[str, str, str, int | None]] = []
     missing: set[str] = set()
+    unsealable: list[Violation] = []
+    if outdir is not None:
+        # Whatever the harness's seal would refuse (a path escaping outdir through a symlinked
+        # parent, an absolute or `..` path, the reserved metadata.json, a duplicate id, a dangling
+        # ArtifactRef) turns every real job into engine_error; say so rather than re-implement it.
+        from .envelope import seal_envelope
+
+        try:
+            seal_envelope(engine=contract.engine.name, outdir=Path(outdir), input_sha256="0" * 64,
+                          detected=result.detected, declared=list(result.artifacts),
+                          warnings=list(getattr(result, "warnings", None) or []),
+                          payload=result.payload, status=result.status)
+        except (ValueError, OSError) as exc:
+            unsealable.append(Violation("unsealable", f"seal_envelope would refuse this result: {exc}"))
     for a in result.artifacts:
         size = None
         if outdir is not None:
@@ -300,8 +326,8 @@ def check_result(contract: EngineContract, result: Any, outdir: str | Path | Non
             else:
                 missing.add(a.path)
         arts.append((a.id, a.path, a.kind, size))
-    return _check(contract, engine=None, status=result.status, artifacts=arts, payload=result.payload,
-                  missing_files=frozenset(missing))
+    return unsealable + _check(contract, engine=None, status=result.status, artifacts=arts,
+                               payload=result.payload, missing_files=frozenset(missing))
 
 
 def builtin_contract(name: str) -> EngineContract:
@@ -324,12 +350,19 @@ def assert_conforms(contract: EngineContract, result: Any, outdir: str | Path | 
                              + "\n".join(f"  {p}" for p in problems))
 
 
-def _contract_engine_name(path: Path) -> str | None:
+_UNPARSEABLE = object()
+
+
+def _contract_engine_name(path: Path) -> object:
+    """``[engine].name``, None when absent, or ``_UNPARSEABLE`` when the file cannot be read
+    as TOML (then the caller returns it so ``load_contract`` reports the real error)."""
     try:
         with open(path, "rb") as fh:
-            name = tomllib.load(fh).get("engine", {}).get("name")
-    except (OSError, tomllib.TOMLDecodeError, AttributeError):
-        return None
+            data = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+        return _UNPARSEABLE
+    engine = data.get("engine")
+    name = engine.get("name") if isinstance(engine, dict) else None
     return name if isinstance(name, str) else None
 
 
@@ -346,8 +379,12 @@ def find_contract(start: str | Path, engine: str | None = None) -> Path | None:
             if candidate.is_file():
                 return candidate
         candidate = d / CONTRACT_FILENAME
-        if candidate.is_file() and (engine is None or _contract_engine_name(candidate) == engine):
-            return candidate
+        if candidate.is_file():
+            if engine is None:
+                return candidate
+            name = _contract_engine_name(candidate)
+            if name is _UNPARSEABLE or name == engine:
+                return candidate
     return None
 
 

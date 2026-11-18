@@ -56,9 +56,11 @@ CONTRACT = load_contract(find_contract(__file__))
 assert_conforms(CONTRACT, result, outdir)     # DetonationResult, Envelope, or metadata.json dict
 ```
 
-An artifact the contract does not list (or one declared but never written), a required artifact
-missing on `ok`, a node type the contract does not allow (on any status; the harness's own
-`engine_error` Record is always allowed), a wrong root on `ok`, or a missing root field on `ok`
+An artifact the contract does not list (or one declared but never written), a result the
+harness's seal would refuse (`unsealable`: a path escaping `outdir`, the reserved `metadata.json`,
+a duplicate id; checked when `outdir` is given), a required artifact missing on `ok`, a node type
+the contract does not allow (on any status; on `rejected`/`engine_error` the harness's own bare
+Record root is allowed, nodes below it are still checked), a wrong root on `ok`, or a missing root field on `ok`
 fails the test. An artifact counts toward the first family it matches but must satisfy the
 `max_bytes` of, and satisfies `required` for, every family it matches. Checking a sealed
 `metadata.json` of an engine whose `network` allows a capturing exit (anything but `none`/`drop`)

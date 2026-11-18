@@ -318,7 +318,7 @@ def test_declared_but_unwritten_artifact_fails_with_outdir(contract_path: Path, 
     out = _outdir(tmp_path)
     (out / "manifest.json").unlink()
     codes = [v.code for v in check_result(load_contract(contract_path), _result(), out)]
-    assert codes == ["artifact_file_missing", "missing_artifact"]
+    assert codes == ["unsealable", "artifact_file_missing", "missing_artifact"]
 
 
 def test_find_contract_engine_never_falls_back_to_another_engine(tmp_path: Path) -> None:
@@ -426,4 +426,128 @@ def test_undeclared_and_unwritten_reports_both(contract_path: Path, tmp_path: Pa
     out = _outdir(tmp_path)
     extra = [DeclaredArtifact(id="debug", path="debug.log", kind="file")]
     codes = sorted(v.code for v in check_result(load_contract(contract_path), _result(extra=extra), out))
-    assert codes == ["artifact_file_missing", "undeclared_artifact"]
+    assert codes == ["artifact_file_missing", "undeclared_artifact", "unsealable"]
+
+
+# --- marla round 2 (Claude lens) ----------------------------------------------------------
+
+@pytest.mark.parametrize("case", ["symlinked_parent", "absolute", "dotdot", "reserved", "dup_id"])
+def test_check_result_with_outdir_refuses_what_sealing_refuses(contract_path: Path, tmp_path: Path, case: str) -> None:
+    contract_path.write_text(CONTRACT.replace('''[[artifacts]]
+id = "manifest"''', '''[[artifacts]]
+id = "*"
+path = "*"
+kind = "file"
+max_count = 0
+
+[[artifacts]]
+id = "manifest"'''))
+    out = _outdir(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "x.bin").write_text("x")
+    extra: list[DeclaredArtifact]
+    if case == "symlinked_parent":
+        (out / "linked").symlink_to(outside, target_is_directory=True)
+        extra = [DeclaredArtifact(id="x", path="linked/x.bin", kind="file")]
+    elif case == "absolute":
+        extra = [DeclaredArtifact(id="x", path=str(outside / "x.bin"), kind="file")]
+    elif case == "dotdot":
+        extra = [DeclaredArtifact(id="x", path="../outside/x.bin", kind="file")]
+    elif case == "reserved":
+        (out / "metadata.json").write_text("{}")
+        extra = [DeclaredArtifact(id="x", path="metadata.json", kind="file")]
+    else:
+        extra = [DeclaredArtifact(id="manifest", path="manifest.json", kind="file")]
+    codes = {v.code for v in check_result(load_contract(contract_path), _result(extra=extra), out)}
+    assert "unsealable" in codes, codes
+
+
+def test_symlinked_leaf_is_not_present(contract_path: Path, tmp_path: Path) -> None:
+    out = _outdir(tmp_path)
+    real = tmp_path / "real.json"
+    real.write_text("{}")
+    (out / "manifest.json").unlink()
+    (out / "manifest.json").symlink_to(real)
+    codes = [v.code for v in check_result(load_contract(contract_path), _result(), out)]
+    assert "artifact_file_missing" in codes and "missing_artifact" in codes
+
+
+def test_host_capture_exemption_needs_the_exact_triple(contract_path: Path, tmp_path: Path) -> None:
+    contract_path.write_text(CONTRACT.replace('network = ["none"]', 'network = ["inetsim"]'))
+    out = _outdir(tmp_path)
+    r = _result()
+    env = seal_envelope(engine="demo", outdir=out, input_sha256="0" * 64, detected=DET,
+                        declared=r.artifacts, warnings=[], payload=r.payload)
+    base = json.loads(env.model_dump_json(by_alias=True))
+    for art in ({"id": "network.capture.pcap", "kind": "network_capture", "path": "loot.bin"},
+                {"id": "network.capture.pcap", "kind": "file", "path": "capture/dump.pcap"}):
+        data = json.loads(json.dumps(base))
+        data["artifacts"].append({**art, "sha256": "0" * 64, "bytes": 1})
+        assert [v.code for v in check_envelope(load_contract(contract_path), data)] == \
+            ["undeclared_artifact"], art
+
+
+def test_find_contract_returns_a_broken_own_contract_for_load_to_report(tmp_path: Path) -> None:
+    (tmp_path / CONTRACT_FILENAME).write_text('[engine]\nname = "demo"\nformats = ["x"\n')
+    assert find_contract(tmp_path / "tests", "demo") == tmp_path / CONTRACT_FILENAME
+    (tmp_path / CONTRACT_FILENAME).write_bytes(b'# caf\xe9\n[engine]\nname = "demo"\n')
+    assert find_contract(tmp_path / "tests", "demo") == tmp_path / CONTRACT_FILENAME
+    with pytest.raises((ValueError, UnicodeDecodeError)):
+        load_contract(tmp_path / CONTRACT_FILENAME)
+
+
+def test_walker_descends_dataclasses_and_extra_fields() -> None:
+    from dataclasses import dataclass
+    from typing import Literal
+    from pydantic import BaseModel, ConfigDict, Field
+    from blastbox.contract.engine_contract import _payload_nodes
+    from blastbox.contract.nodes import _Node
+
+    page = Page(index=0, dims=Dimensions(width=1, height=1, unit="px"), image=ArtifactRef(id="p"))
+
+    @dataclass
+    class Section:
+        page: Page
+
+    class Loose(BaseModel):
+        model_config = ConfigDict(extra="allow")
+
+    class ReportDc(_Node):
+        type: Literal["report_dc"] = Field(default="report_dc", alias="_type")
+        sections: list[Section] = Field(default_factory=list)
+        loose: Loose | None = None
+
+    rep = ReportDc(sections=[Section(page=page)], loose=Loose(p=page))
+    types = [getattr(n, "type") for n in _payload_nodes(rep)]
+    assert types.count("page") == 2
+
+
+def test_oversized_artifact_still_satisfies_later_required_family(tmp_path: Path) -> None:
+    p = tmp_path / CONTRACT_FILENAME
+    p.write_text(CONTRACT.replace('''[[artifacts]]
+id = "manifest"''', '''[[artifacts]]
+id = "*"
+path = "*.json"
+kind = "file"
+max_count = 0
+max_bytes = 1
+
+[[artifacts]]
+id = "manifest"'''))
+    out = _outdir(tmp_path)
+    assert [v.code for v in check_result(load_contract(p), _result(), out)] == ["artifact_too_large"]
+
+
+def test_non_ok_record_allowance_is_root_only(tmp_path: Path) -> None:
+    from blastbox.contract import EmbeddedResource
+    p = tmp_path / CONTRACT_FILENAME
+    p.write_text(CONTRACT.replace('root = "record"', 'root = "embedded_resource"')
+                 .replace('node_types = ["record", "page"]', 'node_types = ["embedded_resource"]')
+                 .replace('required_root_fields = ["schema_version"]\nschema_version = "demo/1"\n', ''))
+    c = load_contract(p)
+    inner = EmbeddedResource(embedded_path="x", content_type="t", depth=1, metadata=Record())
+    root = EmbeddedResource(embedded_path="", content_type="t", depth=0, children=[inner])
+    for status in ("rejected", "engine_error"):
+        r = DetonationResult(payload=root, artifacts=[], detected=DET, status=status)  # type: ignore[arg-type]
+        assert [v.code for v in check_result(c, r)] == ["undeclared_node_type"], status
