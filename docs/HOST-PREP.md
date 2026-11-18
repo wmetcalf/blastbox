@@ -248,9 +248,9 @@ sudo grep -E '^(bwrap|unpriv_bwrap) ' /sys/kernel/security/apparmor/profiles   #
 
 The symlink keeps it from loading at boot or on a policy reload; `-R` removes the loaded copy.
 Preflight reports `PASS` when it is absent or disabled-and-unloaded, or active on a host where
-nothing runs host namespace sandboxes; it reports `WARN` when it is active and
-`BLASTBOX_SANDBOX=bwrap|nsjail`, `BLASTBOX_WORKER_RUNTIME=runc` or `BLASTBOX_GVISOR_ROOTLESS` is set
-(the same predicate as the `userns` check), or disabled but still loaded. Reverse with `sudo rm /etc/apparmor.d/disable/bwrap-userns-restrict &&
+nothing runs host bwrap; it reports `WARN` when it is active and `BLASTBOX_SANDBOX=bwrap` or
+`BLASTBOX_WORKER_RUNTIME=runc` (whose inner sandbox may be bwrap) is set, or disabled but still
+loaded. The profile attaches to bwrap only, so nsjail and rootless runsc don't trigger it. Reverse with `sudo rm /etc/apparmor.d/disable/bwrap-userns-restrict &&
 sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict`.
 
 ## Clock and aged warm checkpoints

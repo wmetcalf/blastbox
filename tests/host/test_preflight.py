@@ -958,3 +958,10 @@ def test_snapshot_age_does_not_log_a_wrong_knob(caplog):
     with caplog.at_level("WARNING"):
         pf.run_preflight(host, ["gvisor"])
     assert "invalid v=" not in caplog.text
+
+
+def test_stock_bwrap_profile_is_irrelevant_to_nsjail_only():
+    host = _healthy(env={"BLASTBOX_SANDBOX": "nsjail"},
+                    files={"/etc/apparmor.d/bwrap-userns-restrict": "profile bwrap ..."})
+    assert _by_name(pf.run_preflight(host, ["docker"]))["bwrap-userns-restrict"].status \
+        is Status.PASS

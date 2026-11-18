@@ -649,7 +649,13 @@ def _check_bwrap_stock_profile(host: HostView) -> Check:
                          f"sudo apparmor_parser -R {path}", doc)
         suffix = "" if loaded is not None else " (load state unverifiable without root)"
         return Check("bwrap-userns-restrict", Status.PASS, "stock profile disabled" + suffix)
-    needs = _needs_userns(host.env)
+    # The stock profile attaches to bwrap only: nsjail and rootless runsc are unaffected.
+    env = host.env
+    needs = []
+    if env.get("BLASTBOX_SANDBOX", "").strip().lower() == "bwrap":
+        needs.append("BLASTBOX_SANDBOX=bwrap")
+    if env.get("BLASTBOX_WORKER_RUNTIME", "").strip().lower() == "runc":
+        needs.append("BLASTBOX_WORKER_RUNTIME=runc (inner bwrap)")
     if not needs:
         return Check("bwrap-userns-restrict", Status.PASS,
                      "stock profile active (irrelevant here: nothing configured runs host bwrap; "
