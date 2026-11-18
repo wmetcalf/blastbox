@@ -746,3 +746,15 @@ def test_minimal_engine_example_ships_a_conforming_contract(tmp_path: Path) -> N
     r = mod.EchoEngine().detonate(sample, out, Limits())
     assert check_result(c, r, out) == []
     assert c.engine.name == mod.EchoEngine.name
+
+
+def test_assert_conforms_passes_limits_through(contract_path: Path, tmp_path: Path) -> None:
+    from blastbox.contract.engine_contract import assert_conforms
+    from blastbox.limits import Limits
+    out = _outdir(tmp_path)
+    big = _result()
+    big.payload = Record(fields={"schema_version": "demo/1", "blob": "x" * 2_000_000})
+    c = load_contract(contract_path)
+    assert_conforms(c, big, out)
+    with pytest.raises(AssertionError, match="unsealable"):
+        assert_conforms(c, big, out, limits=Limits(max_metadata_bytes=1_000_000))

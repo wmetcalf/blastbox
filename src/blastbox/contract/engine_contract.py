@@ -370,11 +370,12 @@ def builtin_contract(name: str) -> EngineContract:
 
 
 def assert_conforms(contract: EngineContract, result: Any, outdir: str | Path | None = None, *,
-                    check_name: bool = True) -> None:
+                    check_name: bool = True, limits: Any = None) -> None:
     """Test helper: raise ``AssertionError`` listing every violation. Accepts a sealed Envelope,
-    its parsed ``metadata.json``, or an unsealed ``DetonationResult``."""
+    its parsed ``metadata.json``, or an unsealed ``DetonationResult``. ``limits`` (a host's
+    ``Limits``) is passed to :func:`check_result` for an unsealed result."""
     if hasattr(result, "artifacts") and not hasattr(result, "input_sha256") and not isinstance(result, dict):
-        problems = check_result(contract, result, outdir)
+        problems = check_result(contract, result, outdir, limits=limits)
     else:
         problems = check_envelope(contract, result)
     if not check_name:
