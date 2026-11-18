@@ -300,7 +300,8 @@ Preflight reads `/proc/cpuinfo` and warns on flags with operational consequences
 - Keep blastbox state **off `/tmp`** (and `/var/tmp`): `systemd-tmpfiles` ages it out, tmpfs caps
   it at a fraction of RAM, and a reboot loses sealed results that may be the only copy. Preflight
   warns when `BLASTBOX_JOB_ROOT` (default `/var/lib/blastbox/jobs`), `BLASTBOX_SNAPSHOT_MEM_DIR` or
-  `BLASTBOX_GVISOR_ROOT` sits under them.
+  `BLASTBOX_GVISOR_ROOT` sits under them, and when the job root is missing or not writable by the
+  user preflight runs as (run it as the dispatcher user).
 - The Firecracker slot scratch is hard-wired to `/tmp/blastbox-fc-slots` (no knob today): slot
   disks, sockets, and the warm base unless `BLASTBOX_SNAPSHOT_MEM_DIR` moves it. Preflight's
   `fc-scratch` check warns when the mount holding `/tmp/blastbox-fc-slots` is a tmpfs; since there is no knob,

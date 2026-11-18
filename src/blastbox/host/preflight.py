@@ -829,6 +829,9 @@ def _check_scratch(host: HostView, tiers: Sequence[str]) -> Check:
                         "results): " + ", ".join(on_tmp))
     if not host.exists(job_root):
         problems.append(f"job root {job_root} does not exist")
+    elif not host.rw_access(job_root):
+        problems.append(f"job root {job_root} is not writable by uid {host.euid} (run preflight as "
+                        "the dispatcher user)")
     if problems:
         return Check("scratch", Status.WARN, "; ".join(problems), doc)
     return Check("scratch", Status.PASS, ", ".join(f"{k}={v}" for k, v in dirs))

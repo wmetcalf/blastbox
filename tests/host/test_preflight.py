@@ -105,7 +105,7 @@ def _healthy(**over) -> FakeHost:
         },
         paths={"/dev/kvm", "/var/lib/blastbox/jobs", "/var/lib/blastbox/fc/vmlinux",
                "/var/lib/blastbox/fc/rootfs.ext4", "/var/lib/blastbox/gvisor-rootfs/bin/sh"},
-        rw={"/dev/kvm"},
+        rw={"/dev/kvm", "/var/lib/blastbox/jobs"},
         executables={
             "docker": "/usr/bin/docker",
             "runsc": "/usr/bin/runsc",
@@ -1269,3 +1269,10 @@ def test_text_output_survives_non_utf8_env_bytes():
     checks = [pf.Check("scratch", Status.WARN, "BLASTBOX_JOB_ROOT=/var/lib/x\\udcff")]
     checks[0] = pf.Check("scratch", Status.WARN, "BLASTBOX_JOB_ROOT=/var/lib/x" + chr(0xDCFF))
     pf.render_text(checks, ["remote"]).encode("utf-8")
+
+
+def test_unwritable_job_root_warns():
+    host = _healthy(rw={"/dev/kvm"})          # job root exists but is not read/write
+    host.rw.discard("/var/lib/blastbox/jobs")
+    c = _by_name(pf.run_preflight(host, ["docker"]))["scratch"]
+    assert c.status is Status.WARN and "not writable" in c.detail
