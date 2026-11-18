@@ -462,11 +462,14 @@ def _check_gvisor_rootless(host: HostView) -> Check | None:
                  "Run it rootful (unset BLASTBOX_GVISOR_ROOTLESS)", f"{DOC}#gvisor-runsc")
 
 
+_KVM_MISSING = "/dev/kvm missing"
+
+
 def _check_kvm(host: HostView) -> Check:
     doc = f"{DOC}#firecracker"
     if not host.exists("/dev/kvm"):
         return Check("kvm", Status.FAIL,
-                     "/dev/kvm missing: no hardware virtualisation (BIOS VT-x/AMD-V, "
+                     f"{_KVM_MISSING}: no hardware virtualisation (BIOS VT-x/AMD-V, "
                      "kvm_intel/kvm_amd module, or nested virt on a VM host)", doc)
     if not host.rw_access("/dev/kvm"):
         return Check("kvm", Status.FAIL,
@@ -992,9 +995,11 @@ def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc]) -> Check:
 
 _TIER_CHECKS = {
     "firecracker": ("kvm", "firecracker", "fc-guest"),
-    # gvisor-rootfs is not a startup gate: the runtime boots a missing/unstamped rootfs anyway.
     "gvisor": ("runsc", "gvisor-rootless"),
 }
+#: Per-tier checks that are not startup gates (see _is_startup_gate) but are moot once the tier
+#: is skipped for another reason.
+_SOFT_CHECKS = {"firecracker": (), "gvisor": ("gvisor-rootfs",)}
 
 
 def _overflow_only_tiers(env: Mapping[str, str]) -> set[str]:
@@ -1008,16 +1013,25 @@ def _overflow_only_tiers(env: Mapping[str, str]) -> set[str]:
     return {m for m in members[1:] if m in _TIER_CHECKS and m != members[0]}
 
 
+def _is_startup_gate(c: Check) -> bool:
+    """Whether this FAIL is one the runtime's availability probe also fails on (so a cascade
+    skips the tier). firecracker_available() only checks that /dev/kvm EXISTS: a non-rw one is
+    admitted and every spawn fails; a missing gVisor rootfs is booted anyway."""
+    if c.name == "kvm":
+        return c.detail.startswith(_KVM_MISSING)
+    return c.name != "gvisor-rootfs"
+
+
 def _downgrade_overflow(checks: list[Check], env: Mapping[str, str]) -> list[Check]:
     overflow = _overflow_only_tiers(env)
-    names = {n: tier for tier in overflow for n in _TIER_CHECKS[tier]}
+    names = {n: tier for tier in overflow for n in (*_TIER_CHECKS[tier], *_SOFT_CHECKS[tier])}
+    # A tier any of whose startup gates FAILs is skipped whole, so its other FAILs are moot too.
+    skipped = {names[c.name] for c in checks
+               if c.name in names and c.status is Status.FAIL and _is_startup_gate(c)}
     out = []
     for c in checks:
         tier = names.get(c.name)
-        # firecracker_available() only checks that /dev/kvm EXISTS: a non-rw one is admitted
-        # and every spawn fails, so only "missing" is a skip.
-        gate = c.name != "kvm" or c.detail.startswith("/dev/kvm missing")
-        if tier and gate and c.status is Status.FAIL:
+        if tier in skipped and c.status is Status.FAIL:
             c = Check(c.name, Status.WARN,
                       f"{c.detail} -- {tier} is an overflow tier of this cascade, so the "
                       "dispatcher skips it at startup and runs without it", c.doc)

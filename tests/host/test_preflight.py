@@ -1160,3 +1160,12 @@ def test_remote_only_hosts_skip_local_worker_checks():
     del host.files["/sys/module/apparmor/parameters/enabled"]
     names = {c.name for c in pf.run_preflight(host, ["remote"])}
     assert not names & {"apparmor", "cpu-flags", "bwrap-userns-restrict", "userns"}
+
+
+def test_a_skipped_overflow_tier_downgrades_all_its_fails():
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2"}
+    host = _healthy(env=env, rw=set())          # /dev/kvm present but not rw (not a gate)
+    host.executables.pop("firecracker")         # ...but the binary is missing (a gate)
+    by = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env)))
+    assert by["firecracker"].status is Status.WARN
+    assert by["kvm"].status is Status.WARN      # moot: the whole tier is skipped
