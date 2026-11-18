@@ -134,10 +134,14 @@ def load_contract(path: str | Path) -> EngineContract:
         raise ValueError(f"{path}: invalid engine contract\n{exc}") from None
 
 
+def _matches(spec: ArtifactSpec, ident: str, path: str, kind: str) -> bool:
+    return (fnmatch.fnmatchcase(ident, spec.id) and fnmatch.fnmatchcase(path, spec.path)
+            and kind == spec.kind)
+
+
 def _spec_for(contract: EngineContract, ident: str, path: str, kind: str) -> ArtifactSpec | None:
     for spec in contract.artifacts:
-        if (fnmatch.fnmatchcase(ident, spec.id) and fnmatch.fnmatchcase(path, spec.path)
-                and kind == spec.kind):
+        if _matches(spec, ident, path, kind):
             return spec
     return None
 
@@ -200,6 +204,7 @@ def _check(contract: EngineContract, *, engine: str | None, status: str,
         out.append(Violation("status", f"status {status!r} not in contract statuses {contract.engine.statuses}"))
 
     counts: dict[int, int] = {}
+    present: set[int] = set()
     for ident, path, kind, size in artifacts:
         if path in missing_files:
             # Declared but never written: sealing rejects this, so it is not present.
@@ -211,13 +216,17 @@ def _check(contract: EngineContract, *, engine: str | None, status: str,
             continue
         key = contract.artifacts.index(spec)
         counts[key] = counts.get(key, 0) + 1
+        # Caps go to the first matching family; presence counts for every family it matches,
+        # so an earlier catch-all glob cannot make a later required family look absent.
+        present.update(i for i, other in enumerate(contract.artifacts)
+                       if _matches(other, ident, path, kind))
         if spec.max_bytes is not None and size is not None and size > spec.max_bytes:
             out.append(Violation("artifact_too_large", f"{ident} is {size} bytes, contract max {spec.max_bytes}"))
     for key, spec in enumerate(contract.artifacts):
         n = counts.get(key, 0)
         if spec.max_count and n > spec.max_count:
             out.append(Violation("artifact_count", f"{spec.id}: {n} artifacts, contract max {spec.max_count}"))
-        if spec.required and status == "ok" and n == 0:
+        if spec.required and status == "ok" and key not in present:
             out.append(Violation("missing_artifact", f"required artifact {spec.id} ({spec.kind}) absent"))
 
     allowed = set(contract.payload.node_types)

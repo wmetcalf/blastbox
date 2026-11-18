@@ -356,3 +356,19 @@ def test_nodes_inside_plain_models_are_walked(tmp_path: Path) -> None:
 
     report = Report(sections=[Section(meta=Record(fields={"a": 1}))])
     assert [getattr(n, "type") for n in _payload_nodes(report)] == ["report_t", "record"]
+
+
+def test_overlapping_specs_satisfy_a_required_family(tmp_path: Path) -> None:
+    """An artifact matching an earlier optional family still satisfies a later required one."""
+    p = tmp_path / CONTRACT_FILENAME
+    p.write_text(CONTRACT.replace('''[[artifacts]]
+id = "manifest"''', '''[[artifacts]]
+id = "*"
+path = "*.json"
+kind = "file"
+max_count = 0
+
+[[artifacts]]
+id = "manifest"'''))
+    out = _outdir(tmp_path)
+    assert check_result(load_contract(p), _result(), out) == []
