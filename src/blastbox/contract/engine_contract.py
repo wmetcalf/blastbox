@@ -149,11 +149,25 @@ def _node_type(node: object) -> str | None:
 
 _MAX_WALK_DEPTH = 256
 
+# Artifacts the HOST appends to a sealed envelope after validating the worker's output (the netd
+# capture and its TLS-decrypted/mixed derivatives, ``host/dispatch.py``). They are not the
+# engine's output, so an engine contract never lists them; matched on the exact
+# (id, kind, path) the host writes so an engine cannot hide an undeclared file behind the id.
+_HOST_ARTIFACTS: frozenset[tuple[str, str, str]] = frozenset({
+    ("network.capture.pcap", "network_capture", "capture/dump.pcap"),
+    ("network.capture.decrypted.pcap", "network_capture_decrypted", "capture/decrypted.pcap"),
+    ("network.capture.mixed.pcap", "network_capture_mixed", "capture/mixed.pcap"),
+})
+
+# The payload the worker harness itself seals for an engine that raised (``harness.py``
+# ``_engine_error_envelope``): a Record, whatever the engine's own root type is.
+_HARNESS_ERROR_NODE = "record"
+
 
 def _payload_nodes(root: object) -> list[object]:
     """Every node in the payload: ``children`` AND node-bearing fields (``EmbeddedResource.metadata``,
     Records nested in ``Record.fields``, any node a registered engine type carries in its own
-    fields). ``walk.iter_nodes`` follows ``children`` only, which would let a node type the
+    fields, including inside plain pydantic models). ``walk.iter_nodes`` follows ``children`` only, which would let a node type the
     contract never declared ride in under ``metadata``."""
     found: list[object] = []
     stack: list[tuple[object, int]] = [(root, 0)]
@@ -161,8 +175,9 @@ def _payload_nodes(root: object) -> list[object]:
         value, depth = stack.pop()
         if depth > _MAX_WALK_DEPTH:
             raise ValueError(f"payload tree exceeds maximum nesting depth of {_MAX_WALK_DEPTH}")
-        if isinstance(value, _Node):
-            found.append(value)
+        if isinstance(value, BaseModel):
+            if isinstance(value, _Node):
+                found.append(value)
             items: list[object] = [getattr(value, name, None) for name in type(value).model_fields]
         elif isinstance(value, dict):
             items = list(value.values())
@@ -171,12 +186,13 @@ def _payload_nodes(root: object) -> list[object]:
         else:
             continue
         stack.extend((item, depth + 1) for item in reversed(items)
-                     if isinstance(item, (_Node, dict, list, tuple)))
+                     if isinstance(item, (BaseModel, dict, list, tuple)))
     return found
 
 
 def _check(contract: EngineContract, *, engine: str | None, status: str,
-           artifacts: list[tuple[str, str, str, int | None]], payload: object) -> list[Violation]:
+           artifacts: list[tuple[str, str, str, int | None]], payload: object,
+           missing_files: frozenset[str] = frozenset()) -> list[Violation]:
     out: list[Violation] = []
     if engine is not None and engine != contract.engine.name:
         out.append(Violation("engine_name", f"result is from {engine!r}, contract is {contract.engine.name!r}"))
@@ -185,6 +201,10 @@ def _check(contract: EngineContract, *, engine: str | None, status: str,
 
     counts: dict[int, int] = {}
     for ident, path, kind, size in artifacts:
+        if path in missing_files:
+            # Declared but never written: sealing rejects this, so it is not present.
+            out.append(Violation("artifact_file_missing", f"{ident} declared at {path} but no file is there"))
+            continue
         spec = _spec_for(contract, ident, path, kind)
         if spec is None:
             out.append(Violation("undeclared_artifact", f"{ident} ({kind}) at {path} matches no contract artifact"))
@@ -200,14 +220,17 @@ def _check(contract: EngineContract, *, engine: str | None, status: str,
         if spec.required and status == "ok" and n == 0:
             out.append(Violation("missing_artifact", f"required artifact {spec.id} ({spec.kind}) absent"))
 
+    allowed = set(contract.payload.node_types)
+    if status != "ok":
+        allowed.add(_HARNESS_ERROR_NODE)
+    seen = {t for t in (_node_type(n) for n in _payload_nodes(payload)) if t is not None}
+    for t in sorted(seen - allowed):
+        out.append(Violation("undeclared_node_type", f"payload contains {t!r}, not in contract node_types"))
+
     if status == "ok":
         root_type = _node_type(payload)
         if root_type != contract.payload.root:
             out.append(Violation("payload_root", f"payload root is {root_type!r}, contract says {contract.payload.root!r}"))
-        allowed = set(contract.payload.node_types)
-        seen = {t for t in (_node_type(n) for n in _payload_nodes(payload)) if t is not None}
-        for t in sorted(seen - allowed):
-            out.append(Violation("undeclared_node_type", f"payload contains {t!r}, not in contract node_types"))
         fields = getattr(payload, "fields", None)
         if fields is None:
             # Non-Record roots (EmbeddedResource) carry their typed bag in `metadata`.
@@ -230,7 +253,9 @@ def check_envelope(contract: EngineContract, envelope: Any) -> list[Violation]:
     from .envelope import Envelope
 
     env = envelope if isinstance(envelope, Envelope) else Envelope.model_validate(envelope)
-    arts: list[tuple[str, str, str, int | None]] = [(a.id, a.path, a.kind, a.bytes) for a in env.artifacts]
+    arts: list[tuple[str, str, str, int | None]] = [
+        (a.id, a.path, a.kind, a.bytes) for a in env.artifacts
+        if (a.id, a.kind, a.path) not in _HOST_ARTIFACTS]
     return _check(contract, engine=env.engine, status=env.status, artifacts=arts, payload=env.payload)
 
 
@@ -238,13 +263,18 @@ def check_result(contract: EngineContract, result: Any, outdir: str | Path | Non
     """Check an unsealed ``DetonationResult`` (what an engine's own tests hold). With ``outdir``,
     byte caps are checked from the files on disk."""
     arts: list[tuple[str, str, str, int | None]] = []
+    missing: set[str] = set()
     for a in result.artifacts:
         size = None
         if outdir is not None:
             p = Path(outdir) / a.path
-            size = p.stat().st_size if p.is_file() else None
+            if p.is_file() and not p.is_symlink():
+                size = p.stat().st_size
+            else:
+                missing.add(a.path)
         arts.append((a.id, a.path, a.kind, size))
-    return _check(contract, engine=None, status=result.status, artifacts=arts, payload=result.payload)
+    return _check(contract, engine=None, status=result.status, artifacts=arts, payload=result.payload,
+                  missing_files=frozenset(missing))
 
 
 def builtin_contract(name: str) -> EngineContract:
@@ -267,16 +297,32 @@ def assert_conforms(contract: EngineContract, result: Any, outdir: str | Path | 
                              + "\n".join(f"  {p}" for p in problems))
 
 
+def _contract_engine_name(path: Path) -> str | None:
+    try:
+        with open(path, "rb") as fh:
+            name = tomllib.load(fh).get("engine", {}).get("name")
+    except (OSError, tomllib.TOMLDecodeError, AttributeError):
+        return None
+    return name if isinstance(name, str) else None
+
+
 def find_contract(start: str | Path, engine: str | None = None) -> Path | None:
-    """Walk up from ``start`` to the nearest contract. With ``engine``, a multi-engine repo's
-    ``blastbox-engine.<engine>.toml`` is preferred over a plain ``blastbox-engine.toml``."""
+    """Walk up from ``start`` to the nearest contract.
+
+    With ``engine``, a multi-engine repo's ``blastbox-engine.<engine>.toml`` is found wherever it
+    sits on the way up, and a plain ``blastbox-engine.toml`` is accepted only when its
+    ``[engine].name`` is ``engine``: it never silently returns another engine's contract."""
     here = Path(start).resolve()
-    names = ([f"blastbox-engine.{engine}.toml"] if engine else []) + [CONTRACT_FILENAME]
-    for d in (here, *here.parents):
-        for name in names:
-            candidate = d / name
+    dirs = (here, *here.parents)
+    if engine:
+        for d in dirs:
+            candidate = d / f"blastbox-engine.{engine}.toml"
             if candidate.is_file():
                 return candidate
+    for d in dirs:
+        candidate = d / CONTRACT_FILENAME
+        if candidate.is_file() and (engine is None or _contract_engine_name(candidate) == engine):
+            return candidate
     return None
 
 

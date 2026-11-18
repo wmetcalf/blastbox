@@ -600,6 +600,13 @@ class ClamAVEngine:
                 message="clamd hit a scan limit (MaxScanSize/MaxFiles/MaxRecursion) and "
                         "stopped early, so parts of this sample were never examined: "
                         + ", ".join(sorted(set(truncated))[:5])))
+        if encrypted:
+            # A real hit seals infected=true, but the encrypted members were still never
+            # examined; first_hit_only=false must not read as "every signature that matched".
+            warnings.append(Warning(
+                code="encrypted_archive_not_scanned",
+                message="encrypted archive member(s) clamd could not inspect were skipped: "
+                        + ", ".join(sorted(set(encrypted))[:5])))
         if degraded:
             warnings.append(Warning(
                 code="all_match_unavailable",

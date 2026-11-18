@@ -276,3 +276,83 @@ def test_cli_imports_registration_modules(tmp_path: Path, monkeypatch: pytest.Mo
         nodes._ENGINE_NODE_TYPES[:] = [t for t in nodes._ENGINE_NODE_TYPES
                                        if getattr(t, "__module__", "") != "demo_nodes_mod"]
         nodes.rebuild_node_union()
+
+
+def test_node_types_checked_on_every_status(contract_path: Path) -> None:
+    """Root/field checks are ok-only, but a node type the contract never declared fails on any
+    status. The harness's own error payload (a Record) is always allowed."""
+    p = contract_path
+    p.write_text(CONTRACT.replace('node_types = ["record", "page"]', 'node_types = ["record"]'))
+    c = load_contract(p)
+    page = Page(index=0, dims=Dimensions(width=1, height=1, unit="px"), image=ArtifactRef(id="page-0"))
+    bad = DetonationResult(payload=page, artifacts=[], detected=DET, status="engine_error")  # type: ignore[arg-type]
+    assert [v.code for v in check_result(c, bad)] == ["undeclared_node_type"]
+    p.write_text(CONTRACT.replace('root = "record"', 'root = "page"')
+                 .replace('node_types = ["record", "page"]', 'node_types = ["page"]'))
+    harness_error = DetonationResult(payload=Record(fields={"error": "x"}), artifacts=[],
+                                     detected=DET, status="engine_error")
+    assert check_result(load_contract(p), harness_error) == []
+
+
+def test_host_sealed_capture_artifacts_are_not_the_engines(contract_path: Path, tmp_path: Path) -> None:
+    """The host appends netd capture pcaps to the sealed envelope; they are not engine output."""
+    out = _outdir(tmp_path)
+    r = _result()
+    env = seal_envelope(engine="demo", outdir=out, input_sha256="0" * 64, detected=DET,
+                        declared=r.artifacts, warnings=[], payload=r.payload)
+    data = json.loads(env.model_dump_json(by_alias=True))
+    for art_id, kind, path in (("network.capture.pcap", "network_capture", "capture/dump.pcap"),
+                               ("network.capture.decrypted.pcap", "network_capture_decrypted",
+                                "capture/decrypted.pcap")):
+        data["artifacts"].append({"id": art_id, "path": path, "kind": kind,
+                                  "sha256": "0" * 64, "bytes": 1})
+    assert check_envelope(load_contract(contract_path), data) == []
+    # Only the host's exact shape is exempt: the same id with another kind is still undeclared.
+    data["artifacts"].append({"id": "network.capture.mixed.pcap", "path": "x.pcap", "kind": "file",
+                              "sha256": "0" * 64, "bytes": 1})
+    assert [v.code for v in check_envelope(load_contract(contract_path), data)] == ["undeclared_artifact"]
+
+
+def test_declared_but_unwritten_artifact_fails_with_outdir(contract_path: Path, tmp_path: Path) -> None:
+    out = _outdir(tmp_path)
+    (out / "manifest.json").unlink()
+    codes = [v.code for v in check_result(load_contract(contract_path), _result(), out)]
+    assert codes == ["artifact_file_missing", "missing_artifact"]
+
+
+def test_find_contract_engine_never_falls_back_to_another_engine(tmp_path: Path) -> None:
+    (tmp_path / CONTRACT_FILENAME).write_text(CONTRACT)  # engine "demo"
+    nested = tmp_path / "src"
+    nested.mkdir()
+    assert find_contract(nested, "other") is None
+    assert find_contract(nested, "demo") == tmp_path / CONTRACT_FILENAME
+    # An engine-specific file higher up beats a nearer plain contract for another engine.
+    (tmp_path / "blastbox-engine.other.toml").write_text(CONTRACT.replace('name = "demo"', 'name = "other"'))
+    (nested / CONTRACT_FILENAME).write_text(CONTRACT)
+    assert find_contract(nested, "other") == tmp_path / "blastbox-engine.other.toml"
+
+
+def test_builtin_contract_names_match_their_engines() -> None:
+    from blastbox.contract.engine_contract import builtin_contract
+    from blastbox.engines import clamav, detonate, magika, urlgrab
+    engines = {"clamav": clamav.ClamAVEngine, "detonate": detonate.DetonateEngine,
+               "magika": magika.MagikaEngine, "urlgrab": urlgrab.UrlGrabEngine}
+    for stem, cls in engines.items():
+        assert builtin_contract(stem).engine.name == cls.name, stem
+
+
+def test_nodes_inside_plain_models_are_walked(tmp_path: Path) -> None:
+    from typing import Literal
+    from pydantic import BaseModel, Field
+    from blastbox.contract.engine_contract import _payload_nodes
+    from blastbox.contract.nodes import _Node
+
+    class Section(BaseModel):
+        meta: Record
+
+    class Report(_Node):
+        type: Literal["report_t"] = Field(default="report_t", alias="_type")
+        sections: list[Section] = Field(default_factory=list)
+
+    report = Report(sections=[Section(meta=Record(fields={"a": 1}))])
+    assert [getattr(n, "type") for n in _payload_nodes(report)] == ["report_t", "record"]

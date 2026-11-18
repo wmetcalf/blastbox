@@ -759,3 +759,16 @@ def test_no_incomplete_scan_ever_seals_ok_and_uninfected(tmp_path, hits):
     assert res.detected.label != "clean"
     assert {g.id for g in builtin_contract("clamav").gaps}.isdisjoint(
         {"truncated-scan-not-clean"})
+
+
+def test_encrypted_members_beside_a_real_hit_are_disclosed(tmp_path):
+    """A real hit seals infected=true, but encrypted members clamd skipped must still be said:
+    first_hit_only=false reads as "every signature that matched", which is false for content
+    that was never examined."""
+    hits = ["Eicar-Test-Signature", "Heuristics.Encrypted.Zip"]
+    res = _detonate(_stub_engine(path_scan_fn=lambda p, timeout=None: list(hits),
+                                 scan_fn=lambda d, timeout=None: list(hits)),
+                    tmp_path, 16)
+    assert res.status == "ok" and res.payload.fields["infected"] is True
+    assert "encrypted_archive_not_scanned" in {w.code for w in res.warnings}
+    assert_conforms(builtin_contract("clamav"), res, tmp_path / "out")

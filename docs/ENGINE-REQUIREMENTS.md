@@ -17,7 +17,7 @@ contract makes the second checkable.
 
 ## 2. The contract (`blastbox-engine.toml`, checked by your tests)
 
-At the engine repo root; a repo with several engines uses `blastbox-engine.<engine>.toml` (found by `find_contract(path, engine)`). Built-ins: `src/blastbox/engines/contracts/<name>.toml`. Schema
+At the engine repo root; a repo with several engines uses `blastbox-engine.<engine>.toml` (found by `find_contract(path, engine)`, which falls back to a plain `blastbox-engine.toml` only when its `[engine].name` matches). Built-ins: `src/blastbox/engines/contracts/<name>.toml`. Schema
 `blastbox-engine-contract/1`, parsed by `blastbox.contract.engine_contract`:
 
 ```text
@@ -56,8 +56,11 @@ CONTRACT = load_contract(find_contract(__file__))
 assert_conforms(CONTRACT, result, outdir)     # DetonationResult, Envelope, or metadata.json dict
 ```
 
-An artifact the contract does not list, a required artifact missing on `ok`, a node type the
-contract does not allow, a wrong root, or a missing root field fails the test. The built-in
+An artifact the contract does not list (or one declared but never written), a required artifact
+missing on `ok`, a node type the contract does not allow (on any status; the harness's own
+`engine_error` Record is always allowed), a wrong root on `ok`, or a missing root field on `ok`
+fails the test. Checking a sealed `metadata.json` ignores the capture pcaps the host appends
+(`network.capture*.pcap`): they are not engine output. The built-in
 engines do this in `tests/engines/`; `tests/contract/test_engine_contract.py` fails if a
 built-in engine has no contract.
 
