@@ -123,6 +123,22 @@ What the sandbox sees:
 - **Rootful only for the warm tier.** gVisor cannot `restore` rootless. Rootless runsc (no current
   tier uses it) needs `deploy/apparmor/blastbox-runsc` on Ubuntu 24.04+.
 
+### runsc processes and host root
+
+With docker's stock (non-remapped) setup, the host-side `runsc-sandbox` (Sentry) and
+`runsc-gofer` processes are **real host root**: their `/proc/<pid>/uid_map` is the identity map
+`0 0 4294967295` and `Uid` is 0, with capabilities such as `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH`
+(sandbox) and `CAP_SYS_CHROOT` (gofer). gVisor is the boundary, but a Sentry or gofer escape then
+lands as host root. Preflight's `runsc-host-root` check warns when it sees this. The recommended
+direction is a **user-namespace-remapped** setup: a separate docker daemon with `userns-remap`
+for the blastbox runtime, or containerd per-container uid/gid mappings. This is pending a spike
+(warm checkpoint/restore under a remapped daemon is unverified), so treat the warning as known
+residual risk until then; do not flip `userns-remap` on a shared daemon, which remaps every
+existing container and its volumes.
+
+Reading another user's `/proc/<pid>/uid_map`/`status` can need privileges; preflight then says
+`unknown (run as root)` and does not fail.
+
 ## Firecracker
 
 ```sh
@@ -139,6 +155,22 @@ firecracker --version               # >= v1.15.1 (older: virtio-rng entropy DoS)
 - **Host AppArmor profiles don't apply to the job.** The engine runs on the guest kernel. Host
   userns restrictions are irrelevant to Firecracker itself (a KVM hypervisor, not a userns
   sandbox); confinement inside the guest is the guest's business (nono works there).
+
+### Confining firecracker and runsc processes
+
+Warm Firecracker slots share one slot directory, and it holds every job's `warm-*.mem` snapshot
+file. A firecracker process that is not jailed and not confined by AppArmor can read another
+job's guest memory if the VMM is compromised. Recommended:
+
+- start firecracker through the **jailer** (chroot, its own uid/gid, cgroup and namespaces), so a
+  slot's VMM only sees its own files;
+- attach a **per-slot AppArmor profile** that allows only that slot's files.
+
+Preflight's `sandbox-confinement` check warns when a firecracker or runsc process is
+`unconfined` (`/proc/<pid>/attr/current`) or a firecracker was not started by the jailer (no
+`--start-time-us` in its argv and a root of `/`). Without privileges to read those it reports
+`unknown (run as root)` and does not fail. A firecracker inside a docker container shows the
+container's profile (e.g. `docker-default`), which counts as confined, but it is not jailed.
 
 ## AppArmor and user namespaces
 

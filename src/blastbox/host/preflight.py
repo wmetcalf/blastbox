@@ -102,6 +102,15 @@ class HostView:
         """Resolved executable path for a name or an absolute path; None if not executable."""
         raise NotImplementedError
 
+    def listdir(self, path: str) -> list[str] | None:
+        """Entry names of a directory; None if it cannot be listed."""
+        raise NotImplementedError
+
+    def readlink(self, path: str) -> str | None:
+        """A symlink's target; None if it is not a link or cannot be read (another user's
+        ``/proc/<pid>/root`` needs privileges)."""
+        raise NotImplementedError
+
     def run(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str] | None:
         """Run a read-only query; None if it could not be spawned or timed out."""
         raise NotImplementedError
@@ -138,6 +147,18 @@ class RealHost(HostView):
         if os.path.isabs(name):
             return name if os.path.isfile(name) and os.access(name, os.X_OK) else None
         return shutil.which(name)
+
+    def listdir(self, path: str) -> list[str] | None:
+        try:
+            return os.listdir(path)
+        except OSError:
+            return None
+
+    def readlink(self, path: str) -> str | None:
+        try:
+            return os.readlink(path)
+        except OSError:
+            return None
 
     def run(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str] | None:
         if not is_read_only(argv):
@@ -474,6 +495,153 @@ def _check_scratch(host: HostView, tiers: Sequence[str]) -> Check:
     return Check("scratch", Status.PASS, ", ".join(f"{k}={v}" for k, v in dirs))
 
 
+# --- running sandbox processes ------------------------------------------------------------
+
+_RUNSC_ROLES = ("runsc-sandbox", "runsc-gofer")
+_IDENTITY_UID_MAP = ["0", "0", "4294967295"]
+#: Capabilities worth naming when a sandbox process holds them as real host root.
+_NOTABLE_CAPS = {1: "DAC_OVERRIDE", 2: "DAC_READ_SEARCH", 18: "SYS_CHROOT", 21: "SYS_ADMIN",
+                 12: "NET_ADMIN", 19: "SYS_PTRACE"}
+_SHOW_PIDS = 5
+_UNKNOWN = "unknown (run as root)"
+
+
+@dataclass(frozen=True)
+class _Proc:
+    pid: str
+    role: str            # "runsc-sandbox" | "runsc-gofer" | "firecracker"
+    argv: tuple[str, ...]
+
+
+def _sandbox_processes(host: HostView) -> list[_Proc]:
+    """Running runsc sandbox/gofer and firecracker processes, found by argv[0] (runsc re-execs
+    itself with argv[0] ``runsc-sandbox``/``runsc-gofer``; its comm is often just ``exe``) or
+    by comm. Reads only world-readable ``/proc/<pid>/cmdline`` and ``comm``."""
+    found: list[_Proc] = []
+    for pid in sorted((n for n in host.listdir("/proc") or [] if n.isdigit()), key=int):
+        raw = host.read(f"/proc/{pid}/cmdline")
+        argv = tuple(a for a in (raw or "").split("\0") if a)
+        names = {_first_line(host.read(f"/proc/{pid}/comm"))}
+        if argv:
+            names.add(os.path.basename(argv[0]))
+        for role in (*_RUNSC_ROLES, "firecracker"):
+            if role in names:
+                found.append(_Proc(pid, role, argv))
+                break
+    return found
+
+
+def _status_field(host: HostView, pid: str, key: str) -> str | None:
+    raw = host.read(f"/proc/{pid}/status")
+    if raw is None:
+        return None
+    for line in raw.splitlines():
+        k, _, v = line.partition(":")
+        if k.strip() == key:
+            return v.strip()
+    return None
+
+
+def _caps(host: HostView, pid: str) -> list[str]:
+    raw = _status_field(host, pid, "CapEff")
+    try:
+        mask = int(raw or "0", 16)
+    except ValueError:
+        return []
+    return [name for bit, name in sorted(_NOTABLE_CAPS.items()) if mask & (1 << bit)]
+
+
+def _pids(procs: Sequence[_Proc]) -> str:
+    shown = ", ".join(f"{p.role} {p.pid}" for p in procs[:_SHOW_PIDS])
+    return shown + (f" (+{len(procs) - _SHOW_PIDS} more)" if len(procs) > _SHOW_PIDS else "")
+
+
+def _check_runsc_host_root(host: HostView, procs: Sequence[_Proc]) -> Check:
+    doc = f"{DOC}#runsc-processes-and-host-root"
+    runsc = [p for p in procs if p.role in _RUNSC_ROLES]
+    if not runsc:
+        return Check("runsc-host-root", Status.PASS,
+                     "no running runsc-sandbox/runsc-gofer processes to inspect")
+    root: list[str] = []
+    unknown: list[_Proc] = []
+    for p in runsc:
+        uid_map = host.read(f"/proc/{p.pid}/uid_map")
+        uid = _status_field(host, p.pid, "Uid")
+        if uid_map is None or uid is None:
+            unknown.append(p)
+            continue
+        identity = uid_map.split() == _IDENTITY_UID_MAP
+        if identity and uid.split()[:1] == ["0"]:
+            caps = _caps(host, p.pid)
+            root.append(f"{p.role} {p.pid}" + (f" [{','.join(caps)}]" if caps else ""))
+    if root:
+        shown = ", ".join(root[:_SHOW_PIDS]) + (
+            f" (+{len(root) - _SHOW_PIDS} more)" if len(root) > _SHOW_PIDS else "")
+        return Check("runsc-host-root", Status.WARN,
+                     f"{len(root)} runsc process(es) run as real host root (identity uid_map, "
+                     f"uid 0): {shown}. A sandbox escape lands as host root with those "
+                     "capabilities; a user-namespace-remapped setup (a separate remapped docker "
+                     "daemon, or containerd per-container mappings) is recommended, pending a "
+                     "spike", doc)
+    if unknown:
+        return Check("runsc-host-root", Status.WARN,
+                     f"{_UNKNOWN}: cannot read uid_map/status of {_pids(unknown)}", doc)
+    return Check("runsc-host-root", Status.PASS,
+                 f"{len(runsc)} runsc process(es), none real host root")
+
+
+def _jailed(host: HostView, p: _Proc) -> bool | None:
+    """True when firecracker was started by the jailer: the jailer always passes
+    ``--start-time-us`` to the firecracker it execs, and chroots it (``/proc/<pid>/root`` is
+    not ``/``, readable only with privileges). None when it cannot be told."""
+    if "--start-time-us" in p.argv:
+        return True
+    root = host.readlink(f"/proc/{p.pid}/root")
+    if root is None:
+        return None
+    return root != "/"
+
+
+def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc]) -> Check:
+    doc = f"{DOC}#confining-firecracker-and-runsc-processes"
+    if not procs:
+        return Check("sandbox-confinement", Status.PASS,
+                     "no running firecracker/runsc processes to inspect")
+    unconfined: list[_Proc] = []
+    unjailed: list[_Proc] = []
+    unknown: list[_Proc] = []
+    for p in procs:
+        label = host.read(f"/proc/{p.pid}/attr/current")
+        if label is None:
+            unknown.append(p)
+        elif label.strip().split(" (", 1)[0] == "unconfined":
+            unconfined.append(p)
+        if p.role == "firecracker":
+            jailed = _jailed(host, p)
+            if jailed is None and p not in unknown:
+                unknown.append(p)
+            elif jailed is False:
+                unjailed.append(p)
+    problems = []
+    if unconfined:
+        problems.append(f"unconfined by AppArmor: {_pids(unconfined)}")
+    if unjailed:
+        problems.append(f"firecracker without the jailer: {_pids(unjailed)}")
+    if problems:
+        return Check("sandbox-confinement", Status.WARN,
+                     "; ".join(problems) + ". The shared slot dir holds other jobs' warm-*.mem "
+                     "snapshot files; run firecracker under the jailer with a per-slot AppArmor "
+                     "profile so one VMM cannot read another job's memory", doc)
+    if unknown:
+        return Check("sandbox-confinement", Status.WARN,
+                     f"{_UNKNOWN}: cannot read AppArmor label or jail root of {_pids(unknown)}",
+                     doc)
+    return Check("sandbox-confinement", Status.PASS,
+                 f"{len(procs)} process(es) confined" + (
+                     " (firecracker jailed)" if any(p.role == "firecracker" for p in procs)
+                     else ""))
+
+
 def run_preflight(host: HostView, tiers: Sequence[str]) -> list[Check]:
     """Run every check relevant to ``tiers``. Pure reads; never raises on host state."""
     t = set(tiers)
@@ -489,6 +657,16 @@ def run_preflight(host: HostView, tiers: Sequence[str]) -> list[Check]:
         out.append(_check_fc_guest(host))
     if t & {"gvisor", "firecracker"}:
         out.append(_check_snapshot_age(host))
+    if t & {"docker", "gvisor", "firecracker"}:
+        roles: set[str] = set()
+        if t & {"docker", "gvisor"}:
+            roles.update(_RUNSC_ROLES)
+        if "firecracker" in t:
+            roles.add("firecracker")
+        procs = [p for p in _sandbox_processes(host) if p.role in roles]
+        if t & {"docker", "gvisor"}:
+            out.append(_check_runsc_host_root(host, procs))
+        out.append(_check_sandbox_confinement(host, procs))
     out.append(_check_apparmor(host))
     out.append(_check_bwrap_stock_profile(host))
     out.append(_check_userns(host))

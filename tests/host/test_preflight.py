@@ -32,6 +32,7 @@ class FakeHost(pf.HostView):
         rw: set[str] | None = None,
         executables: dict[str, str] | None = None,
         commands: dict[tuple[str, ...], tuple[int, str, str]] | None = None,
+        links: dict[str, str] | None = None,
     ) -> None:
         self.env = dict(env or {})
         self.files = dict(files or {})
@@ -40,6 +41,7 @@ class FakeHost(pf.HostView):
         self.executables = dict(executables or {})   # name -> resolved path
         self.commands = dict(commands or {})
         self.ran: list[tuple[str, ...]] = []
+        self.links = dict(links or {})
 
     def read(self, path: str) -> str | None:
         return self.files.get(path)
@@ -54,6 +56,14 @@ class FakeHost(pf.HostView):
         if name.startswith("/"):
             return name if name in self.executables.values() else None
         return self.executables.get(name)
+
+    def listdir(self, path: str) -> list[str] | None:
+        prefix = path.rstrip("/") + "/"
+        names = {p[len(prefix):].split("/", 1)[0] for p in self.paths if p.startswith(prefix)}
+        return sorted(names) if names or path in self.paths else None
+
+    def readlink(self, path: str) -> str | None:
+        return self.links.get(path)
 
     def run(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str] | None:
         key = tuple(argv)
@@ -84,6 +94,7 @@ def _healthy(**over) -> FakeHost:
             "firecracker": "/usr/local/bin/firecracker",
             "timedatectl": "/usr/bin/timedatectl",
         },
+        links={},
         commands={
             ("/usr/bin/docker", "version", "--format", "{{.Server.Version}}"):
                 (0, "29.1.3\n", ""),
@@ -96,7 +107,7 @@ def _healthy(**over) -> FakeHost:
         },
     )
     for k, v in over.items():
-        if k in ("env", "files", "commands"):          # merged; everything else replaces
+        if k in ("env", "files", "commands", "links"):          # merged; everything else replaces
             merged = dict(base[k])
             merged.update(v)
             base[k] = merged
@@ -471,3 +482,118 @@ def test_every_doc_pointer_names_a_real_heading_in_host_prep():
     anchors = set(re.findall(r'\{DOC\}#([a-z0-9\-]+)', src))
     assert anchors, "no doc pointers found"
     assert anchors <= slugs, f"dangling anchors: {sorted(anchors - slugs)}"
+
+
+# --- running sandbox processes: host root, AppArmor confinement, jailer -------------------
+
+_IDENTITY = "         0          0 4294967295\n"
+_REMAPPED = "         0     100000      65536\n"
+# CapEff bits: DAC_OVERRIDE=1, DAC_READ_SEARCH=2, SYS_CHROOT=18.
+_SANDBOX_CAPS = f"{(1 << 1) | (1 << 2):016x}"
+_GOFER_CAPS = f"{1 << 18:016x}"
+
+
+def _proc(pid: int, argv: list[str], *, uid: int = 0, uid_map: str | None = _IDENTITY,
+          caps: str = "0000000000000000", aa: str | None = "docker-default (enforce)\n",
+          comm: str | None = None) -> dict[str, str]:
+    files = {
+        f"/proc/{pid}/cmdline": "\0".join(argv) + "\0",
+        f"/proc/{pid}/comm": (comm or argv[0].rsplit("/", 1)[-1])[:15] + "\n",
+        f"/proc/{pid}/status": f"Name:\tx\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nCapEff:\t{caps}\n",
+    }
+    if uid_map is not None:
+        files[f"/proc/{pid}/uid_map"] = uid_map
+    if aa is not None:
+        files[f"/proc/{pid}/attr/current"] = aa
+    return files
+
+
+def _with_procs(*procs: dict[str, str], links: dict[str, str] | None = None, **over) -> FakeHost:
+    files: dict[str, str] = {}
+    for p in procs:
+        files.update(p)
+    files["/proc/1/cmdline"] = "/sbin/init\0"
+    return _healthy(files=files, links=links or {}, **over)
+
+
+def test_no_sandbox_processes_running_passes_the_process_checks():
+    by = _by_name(pf.run_preflight(_healthy(), ALL))
+    assert by["runsc-host-root"].status is Status.PASS
+    assert by["sandbox-confinement"].status is Status.PASS
+
+
+def test_runsc_processes_running_as_real_host_root_warn_with_their_caps():
+    host = _with_procs(
+        _proc(200, ["runsc-sandbox", "--root=/var/run/docker/runtime-runc/moby", "boot"],
+              caps=_SANDBOX_CAPS, comm="exe"),
+        _proc(201, ["runsc-gofer", "--root=/x", "gofer"], caps=_GOFER_CAPS, comm="exe"))
+    c = _by_name(pf.run_preflight(host, ["gvisor"]))["runsc-host-root"]
+    assert c.status is Status.WARN
+    assert "DAC_OVERRIDE" in c.detail and "DAC_READ_SEARCH" in c.detail
+    assert "SYS_CHROOT" in c.detail and "user-namespace" in c.detail
+    assert c.doc.endswith("#runsc-processes-and-host-root")
+
+
+def test_userns_remapped_runsc_passes():
+    host = _with_procs(_proc(200, ["runsc-sandbox", "boot"], uid=0, uid_map=_REMAPPED,
+                             caps=_SANDBOX_CAPS))
+    assert _by_name(pf.run_preflight(host, ["gvisor"]))["runsc-host-root"].status is Status.PASS
+
+
+def test_unreadable_process_identity_degrades_to_unknown_not_fail():
+    host = _with_procs(_proc(200, ["runsc-sandbox", "boot"], uid_map=None, aa=None))
+    by = _by_name(pf.run_preflight(host, ["gvisor"]))
+    for name in ("runsc-host-root", "sandbox-confinement"):
+        assert by[name].status is Status.WARN
+        assert "unknown (run as root)" in by[name].detail
+    assert pf.exit_code(list(by.values())) == 0
+
+
+def test_unconfined_runsc_or_firecracker_warns():
+    host = _with_procs(
+        _proc(200, ["runsc-sandbox", "boot"], uid_map=_REMAPPED, aa="unconfined\n"),
+        _proc(300, ["/usr/local/bin/firecracker", "--id", "a", "--start-time-us", "1"],
+              uid=10001, aa="unconfined\n"))
+    c = _by_name(pf.run_preflight(host, ALL))["sandbox-confinement"]
+    assert c.status is Status.WARN
+    assert "unconfined" in c.detail and "200" in c.detail and "300" in c.detail
+    assert c.doc.endswith("#confining-firecracker-and-runsc-processes")
+
+
+def test_firecracker_without_the_jailer_warns():
+    host = _with_procs(
+        _proc(300, ["/var/lib/blastbox-fc/firecracker", "--api-sock", "/s/fc.sock"], uid=10001),
+        links={"/proc/300/root": "/"})
+    c = _by_name(pf.run_preflight(host, ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.WARN
+    assert "without the jailer" in c.detail and "warm-" in c.detail
+
+
+def test_jailed_and_confined_firecracker_passes():
+    jailed_by_argv = _proc(300, ["firecracker", "--id", "a", "--start-time-us", "1",
+                                 "--start-time-cpu-us", "2"], uid=10001,
+                           aa="blastbox-fc-slot-3 (enforce)\n")
+    jailed_by_root = _proc(301, ["firecracker", "--api-sock", "/run/fc.sock"], uid=10001,
+                           aa="blastbox-fc-slot-4 (enforce)\n")
+    host = _with_procs(jailed_by_argv, jailed_by_root,
+                       links={"/proc/301/root": "/srv/jailer/firecracker/b/root"})
+    c = _by_name(pf.run_preflight(host, ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.PASS, c.detail
+
+
+def test_process_checks_only_inspect_processes_for_the_selected_tiers():
+    host = _with_procs(_proc(300, ["firecracker", "--api-sock", "/s"], aa="unconfined\n"),
+                       links={"/proc/300/root": "/"})
+    by = _by_name(pf.run_preflight(host, ["gvisor"]))
+    assert by["sandbox-confinement"].status is Status.PASS
+    assert "firecracker" not in {c.name for c in pf.run_preflight(host, ["remote"])}
+    assert "sandbox-confinement" not in {c.name for c in pf.run_preflight(host, ["remote"])}
+
+
+def test_real_host_listdir_and_readlink_degrade_to_none(tmp_path):
+    h = pf.RealHost()
+    assert h.listdir(str(tmp_path / "missing")) is None
+    assert h.readlink(str(tmp_path / "missing")) is None
+    (tmp_path / "l").symlink_to("/")
+    assert h.readlink(str(tmp_path / "l")) == "/"
+    assert "l" in (h.listdir(str(tmp_path)) or [])
