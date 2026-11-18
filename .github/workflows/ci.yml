@@ -5,9 +5,15 @@ on:
     branches: [main, master]
   pull_request:
 
+# The test and sandbox jobs are pinned to ubuntu-24.04: `ubuntu-latest` moved to 26.04 (Nov 2026), whose
+# uutils coreutils (/usr/bin/echo -> /usr/lib/cargo/bin/coreutils/...) break the appsandbox
+# path-confinement tests and whose AppArmor/userns policy fails the sandbox job's bwrap
+# --unshare-all probe ("loopback: Failed RTM_NEWADDR"). The other jobs pass on 26.04 and stay on
+# ubuntu-latest (profile-gate's libreoffice install hung twice on 24.04). Move test/sandbox to
+# 26.04 deliberately, as its own change, once those are handled.
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -32,7 +38,7 @@ jobs:
     # worker images). That block therefore ran NOWHERE: a regression in the sandbox argv, the
     # seccomp policy wiring or the insecurity reasons would have shipped green. Same reasoning
     # as pg-search below: provide the dependencies and run them for real.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install bubblewrap and the seccomp binding
