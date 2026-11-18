@@ -106,6 +106,10 @@ class HostView:
         """Resolved executable path for a name or an absolute path; None if not executable."""
         raise NotImplementedError
 
+    def guest_problem(self, rootfs: str, runtime: str) -> str:
+        """rootfs_stamp.guest_problem: why the runtime would refuse this rootfs, or ""."""
+        raise NotImplementedError
+
     def listdir(self, path: str) -> list[str] | None:
         """Entry names of a directory; None if it cannot be listed."""
         raise NotImplementedError
@@ -159,6 +163,14 @@ class RealHost(HostView):
         if os.path.isabs(name):
             return name if os.path.isfile(name) and os.access(name, os.X_OK) else None
         return shutil.which(name)
+
+    def guest_problem(self, rootfs: str, runtime: str) -> str:
+        from blastbox.host.rootfs_stamp import guest_problem  # noqa: PLC0415
+
+        try:
+            return guest_problem(rootfs, runtime)
+        except Exception:  # noqa: BLE001 -- never raise on host state
+            return ""
 
     def listdir(self, path: str) -> list[str] | None:
         try:
@@ -444,6 +456,11 @@ def _check_gvisor_rootfs(host: HostView) -> Check:
     rootfs = host.env.get("BLASTBOX_GVISOR_ROOTFS", "/var/lib/blastbox/gvisor-rootfs")
     entries = host.listdir(rootfs) if rootfs else None
     if entries:
+        # The runtime's own stamp gate (select_gvisor_snapshot_runtime): a rootfs stamped for
+        # another release/arch/runtime is refused; an unstamped (legacy) one is allowed.
+        problem = host.guest_problem(rootfs, "gvisor")
+        if problem:
+            return Check("gvisor-rootfs", Status.FAIL, f"rootfs {rootfs}: {problem}", doc)
         return Check("gvisor-rootfs", Status.PASS, f"rootfs {rootfs}")
     pool = host.env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower()
     selected = pool == "gvisor" or (pool == "cascade" and "gvisor" in _cascade_members(host.env))
@@ -643,12 +660,11 @@ def _needs_userns(env: Mapping[str, str], tiers: Collection[str] = ("docker",), 
     # remote-only dispatcher runs no worker here.
     if "docker" not in tiers or not cold_runc:
         return why
+    # Inside a container the worker auto-selects the `container` backend (no user namespace);
+    # only an explicitly pinned bwrap/nsjail creates one on the host kernel.
     sandbox = env.get("BLASTBOX_SANDBOX", "").strip().lower()
-    if sandbox in ("container", "nono"):
-        return why          # no user namespace: the OCI boundary itself / Landlock
     if sandbox in ("bwrap", "nsjail"):
-        why.append(f"BLASTBOX_SANDBOX={sandbox}")
-    why.append("cold workers run plain runc (inner nsjail/bwrap on the host kernel)")
+        why.append(f"BLASTBOX_SANDBOX={sandbox} under plain runc (inner sandbox on the host kernel)")
     # BLASTBOX_GVISOR_ROOTLESS is not counted: the warm gVisor tier refuses it outright
     # (gvisor-rootless FAIL), and it needs blastbox-runsc, not the bwrap/nsjail profiles.
     return why
@@ -743,8 +759,7 @@ def _check_bwrap_stock_profile(host: HostView, tiers: Collection[str] = ("docker
     # The stock profile attaches to bwrap only: nsjail and rootless runsc are unaffected.
     env = host.env
     needs = []
-    if ("docker" in tiers
-            and env.get("BLASTBOX_SANDBOX", "").strip().lower() not in ("nsjail", "container", "nono")
+    if ("docker" in tiers and env.get("BLASTBOX_SANDBOX", "").strip().lower() == "bwrap"
             and _cold_runs_runc(host)):
         needs.append("cold workers run plain runc (inner bwrap on the host kernel)")
     if not needs:
@@ -1159,8 +1174,9 @@ def run_preflight(host: HostView, tiers: Sequence[str], *, explicit: bool = True
     out.append(_check_scratch(host, tiers))
     if "firecracker" in t:
         out.append(_check_fc_scratch(host))
-    out = _downgrade_overflow(out, host.env)
-    return out if explicit else _downgrade_unselected(out, host.env)
+    if explicit:   # an explicitly requested tier gates on its own prerequisites
+        return out
+    return _downgrade_unselected(_downgrade_overflow(out, host.env), host.env)
 
 
 # --- output -----------------------------------------------------------------------------

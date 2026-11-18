@@ -220,8 +220,9 @@ Use the **scoped per-binary profiles** in [`deploy/apparmor/`](../deploy/apparmo
 attack-surface control for every process. Preflight's `userns` check warns only when the
 environment actually configures something that needs a user namespace on a tier being checked
 (cold docker workers running plain runc, forced by `BLASTBOX_WORKER_RUNTIME=runc` or the
-`BLASTBOX_ALLOW_RUNC` fallback when runsc is not registered: the only case where an inner
-nsjail/bwrap runs on the host kernel; under runsc, gVisor's Sentry implements namespaces itself;
+`BLASTBOX_ALLOW_RUNC` fallback when runsc is not registered, with `BLASTBOX_SANDBOX` pinned to
+`bwrap`/`nsjail`: the only case where an inner sandbox creates a user namespace on the host kernel
+(inside a container the worker otherwise auto-selects the `container` backend, which does not); under runsc, gVisor's Sentry implements namespaces itself;
 `BLASTBOX_GVISOR_ROOTLESS` is the `gvisor-rootless` check's concern), and passes when the scoped profiles
 are visibly loaded (securityfs is root-only; run preflight as root to confirm). `max_user_namespaces=0`
 or `unprivileged_userns_clone=0` switches user namespaces off outright: a FAIL only when something
@@ -259,7 +260,7 @@ sudo grep -E '^(bwrap|unpriv_bwrap) ' /sys/kernel/security/apparmor/profiles   #
 The symlink keeps it from loading at boot or on a policy reload; `-R` removes the loaded copy.
 Preflight reports `PASS` when it is absent or disabled-and-unloaded, or active on a host where
 nothing runs host bwrap; it reports `WARN` when it is active and cold docker workers run plain runc
-with an inner sandbox other than nsjail, or disabled but still
+with `BLASTBOX_SANDBOX=bwrap`, or disabled but still
 loaded. The profile attaches to bwrap only, so nsjail and rootless runsc don't trigger it. Reverse with `sudo rm /etc/apparmor.d/disable/bwrap-userns-restrict &&
 sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict`.
 
@@ -309,12 +310,14 @@ Preflight reads `/proc/cpuinfo` and warns on flags with operational consequences
 - `BLASTBOX_JOB_ROOT` (dispatcher) and `BLASTBOX_GVISOR_ROOT` (warm gVisor tier) are read
   unstripped: set-but-empty means the process's working directory. Preflight warns on an empty or
   padded value.
-- A local tier that a cascade lists only as an **overflow** member is skipped by the dispatcher
+- Without `--tier`, a local tier that a cascade lists only as an **overflow** member is skipped by the dispatcher
   when its startup gate fails, so those FAILs (`kvm` when `/dev/kvm` is missing, `firecracker`,
   `fc-guest`, `runsc`, `gvisor-rootless`) are reported as WARNs saying so. A non-rw `/dev/kvm` or a
   missing gVisor rootfs is not a startup gate: a warm overflow tier is admitted but its base never
   builds, so the cascade runs without it (WARN); a cold Firecracker overflow tier really spawns
-  there and every spawn fails (FAIL).
+  there and every spawn fails (FAIL). With `--tier <that tier>` its prerequisites gate as usual.
+- `gvisor-rootfs` also applies the runtime's rootfs stamp check: a tree stamped for another release,
+  architecture or runtime FAILs; an unstamped legacy tree is allowed.
 - `BLASTBOX_JOB_ROOT` must be the same path for serve, dispatch and the worker mount, and must
   **not** be shared between a container dispatcher and a network-tier (aws/static) dispatcher
   (CONFIGURATION *Core*).

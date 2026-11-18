@@ -75,6 +75,9 @@ class FakeHost(pf.HostView):
     def guest_kernel_version(self, path: str) -> tuple[int, int] | None:
         return self.kernels.get(path)
 
+    def guest_problem(self, rootfs: str, runtime: str) -> str:
+        return getattr(self, "guest_problems", {}).get(rootfs, "")
+
     def listdir(self, path: str) -> list[str] | None:
         prefix = path.rstrip("/") + "/"
         names = {p[len(prefix):].split("/", 1)[0] for p in self.paths if p.startswith(prefix)}
@@ -919,7 +922,8 @@ def test_cli_honours_strict_ack_and_json(capsys, monkeypatch):
 
 
 def test_stock_bwrap_profile_warns_for_runc_like_userns():
-    host = _healthy(env={"BLASTBOX_WORKER_RUNTIME": "runc", "BLASTBOX_ALLOW_RUNC": "1"},
+    host = _healthy(env={"BLASTBOX_WORKER_RUNTIME": "runc", "BLASTBOX_ALLOW_RUNC": "1",
+                         "BLASTBOX_SANDBOX": "bwrap"},
                     files={"/etc/apparmor.d/bwrap-userns-restrict": "profile bwrap ..."})
     assert _by_name(pf.run_preflight(host, ["docker"]))["bwrap-userns-restrict"].status \
         is Status.WARN
@@ -1043,7 +1047,7 @@ def test_fc_overflow_problems_warn_because_the_dispatcher_skips_the_tier(drop):
                            "/var/lib/blastbox/fc/rootfs.ext4", "/var/lib/blastbox/gvisor-rootfs/x"})
     for k in drop:
         del host.env[k]
-    by = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env)))
+    by = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False))
     for name in ("fc-guest", "kvm"):   # kvm here: /dev/kvm missing, a startup gate
         assert by[name].status is Status.WARN, (name, by[name])
         assert "skips" in by[name].detail
@@ -1132,17 +1136,17 @@ def test_overflow_non_gate_problems_on_warm_tiers_warn_never_ready():
     env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "firecracker:2,gvisor:2"}
     host = _healthy(env=env, paths={"/dev/kvm", "/var/lib/blastbox/jobs",
                                     "/var/lib/blastbox/fc/vmlinux", "/var/lib/blastbox/fc/rootfs.ext4"})
-    c = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env)))["gvisor-rootfs"]
+    c = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False))["gvisor-rootfs"]
     assert c.status is Status.WARN and "never" in c.detail
     env2 = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2",
             "BLASTBOX_POOL_WARM_SNAPSHOT": "1"}
     host2 = _healthy(env=env2, rw=set())
-    assert _by_name(pf.run_preflight(host2, pf.resolve_tiers([], host2.env)))["kvm"].status \
+    assert _by_name(pf.run_preflight(host2, pf.resolve_tiers([], host2.env), explicit=False))["kvm"].status \
         is Status.WARN
     # A COLD firecracker overflow tier really spawns on a non-rw kvm, and every spawn fails.
     env3 = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2"}
     host3 = _healthy(env=env3, rw=set())
-    assert _by_name(pf.run_preflight(host3, pf.resolve_tiers([], host3.env)))["kvm"].status \
+    assert _by_name(pf.run_preflight(host3, pf.resolve_tiers([], host3.env), explicit=False))["kvm"].status \
         is Status.FAIL
 
 
@@ -1212,7 +1216,7 @@ def test_a_skipped_overflow_tier_downgrades_all_its_fails():
     env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2"}
     host = _healthy(env=env, rw=set())          # /dev/kvm present but not rw (not a gate)
     host.executables.pop("firecracker")         # ...but the binary is missing (a gate)
-    by = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env)))
+    by = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False))
     assert by["firecracker"].status is Status.WARN
     assert by["kvm"].status is Status.WARN      # moot: the whole tier is skipped
 
@@ -1229,7 +1233,7 @@ def test_fc_overflow_skipped_for_unset_guest_knobs_downgrades_kvm():
     env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2"}
     host = _healthy(env=env, rw=set())
     del host.env["BLASTBOX_FC_KERNEL"], host.env["BLASTBOX_FC_ROOTFS"]
-    checks = pf.run_preflight(host, pf.resolve_tiers([], host.env))
+    checks = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False)
     assert _by_name(checks)["kvm"].status is Status.WARN
     assert pf.exit_code(checks) == 0
 
@@ -1291,3 +1295,29 @@ def test_runc_with_a_non_namespace_backend_needs_no_userns(backend):
     host = _healthy(env={**_RUNC, "BLASTBOX_SANDBOX": backend},
                     files={"/proc/sys/user/max_user_namespaces": "0"})
     assert _by_name(pf.run_preflight(host, ["docker"]))["userns"].status is Status.PASS
+
+
+def test_runc_with_the_default_container_backend_needs_no_userns():
+    host = _healthy(env=dict(_RUNC), files={"/proc/sys/user/max_user_namespaces": "0",
+                                            "/etc/apparmor.d/bwrap-userns-restrict": "profile bwrap"})
+    by = _by_name(pf.run_preflight(host, ["docker"]))
+    assert by["userns"].status is Status.PASS
+    assert by["bwrap-userns-restrict"].status is Status.PASS
+
+
+def test_explicit_tier_keeps_overflow_fails():
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2"}
+    host = _healthy(env=env)
+    host.executables.pop("firecracker")
+    assert _by_name(pf.run_preflight(host, ["firecracker"], explicit=True))["firecracker"].status \
+        is Status.FAIL
+    assert _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False))[
+        "firecracker"].status is Status.WARN
+
+
+def test_gvisor_rootfs_with_an_incompatible_stamp_fails():
+    env = {"BLASTBOX_POOL_RUNTIME": "gvisor"}
+    host = _healthy(env=env)
+    host.guest_problems = {"/var/lib/blastbox/gvisor-rootfs": "stamped for blastbox 0.1.10"}
+    c = _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-rootfs"]
+    assert c.status is Status.FAIL and "0.1.10" in c.detail
