@@ -8,7 +8,7 @@ Check a host with the read-only preflight. It never changes anything; every find
 fix and a pointer back to a section of this page:
 
 ```sh
-blastbox preflight                      # cold docker tier + BLASTBOX_POOL_RUNTIME's tier
+blastbox preflight                      # BLASTBOX_POOL_RUNTIME's tier(s) (+ cold docker if local)
 blastbox preflight --tier all           # docker, gvisor, firecracker, remote
 blastbox preflight --tier firecracker --json
 blastbox preflight --strict             # exit 1 on WARN too (CI / provisioning gates)
@@ -31,7 +31,9 @@ each member named in `BLASTBOX_POOL_TIERS` (local `firecracker` / `gvisor` membe
 checks, `static` / `aws-*` members map to `remote`). The cold docker tier is added only for a local
 (file-handshake) dispatcher that is not `BLASTBOX_DISPATCH_WARM_ONLY`: network-endpoint pools have
 no cold path. The `pool-runtime` check FAILs a pool name or cascade spec the dispatcher refuses
-(unknown name, missing/zero capacity, a mix of local and remote tiers).
+(unknown or set-but-empty name, unknown cascade primary, missing/zero capacity, a mix of local and
+remote tiers, `BLASTBOX_DISPATCH_WARM_ONLY` without a pool) and WARNs on an unknown overflow member,
+which the dispatcher skips at startup.
 
 `blastbox preflight` checks the **host**; `blastbox doctor` checks what is **running** on it
 (container and rootfs versions). Run both after an upgrade.
@@ -245,8 +247,10 @@ sudo grep -E '^(bwrap|unpriv_bwrap) ' /sys/kernel/security/apparmor/profiles   #
 ```
 
 The symlink keeps it from loading at boot or on a policy reload; `-R` removes the loaded copy.
-Preflight reports `PASS` when it is absent or disabled-and-unloaded, and `WARN` when it is active or
-disabled but still loaded. Reverse with `sudo rm /etc/apparmor.d/disable/bwrap-userns-restrict &&
+Preflight reports `PASS` when it is absent or disabled-and-unloaded, or active on a host where
+nothing runs host namespace sandboxes; it reports `WARN` when it is active and
+`BLASTBOX_SANDBOX=bwrap|nsjail`, `BLASTBOX_WORKER_RUNTIME=runc` or `BLASTBOX_GVISOR_ROOTLESS` is set
+(the same predicate as the `userns` check), or disabled but still loaded. Reverse with `sudo rm /etc/apparmor.d/disable/bwrap-userns-restrict &&
 sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict`.
 
 ## Clock and aged warm checkpoints
@@ -286,8 +290,11 @@ Preflight reads `/proc/cpuinfo` and warns on flags with operational consequences
   warns when `BLASTBOX_JOB_ROOT` (default `/var/lib/blastbox/jobs`), `BLASTBOX_SNAPSHOT_MEM_DIR` or
   `BLASTBOX_GVISOR_ROOT` sits under them.
 - The Firecracker slot scratch is hard-wired to `/tmp/blastbox-fc-slots` (no knob today): slot
-  disks, sockets, and the warm base unless `BLASTBOX_SNAPSHOT_MEM_DIR` moves it. Preflight warns
-  when `/tmp` is a tmpfs on a Firecracker host.
+  disks, sockets, and the warm base unless `BLASTBOX_SNAPSHOT_MEM_DIR` moves it. Preflight's
+  `fc-scratch` check warns when `/tmp` is a tmpfs on a Firecracker host; since there is no knob,
+  `--ack fc-scratch` once the RAM budget is understood.
+- `BLASTBOX_JOB_ROOT` is read unstripped by the dispatcher: set-but-empty means its working
+  directory. Preflight warns on an empty or padded value.
 - `BLASTBOX_JOB_ROOT` must be the same path for serve, dispatch and the worker mount, and must
   **not** be shared between a container dispatcher and a network-tier (aws/static) dispatcher
   (CONFIGURATION *Core*).

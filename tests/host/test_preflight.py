@@ -726,7 +726,7 @@ def test_scoped_profile_attached_to_another_path_than_the_binary_warns():
 
 def test_unknown_pool_runtime_fails():
     for env in ({"BLASTBOX_POOL_RUNTIME": "firecrakcer"},
-                {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "firecracker:2,gvsior:1"},
+                {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvsior:1,firecracker:2"},
                 {"BLASTBOX_POOL_RUNTIME": "cascade"}):
         c = _by_name(pf.run_preflight(_healthy(env=env), ["docker"]))["pool-runtime"]
         assert c.status is Status.FAIL, env
@@ -814,10 +814,10 @@ def test_cascade_specs_the_dispatcher_refuses_fail(tiers):
 
 def test_fc_slot_scratch_on_a_tmpfs_tmp_warns():
     host = _healthy(mounts="tmpfs /tmp tmpfs rw,nosuid 0 0\n/dev/sda1 / ext4 rw 0 0\n")
-    c = _by_name(pf.run_preflight(host, ["firecracker"]))["scratch"]
+    c = _by_name(pf.run_preflight(host, ["firecracker"]))["fc-scratch"]
     assert c.status is Status.WARN and "/tmp/blastbox-fc-slots" in c.detail
     disk = _healthy(mounts="/dev/sda1 / ext4 rw 0 0\n")
-    assert _by_name(pf.run_preflight(disk, ["firecracker"]))["scratch"].status is Status.PASS
+    assert _by_name(pf.run_preflight(disk, ["firecracker"]))["fc-scratch"].status is Status.PASS
 
 
 def test_profile_attachment_compares_the_resolved_binary_only():
@@ -869,3 +869,92 @@ def test_warm_only_without_a_pool_fails(pool):
         env["BLASTBOX_POOL_RUNTIME"] = pool
     c = _by_name(pf.run_preflight(_healthy(env=env), pf.resolve_tiers([], env)))["pool-runtime"]
     assert c.status is Status.FAIL and "WARM_ONLY" in c.detail
+
+
+# --- marla round 2 Claude lens on #208 -----------------------------------------------------
+
+def test_set_but_empty_pool_runtime_fails():
+    c = _by_name(pf.run_preflight(_healthy(env={"BLASTBOX_POOL_RUNTIME": ""}), ["docker"]))
+    assert c["pool-runtime"].status is Status.FAIL
+
+
+def test_fc_guest_unset_fails_when_this_env_selects_the_fc_pool():
+    for env in ({"BLASTBOX_POOL_RUNTIME": "firecracker"},
+                {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "firecracker:2"}):
+        host = _healthy(env=env)
+        del host.env["BLASTBOX_FC_KERNEL"], host.env["BLASTBOX_FC_ROOTFS"]
+        assert _by_name(pf.run_preflight(host, ["firecracker"]))["fc-guest"].status is Status.FAIL
+
+
+def test_fc_tmpfs_scratch_is_its_own_check_and_hides_nothing():
+    host = _healthy(env={"BLASTBOX_JOB_ROOT": "/tmp/jobs"},
+                    mounts="tmpfs /tmp tmpfs rw 0 0\n")
+    checks = pf.run_preflight(host, ["firecracker"])
+    by = _by_name(checks)
+    assert by["fc-scratch"].status is Status.WARN
+    assert by["scratch"].status is Status.WARN and "/tmp/jobs" in by["scratch"].detail
+    assert pf.exit_code(checks, strict=True, ack={"fc-scratch"}) == 1
+
+
+def test_real_host_run_survives_non_utf8_output(tmp_path, monkeypatch):
+    fake = tmp_path / "fc"
+    fake.write_text("#!/bin/sh\nprintf '\\377'\n")
+    fake.chmod(0o755)
+    proc = pf.RealHost().run([str(fake), "--version"])
+    assert proc is not None and proc.returncode == 0
+
+
+def test_cli_honours_strict_ack_and_json(capsys, monkeypatch):
+    from blastbox.host import cli
+
+    host = _healthy(files={"/proc/cpuinfo": "flags\t: avx512vbmi\n"})
+    monkeypatch.setattr(pf, "RealHost", lambda: host)
+    assert cli.main(["preflight", "--tier", "docker", "--strict"]) == 1
+    assert cli.main(["preflight", "--tier", "docker", "--strict", "--ack", "cpu-flags"]) == 0
+    capsys.readouterr()
+    assert cli.main(["preflight", "--tier", "docker", "--strict", "--json"]) == 1
+    assert json.loads(capsys.readouterr().out)["ok"] is False
+
+
+def test_stock_bwrap_profile_warns_for_runc_like_userns():
+    host = _healthy(env={"BLASTBOX_WORKER_RUNTIME": "runc", "BLASTBOX_ALLOW_RUNC": "1"},
+                    files={"/etc/apparmor.d/bwrap-userns-restrict": "profile bwrap ..."})
+    assert _by_name(pf.run_preflight(host, ["docker"]))["bwrap-userns-restrict"].status \
+        is Status.WARN
+
+
+def test_unknown_overflow_cascade_member_warns_unknown_primary_fails():
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "firecracker:2,gvsior:1"}
+    assert _by_name(pf.run_preflight(_healthy(env=env), ["firecracker"]))["pool-runtime"].status \
+        is Status.WARN
+    env["BLASTBOX_POOL_TIERS"] = "gvsior:1,firecracker:2"
+    assert _by_name(pf.run_preflight(_healthy(env=env), ["firecracker"]))["pool-runtime"].status \
+        is Status.FAIL
+
+
+def test_non_apparmor_label_is_unknown_not_confined():
+    host = _with_procs(_proc(200, ["runsc-sandbox", "boot"], uid_map=_REMAPPED,
+                             aa="unconfined_u:unconfined_r:unconfined_t:s0\n"))
+    c = _by_name(pf.run_preflight(host, ["gvisor"]))["sandbox-confinement"]
+    assert c.status is Status.WARN and "unknown" in c.detail
+
+
+def test_apparmor_specific_attr_is_preferred():
+    files = _proc(200, ["runsc-sandbox", "boot"], uid_map=_REMAPPED,
+                  aa="system_u:system_r:spc_t:s0\n")
+    files["/proc/200/attr/apparmor/current"] = "blastbox-runsc (unconfined)\n"
+    c = _by_name(pf.run_preflight(_with_procs(files), ["gvisor"]))["sandbox-confinement"]
+    assert c.status is Status.WARN and "not confined" in c.detail
+
+
+@pytest.mark.parametrize("value", ["", " /var/lib/blastbox/jobs"])
+def test_set_but_empty_or_padded_job_root_warns(value):
+    c = _by_name(pf.run_preflight(_healthy(env={"BLASTBOX_JOB_ROOT": value}), ["docker"]))
+    assert c["scratch"].status is Status.WARN
+
+
+def test_snapshot_age_does_not_log_a_wrong_knob(caplog):
+    host = _healthy(env={"BLASTBOX_SNAPSHOT_MAX_AGE_S": "6h"})
+    with caplog.at_level("WARNING"):
+        pf.run_preflight(host, ["gvisor"])
+    assert "invalid v=" not in caplog.text

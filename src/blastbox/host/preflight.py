@@ -17,6 +17,7 @@ host (``tests/host/test_preflight.py``) with no dependence on the machine runnin
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -181,6 +182,7 @@ class RealHost(HostView):
             raise NotReadOnly(f"preflight refused a non-read-only command: {list(argv)!r}")
         try:
             return subprocess.run(list(argv), capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace",
                                   timeout=_RUN_TIMEOUT_S, check=False)
         except (OSError, subprocess.SubprocessError):
             return None
@@ -191,9 +193,10 @@ class RealHost(HostView):
 def resolve_tiers(requested: Sequence[str], env: Mapping[str, str]) -> list[str]:
     """The tiers to check, in canonical order.
 
-    Explicit ``--tier`` values win (``all`` = every tier). Otherwise: the cold docker
-    dispatcher always, plus the tier ``BLASTBOX_POOL_RUNTIME`` selects; with nothing
-    configured, every local tier (a host being prepared has not chosen yet).
+    Explicit ``--tier`` values win (``all`` = every tier). Otherwise: the tier(s)
+    ``BLASTBOX_POOL_RUNTIME`` selects, plus the cold docker tier on a local (file-handshake)
+    dispatcher that is not warm-only; with nothing configured, every local tier (a host being
+    prepared has not chosen yet).
     """
     chosen: set[str] = set()
     for t in requested:
@@ -366,6 +369,12 @@ def _check_pool_runtime(host: HostView) -> Check | None:
     """An unknown BLASTBOX_POOL_RUNTIME (or cascade member) is refused by the dispatcher; the
     tier preflight would have checked for it is unknowable, so say so instead of passing."""
     doc = f"{DOC}#what-each-tier-needs"
+    if "BLASTBOX_POOL_RUNTIME" in host.env and not host.env["BLASTBOX_POOL_RUNTIME"].strip():
+        # PoolConfig.from_env defaults only an ABSENT variable to "none"; a set-but-empty one
+        # (compose ${BLASTBOX_POOL_RUNTIME:-}) is runtime "" and select_runtime_by_name refuses it.
+        return Check("pool-runtime", Status.FAIL,
+                     "BLASTBOX_POOL_RUNTIME is set but empty; the dispatcher refuses runtime '' "
+                     "(unset it, or set none)", doc)
     pool = host.env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower()
     warm_only = host.env.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower() in (
         "1", "true", "yes", "on")
@@ -391,17 +400,27 @@ def _check_pool_runtime(host: HostView) -> Check | None:
         if not members:
             return Check("pool-runtime", Status.FAIL,
                          "BLASTBOX_POOL_RUNTIME=cascade but BLASTBOX_POOL_TIERS is empty", doc)
-        bad = [m for m in members if m in ("cascade", "none") or m not in _KNOWN_POOL_RUNTIMES]
-        if bad:
+        def _bad(m: str) -> bool:
+            return m in ("cascade", "none") or m not in _KNOWN_POOL_RUNTIMES
+
+        if _bad(members[0]):
             return Check("pool-runtime", Status.FAIL,
-                         f"BLASTBOX_POOL_TIERS has unknown/invalid member(s): {', '.join(bad)}",
-                         doc)
+                         f"BLASTBOX_POOL_TIERS primary {members[0]!r} is unknown/invalid; the "
+                         "dispatcher refuses the cascade", doc)
+        dropped = [m for m in members[1:] if _bad(m)]
+        members = [m for m in members if not _bad(m)]
         local = {m for m in members if m in ("firecracker", "gvisor")}
         if local and len(local) != len(set(members)):
             return Check("pool-runtime", Status.FAIL,
                          "BLASTBOX_POOL_TIERS mixes file-handshake (firecracker/gvisor) and "
                          "network-endpoint (static/aws-*) tiers; the dispatcher refuses a mixed "
                          "cascade", doc)
+        if dropped:
+            # build_cascade_runtime skips an unavailable overflow tier at startup and boots
+            # on the rest -- a typo there silently shrinks the pool.
+            return Check("pool-runtime", Status.WARN,
+                         f"BLASTBOX_POOL_TIERS overflow member(s) {', '.join(dropped)} are unknown; "
+                         f"the dispatcher skips them and runs on {', '.join(members)}", doc)
         return Check("pool-runtime", Status.PASS, f"cascade of {', '.join(members)}")
     return Check("pool-runtime", Status.PASS, f"BLASTBOX_POOL_RUNTIME={pool}")
 
@@ -463,11 +482,24 @@ def _check_firecracker(host: HostView) -> Check:
     return Check("firecracker", Status.PASS, f"{path}: v{shown}")
 
 
+def _primary_pool(env: Mapping[str, str]) -> str:
+    pool = env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower()
+    if pool == "cascade":
+        first = env.get("BLASTBOX_POOL_TIERS", "").split(",")[0]
+        pool = first.partition(":")[0].strip().lower()
+    return pool
+
+
 def _check_fc_guest(host: HostView) -> Check:
     doc = f"{DOC}#firecracker"
     kernel = host.env.get("BLASTBOX_FC_KERNEL", "").strip()
     rootfs = host.env.get("BLASTBOX_FC_ROOTFS", "").strip()
     if not kernel and not rootfs:
+        if _primary_pool(host.env) == "firecracker":
+            # This IS the FC dispatcher's environment: FCConfig.from_env refuses it.
+            return Check("fc-guest", Status.FAIL,
+                         "BLASTBOX_POOL_RUNTIME selects Firecracker but BLASTBOX_FC_KERNEL/"
+                         "BLASTBOX_FC_ROOTFS are unset; the dispatcher refuses to start", doc)
         return Check("fc-guest", Status.WARN,
                      "BLASTBOX_FC_KERNEL/BLASTBOX_FC_ROOTFS unset here (check from the FC "
                      "dispatcher's environment to verify the guest artifacts)", doc)
@@ -502,12 +534,14 @@ def _float_or_none(raw: str) -> float | None:
 
 def _check_snapshot_age(host: HostView) -> Check:
     doc = f"{DOC}#clock-and-aged-warm-checkpoints"
-    from blastbox.host.runtime.env_knobs import max_age_env  # noqa: PLC0415
     from blastbox.host.runtime.fc_snapshot import DEFAULT_SNAPSHOT_MAX_AGE_S  # noqa: PLC0415
 
     raw = host.env.get("BLASTBOX_SNAPSHOT_MAX_AGE_S", "").strip()
     default = DEFAULT_SNAPSHOT_MAX_AGE_S
-    value = max_age_env({"v": raw}, "v", default)   # the runtime's own parse
+    # env_knobs.max_age_env's rule, without its stderr log line (which would land in --json
+    # 2>&1 output): blank = default; unparseable, non-finite or negative = default; 0 disables.
+    parsed = _float_or_none(raw) if raw else default
+    value = parsed if parsed is not None and math.isfinite(parsed) and parsed >= 0 else default
     if value <= 0:
         return Check("snapshot-age", Status.WARN,
                      f"BLASTBOX_SNAPSHOT_MAX_AGE_S={raw} disables warm-base refresh: a checkpoint "
@@ -615,14 +649,15 @@ def _check_bwrap_stock_profile(host: HostView) -> Check:
                          f"sudo apparmor_parser -R {path}", doc)
         suffix = "" if loaded is not None else " (load state unverifiable without root)"
         return Check("bwrap-userns-restrict", Status.PASS, "stock profile disabled" + suffix)
-    if host.env.get("BLASTBOX_SANDBOX", "").strip().lower() != "bwrap":
+    needs = _needs_userns(host.env)
+    if not needs:
         return Check("bwrap-userns-restrict", Status.PASS,
                      "stock profile active (irrelevant here: nothing configured runs host bwrap; "
                      "see the guide if an engine nests bwrap outside runsc/Firecracker)")
     return Check("bwrap-userns-restrict", Status.WARN,
-                 "Ubuntu's stock bwrap-userns-restrict profile is active and BLASTBOX_SANDBOX="
-                 "bwrap: it confines what bwrap-based engines can do inside their namespace; "
-                 "see the guide for when to disable it", doc)
+                 f"Ubuntu's stock bwrap-userns-restrict profile is active and {'; '.join(needs)} "
+                 "runs host namespace sandboxes: it confines what bwrap-based engines can do "
+                 "inside their namespace; see the guide for when to disable it", doc)
 
 
 def _check_clock(host: HostView) -> Check:
@@ -671,27 +706,41 @@ def _check_cpu_flags(host: HostView) -> Check:
 def _check_scratch(host: HostView, tiers: Sequence[str]) -> Check:
     doc = f"{DOC}#disk-and-scratch"
     env = host.env
-    dirs = [("BLASTBOX_JOB_ROOT", env.get("BLASTBOX_JOB_ROOT", "").strip() or _DEFAULT_JOB_ROOT)]
+    problems: list[str] = []
+    # The dispatcher reads BLASTBOX_JOB_ROOT raw (Path(os.environ.get(..., default))): a
+    # set-but-empty value is its working directory and a padded one is a relative path.
+    raw_root = env.get("BLASTBOX_JOB_ROOT")
+    if raw_root is not None and (not raw_root.strip() or raw_root != raw_root.strip()):
+        problems.append(f"BLASTBOX_JOB_ROOT={raw_root!r} is empty or padded: the dispatcher uses "
+                        "it unstripped (empty = its working directory)")
+    job_root = (raw_root or "").strip() or _DEFAULT_JOB_ROOT
+    dirs = [("BLASTBOX_JOB_ROOT", job_root)]
     if "firecracker" in tiers or "gvisor" in tiers:
         for knob in ("BLASTBOX_SNAPSHOT_MEM_DIR", "BLASTBOX_GVISOR_ROOT"):
             if env.get(knob, "").strip():
                 dirs.append((knob, env[knob].strip()))
-    if "firecracker" in tiers and _tmpfs(host, "/tmp"):
+    on_tmp = [f"{k}={v}" for k, v in dirs if _under_tmp(v)]
+    if on_tmp:
+        problems.append("under /tmp (tmpfiles cleanup / tmpfs size / reboot loses sealed "
+                        "results): " + ", ".join(on_tmp))
+    if not host.exists(job_root):
+        problems.append(f"job root {job_root} does not exist")
+    if problems:
+        return Check("scratch", Status.WARN, "; ".join(problems), doc)
+    return Check("scratch", Status.PASS, ", ".join(f"{k}={v}" for k, v in dirs))
+
+
+def _check_fc_scratch(host: HostView) -> Check:
+    """Separate from ``scratch`` so the unfixable hard-wired path can be ``--ack``ed alone."""
+    doc = f"{DOC}#disk-and-scratch"
+    if _tmpfs(host, "/tmp"):
         # FCConfig.scratch_root is hard-wired to /tmp/blastbox-fc-slots (no knob): every slot's
         # outdisk/in/sockets, and warm-*.mem unless BLASTBOX_SNAPSHOT_MEM_DIR moves it.
-        return Check("scratch", Status.WARN,
+        return Check("fc-scratch", Status.WARN,
                      "/tmp is tmpfs and the Firecracker slot scratch is hard-wired to "
                      "/tmp/blastbox-fc-slots (slot disks, and warm-*.mem unless "
                      "BLASTBOX_SNAPSHOT_MEM_DIR is set): RAM-backed and capped", doc)
-    on_tmp = [f"{k}={v}" for k, v in dirs if _under_tmp(v)]
-    if on_tmp:
-        return Check("scratch", Status.WARN,
-                     "under /tmp (tmpfiles cleanup / tmpfs size / reboot loses sealed "
-                     "results): " + ", ".join(on_tmp), doc)
-    job_root = dirs[0][1]
-    if not host.exists(job_root):
-        return Check("scratch", Status.WARN, f"job root {job_root} does not exist", doc)
-    return Check("scratch", Status.PASS, ", ".join(f"{k}={v}" for k, v in dirs))
+    return Check("fc-scratch", Status.PASS, "/tmp/blastbox-fc-slots is not on tmpfs")
 
 
 # --- running sandbox processes ------------------------------------------------------------
@@ -798,6 +847,11 @@ def _jailed(p: _Proc) -> bool | None:
     return "--start-time-us" in p.argv
 
 
+def _apparmor_shaped(label: str) -> bool:
+    text = label.strip()
+    return text == "unconfined" or (text.endswith(")") and " (" in text)
+
+
 def _is_unconfined(label: str) -> bool:
     """``unconfined``, or a profile in ``(unconfined)`` / ``(complain)`` mode: the name alone
     says nothing -- the shipped deploy/apparmor profiles are all flags=(unconfined), and
@@ -815,7 +869,14 @@ def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc]) -> Check:
     unjailed: list[_Proc] = []
     unknown: list[_Proc] = []
     for p in procs:
-        label = host.read(f"/proc/{p.pid}/attr/current")
+        # attr/apparmor/current is AppArmor's own label under LSM stacking; attr/current is the
+        # display LSM's (an SELinux context on a non-AppArmor host), so only trust an
+        # AppArmor-shaped value there.
+        label = host.read(f"/proc/{p.pid}/attr/apparmor/current")
+        if label is None:
+            label = host.read(f"/proc/{p.pid}/attr/current")
+            if label is not None and not _apparmor_shaped(label):
+                label = None
         if label is None:
             unknown.append(p)
         elif _is_unconfined(label):
@@ -886,6 +947,8 @@ def run_preflight(host: HostView, tiers: Sequence[str]) -> list[Check]:
     out.append(_check_clock(host))
     out.append(_check_cpu_flags(host))
     out.append(_check_scratch(host, tiers))
+    if "firecracker" in t:
+        out.append(_check_fc_scratch(host))
     return out
 
 

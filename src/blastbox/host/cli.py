@@ -2323,8 +2323,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="TIER",
         help="tier to check: docker, gvisor, firecracker, remote, or all. Repeatable. "
-        "Default: the cold docker tier plus BLASTBOX_POOL_RUNTIME's tier, or every "
-        "local tier when that is unset",
+        "Default: BLASTBOX_POOL_RUNTIME's tier(s), plus the cold docker tier unless the pool "
+        "is remote-only or BLASTBOX_DISPATCH_WARM_ONLY is set; every local tier when unset",
     )
     ppf.add_argument("--json", action="store_true", help="emit one JSON object")
     ppf.add_argument(
