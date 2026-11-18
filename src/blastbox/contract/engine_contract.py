@@ -12,6 +12,7 @@ output mapper and should check they reference an engine that ships a contract.
 from __future__ import annotations
 
 import fnmatch
+import importlib
 import json
 import sys
 import tomllib
@@ -21,7 +22,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from .walk import iter_nodes
+from .nodes import _Node
 
 SCHEMA = "blastbox-engine-contract/1"
 CONTRACT_FILENAME = "blastbox-engine.toml"
@@ -146,6 +147,34 @@ def _node_type(node: object) -> str | None:
     return value if isinstance(value, str) else None
 
 
+_MAX_WALK_DEPTH = 256
+
+
+def _payload_nodes(root: object) -> list[object]:
+    """Every node in the payload: ``children`` AND node-bearing fields (``EmbeddedResource.metadata``,
+    Records nested in ``Record.fields``, any node a registered engine type carries in its own
+    fields). ``walk.iter_nodes`` follows ``children`` only, which would let a node type the
+    contract never declared ride in under ``metadata``."""
+    found: list[object] = []
+    stack: list[tuple[object, int]] = [(root, 0)]
+    while stack:
+        value, depth = stack.pop()
+        if depth > _MAX_WALK_DEPTH:
+            raise ValueError(f"payload tree exceeds maximum nesting depth of {_MAX_WALK_DEPTH}")
+        if isinstance(value, _Node):
+            found.append(value)
+            items: list[object] = [getattr(value, name, None) for name in type(value).model_fields]
+        elif isinstance(value, dict):
+            items = list(value.values())
+        elif isinstance(value, (list, tuple)):
+            items = list(value)
+        else:
+            continue
+        stack.extend((item, depth + 1) for item in reversed(items)
+                     if isinstance(item, (_Node, dict, list, tuple)))
+    return found
+
+
 def _check(contract: EngineContract, *, engine: str | None, status: str,
            artifacts: list[tuple[str, str, str, int | None]], payload: object) -> list[Violation]:
     out: list[Violation] = []
@@ -176,7 +205,7 @@ def _check(contract: EngineContract, *, engine: str | None, status: str,
         if root_type != contract.payload.root:
             out.append(Violation("payload_root", f"payload root is {root_type!r}, contract says {contract.payload.root!r}"))
         allowed = set(contract.payload.node_types)
-        seen = {t for t in (_node_type(n) for n in iter_nodes(payload)) if t is not None}
+        seen = {t for t in (_node_type(n) for n in _payload_nodes(payload)) if t is not None}
         for t in sorted(seen - allowed):
             out.append(Violation("undeclared_node_type", f"payload contains {t!r}, not in contract node_types"))
         fields = getattr(payload, "fields", None)
@@ -251,9 +280,16 @@ def find_contract(start: str | Path, engine: str | None = None) -> Path | None:
     return None
 
 
+_USAGE = """usage: python -m blastbox.contract.engine_contract validate CONTRACT
+       python -m blastbox.contract.engine_contract check [--import MODULE]... CONTRACT ENVELOPE.json
+
+--import MODULE imports the engine module that calls ``register_node_type`` for its custom payload
+nodes, so the envelope's payload can be parsed (repeatable)."""
+
+
 def main(argv: list[str] | None = None) -> int:
-    """``python -m blastbox.contract.engine_contract (validate CONTRACT | check CONTRACT ENVELOPE.json)``"""
-    args = sys.argv[1:] if argv is None else argv
+    """Command line entry point; see ``_USAGE``."""
+    args = list(sys.argv[1:] if argv is None else argv)
     if len(args) == 2 and args[0] == "validate":
         try:
             c = load_contract(args[1])
@@ -262,19 +298,26 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(f"ok: {c.engine.name} ({len(c.artifacts)} artifact families, {len(c.gaps)} gaps)")
         return 0
-    if len(args) == 3 and args[0] == "check":
-        try:
-            c = load_contract(args[1])
-            env = json.loads(Path(args[2]).read_text())
-            problems = check_envelope(c, env)
-        except (ValueError, OSError, ValidationError) as exc:
-            print(exc, file=sys.stderr)
-            return 1
-        for p in problems:
-            print(p)
-        print("conforms" if not problems else f"{len(problems)} violation(s)")
-        return 0 if not problems else 1
-    print(main.__doc__, file=sys.stderr)
+    if args and args[0] == "check":
+        rest, modules = args[1:], []
+        while len(rest) >= 2 and rest[0] == "--import":
+            modules.append(rest[1])
+            rest = rest[2:]
+        if len(rest) == 2 and not rest[0].startswith("--"):
+            try:
+                for module in modules:
+                    importlib.import_module(module)
+                c = load_contract(rest[0])
+                env = json.loads(Path(rest[1]).read_text())
+                problems = check_envelope(c, env)
+            except (ImportError, ValueError, OSError, ValidationError) as exc:
+                print(exc, file=sys.stderr)
+                return 1
+            for p in problems:
+                print(p)
+            print("conforms" if not problems else f"{len(problems)} violation(s)")
+            return 0 if not problems else 1
+    print(_USAGE, file=sys.stderr)
     return 2
 
 

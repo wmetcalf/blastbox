@@ -209,3 +209,70 @@ def test_builtin_engines_ship_contracts() -> None:
     assert missing == []
     for e in engines:
         assert load_contract(root / "contracts" / f"{e}.toml").engine.name
+
+
+def test_node_types_cover_metadata_and_nested_records(tmp_path: Path) -> None:
+    """`payload.node_types` constrains types anywhere in the tree -- including the Record behind
+    EmbeddedResource.metadata and Records nested in Record.fields, not only `children`."""
+    from blastbox.contract import EmbeddedResource
+    p = tmp_path / CONTRACT_FILENAME
+    p.write_text(CONTRACT.replace('root = "record"', 'root = "embedded_resource"')
+                 .replace('node_types = ["record", "page"]', 'node_types = ["embedded_resource"]')
+                 .replace('required_root_fields = ["schema_version"]\nschema_version = "demo/1"\n', ''))
+    c = load_contract(p)
+    manifest = [DeclaredArtifact(id="manifest", path="manifest.json", kind="file")]
+    bare = EmbeddedResource(embedded_path="", content_type="message/rfc822", depth=0)
+    assert check_result(c, DetonationResult(payload=bare, artifacts=manifest, detected=DET)) == []
+    with_meta = EmbeddedResource(embedded_path="", content_type="message/rfc822", depth=0,
+                                 metadata=Record(fields={"k": "v"}))
+    assert [v.code for v in check_result(c, DetonationResult(payload=with_meta, artifacts=manifest,
+                                                             detected=DET))] == ["undeclared_node_type"]
+    # A Record nested in a Record's fields is a node too.
+    p.write_text(CONTRACT.replace('node_types = ["record", "page"]', 'node_types = ["record"]'))
+    c2 = load_contract(p)
+    nested = Record(fields={"schema_version": "demo/1", "inner": Record(fields={"a": 1})})
+    assert check_result(c2, DetonationResult(payload=nested, artifacts=manifest, detected=DET)) == []
+    child = EmbeddedResource(embedded_path="x", content_type="text/plain", depth=1)
+    deep = Record(fields={"schema_version": "demo/1", "inner": Record(fields={"a": 1})})
+    holder = EmbeddedResource(embedded_path="", content_type="message/rfc822", depth=0,
+                              metadata=deep, children=[child])
+    p.write_text(CONTRACT.replace('root = "record"', 'root = "embedded_resource"')
+                 .replace('node_types = ["record", "page"]', 'node_types = ["embedded_resource", "page"]'))
+    codes = [v.detail for v in check_result(load_contract(p), DetonationResult(
+        payload=holder, artifacts=manifest, detected=DET))]
+    assert any("'record'" in d for d in codes)
+
+
+def test_cli_imports_registration_modules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A custom node registered by the engine's own module is parseable once the CLI imports it."""
+    mod = tmp_path / "demo_nodes_mod.py"
+    mod.write_text(
+        "from typing import Literal\n"
+        "from pydantic import Field\n"
+        "from blastbox.contract.nodes import Record, register_node_type\n"
+        "class DemoNode(Record):\n"
+        "    type: Literal['demo_node'] = Field(default='demo_node', alias='_type')\n"
+        "register_node_type(DemoNode)\n"
+    )
+    contract = tmp_path / CONTRACT_FILENAME
+    contract.write_text(CONTRACT.replace('root = "record"', 'root = "demo_node"')
+                        .replace('node_types = ["record", "page"]', 'node_types = ["demo_node"]')
+                        .replace('required_root_fields = ["schema_version"]\nschema_version = "demo/1"\n', '')
+                        .replace("max_count = 2", "max_count = 0"))
+    out = _outdir(tmp_path)
+    env_json = tmp_path / "metadata.json"
+    # Built in a subprocess-free way: the envelope JSON a demo engine would emit.
+    env = seal_envelope(engine="demo", outdir=out, input_sha256="0" * 64, detected=DET,
+                        declared=_result().artifacts, warnings=[], payload=Record(fields={}))
+    data = json.loads(env.model_dump_json(by_alias=True))
+    data["payload"]["_type"] = "demo_node"
+    env_json.write_text(json.dumps(data))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    try:
+        assert main(["check", "--import", "demo_nodes_mod", str(contract), str(env_json)]) == 0
+        assert main(["check", "--import", "no_such_module_xyz", str(contract), str(env_json)]) == 1
+    finally:
+        from blastbox.contract import nodes
+        nodes._ENGINE_NODE_TYPES[:] = [t for t in nodes._ENGINE_NODE_TYPES
+                                       if getattr(t, "__module__", "") != "demo_nodes_mod"]
+        nodes.rebuild_node_union()

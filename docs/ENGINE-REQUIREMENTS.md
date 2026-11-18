@@ -26,7 +26,9 @@ At the engine repo root; a repo with several engines uses `blastbox-engine.<engi
 [[artifacts]]   id + path (fnmatch globs), kind, required, max_count (default 1; 0 =
                 uncapped), max_bytes, role,
                 description — every artifact family the engine can declare
-[payload]       root node type, node_types allowed anywhere in the tree,
+[payload]       root node type, node_types allowed anywhere in the tree (children,
+                EmbeddedResource.metadata, Records nested in Record.fields -- a
+                root with metadata must list "record"),
                 required_root_fields, schema_version (+ schema_field, default
                 "schema_version"); checked on a Record root's fields or an
                 EmbeddedResource root's metadata fields
@@ -40,6 +42,8 @@ At the engine repo root; a repo with several engines uses `blastbox-engine.<engi
 
 Validate: `python -m blastbox.contract.engine_contract validate blastbox-engine.toml`.
 Check a real result: `python -m blastbox.contract.engine_contract check blastbox-engine.toml metadata.json`.
+An engine with `register_node_type` payload nodes passes the module that registers them:
+`... check --import my_engine.nodes blastbox-engine.toml metadata.json` (repeatable).
 
 ## 3. Conformance in the engine's own tests
 
