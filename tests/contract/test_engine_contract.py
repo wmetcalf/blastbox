@@ -296,6 +296,7 @@ def test_node_types_checked_on_every_status(contract_path: Path) -> None:
 
 def test_host_sealed_capture_artifacts_are_not_the_engines(contract_path: Path, tmp_path: Path) -> None:
     """The host appends netd capture pcaps to the sealed envelope; they are not engine output."""
+    contract_path.write_text(CONTRACT.replace('network = ["none"]', 'network = ["inetsim"]'))
     out = _outdir(tmp_path)
     r = _result()
     env = seal_envelope(engine="demo", outdir=out, input_sha256="0" * 64, detected=DET,
@@ -372,3 +373,57 @@ max_count = 0
 id = "manifest"'''))
     out = _outdir(tmp_path)
     assert check_result(load_contract(p), _result(), out) == []
+
+
+def test_host_capture_exemption_needs_a_network_that_captures(contract_path: Path, tmp_path: Path) -> None:
+    """The host only seals a capture for an exit driver other than none/drop; an engine whose
+    contract allows only those cannot hide an undeclared file behind the capture's name."""
+    out = _outdir(tmp_path)
+    r = _result()
+    env = seal_envelope(engine="demo", outdir=out, input_sha256="0" * 64, detected=DET,
+                        declared=r.artifacts, warnings=[], payload=r.payload)
+    data = json.loads(env.model_dump_json(by_alias=True))
+    data["artifacts"].append({"id": "network.capture.pcap", "path": "capture/dump.pcap",
+                              "kind": "network_capture", "sha256": "0" * 64, "bytes": 1})
+    offline = load_contract(contract_path)  # network = ["none"]
+    assert [v.code for v in check_envelope(offline, data)] == ["undeclared_artifact"]
+    contract_path.write_text(CONTRACT.replace('network = ["none"]', 'network = ["none", "inetsim"]'))
+    assert check_envelope(load_contract(contract_path), data) == []
+
+
+def test_every_matching_family_byte_cap_applies(tmp_path: Path) -> None:
+    p = tmp_path / CONTRACT_FILENAME
+    p.write_text(CONTRACT.replace('''[[artifacts]]
+id = "manifest"
+path = "manifest.json"
+kind = "file"
+required = true''', '''[[artifacts]]
+id = "*"
+path = "*.json"
+kind = "file"
+max_count = 0
+
+[[artifacts]]
+id = "manifest"
+path = "manifest.json"
+kind = "file"
+required = true
+max_bytes = 1'''))
+    out = _outdir(tmp_path)
+    (out / "manifest.json").write_text("{}")  # 2 bytes > 1
+    assert [v.code for v in check_result(load_contract(p), _result(), out)] == ["artifact_too_large"]
+
+
+def test_find_contract_prefers_the_nearest_matching_contract(tmp_path: Path) -> None:
+    (tmp_path / "blastbox-engine.demo.toml").write_text(CONTRACT)
+    nested = tmp_path / "engine"
+    nested.mkdir()
+    (nested / CONTRACT_FILENAME).write_text(CONTRACT)  # name "demo", nearer
+    assert find_contract(nested / "x", "demo") == nested / CONTRACT_FILENAME
+
+
+def test_undeclared_and_unwritten_reports_both(contract_path: Path, tmp_path: Path) -> None:
+    out = _outdir(tmp_path)
+    extra = [DeclaredArtifact(id="debug", path="debug.log", kind="file")]
+    codes = sorted(v.code for v in check_result(load_contract(contract_path), _result(extra=extra), out))
+    assert codes == ["artifact_file_missing", "undeclared_artifact"]

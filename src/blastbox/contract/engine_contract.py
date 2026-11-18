@@ -14,6 +14,8 @@ from __future__ import annotations
 import fnmatch
 import importlib
 import json
+import os
+import stat
 import sys
 import tomllib
 from dataclasses import dataclass
@@ -163,6 +165,8 @@ _HOST_ARTIFACTS: frozenset[tuple[str, str, str]] = frozenset({
     ("network.capture.mixed.pcap", "network_capture_mixed", "capture/mixed.pcap"),
 })
 
+_NO_CAPTURE_NETWORKS = frozenset({"none", "drop"})
+
 # The payload the worker harness itself seals for an engine that raised (``harness.py``
 # ``_engine_error_envelope``): a Record, whatever the engine's own root type is.
 _HARNESS_ERROR_NODE = "record"
@@ -206,22 +210,29 @@ def _check(contract: EngineContract, *, engine: str | None, status: str,
     counts: dict[int, int] = {}
     present: set[int] = set()
     for ident, path, kind, size in artifacts:
-        if path in missing_files:
-            # Declared but never written: sealing rejects this, so it is not present.
-            out.append(Violation("artifact_file_missing", f"{ident} declared at {path} but no file is there"))
-            continue
         spec = _spec_for(contract, ident, path, kind)
+        if path in missing_files:
+            # Declared but not a regular file (absent, or a symlink): sealing refuses it.
+            out.append(Violation("artifact_file_missing",
+                                 f"{ident} declared at {path} but no regular file is there"))
+            if spec is None:
+                out.append(Violation("undeclared_artifact", f"{ident} ({kind}) at {path} matches no contract artifact"))
+            continue
         if spec is None:
             out.append(Violation("undeclared_artifact", f"{ident} ({kind}) at {path} matches no contract artifact"))
             continue
         key = contract.artifacts.index(spec)
         counts[key] = counts.get(key, 0) + 1
-        # Caps go to the first matching family; presence counts for every family it matches,
-        # so an earlier catch-all glob cannot make a later required family look absent.
-        present.update(i for i, other in enumerate(contract.artifacts)
-                       if _matches(other, ident, path, kind))
-        if spec.max_bytes is not None and size is not None and size > spec.max_bytes:
-            out.append(Violation("artifact_too_large", f"{ident} is {size} bytes, contract max {spec.max_bytes}"))
+        # Counts go to the first matching family; presence and byte caps apply for every family
+        # it matches, so an earlier catch-all glob can neither make a later required family look
+        # absent nor carry an artifact past that family's max_bytes.
+        for i, other in enumerate(contract.artifacts):
+            if not _matches(other, ident, path, kind):
+                continue
+            present.add(i)
+            if other.max_bytes is not None and size is not None and size > other.max_bytes:
+                out.append(Violation("artifact_too_large", f"{ident} is {size} bytes, contract max {other.max_bytes}"))
+                break
     for key, spec in enumerate(contract.artifacts):
         n = counts.get(key, 0)
         if spec.max_count and n > spec.max_count:
@@ -262,9 +273,13 @@ def check_envelope(contract: EngineContract, envelope: Any) -> list[Violation]:
     from .envelope import Envelope
 
     env = envelope if isinstance(envelope, Envelope) else Envelope.model_validate(envelope)
+    # The host seals a capture only for an exit driver other than none/drop, so the exemption
+    # applies only when the contract allows one. A sealed envelope cannot say who wrote a file;
+    # an engine's own tests (check_result) never get the exemption.
+    captures = bool(set(contract.engine.network) - _NO_CAPTURE_NETWORKS)
     arts: list[tuple[str, str, str, int | None]] = [
         (a.id, a.path, a.kind, a.bytes) for a in env.artifacts
-        if (a.id, a.kind, a.path) not in _HOST_ARTIFACTS]
+        if not (captures and (a.id, a.kind, a.path) in _HOST_ARTIFACTS)]
     return _check(contract, engine=env.engine, status=env.status, artifacts=arts, payload=env.payload)
 
 
@@ -276,9 +291,12 @@ def check_result(contract: EngineContract, result: Any, outdir: str | Path | Non
     for a in result.artifacts:
         size = None
         if outdir is not None:
-            p = Path(outdir) / a.path
-            if p.is_file() and not p.is_symlink():
-                size = p.stat().st_size
+            try:
+                st = os.lstat(Path(outdir) / a.path)
+            except OSError:
+                st = None
+            if st is not None and stat.S_ISREG(st.st_mode):
+                size = st.st_size
             else:
                 missing.add(a.path)
         arts.append((a.id, a.path, a.kind, size))
@@ -318,17 +336,15 @@ def _contract_engine_name(path: Path) -> str | None:
 def find_contract(start: str | Path, engine: str | None = None) -> Path | None:
     """Walk up from ``start`` to the nearest contract.
 
-    With ``engine``, a multi-engine repo's ``blastbox-engine.<engine>.toml`` is found wherever it
-    sits on the way up, and a plain ``blastbox-engine.toml`` is accepted only when its
-    ``[engine].name`` is ``engine``: it never silently returns another engine's contract."""
+    With ``engine``, each directory (nearest first) offers its ``blastbox-engine.<engine>.toml``,
+    then its plain ``blastbox-engine.toml`` only when that file's ``[engine].name`` is
+    ``engine``: it never silently returns another engine's contract."""
     here = Path(start).resolve()
-    dirs = (here, *here.parents)
-    if engine:
-        for d in dirs:
+    for d in (here, *here.parents):
+        if engine:
             candidate = d / f"blastbox-engine.{engine}.toml"
             if candidate.is_file():
                 return candidate
-    for d in dirs:
         candidate = d / CONTRACT_FILENAME
         if candidate.is_file() and (engine is None or _contract_engine_name(candidate) == engine):
             return candidate
