@@ -587,10 +587,15 @@ def _check_snapshot_age(host: HostView) -> Check:
                      f"BLASTBOX_SNAPSHOT_MAX_AGE_S={raw} disables warm-base refresh: a checkpoint "
                      "restored long after it was taken sees its monotonic clock jump and "
                      "every job hangs (the ~24h warm outage)", doc)
-    if value >= 86400:
+    from blastbox.host.runtime.fc_snapshot import SNAPSHOT_AGE_CEILING_FACTOR  # noqa: PLC0415
+
+    # An aged base keeps serving while its refresh fails, until CEILING_FACTOR x max-age.
+    if value > 0 and value * SNAPSHOT_AGE_CEILING_FACTOR >= 86400:
         return Check("snapshot-age", Status.WARN,
-                     f"BLASTBOX_SNAPSHOT_MAX_AGE_S={raw}: warm bases may age a day or more before "
-                     "refresh, past the restore clock-jump edge (the ~24h warm outage)", doc)
+                     f"BLASTBOX_SNAPSHOT_MAX_AGE_S={raw}: with the runtime's "
+                     f"{SNAPSHOT_AGE_CEILING_FACTOR:g}x ceiling a base can serve "
+                     f"{value * SNAPSHOT_AGE_CEILING_FACTOR / 3600:g}h when a refresh fails, past "
+                     "the ~24h restore clock-jump edge (the warm outage); keep it under 12h", doc)
     if raw and value == default and _float_or_none(raw) != default:
         return Check("snapshot-age", Status.WARN,
                      f"BLASTBOX_SNAPSHOT_MAX_AGE_S={raw!r} is invalid; the runtime ignores it "
@@ -616,10 +621,12 @@ def _needs_userns(env: Mapping[str, str], tiers: Collection[str] = ("docker",)) 
 
 
 def _profile_attachment_mismatches(host: HostView) -> list[str]:
-    """For each installed scoped profile, the binary it attaches to vs the one PATH resolves.
-    A profile attached to /usr/local/bin/nsjail confers nothing on /usr/bin/nsjail."""
+    """For each scoped profile of a tool in use, the binary it attaches to vs the one PATH
+    resolves. A profile attached to /usr/local/bin/nsjail confers nothing on /usr/bin/nsjail."""
     out = []
-    for tool in ("bwrap", "nsjail"):
+    sandbox = host.env.get("BLASTBOX_SANDBOX", "").strip().lower()
+    tools = (sandbox,) if sandbox in ("bwrap", "nsjail") else ("bwrap", "nsjail")
+    for tool in tools:
         raw = host.read(f"/etc/apparmor.d/blastbox-{tool}")
         m = re.search(rf"^\s*profile\s+blastbox-{tool}\s+(/\S+)", raw or "", re.MULTILINE)
         binary = host.which(tool)
@@ -702,7 +709,7 @@ def _check_bwrap_stock_profile(host: HostView, tiers: Collection[str] = ("docker
     # The stock profile attaches to bwrap only: nsjail and rootless runsc are unaffected.
     env = host.env
     needs = []
-    if env.get("BLASTBOX_SANDBOX", "").strip().lower() == "bwrap":
+    if "docker" in tiers and env.get("BLASTBOX_SANDBOX", "").strip().lower() == "bwrap":
         needs.append("BLASTBOX_SANDBOX=bwrap")
     if ("docker" in tiers and env.get("BLASTBOX_WORKER_RUNTIME", "").strip().lower() == "runc"
             and env.get("BLASTBOX_SANDBOX", "").strip().lower() != "nsjail"):
@@ -1028,6 +1035,7 @@ def _downgrade_overflow(checks: list[Check], env: Mapping[str, str]) -> list[Che
     # A tier any of whose startup gates FAILs is skipped whole, so its other FAILs are moot too.
     skipped = {names[c.name] for c in checks
                if c.name in names and c.status is Status.FAIL and _is_startup_gate(c)}
+    warm = {"gvisor"} | ({"firecracker"} if _warm_snapshot(env) else set())
     out = []
     for c in checks:
         tier = names.get(c.name)
@@ -1035,8 +1043,19 @@ def _downgrade_overflow(checks: list[Check], env: Mapping[str, str]) -> list[Che
             c = Check(c.name, Status.WARN,
                       f"{c.detail} -- {tier} is an overflow tier of this cascade, so the "
                       "dispatcher skips it at startup and runs without it", c.doc)
+        elif tier in warm and c.status is Status.FAIL:
+            # Admitted, but its warm base never builds: the cascade never spawns there and
+            # serves on the other tiers.
+            c = Check(c.name, Status.WARN,
+                      f"{c.detail} -- {tier} is a warm overflow tier of this cascade: it is "
+                      "admitted but never becomes ready, so the cascade runs without it", c.doc)
         out.append(c)
     return out
+
+
+def _warm_snapshot(env: Mapping[str, str]) -> bool:
+    raw = env.get("BLASTBOX_POOL_WARM_SNAPSHOT", "").strip().lower()
+    return bool(raw) and raw not in ("0", "false", "no", "off")
 
 
 def _downgrade_unselected(checks: list[Check], env: Mapping[str, str]) -> list[Check]:

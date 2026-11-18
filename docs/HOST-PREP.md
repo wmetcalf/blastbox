@@ -49,7 +49,8 @@ which the dispatcher skips at startup.
 | **gvisor** (warm C/R) | the `runsc` binary with checkpoint/restore (driven directly, no docker; root) | `runsc`, `gvisor-rootfs`, `gvisor-rootless`, `snapshot-age`, `runsc-host-root`, `sandbox-confinement` |
 | **firecracker** (warm/cold) | `/dev/kvm` read/write, `firecracker` ≥ 1.15.1, guest kernel + rootfs | `kvm`, `firecracker`, `fc-guest`, `snapshot-age`, `sandbox-confinement`, `fc-scratch` |
 | **remote** (static / AWS) | nothing runtime-specific locally; the remote box runs the worker image under its own runsc | common checks only (no docker: no cold path) |
-| every tier | a pool the dispatcher accepts, AppArmor state known, synced clock, CPU flags reviewed, scratch off `/tmp` | `pool-runtime`, `apparmor`, `bwrap-userns-restrict`, `userns`, `clock`, `cpu-flags`, `scratch` |
+| every tier | a pool the dispatcher accepts, synced clock, scratch off `/tmp` | `pool-runtime`, `clock`, `scratch` |
+| every local tier | AppArmor state known, CPU flags reviewed | `apparmor`, `bwrap-userns-restrict`, `userns`, `cpu-flags` |
 
 Prefer the **warm Firecracker** tier where KVM exists: it is the stronger boundary and, with
 memory snapshots, the faster warm path. gVisor is the fallback for hosts without KVM.
@@ -217,8 +218,9 @@ Use the **scoped per-binary profiles** in [`deploy/apparmor/`](../deploy/apparmo
 **not** set `kernel.apparmor_restrict_unprivileged_userns=0`: that lowers a host-wide
 attack-surface control for every process. Preflight's `userns` check warns only when the
 environment actually configures something that needs a user namespace on a tier being checked
-(`BLASTBOX_SANDBOX=bwrap|nsjail`; `BLASTBOX_WORKER_RUNTIME=runc` on the cold docker tier, the only
-one that reads it; `BLASTBOX_GVISOR_ROOTLESS` on the gvisor tier), and passes when the scoped profiles
+(`BLASTBOX_SANDBOX=bwrap|nsjail` or `BLASTBOX_WORKER_RUNTIME=runc`, both only on the cold docker
+tier, the only one whose inner sandbox runs on the host kernel; `BLASTBOX_GVISOR_ROOTLESS` is the
+`gvisor-rootless` check's concern), and passes when the scoped profiles
 are visibly loaded (securityfs is root-only; run preflight as root to confirm). `max_user_namespaces=0`
 or `unprivileged_userns_clone=0` switches user namespaces off outright: a FAIL only when something
 configured needs one, otherwise a fine hardening choice (PASS).
@@ -272,8 +274,9 @@ than the 24h idle timeout timed out on its first poll and exited without process
 (empty output, `metadata.json not found`). The worker now detects the jump and restarts its idle
 countdown, and `BLASTBOX_SNAPSHOT_MAX_AGE_S` (default 6h) refreshes warm bases before they age.
 
-- Do **not** set `BLASTBOX_SNAPSHOT_MAX_AGE_S=0` (preflight warns): it disables refresh. A value of
-  a day or more also warns: bases then age past the restore clock-jump edge.
+- Do **not** set `BLASTBOX_SNAPSHOT_MAX_AGE_S=0` (preflight warns): it disables refresh. Keep it
+  under 12h: a base keeps serving while its refresh fails until 2x max-age, so 12h or more lets it
+  reach the ~24h restore clock-jump edge (preflight warns).
 - After upgrading blastbox, a host clock fix, or any long outage, **rebuild warm snapshots**
   (restart the warm sidecar so it re-checkpoints) rather than serving the old base.
 
@@ -306,8 +309,9 @@ Preflight reads `/proc/cpuinfo` and warns on flags with operational consequences
 - A local tier that a cascade lists only as an **overflow** member is skipped by the dispatcher
   when its startup gate fails, so those FAILs (`kvm` when `/dev/kvm` is missing, `firecracker`,
   `fc-guest`, `runsc`, `gvisor-rootless`) are reported as WARNs saying so. A non-rw `/dev/kvm` or a
-  missing gVisor rootfs is not a startup gate (the tier is admitted and its spawns fail), so those
-  stay FAIL.
+  missing gVisor rootfs is not a startup gate: a warm overflow tier is admitted but its base never
+  builds, so the cascade runs without it (WARN); a cold Firecracker overflow tier really spawns
+  there and every spawn fails (FAIL).
 - `BLASTBOX_JOB_ROOT` must be the same path for serve, dispatch and the worker mount, and must
   **not** be shared between a container dispatcher and a network-tier (aws/static) dispatcher
   (CONFIGURATION *Core*).

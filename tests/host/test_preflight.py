@@ -1124,15 +1124,59 @@ def test_fc_scratch_resolves_the_mount_holding_the_slot_dir(mounts, status):
     assert c.status is status, c.detail
 
 
-def test_overflow_downgrade_keeps_fails_the_runtime_does_not_gate_on():
+def test_overflow_non_gate_problems_on_warm_tiers_warn_never_ready():
+    """A missing gVisor rootfs / non-rw kvm on a WARM overflow tier is admitted, its base never
+    builds, and the cascade serves on the primary: degraded (WARN), not refused."""
     env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "firecracker:2,gvisor:2"}
-    host = _healthy(env=env, paths={"/var/lib/blastbox/jobs"})
-    by = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env)))
-    assert by["gvisor-rootfs"].status is Status.FAIL     # the runtime boots it anyway
-    env2 = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2"}
+    host = _healthy(env=env, paths={"/dev/kvm", "/var/lib/blastbox/jobs",
+                                    "/var/lib/blastbox/fc/vmlinux", "/var/lib/blastbox/fc/rootfs.ext4"})
+    c = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env)))["gvisor-rootfs"]
+    assert c.status is Status.WARN and "never" in c.detail
+    env2 = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2",
+            "BLASTBOX_POOL_WARM_SNAPSHOT": "1"}
     host2 = _healthy(env=env2, rw=set())
     assert _by_name(pf.run_preflight(host2, pf.resolve_tiers([], host2.env)))["kvm"].status \
-        is Status.FAIL                                   # present but not rw: spawns fail
+        is Status.WARN
+    # A COLD firecracker overflow tier really spawns on a non-rw kvm, and every spawn fails.
+    env3 = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2"}
+    host3 = _healthy(env=env3, rw=set())
+    assert _by_name(pf.run_preflight(host3, pf.resolve_tiers([], host3.env)))["kvm"].status \
+        is Status.FAIL
+
+
+def test_snapshot_age_counts_the_runtime_ceiling_factor():
+    host = _healthy(env={"BLASTBOX_SNAPSHOT_MAX_AGE_S": "43200"})
+    assert _by_name(pf.run_preflight(host, ["gvisor"]))["snapshot-age"].status is Status.WARN
+
+
+def test_stock_bwrap_profile_ignores_the_sandbox_knob_off_the_docker_tier():
+    env = {"BLASTBOX_POOL_RUNTIME": "firecracker", "BLASTBOX_DISPATCH_WARM_ONLY": "1",
+           "BLASTBOX_SANDBOX": "bwrap"}
+    host = _healthy(env=env, files={"/etc/apparmor.d/bwrap-userns-restrict": "profile bwrap"})
+    assert _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env)))[
+        "bwrap-userns-restrict"].status is Status.PASS
+
+
+def test_attachment_mismatch_only_for_the_configured_tool():
+    host = _healthy(env={"BLASTBOX_SANDBOX": "bwrap"},
+                    executables={"docker": "/usr/bin/docker", "bwrap": "/usr/bin/bwrap",
+                                 "nsjail": "/usr/bin/nsjail"},
+                    files={"/sys/kernel/security/apparmor/profiles":
+                           "blastbox-bwrap (unconfined)\nblastbox-nsjail (unconfined)\n",
+                           "/etc/apparmor.d/blastbox-bwrap": "profile blastbox-bwrap /usr/bin/bwrap {\n}\n",
+                           "/etc/apparmor.d/blastbox-nsjail":
+                           "profile blastbox-nsjail /usr/local/bin/nsjail {\n}\n"})
+    assert _by_name(pf.run_preflight(host, ["docker"]))["userns"].status is Status.PASS
+
+
+def test_cli_without_tier_previews_unselected_tiers(capsys, monkeypatch):
+    from blastbox.host import cli
+    host = _healthy(paths={"/var/lib/blastbox/jobs"}, rw=set())
+    host.executables.pop("firecracker")
+    monkeypatch.setattr(pf, "RealHost", lambda: host)
+    assert cli.main(["preflight"]) == 0
+    assert cli.main(["preflight", "--tier", "firecracker"]) == 1
+    capsys.readouterr()
 
 
 def test_sandbox_knob_needs_host_userns_only_on_the_docker_tier():
@@ -1149,7 +1193,7 @@ def test_userns_off_with_nothing_needing_it_passes():
 
 
 @pytest.mark.parametrize("value,status", [("86400", Status.WARN), ("172800", Status.WARN),
-                                          ("43200", Status.PASS)])
+                                          ("21600", Status.PASS)])
 def test_snapshot_age_past_a_day_warns(value, status):
     host = _healthy(env={"BLASTBOX_SNAPSHOT_MAX_AGE_S": value})
     assert _by_name(pf.run_preflight(host, ["gvisor"]))["snapshot-age"].status is status
