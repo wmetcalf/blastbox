@@ -597,3 +597,59 @@ def test_real_host_listdir_and_readlink_degrade_to_none(tmp_path):
     (tmp_path / "l").symlink_to("/")
     assert h.readlink(str(tmp_path / "l")) == "/"
     assert "l" in (h.listdir(str(tmp_path)) or [])
+
+
+# --- upstream review (codex) on #208 ------------------------------------------------------
+
+def test_cascade_tiers_resolve_to_their_local_members():
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "firecracker:2,gvisor:2"}
+    assert pf.resolve_tiers([], env) == ["docker", "gvisor", "firecracker"]
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "static:4,aws-ec2:16"}
+    assert pf.resolve_tiers([], env) == ["docker", "remote"]
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "firecracker:2, aws-ec2:4"}
+    assert pf.resolve_tiers([], env) == ["docker", "firecracker", "remote"]
+
+
+@pytest.mark.parametrize("env", [
+    {"BLASTBOX_WORKER_RUNTIME": "runc"},
+    {"BLASTBOX_WORKER_RUNTIME": "runc", "BLASTBOX_ALLOW_RUNC": "1",
+     "BLASTBOX_REQUIRE_SECURE_RUNTIME": "1"},
+])
+def test_forced_runc_that_the_dispatcher_refuses_fails_even_with_runsc_registered(env):
+    c = _by_name(pf.run_preflight(_healthy(env=env), ["docker"]))["docker-runsc-runtime"]
+    assert c.status is Status.FAIL
+    assert "BLASTBOX_WORKER_RUNTIME=runc" in c.detail
+
+
+def test_forced_runc_with_consent_is_a_degraded_warning():
+    env = {"BLASTBOX_WORKER_RUNTIME": "runc", "BLASTBOX_ALLOW_RUNC": "1"}
+    c = _by_name(pf.run_preflight(_healthy(env=env), ["docker"]))["docker-runsc-runtime"]
+    assert c.status is Status.WARN and "degraded" in c.detail
+
+
+@pytest.mark.parametrize("result", [None, (127, "", "error while loading shared libraries")])
+def test_runsc_that_cannot_run_its_version_query_fails(result):
+    commands = {} if result is None else {("/usr/bin/runsc", "--version"): result}
+    host = _healthy(commands=commands)
+    if result is None:
+        del host.commands[("/usr/bin/runsc", "--version")]
+    c = _by_name(pf.run_preflight(host, ["gvisor"]))["runsc"]
+    assert c.status is Status.FAIL
+    if result is not None:
+        assert "shared libraries" in c.detail
+
+
+def test_rootless_gvisor_fails_the_warm_gvisor_tier():
+    host = _healthy(env={"BLASTBOX_GVISOR_ROOTLESS": "1"})
+    by = _by_name(pf.run_preflight(host, ["gvisor"]))
+    assert by["gvisor-rootless"].status is Status.FAIL
+    assert "restore" in by["gvisor-rootless"].detail
+    assert "gvisor-rootless" not in _by_name(pf.run_preflight(_healthy(), ["gvisor"]))
+
+
+def test_forced_runsc_missing_fails_even_with_runc_consent():
+    host = _healthy(env={"BLASTBOX_WORKER_RUNTIME": "runsc", "BLASTBOX_ALLOW_RUNC": "1"},
+                    commands={("/usr/bin/docker", "info", "--format", "{{json .Runtimes}}"):
+                              (0, '{"runc":{}}', "")})
+    assert _by_name(pf.run_preflight(host, ["docker"]))["docker-runsc-runtime"].status \
+        is Status.FAIL

@@ -21,8 +21,12 @@ Tiers:
 docker       the cold dispatcher: one disposable docker container per job (runsc by default)
 gvisor       the gVisor C/R warm tier (runsc driven directly)
 firecracker  the Firecracker warm/cold microVM tier
-remote       static / aws-* / cascade: the worker runs elsewhere; this host only dispatches
+remote       static / aws-*: the worker runs elsewhere; this host only dispatches
 ```
+
+Without `--tier`, preflight checks the cold docker tier plus whatever `BLASTBOX_POOL_RUNTIME`
+selects; for `cascade` that is each member named in `BLASTBOX_POOL_TIERS` (local `firecracker` /
+`gvisor` members get their local checks, `static` / `aws-*` members map to `remote`).
 
 `blastbox preflight` checks the **host**; `blastbox doctor` checks what is **running** on it
 (container and rootfs versions). Run both after an upgrade.
@@ -120,7 +124,8 @@ What the sandbox sees:
   nsjail must use their container / no-nested-sandbox mode inside runsc (and inside Firecracker):
   e.g. ClippyShot sets `CLIPPYSHOT_SANDBOX=container` (passed via `BLASTBOX_GVISOR_EXTRA_ENV` on
   the warm tier). Landlock (nono) is also unavailable: the Sentry returns `ENOSYS`.
-- **Rootful only for the warm tier.** gVisor cannot `restore` rootless. Rootless runsc (no current
+- **Rootful only for the warm tier.** gVisor cannot `restore` rootless, so the tier refuses
+  `BLASTBOX_GVISOR_ROOTLESS` (preflight's `gvisor-rootless` FAIL). Rootless runsc (no current
   tier uses it) needs `deploy/apparmor/blastbox-runsc` on Ubuntu 24.04+.
 
 ### runsc processes and host root

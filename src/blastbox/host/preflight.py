@@ -194,10 +194,18 @@ def resolve_tiers(requested: Sequence[str], env: Mapping[str, str]) -> list[str]
             chosen.update(_LOCAL_TIERS)
         else:
             chosen.add("docker")
-            if pool in ("firecracker", "gvisor"):
-                chosen.add(pool)
-            elif pool in _REMOTE_POOL_RUNTIMES:
-                chosen.add("remote")
+            members = [pool]
+            if pool == "cascade":
+                # A cascade's members are whatever BLASTBOX_POOL_TIERS lists ("firecracker:2,
+                # aws-ec2:4"), and local members need their local checks.
+                members = [item.partition(":")[0].strip().lower()
+                           for item in env.get("BLASTBOX_POOL_TIERS", "").split(",")
+                           if item.strip()]
+            for member in members:
+                if member in ("firecracker", "gvisor"):
+                    chosen.add(member)
+                elif member in _REMOTE_POOL_RUNTIMES:
+                    chosen.add("remote")
     return [t for t in TIERS if t in chosen]
 
 
@@ -212,6 +220,12 @@ def _first_line(text: str | None) -> str:
 
 def _truthy(val: str | None) -> bool:
     return (val or "").strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _docker_flag(val: str | None) -> bool:
+    """Truthiness exactly as ``runtime/docker.py`` reads BLASTBOX_ALLOW_RUNC /
+    BLASTBOX_REQUIRE_SECURE_RUNTIME (``off`` counts as SET there)."""
+    return (val or "").strip().lower() not in ("", "0", "false", "no")
 
 
 def _loaded_profiles(host: HostView) -> set[str] | None:
@@ -252,10 +266,23 @@ def _check_docker(host: HostView) -> Check:
 def _check_docker_runsc(host: HostView) -> Check:
     doc = f"{DOC}#gvisor-runsc"
     env = host.env
-    runc_consented = (env.get("BLASTBOX_WORKER_RUNTIME", "").strip().lower() == "runc"
-                      and _truthy(env.get("BLASTBOX_ALLOW_RUNC"))
-                      and not _truthy(env.get("BLASTBOX_REQUIRE_SECURE_RUNTIME")))
-    missing = Status.WARN if runc_consented else Status.FAIL
+    forced = env.get("BLASTBOX_WORKER_RUNTIME", "").strip().lower()
+    runc_allowed = (_docker_flag(env.get("BLASTBOX_ALLOW_RUNC"))
+                    and not _docker_flag(env.get("BLASTBOX_REQUIRE_SECURE_RUNTIME")))
+    if forced == "runc":
+        # select_worker_runtime() honours the forced runtime even when runsc is registered,
+        # and _finalize_runtime() refuses runc without consent: every cold job is refused.
+        if not runc_allowed:
+            return Check("docker-runsc-runtime", Status.FAIL,
+                         "BLASTBOX_WORKER_RUNTIME=runc forces plain runc, which the dispatcher "
+                         "refuses (needs BLASTBOX_ALLOW_RUNC=1 and no "
+                         "BLASTBOX_REQUIRE_SECURE_RUNTIME); unset it to use runsc", doc)
+        return Check("docker-runsc-runtime", Status.WARN,
+                     "BLASTBOX_WORKER_RUNTIME=runc with BLASTBOX_ALLOW_RUNC=1: cold workers run "
+                     "WITHOUT gVisor (explicit degraded mode)", doc)
+    # Auto-selection falls back to runc when runsc is missing; that runs only with consent.
+    # A forced runsc never falls back, so its absence fails whatever the consent.
+    missing = Status.WARN if runc_allowed and forced != "runsc" else Status.FAIL
     fix = ("install it with `sudo runsc install` then `sudo systemctl reload docker` "
            "(SIGHUP -- never restart, which stops every running container)")
     docker = host.which("docker")
@@ -270,7 +297,7 @@ def _check_docker_runsc(host: HostView) -> Check:
     names = {str(k).strip().lower() for k in (parsed if isinstance(parsed, (dict, list)) else [])}
     if "runsc" in names:
         return Check("docker-runsc-runtime", Status.PASS, "runsc is a registered docker runtime")
-    extra = " (runc explicitly consented, degraded mode)" if runc_consented else \
+    extra = " (runc explicitly consented, degraded mode)" if runc_allowed else \
         " -- the dispatcher fails closed without it"
     return Check("docker-runsc-runtime", missing,
                  f"runsc is not a registered docker runtime{extra}; {fix}", doc)
@@ -283,8 +310,26 @@ def _check_runsc_binary(host: HostView) -> Check:
     if path is None:
         return Check("runsc", Status.FAIL, f"runsc binary {name!r} not found/executable", doc)
     proc = host.run([path, "--version"])
-    ver = _first_line(proc.stdout if proc else "") or "version unknown"
+    if proc is None:
+        return Check("runsc", Status.FAIL, f"{path} --version did not run (spawn failure or "
+                     "timeout)", doc)
+    if proc.returncode != 0:
+        why = _first_line(proc.stderr) or _first_line(proc.stdout) or f"rc={proc.returncode}"
+        return Check("runsc", Status.FAIL, f"{path} --version failed: {why}", doc)
+    ver = _first_line(proc.stdout) or "version unknown"
     return Check("runsc", Status.PASS, f"{path}: {ver}")
+
+
+def _check_gvisor_rootless(host: HostView) -> Check | None:
+    """The warm gVisor tier refuses BLASTBOX_GVISOR_ROOTLESS outright: it needs ``runsc
+    restore``, which gVisor does not support rootless. No AppArmor/userns prep fixes that."""
+    raw = host.env.get("BLASTBOX_GVISOR_ROOTLESS", "").strip().lower()
+    if raw not in ("1", "true", "yes", "on"):
+        return None
+    return Check("gvisor-rootless", Status.FAIL,
+                 "BLASTBOX_GVISOR_ROOTLESS is set, but the warm gVisor tier needs `runsc "
+                 "restore`, which gVisor does not support rootless; the tier refuses to start. "
+                 "Run it rootful (unset BLASTBOX_GVISOR_ROOTLESS)", f"{DOC}#gvisor-runsc")
 
 
 def _check_kvm(host: HostView) -> Check:
@@ -651,6 +696,9 @@ def run_preflight(host: HostView, tiers: Sequence[str]) -> list[Check]:
         out.append(_check_docker_runsc(host))
     if "gvisor" in t:
         out.append(_check_runsc_binary(host))
+        rootless = _check_gvisor_rootless(host)
+        if rootless is not None:
+            out.append(rootless)
     if "firecracker" in t:
         out.append(_check_kvm(host))
         out.append(_check_firecracker(host))
