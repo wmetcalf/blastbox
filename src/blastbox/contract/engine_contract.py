@@ -16,6 +16,7 @@ import fnmatch
 import importlib
 import json
 import os
+import re
 import stat
 import sys
 import tomllib
@@ -305,21 +306,22 @@ def check_result(contract: EngineContract, result: Any, outdir: str | Path | Non
         # Whatever the harness's seal would refuse (a path escaping outdir through a symlinked
         # parent, an absolute or `..` path, the reserved metadata.json, a duplicate id, a dangling
         # ArtifactRef) turns every real job into engine_error; say so rather than re-implement it.
-        from .envelope import seal_envelope
-        from .leaf import Detection
+        from .envelope import envelope_from_json, seal_envelope
 
         _payload_nodes(result.payload)  # depth cap first: the seal's ref walk has none
-        # Seal exactly as the harness does (warnings verbatim). detected: the harness may use
-        # engine.detect()'s answer instead of result.detected, so a missing one is not judged.
-        detected = result.detected if result.detected is not None else Detection(
-            label="contract-check", mime="application/octet-stream", confidence=0.0,
-            source="contract-check")
+        # Sealed exactly as the harness does (everything verbatim), then parsed the way the host
+        # trust gate parses metadata.json (its JSON depth bound is tighter than the walker's).
         try:
-            seal_envelope(engine=contract.engine.name, outdir=Path(outdir), input_sha256="0" * 64,
-                          detected=detected, declared=list(result.artifacts),
-                          warnings=result.warnings, payload=result.payload, status=result.status)
+            env = seal_envelope(engine=contract.engine.name, outdir=Path(outdir),
+                                input_sha256="0" * 64, detected=result.detected,
+                                declared=list(result.artifacts), warnings=result.warnings,
+                                payload=result.payload, status=result.status)
+            envelope_from_json(env.model_dump_json(by_alias=True).encode())
         except (ValueError, OSError) as exc:
-            unsealable.append(Violation("unsealable", f"seal_envelope would refuse this result: {exc}"))
+            note = (" (detected is None: the harness accepts that only when engine.detect() "
+                    "supplies one at pre-detection)" if result.detected is None else "")
+            unsealable.append(Violation(
+                "unsealable", f"the harness seal or host trust gate would refuse this result{note}: {exc}"))
     for a in result.artifacts:
         size = None
         if outdir is not None:
@@ -372,6 +374,16 @@ def _contract_engine_name(path: Path) -> object:
     return name if isinstance(name, str) else None
 
 
+def _textual_engine_name(path: Path) -> str | None:
+    """The first ``name = "..."`` in a contract that does not parse (best effort)."""
+    try:
+        text = path.read_bytes()[:65536].decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    m = re.search(r'^\s*name\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
+    return m.group(1) if m else None
+
+
 def find_contract(start: str | Path, engine: str | None = None) -> Path | None:
     """Walk up from ``start`` to the nearest contract.
 
@@ -393,8 +405,15 @@ def find_contract(start: str | Path, engine: str | None = None) -> Path | None:
             name = _contract_engine_name(candidate)
             if name == engine:
                 return candidate
-            if name is _UNPARSEABLE and broken is None:
-                broken = candidate    # whose it is can't be told; keep looking first
+            if name is _UNPARSEABLE or name is None:
+                # Whose is it? A broken file that still SAYS name = "<engine>" is this engine's
+                # own (e.g. a worktree being edited): return it so load_contract reports the
+                # error. One that names nobody is the fallback if nothing matches further up.
+                claimed = _textual_engine_name(candidate)
+                if claimed == engine:
+                    return candidate
+                if claimed is None and broken is None:
+                    broken = candidate
     # No matching contract anywhere: hand back the nearest unparseable one so load_contract
     # reports its real error instead of a None TypeError.
     return broken

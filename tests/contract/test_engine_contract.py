@@ -571,12 +571,23 @@ def test_nul_byte_artifact_path_is_a_violation_not_a_crash(contract_path: Path, 
 
 
 def test_cyclic_payload_fails_fast_with_outdir(contract_path: Path, tmp_path: Path) -> None:
+    import signal
     from blastbox.contract import EmbeddedResource
     root = EmbeddedResource(embedded_path="", content_type="t", depth=0)
     root.children.append(root)
     r = DetonationResult(payload=root, artifacts=[], detected=DET)
-    with pytest.raises(ValueError, match="depth"):
-        check_result(load_contract(contract_path), r, _outdir(tmp_path))
+
+    def _hung(*_a: object) -> None:  # a regression must FAIL, not hang CI
+        raise AssertionError("check_result hung on a cyclic payload")
+
+    old = signal.signal(signal.SIGALRM, _hung)
+    signal.alarm(10)
+    try:
+        with pytest.raises(ValueError, match="depth"):
+            check_result(load_contract(contract_path), r, _outdir(tmp_path))
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
 
 
 def test_warnings_none_is_unsealable_like_the_harness(contract_path: Path, tmp_path: Path) -> None:
@@ -594,3 +605,56 @@ def test_reserved_metadata_json_any_spelling_is_refused(tmp_path: Path, spelling
         seal_envelope(engine="demo", outdir=out, input_sha256="0" * 64, detected=DET,
                       declared=[DeclaredArtifact(id="raw", path=spelling, kind="file")],
                       warnings=[], payload=Record())
+
+
+# --- marla round 4 (Claude lens) ----------------------------------------------------------
+
+def test_detected_none_is_unsealable(contract_path: Path, tmp_path: Path) -> None:
+    out = _outdir(tmp_path)
+    r = _result()
+    r.detected = None  # type: ignore[assignment]
+    v = [x for x in check_result(load_contract(contract_path), r, out) if x.code == "unsealable"]
+    assert v and "detect()" in v[0].detail
+
+
+def test_broken_own_contract_beats_a_same_engine_ancestor(tmp_path: Path) -> None:
+    (tmp_path / CONTRACT_FILENAME).write_text(CONTRACT)  # demo, valid
+    wt = tmp_path / ".worktrees" / "feat"
+    (wt / "tests").mkdir(parents=True)
+    (wt / CONTRACT_FILENAME).write_text(CONTRACT.replace('formats = ["ics"]', 'formats = ["ics"'))
+    assert find_contract(wt / "tests", "demo") == wt / CONTRACT_FILENAME
+
+
+def test_nameless_own_contract_is_returned_for_load_to_report(tmp_path: Path) -> None:
+    (tmp_path / "tests").mkdir()
+    (tmp_path / CONTRACT_FILENAME).write_text(CONTRACT.replace("[engine]", "[engin]"))
+    found = find_contract(tmp_path / "tests", "demo")
+    assert found == tmp_path / CONTRACT_FILENAME
+    with pytest.raises(ValueError, match="invalid engine contract"):
+        load_contract(found)
+
+
+def test_metadata_json_directory_is_reserved(tmp_path: Path) -> None:
+    out = _outdir(tmp_path)
+    (out / "metadata.json").mkdir()
+    (out / "metadata.json" / "x").write_text("x")
+    with pytest.raises(ValueError, match="reserved"):
+        seal_envelope(engine="demo", outdir=out, input_sha256="0" * 64, detected=DET,
+                      declared=[DeclaredArtifact(id="x", path="metadata.json/x", kind="file")],
+                      warnings=[], payload=Record())
+
+
+def test_payload_deeper_than_the_host_gate_is_unsealable(tmp_path: Path) -> None:
+    from blastbox.contract import EmbeddedResource
+    p = tmp_path / CONTRACT_FILENAME
+    p.write_text(CONTRACT.replace('root = "record"', 'root = "embedded_resource"')
+                 .replace('node_types = ["record", "page"]', 'node_types = ["embedded_resource"]')
+                 .replace('required_root_fields = ["schema_version"]\nschema_version = "demo/1"\n', '')
+                 .replace('required = true', 'required = false'))
+    root = cur = EmbeddedResource(embedded_path="", content_type="t", depth=0)
+    for k in range(1, 64):
+        nxt = EmbeddedResource(embedded_path=f"e{k}", content_type="t", depth=k)
+        cur.children.append(nxt)
+        cur = nxt
+    r = DetonationResult(payload=root, artifacts=[], detected=DET)
+    assert "unsealable" in {v.code for v in check_result(load_contract(p), r, _outdir(tmp_path))}
