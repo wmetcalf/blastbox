@@ -94,7 +94,9 @@ if __name__ == "__main__":
 The harness seals your declared artifacts (recomputing sha256/size from disk, confining paths,
 resolving references) and writes `metadata.json`. The host's `validate_worker_output` re-validates it.
 Complex engines build recursive `EmbeddedResource` trees (e.g. Tika's recursive metadata); simple
-ones use `Page`/`Record`. Engine-specific node subtypes register via `contract.register_node_type`.
+ones use `Page`/`Record`. A `contract.register_node_type` subtype can validate data inside the
+engine, but the host never imports engine modules and cannot parse it on the wire: seal it as a
+`Record` (see `engines/magika.py` `_sealed`).
 
 ## Install
 

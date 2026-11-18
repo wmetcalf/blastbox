@@ -318,8 +318,10 @@ def _host_cap_problems(env: Any, limits: Any, extra_bytes: int = 0) -> list[str]
     total_cap = getattr(limits, "max_total_artifact_bytes", None)
     total = sum(a.bytes for a in env.artifacts) + meta_len + extra_bytes
     if total_cap is not None and total > total_cap:
-        out.append(f"{total} output bytes (artifacts + metadata.json) exceed the host's "
-                   f"max_total_artifact_bytes {total_cap}")
+        parts = f"artifacts + metadata.json{' + undeclared files in outdir' if extra_bytes else ''}"
+        out.append(f"{total} output bytes ({parts}"
+                   f"{f', {extra_bytes} of them undeclared' if extra_bytes else ''}) exceed the "
+                   f"host's max_total_artifact_bytes {total_cap}")
     return out
 
 

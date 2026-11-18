@@ -243,7 +243,8 @@ def test_node_types_cover_metadata_and_nested_records(tmp_path: Path) -> None:
     assert any("'record'" in d for d in codes)
 
 
-def test_cli_imports_registration_modules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cli_imports_registration_modules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                          capsys: pytest.CaptureFixture[str]) -> None:
     """A custom node registered by the engine's own module is parseable once the CLI imports it."""
     mod = tmp_path / "demo_nodes_mod.py"
     mod.write_text(
@@ -272,6 +273,8 @@ def test_cli_imports_registration_modules(tmp_path: Path, monkeypatch: pytest.Mo
         # Parseable once imported -- but the host dispatcher never imports engine modules, so
         # the result is still reported as a node type the trust gate refuses.
         assert main(["check", "--import", "demo_nodes_mod", str(contract), str(env_json)]) == 1
+        # Parsed (so the import worked) and reported as a type the host cannot parse.
+        assert "host_unknown_node_type" in capsys.readouterr().out
         assert main(["check", "--import", "no_such_module_xyz", str(contract), str(env_json)]) == 1
     finally:
         from blastbox.contract import nodes
@@ -911,3 +914,26 @@ def test_textual_name_with_a_commented_engine_header(tmp_path: Path) -> None:
     (child / CONTRACT_FILENAME).write_text(CONTRACT.replace("[engine]", "[engine] # local engine")
                                            .replace('formats = ["ics"]', 'formats = ["ics"'))
     assert find_contract(child / "tests", "demo") == child / CONTRACT_FILENAME
+
+
+def test_check_envelope_applies_the_host_json_depth_gate(contract_path: Path, tmp_path: Path) -> None:
+    root = cur = Record(fields={"schema_version": "demo/1"})
+    for _ in range(70):
+        nxt = Record()
+        cur.fields["n"] = nxt
+        cur = nxt
+    out = _outdir(tmp_path)
+    r = _result()
+    env = seal_envelope(engine="demo", outdir=out, input_sha256="0" * 64, detected=DET,
+                        declared=r.artifacts, warnings=[], payload=root)
+    data = json.loads(env.model_dump_json(by_alias=True))
+    assert "unsealable" in {v.code for v in check_envelope(load_contract(contract_path), data)}
+
+
+def test_total_cap_message_names_undeclared_bytes(contract_path: Path, tmp_path: Path) -> None:
+    from blastbox.limits import Limits
+    out = _outdir(tmp_path)
+    (out / "scratch.bin").write_bytes(b"x" * 5000)
+    v = check_result(load_contract(contract_path), _result(), out,
+                     limits=Limits(max_total_artifact_bytes=4000))
+    assert any("undeclared" in x.detail for x in v)
