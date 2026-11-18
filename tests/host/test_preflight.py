@@ -1066,3 +1066,32 @@ def test_runc_with_nsjail_inner_sandbox_ignores_the_stock_bwrap_profile():
                     files={"/etc/apparmor.d/bwrap-userns-restrict": "profile bwrap ..."})
     assert _by_name(pf.run_preflight(host, ["docker"]))["bwrap-userns-restrict"].status \
         is Status.PASS
+
+
+# --- final sweep on #208 -------------------------------------------------------------------
+
+def test_remote_only_host_does_not_need_local_userns_for_the_sandbox_knob():
+    env = {"BLASTBOX_POOL_RUNTIME": "static", "BLASTBOX_SANDBOX": "bwrap"}
+    host = _healthy(env=env, files={"/proc/sys/user/max_user_namespaces": "0"})
+    assert _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env)))["userns"].status \
+        is not Status.FAIL
+
+
+def test_scratch_symlinked_into_tmp_warns():
+    host = _healthy(links={"/var/lib/blastbox/jobs": "/tmp/blastbox/jobs"})
+    c = _by_name(pf.run_preflight(host, ["docker"]))["scratch"]
+    assert c.status is Status.WARN and "/tmp" in c.detail
+
+
+def test_renamed_firecracker_binary_is_inspected():
+    host = _with_procs(_proc(300, ["/opt/fc/fc-v1.16", "--api-sock", "/s"], uid=10001,
+                             aa="unconfined\n", comm="fc-v1.16"),
+                       env={"BLASTBOX_FC_BIN": "/opt/fc/fc-v1.16"})
+    c = _by_name(pf.run_preflight(host, ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.WARN and "300" in c.detail
+
+
+def test_only_the_configured_sandboxs_profile_is_required():
+    host = _healthy(env={"BLASTBOX_SANDBOX": "nsjail"},
+                    files={"/sys/kernel/security/apparmor/profiles": "blastbox-nsjail (unconfined)\n"})
+    assert _by_name(pf.run_preflight(host, ["docker"]))["userns"].status is Status.PASS

@@ -587,7 +587,8 @@ def _check_snapshot_age(host: HostView) -> Check:
 def _needs_userns(env: Mapping[str, str], tiers: Collection[str] = ("docker",)) -> list[str]:
     why = []
     sandbox = env.get("BLASTBOX_SANDBOX", "").strip().lower()
-    if sandbox in ("bwrap", "nsjail"):
+    # A remote-only dispatcher runs no worker here: its sandbox knob is the remote host's concern.
+    if sandbox in ("bwrap", "nsjail") and set(tiers) - {"remote"}:
         why.append(f"BLASTBOX_SANDBOX={sandbox}")
     # Only the cold docker path reads BLASTBOX_WORKER_RUNTIME (runtime/docker.py).
     if "docker" in tiers and env.get("BLASTBOX_WORKER_RUNTIME", "").strip().lower() == "runc":
@@ -630,7 +631,9 @@ def _check_userns(host: HostView, tiers: Collection[str] = ("docker",)) -> Check
                      doc)
     if restrict == "1" and needs:
         loaded = _loaded_profiles(host)
-        wanted = {"blastbox-bwrap", "blastbox-nsjail"}
+        sandbox = host.env.get("BLASTBOX_SANDBOX", "").strip().lower()
+        wanted = ({f"blastbox-{sandbox}"} if sandbox in ("bwrap", "nsjail")
+                  else {"blastbox-bwrap", "blastbox-nsjail"})
         if loaded is not None and wanted <= loaded:
             mismatched = _profile_attachment_mismatches(host)
             if mismatched:
@@ -765,7 +768,9 @@ def _check_scratch(host: HostView, tiers: Sequence[str]) -> Check:
     for knob in knobs:
         if env.get(knob, "").strip():
             dirs.append((knob, env[knob].strip()))
-    on_tmp = [f"{k}={v}" for k, v in dirs if _under_tmp(v)]
+    # Resolved too: a job root symlinked into /tmp is under /tmp.
+    on_tmp = [f"{k}={v}" + ("" if _under_tmp(v) else f" (-> {host.realpath(v)})")
+              for k, v in dirs if _under_tmp(v) or _under_tmp(host.realpath(v))]
     if on_tmp:
         problems.append("under /tmp (tmpfiles cleanup / tmpfs size / reboot loses sealed "
                         "results): " + ", ".join(on_tmp))
@@ -812,6 +817,8 @@ def _sandbox_processes(host: HostView) -> list[_Proc]:
     itself with argv[0] ``runsc-sandbox``/``runsc-gofer``; its comm is often just ``exe``) or
     by comm. Reads only world-readable ``/proc/<pid>/cmdline`` and ``comm``."""
     found: list[_Proc] = []
+    # A renamed VMM (BLASTBOX_FC_BIN=/opt/fc/fc-v1.16) is still a firecracker.
+    fc_name = os.path.basename(host.env.get("BLASTBOX_FC_BIN", "").strip()) or None
     for pid in sorted((n for n in host.listdir("/proc") or [] if n.isdigit()), key=int):
         raw = host.read(f"/proc/{pid}/cmdline")
         argv = tuple(a for a in (raw or "").split("\0") if a)
@@ -819,7 +826,7 @@ def _sandbox_processes(host: HostView) -> list[_Proc]:
         if argv:
             names.add(os.path.basename(argv[0]))
         for role in (*_RUNSC_ROLES, "firecracker"):
-            if role in names:
+            if role in names or (role == "firecracker" and fc_name and fc_name in names):
                 found.append(_Proc(pid, role, argv))
                 break
     return found
