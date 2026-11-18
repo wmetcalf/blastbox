@@ -26,7 +26,10 @@ firecracker  the Firecracker warm/cold microVM tier
 remote       static / aws-*: the worker runs elsewhere; this host only dispatches
 ```
 
-Without `--tier`, preflight checks whatever `BLASTBOX_POOL_RUNTIME` selects; for `cascade` that is
+With nothing configured (`BLASTBOX_POOL_RUNTIME` unset) and no `--tier`, preflight previews every
+local tier, but a warm tier's FAIL is reported as a WARN ("not selected"): that dispatcher runs cold
+docker only. Pass `--tier` to gate on a tier. Otherwise, without `--tier`, preflight checks whatever
+`BLASTBOX_POOL_RUNTIME` selects; for `cascade` that is
 each member named in `BLASTBOX_POOL_TIERS` (local `firecracker` / `gvisor` members get their local
 checks, `static` / `aws-*` members map to `remote`). The cold docker tier is added only for a local
 (file-handshake) dispatcher that is not `BLASTBOX_DISPATCH_WARM_ONLY`: network-endpoint pools have
@@ -217,7 +220,8 @@ environment actually configures something that needs a user namespace on a tier 
 (`BLASTBOX_SANDBOX=bwrap|nsjail`; `BLASTBOX_WORKER_RUNTIME=runc` on the cold docker tier, the only
 one that reads it; `BLASTBOX_GVISOR_ROOTLESS` on the gvisor tier), and passes when the scoped profiles
 are visibly loaded (securityfs is root-only; run preflight as root to confirm). `max_user_namespaces=0`
-or `unprivileged_userns_clone=0` switches user namespaces off outright.
+or `unprivileged_userns_clone=0` switches user namespaces off outright: a FAIL only when something
+configured needs one, otherwise a fine hardening choice (PASS).
 
 AppArmor itself should be **enabled** (`/sys/module/apparmor/parameters/enabled` = `Y`): without it
 docker-default is not applied to runsc/worker processes and the `blastbox-sandbox` child profile
@@ -268,7 +272,8 @@ than the 24h idle timeout timed out on its first poll and exited without process
 (empty output, `metadata.json not found`). The worker now detects the jump and restarts its idle
 countdown, and `BLASTBOX_SNAPSHOT_MAX_AGE_S` (default 6h) refreshes warm bases before they age.
 
-- Do **not** set `BLASTBOX_SNAPSHOT_MAX_AGE_S=0` (preflight warns): it disables refresh.
+- Do **not** set `BLASTBOX_SNAPSHOT_MAX_AGE_S=0` (preflight warns): it disables refresh. A value of
+  a day or more also warns: bases then age past the restore clock-jump edge.
 - After upgrading blastbox, a host clock fix, or any long outage, **rebuild warm snapshots**
   (restart the warm sidecar so it re-checkpoints) rather than serving the old base.
 
@@ -293,14 +298,16 @@ Preflight reads `/proc/cpuinfo` and warns on flags with operational consequences
   `BLASTBOX_GVISOR_ROOT` sits under them.
 - The Firecracker slot scratch is hard-wired to `/tmp/blastbox-fc-slots` (no knob today): slot
   disks, sockets, and the warm base unless `BLASTBOX_SNAPSHOT_MEM_DIR` moves it. Preflight's
-  `fc-scratch` check warns when `/tmp` is a tmpfs on a Firecracker host; since there is no knob,
+  `fc-scratch` check warns when the mount holding `/tmp/blastbox-fc-slots` is a tmpfs; since there is no knob,
   `--ack fc-scratch` once the RAM budget is understood.
 - `BLASTBOX_JOB_ROOT` (dispatcher) and `BLASTBOX_GVISOR_ROOT` (warm gVisor tier) are read
   unstripped: set-but-empty means the process's working directory. Preflight warns on an empty or
   padded value.
 - A local tier that a cascade lists only as an **overflow** member is skipped by the dispatcher
-  when unavailable at startup, so its FAILs (`kvm`, `firecracker`, `fc-guest`, `runsc`,
-  `gvisor-rootfs`, `gvisor-rootless`) are reported as WARNs saying so.
+  when its startup gate fails, so those FAILs (`kvm` when `/dev/kvm` is missing, `firecracker`,
+  `fc-guest`, `runsc`, `gvisor-rootless`) are reported as WARNs saying so. A non-rw `/dev/kvm` or a
+  missing gVisor rootfs is not a startup gate (the tier is admitted and its spawns fail), so those
+  stay FAIL.
 - `BLASTBOX_JOB_ROOT` must be the same path for serve, dispatch and the worker mount, and must
   **not** be shared between a container dispatcher and a network-tier (aws/static) dispatcher
   (CONFIGURATION *Core*).
@@ -311,7 +318,8 @@ Preflight reads `/proc/cpuinfo` and warns on flags with operational consequences
 
 ## AWS and static workers
 
-A `remote` dispatcher host needs only the common checks (clock, scratch) plus network reach to its
+A `remote` dispatcher host needs only the common checks (pool-runtime, clock, scratch; preflight
+skips the AppArmor, userns and CPU-flag checks there) plus network reach to its
 workers. Each static box or cloud worker is its own host: prepare it as a **docker + gVisor** host
 (the worker image runs under runsc there) and run `blastbox preflight --tier docker` on it. AWS
 tiers are fail-closed on credentials and entitlement; see CONFIGURATION *Runtime: AWS*.

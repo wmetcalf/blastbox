@@ -267,12 +267,19 @@ def _sysctl(host: HostView, path: str) -> str | None:
     return raw.strip() if raw is not None else None
 
 
-def _tmpfs(host: HostView, mountpoint: str) -> bool:
+def _tmpfs(host: HostView, path: str) -> bool:
+    """Whether ``path`` lives on a tmpfs: the longest /proc/mounts mountpoint containing it, the
+    LAST such entry winning (an over-mount hides what is under it)."""
+    best, fstype = -1, ""
     for line in (host.read("/proc/mounts") or "").splitlines():
         parts = line.split()
-        if len(parts) >= 3 and parts[1] == mountpoint:
-            return parts[2] == "tmpfs"
-    return False
+        if len(parts) < 3:
+            continue
+        mnt = parts[1]
+        inside = path == mnt or path.startswith(mnt.rstrip("/") + "/")
+        if inside and len(mnt) >= best:
+            best, fstype = len(mnt), parts[2]
+    return fstype == "tmpfs"
 
 
 def _under_tmp(path: str) -> bool:
@@ -435,7 +442,8 @@ def _check_gvisor_rootfs(host: HostView) -> Check:
     entries = host.listdir(rootfs) if rootfs else None
     if entries:
         return Check("gvisor-rootfs", Status.PASS, f"rootfs {rootfs}")
-    selected = _primary_pool(host.env) == "gvisor"
+    pool = host.env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower()
+    selected = pool == "gvisor" or (pool == "cascade" and "gvisor" in _cascade_members(host.env))
     return Check("gvisor-rootfs", Status.FAIL if selected else Status.WARN,
                  f"gVisor rootfs {rootfs!r} is missing or empty: the warm tier cannot boot a base"
                  + ("" if selected else " (check from the gVisor dispatcher's environment)"),
@@ -576,6 +584,10 @@ def _check_snapshot_age(host: HostView) -> Check:
                      f"BLASTBOX_SNAPSHOT_MAX_AGE_S={raw} disables warm-base refresh: a checkpoint "
                      "restored long after it was taken sees its monotonic clock jump and "
                      "every job hangs (the ~24h warm outage)", doc)
+    if value >= 86400:
+        return Check("snapshot-age", Status.WARN,
+                     f"BLASTBOX_SNAPSHOT_MAX_AGE_S={raw}: warm bases may age a day or more before "
+                     "refresh, past the restore clock-jump edge (the ~24h warm outage)", doc)
     if raw and value == default and _float_or_none(raw) != default:
         return Check("snapshot-age", Status.WARN,
                      f"BLASTBOX_SNAPSHOT_MAX_AGE_S={raw!r} is invalid; the runtime ignores it "
@@ -588,14 +600,15 @@ def _needs_userns(env: Mapping[str, str], tiers: Collection[str] = ("docker",)) 
     why = []
     sandbox = env.get("BLASTBOX_SANDBOX", "").strip().lower()
     # A remote-only dispatcher runs no worker here: its sandbox knob is the remote host's concern.
-    if sandbox in ("bwrap", "nsjail") and set(tiers) - {"remote"}:
+    # The host-kernel inner sandbox runs only on the cold docker tier (FC guests have their own
+    # kernel, gVisor's Sentry implements namespaces itself; remote runs elsewhere).
+    if sandbox in ("bwrap", "nsjail") and "docker" in tiers:
         why.append(f"BLASTBOX_SANDBOX={sandbox}")
     # Only the cold docker path reads BLASTBOX_WORKER_RUNTIME (runtime/docker.py).
     if "docker" in tiers and env.get("BLASTBOX_WORKER_RUNTIME", "").strip().lower() == "runc":
         why.append("BLASTBOX_WORKER_RUNTIME=runc (inner nsjail/bwrap)")
-    # Only the warm gVisor tier reads it (gvisor_snapshot_runtime); the docker runsc path never does.
-    if "gvisor" in tiers and _truthy(env.get("BLASTBOX_GVISOR_ROOTLESS")):
-        why.append("BLASTBOX_GVISOR_ROOTLESS")
+    # BLASTBOX_GVISOR_ROOTLESS is not counted: the warm gVisor tier refuses it outright
+    # (gvisor-rootless FAIL), and it needs blastbox-runsc, not the bwrap/nsjail profiles.
     return why
 
 
@@ -624,7 +637,7 @@ def _check_userns(host: HostView, tiers: Collection[str] = ("docker",)) -> Check
         ("unprivileged_userns_clone", clone)) if v is not None) or "no userns sysctls readable"
     needs = _needs_userns(host.env, tiers)
     if max_ns == "0" or clone == "0":
-        status = Status.FAIL if needs else Status.WARN
+        status = Status.FAIL if needs else Status.PASS
         return Check("userns", status,
                      f"{shown}: unprivileged user namespaces are off; nsjail/bwrap inner "
                      f"sandboxes cannot start" + (f" ({'; '.join(needs)})" if needs else ""),
@@ -784,11 +797,11 @@ def _check_scratch(host: HostView, tiers: Sequence[str]) -> Check:
 def _check_fc_scratch(host: HostView) -> Check:
     """Separate from ``scratch`` so the unfixable hard-wired path can be ``--ack``ed alone."""
     doc = f"{DOC}#disk-and-scratch"
-    if _tmpfs(host, "/tmp"):
+    if _tmpfs(host, "/tmp/blastbox-fc-slots"):
         # FCConfig.scratch_root is hard-wired to /tmp/blastbox-fc-slots (no knob): every slot's
         # outdisk/in/sockets, and warm-*.mem unless BLASTBOX_SNAPSHOT_MEM_DIR moves it.
         return Check("fc-scratch", Status.WARN,
-                     "/tmp is tmpfs and the Firecracker slot scratch is hard-wired to "
+                     "tmpfs holds /tmp/blastbox-fc-slots: the Firecracker slot scratch is hard-wired to "
                      "/tmp/blastbox-fc-slots (slot disks, and warm-*.mem unless "
                      "BLASTBOX_SNAPSHOT_MEM_DIR is set): RAM-backed and capped", doc)
     return Check("fc-scratch", Status.PASS, "/tmp/blastbox-fc-slots is not on tmpfs")
@@ -979,7 +992,8 @@ def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc]) -> Check:
 
 _TIER_CHECKS = {
     "firecracker": ("kvm", "firecracker", "fc-guest"),
-    "gvisor": ("runsc", "gvisor-rootfs", "gvisor-rootless"),
+    # gvisor-rootfs is not a startup gate: the runtime boots a missing/unstamped rootfs anyway.
+    "gvisor": ("runsc", "gvisor-rootless"),
 }
 
 
@@ -1000,7 +1014,10 @@ def _downgrade_overflow(checks: list[Check], env: Mapping[str, str]) -> list[Che
     out = []
     for c in checks:
         tier = names.get(c.name)
-        if tier and c.status is Status.FAIL:
+        # firecracker_available() only checks that /dev/kvm EXISTS: a non-rw one is admitted
+        # and every spawn fails, so only "missing" is a skip.
+        gate = c.name != "kvm" or c.detail.startswith("/dev/kvm missing")
+        if tier and gate and c.status is Status.FAIL:
             c = Check(c.name, Status.WARN,
                       f"{c.detail} -- {tier} is an overflow tier of this cascade, so the "
                       "dispatcher skips it at startup and runs without it", c.doc)
@@ -1008,7 +1025,21 @@ def _downgrade_overflow(checks: list[Check], env: Mapping[str, str]) -> list[Che
     return out
 
 
-def run_preflight(host: HostView, tiers: Sequence[str]) -> list[Check]:
+def _downgrade_unselected(checks: list[Check], env: Mapping[str, str]) -> list[Check]:
+    """Without --tier and with no pool configured, the local tiers are checked as a preview: the
+    dispatcher (BLASTBOX_POOL_RUNTIME unset = none) runs cold docker only, so a warm tier's FAIL
+    is advice, not a refusal."""
+    if env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower() not in ("", "none"):
+        return checks
+    names = {n for tier_checks in _TIER_CHECKS.values() for n in tier_checks} | {
+        "gvisor-rootfs"}
+    return [Check(c.name, Status.WARN,
+                  f"{c.detail} -- not selected: BLASTBOX_POOL_RUNTIME is unset, so the dispatcher "
+                  "runs cold docker only (check with --tier to gate on it)", c.doc)
+            if c.name in names and c.status is Status.FAIL else c for c in checks]
+
+
+def run_preflight(host: HostView, tiers: Sequence[str], *, explicit: bool = True) -> list[Check]:
     """Run every check relevant to ``tiers``. Pure reads; never raises on host state."""
     t = set(tiers)
     out: list[Check] = []
@@ -1042,15 +1073,19 @@ def run_preflight(host: HostView, tiers: Sequence[str]) -> list[Check]:
         if t & {"docker", "gvisor"}:
             out.append(_check_runsc_host_root(host, procs))
         out.append(_check_sandbox_confinement(host, procs))
-    out.append(_check_apparmor(host))
-    out.append(_check_bwrap_stock_profile(host, t))
-    out.append(_check_userns(host, t))
+    local = bool(t - {"remote"})
+    if local:   # a remote-only dispatcher runs no worker, runsc or JVM engine here
+        out.append(_check_apparmor(host))
+        out.append(_check_bwrap_stock_profile(host, t))
+        out.append(_check_userns(host, t))
     out.append(_check_clock(host))
-    out.append(_check_cpu_flags(host))
+    if local:
+        out.append(_check_cpu_flags(host))
     out.append(_check_scratch(host, tiers))
     if "firecracker" in t:
         out.append(_check_fc_scratch(host))
-    return _downgrade_overflow(out, host.env)
+    out = _downgrade_overflow(out, host.env)
+    return out if explicit else _downgrade_unselected(out, host.env)
 
 
 # --- output -----------------------------------------------------------------------------

@@ -363,14 +363,14 @@ def test_clock_unknown_warns_rather_than_passing():
 
 def test_avx512_vbmi_warns_about_the_jvm_base64_intrinsic():
     host = _healthy(files={"/proc/cpuinfo": "flags\t: fpu avx512f avx512vbmi avx512_vbmi2\n"})
-    c = _by_name(pf.run_preflight(host, ["remote"]))["cpu-flags"]
+    c = _by_name(pf.run_preflight(host, ["docker"]))["cpu-flags"]
     assert c.status is Status.WARN
     assert "-XX:-UseBASE64Intrinsics" in c.detail
 
 
 def test_avx512_vbmi2_alone_is_not_mistaken_for_vbmi():
     host = _healthy(files={"/proc/cpuinfo": "flags\t: fpu avx512_vbmi2\n"})
-    c = _by_name(pf.run_preflight(host, ["remote"]))["cpu-flags"]
+    c = _by_name(pf.run_preflight(host, ["docker"]))["cpu-flags"]
     assert c.status is Status.PASS
 
 
@@ -1036,11 +1036,13 @@ def test_rootless_gvisor_knob_is_a_userns_need_only_on_the_gvisor_tier():
 def test_fc_overflow_problems_warn_because_the_dispatcher_skips_the_tier(drop):
     env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2",
            "BLASTBOX_POOL_WARM_SNAPSHOT": "1"}
-    host = _healthy(env=env, kernels={"/var/lib/blastbox/fc/vmlinux": (5, 10)}, rw=set())
+    host = _healthy(env=env, kernels={"/var/lib/blastbox/fc/vmlinux": (5, 10)},
+                    paths={"/var/lib/blastbox/jobs", "/var/lib/blastbox/fc/vmlinux",
+                           "/var/lib/blastbox/fc/rootfs.ext4", "/var/lib/blastbox/gvisor-rootfs/x"})
     for k in drop:
         del host.env[k]
     by = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env)))
-    for name in ("fc-guest", "kvm"):
+    for name in ("fc-guest", "kvm"):   # kvm here: /dev/kvm missing, a startup gate
         assert by[name].status is Status.WARN, (name, by[name])
         assert "skips" in by[name].detail
 
@@ -1073,8 +1075,8 @@ def test_runc_with_nsjail_inner_sandbox_ignores_the_stock_bwrap_profile():
 def test_remote_only_host_does_not_need_local_userns_for_the_sandbox_knob():
     env = {"BLASTBOX_POOL_RUNTIME": "static", "BLASTBOX_SANDBOX": "bwrap"}
     host = _healthy(env=env, files={"/proc/sys/user/max_user_namespaces": "0"})
-    assert _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env)))["userns"].status \
-        is not Status.FAIL
+    checks = pf.run_preflight(host, pf.resolve_tiers([], host.env))
+    assert all(c.status is not Status.FAIL for c in checks if c.name == "userns")
 
 
 def test_scratch_symlinked_into_tmp_warns():
@@ -1095,3 +1097,66 @@ def test_only_the_configured_sandboxs_profile_is_required():
     host = _healthy(env={"BLASTBOX_SANDBOX": "nsjail"},
                     files={"/sys/kernel/security/apparmor/profiles": "blastbox-nsjail (unconfined)\n"})
     assert _by_name(pf.run_preflight(host, ["docker"]))["userns"].status is Status.PASS
+
+
+# --- full-PR sweep on #208 -----------------------------------------------------------------
+
+def test_default_tiers_on_an_unconfigured_host_warn_rather_than_fail_unselected_tiers():
+    host = _healthy(paths={"/var/lib/blastbox/jobs"}, rw=set())
+    host.executables.pop("firecracker")
+    checks = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False)
+    by = _by_name(checks)
+    assert by["kvm"].status is Status.WARN and by["firecracker"].status is Status.WARN
+    assert "not selected" in by["firecracker"].detail
+    assert pf.exit_code(checks) == 0
+    # An explicit --tier keeps FAIL: the operator asked about that tier.
+    assert _by_name(pf.run_preflight(host, ["firecracker"]))["kvm"].status is Status.FAIL
+
+
+@pytest.mark.parametrize("mounts,status", [
+    ("/dev/sda1 /tmp ext4 rw 0 0\ntmpfs /tmp/blastbox-fc-slots tmpfs rw 0 0\n", Status.WARN),
+    ("tmpfs /tmp tmpfs rw 0 0\n/dev/sdb1 /tmp/blastbox-fc-slots ext4 rw 0 0\n", Status.PASS),
+    ("/dev/sda1 /tmp ext4 rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n", Status.WARN),
+    ("tmpfs / tmpfs rw 0 0\n", Status.WARN),
+])
+def test_fc_scratch_resolves_the_mount_holding_the_slot_dir(mounts, status):
+    c = _by_name(pf.run_preflight(_healthy(mounts=mounts), ["firecracker"]))["fc-scratch"]
+    assert c.status is status, c.detail
+
+
+def test_overflow_downgrade_keeps_fails_the_runtime_does_not_gate_on():
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "firecracker:2,gvisor:2"}
+    host = _healthy(env=env, paths={"/var/lib/blastbox/jobs"})
+    by = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env)))
+    assert by["gvisor-rootfs"].status is Status.FAIL     # the runtime boots it anyway
+    env2 = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2"}
+    host2 = _healthy(env=env2, rw=set())
+    assert _by_name(pf.run_preflight(host2, pf.resolve_tiers([], host2.env)))["kvm"].status \
+        is Status.FAIL                                   # present but not rw: spawns fail
+
+
+def test_sandbox_knob_needs_host_userns_only_on_the_docker_tier():
+    env = {"BLASTBOX_POOL_RUNTIME": "firecracker", "BLASTBOX_DISPATCH_WARM_ONLY": "1",
+           "BLASTBOX_SANDBOX": "nsjail"}
+    host = _healthy(env=env, files={"/proc/sys/user/max_user_namespaces": "0"})
+    assert _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env)))["userns"].status \
+        is Status.PASS
+
+
+def test_userns_off_with_nothing_needing_it_passes():
+    host = _healthy(files={"/proc/sys/kernel/unprivileged_userns_clone": "0\n"})
+    assert _by_name(pf.run_preflight(host, ["docker"]))["userns"].status is Status.PASS
+
+
+@pytest.mark.parametrize("value,status", [("86400", Status.WARN), ("172800", Status.WARN),
+                                          ("43200", Status.PASS)])
+def test_snapshot_age_past_a_day_warns(value, status):
+    host = _healthy(env={"BLASTBOX_SNAPSHOT_MAX_AGE_S": value})
+    assert _by_name(pf.run_preflight(host, ["gvisor"]))["snapshot-age"].status is status
+
+
+def test_remote_only_hosts_skip_local_worker_checks():
+    host = _healthy(files={"/proc/cpuinfo": "flags\t: avx512vbmi\n"})
+    del host.files["/sys/module/apparmor/parameters/enabled"]
+    names = {c.name for c in pf.run_preflight(host, ["remote"])}
+    assert not names & {"apparmor", "cpu-flags", "bwrap-userns-restrict", "userns"}

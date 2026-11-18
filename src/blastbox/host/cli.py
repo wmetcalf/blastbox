@@ -2883,7 +2883,7 @@ def _preflight_cmd(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"preflight: {exc}", file=sys.stderr)
         return 2
-    checks = pf.run_preflight(host, tiers)
+    checks = pf.run_preflight(host, tiers, explicit=bool(args.tier))
     if args.json:
         print(pf.render_json(checks, tiers, strict=bool(args.strict), ack=set(args.ack)))
     else:
