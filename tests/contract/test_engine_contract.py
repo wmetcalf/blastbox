@@ -658,3 +658,19 @@ def test_payload_deeper_than_the_host_gate_is_unsealable(tmp_path: Path) -> None
         cur = nxt
     r = DetonationResult(payload=root, artifacts=[], detected=DET)
     assert "unsealable" in {v.code for v in check_result(load_contract(p), r, _outdir(tmp_path))}
+
+
+def test_walker_descends_other_collections() -> None:
+    from collections import deque
+    from typing import Literal
+    from pydantic import Field
+    from blastbox.contract.engine_contract import _payload_nodes
+    from blastbox.contract.nodes import _Node
+
+    class Holder(_Node):
+        type: Literal["holder_t"] = Field(default="holder_t", alias="_type")
+        q: deque[Record] = Field(default_factory=deque)
+        s: frozenset[str] = frozenset()
+
+    h = Holder(q=deque([Record(fields={"a": 1})]), s=frozenset({"x"}))
+    assert [getattr(n, "type") for n in _payload_nodes(h)] == ["holder_t", "record"]

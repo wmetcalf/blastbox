@@ -12,6 +12,7 @@ output mapper and should check they reference an engine that ships a contract.
 from __future__ import annotations
 
 import dataclasses
+from collections import deque
 import fnmatch
 import importlib
 import json
@@ -196,12 +197,12 @@ def _payload_nodes(root: object) -> list[object]:
             items = [getattr(value, f.name, None) for f in dataclasses.fields(value)]
         elif isinstance(value, dict):
             items = list(value.values())
-        elif isinstance(value, (list, tuple)):
+        elif isinstance(value, (list, tuple, set, frozenset, deque)):
             items = list(value)
         else:
             continue
         stack.extend((item, depth + 1) for item in reversed(items)
-                     if isinstance(item, (BaseModel, dict, list, tuple))
+                     if isinstance(item, (BaseModel, dict, list, tuple, set, frozenset, deque))
                      or (dataclasses.is_dataclass(item) and not isinstance(item, type)))
     return found
 
