@@ -367,6 +367,12 @@ def _check_pool_runtime(host: HostView) -> Check | None:
     tier preflight would have checked for it is unknowable, so say so instead of passing."""
     doc = f"{DOC}#what-each-tier-needs"
     pool = host.env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower()
+    warm_only = host.env.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower() in (
+        "1", "true", "yes", "on")
+    if warm_only and pool in ("", "none"):
+        return Check("pool-runtime", Status.FAIL,
+                     "BLASTBOX_DISPATCH_WARM_ONLY is set but there is no warm pool "
+                     "(BLASTBOX_POOL_RUNTIME unset/none); the dispatcher refuses to start", doc)
     if not pool:
         return None
     if pool not in _KNOWN_POOL_RUNTIMES:
@@ -848,7 +854,9 @@ def run_preflight(host: HostView, tiers: Sequence[str]) -> list[Check]:
     pool = _check_pool_runtime(host)
     if pool is not None:
         out.append(pool)
-    if t & {"docker", "gvisor"}:
+    if "docker" in t:
+        # The warm gVisor tier drives runsc directly against an exported rootfs; docker is
+        # needed only for the cold docker tier.
         out.append(_check_docker(host))
         out.append(_check_docker_runsc(host))
     if "gvisor" in t:

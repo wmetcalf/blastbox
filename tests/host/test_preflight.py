@@ -241,7 +241,7 @@ def test_disabled_snapshot_refresh_warns_about_aged_checkpoints():
 def test_runsc_not_registered_with_docker_fails_and_says_reload_not_restart():
     host = _healthy(commands={("/usr/bin/docker", "info", "--format", "{{json .Runtimes}}"):
                               (0, '{"runc":{"path":"runc"}}\n', "")})
-    c = _by_name(pf.run_preflight(host, ["gvisor"]))["docker-runsc-runtime"]
+    c = _by_name(pf.run_preflight(host, ["docker"]))["docker-runsc-runtime"]
     assert c.status is Status.FAIL
     assert "systemctl reload docker" in c.detail
 
@@ -852,3 +852,20 @@ def test_stock_bwrap_profile_only_warns_when_something_nests_bwrap():
 def test_kvm_as_root_says_the_dispatcher_user_is_unverified():
     c = _by_name(pf.run_preflight(_healthy(euid=0), ["firecracker"]))["kvm"]
     assert c.status is Status.PASS and "dispatcher user" in c.detail
+
+
+def test_warm_only_gvisor_does_not_need_docker():
+    env = {"BLASTBOX_POOL_RUNTIME": "gvisor", "BLASTBOX_DISPATCH_WARM_ONLY": "1"}
+    host = _healthy(env=env, executables={"runsc": "/usr/bin/runsc"})
+    tiers = pf.resolve_tiers([], env)
+    names = {c.name for c in pf.run_preflight(host, tiers)}
+    assert tiers == ["gvisor"] and "docker" not in names and "docker-runsc-runtime" not in names
+
+
+@pytest.mark.parametrize("pool", ["none", ""])
+def test_warm_only_without_a_pool_fails(pool):
+    env = {"BLASTBOX_DISPATCH_WARM_ONLY": "1"}
+    if pool:
+        env["BLASTBOX_POOL_RUNTIME"] = pool
+    c = _by_name(pf.run_preflight(_healthy(env=env), pf.resolve_tiers([], env)))["pool-runtime"]
+    assert c.status is Status.FAIL and "WARM_ONLY" in c.detail

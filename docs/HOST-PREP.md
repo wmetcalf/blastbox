@@ -40,11 +40,11 @@ no cold path. The `pool-runtime` check FAILs a pool name or cascade spec the dis
 
 | Tier | Needs on the host | Preflight checks |
 |---|---|---|
-| **docker** (cold) | docker daemon, `runsc` registered as a docker runtime (fail-closed without it) | `docker`, `docker-runsc-runtime` |
-| **gvisor** (warm C/R) | the above + the `runsc` binary (driven directly; root) | + `runsc`, `snapshot-age` |
-| **firecracker** (warm/cold) | `/dev/kvm` read/write, `firecracker` ≥ 1.15.1, guest kernel + rootfs | `kvm`, `firecracker`, `fc-guest`, `snapshot-age` |
+| **docker** (cold) | docker daemon, `runsc` registered as a docker runtime (fail-closed without it) | `docker`, `docker-runsc-runtime`, `runsc-host-root`, `sandbox-confinement` |
+| **gvisor** (warm C/R) | the `runsc` binary with checkpoint/restore (driven directly, no docker; root) | `runsc`, `gvisor-rootless`, `snapshot-age`, `runsc-host-root`, `sandbox-confinement` |
+| **firecracker** (warm/cold) | `/dev/kvm` read/write, `firecracker` ≥ 1.15.1, guest kernel + rootfs | `kvm`, `firecracker`, `fc-guest`, `snapshot-age`, `sandbox-confinement` |
 | **remote** (static / AWS) | nothing runtime-specific locally; the remote box runs the worker image under its own runsc | common checks only (no docker: no cold path) |
-| every tier | AppArmor state known, synced clock, CPU flags reviewed, scratch off `/tmp` | `apparmor`, `bwrap-userns-restrict`, `userns`, `clock`, `cpu-flags`, `scratch` |
+| every tier | a pool the dispatcher accepts, AppArmor state known, synced clock, CPU flags reviewed, scratch off `/tmp` | `pool-runtime`, `apparmor`, `bwrap-userns-restrict`, `userns`, `clock`, `cpu-flags`, `scratch` |
 
 Prefer the **warm Firecracker** tier where KVM exists: it is the stronger boundary and, with
 memory snapshots, the faster warm path. gVisor is the fallback for hosts without KVM.
