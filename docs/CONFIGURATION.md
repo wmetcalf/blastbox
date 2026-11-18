@@ -462,6 +462,11 @@ registered a different one, in either boot order, including local-versus-remote.
 | `BLASTBOX_MAX_TOTAL_ARTIFACTS` | `524288000` (500 MiB) | Max **total bytes** across all artifacts (a byte cap, despite the name — not a count). |
 | `BLASTBOX_MAX_ARTIFACTS` | `1000` | Max **number** of artifacts. |
 
+The dispatcher forwards its `BLASTBOX_MAX_METADATA`, `BLASTBOX_MAX_ARTIFACT`,
+`BLASTBOX_MAX_TOTAL_ARTIFACTS` and `BLASTBOX_MAX_ARTIFACTS` to every cold worker and remote agent
+(dispatcher-owned: a job param cannot set them), so an engine sizes its output to the cap the host
+trust gate enforces. Set them on the dispatcher.
+
 ## Worker in-process sandbox + nono
 
 | Var | Default | Notes |
