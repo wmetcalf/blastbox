@@ -180,6 +180,9 @@ def _check(contract: EngineContract, *, engine: str | None, status: str,
         for t in sorted(seen - allowed):
             out.append(Violation("undeclared_node_type", f"payload contains {t!r}, not in contract node_types"))
         fields = getattr(payload, "fields", None)
+        if fields is None:
+            # Non-Record roots (EmbeddedResource) carry their typed bag in `metadata`.
+            fields = getattr(getattr(payload, "metadata", None), "fields", None)
         if isinstance(fields, dict):
             for name in contract.payload.required_root_fields:
                 if name not in fields:
@@ -189,7 +192,7 @@ def _check(contract: EngineContract, *, engine: str | None, status: str,
                 out.append(Violation("schema_version",
                                      f"payload {schema_key} {fields.get(schema_key)!r}, contract {want!r}"))
         elif contract.payload.required_root_fields or contract.payload.schema_version:
-            out.append(Violation("missing_root_field", "contract requires root fields but the root is not a Record"))
+            out.append(Violation("missing_root_field", "contract requires root fields but the root has no Record fields or metadata"))
     return out
 
 
@@ -235,13 +238,16 @@ def assert_conforms(contract: EngineContract, result: Any, outdir: str | Path | 
                              + "\n".join(f"  {p}" for p in problems))
 
 
-def find_contract(start: str | Path) -> Path | None:
-    """Walk up from ``start`` to the nearest ``blastbox-engine.toml``."""
+def find_contract(start: str | Path, engine: str | None = None) -> Path | None:
+    """Walk up from ``start`` to the nearest contract. With ``engine``, a multi-engine repo's
+    ``blastbox-engine.<engine>.toml`` is preferred over a plain ``blastbox-engine.toml``."""
     here = Path(start).resolve()
+    names = ([f"blastbox-engine.{engine}.toml"] if engine else []) + [CONTRACT_FILENAME]
     for d in (here, *here.parents):
-        candidate = d / CONTRACT_FILENAME
-        if candidate.is_file():
-            return candidate
+        for name in names:
+            candidate = d / name
+            if candidate.is_file():
+                return candidate
     return None
 
 

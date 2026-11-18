@@ -17,7 +17,7 @@ contract makes the second checkable.
 
 ## 2. The contract (`blastbox-engine.toml`, checked by your tests)
 
-At the engine repo root (built-ins: `src/blastbox/engines/contracts/<name>.toml`). Schema
+At the engine repo root; a repo with several engines uses `blastbox-engine.<engine>.toml` (found by `find_contract(path, engine)`). Built-ins: `src/blastbox/engines/contracts/<name>.toml`. Schema
 `blastbox-engine-contract/1`, parsed by `blastbox.contract.engine_contract`:
 
 ```text
@@ -27,7 +27,8 @@ At the engine repo root (built-ins: `src/blastbox/engines/contracts/<name>.toml`
                 description — every artifact family the engine can declare
 [payload]       root node type, node_types allowed anywhere in the tree,
                 required_root_fields, schema_version (+ schema_field, default
-                "schema_version") for Record roots
+                "schema_version"); checked on a Record root's fields or an
+                EmbeddedResource root's metadata fields
 [[detections]]  code, severity (info low medium high critical), source — findings a
                 consumer is expected to turn into detections, with stable codes
 [[gaps]]        id, description — what the output cannot express today (free-text

@@ -171,6 +171,29 @@ def test_find_contract(contract_path: Path) -> None:
     assert find_contract(nested) == contract_path
 
 
+def test_find_contract_multi_engine(tmp_path: Path) -> None:
+    (tmp_path / "blastbox-engine.email-render.toml").write_text(CONTRACT)
+    nested = tmp_path / "src"
+    nested.mkdir()
+    assert find_contract(nested, "email-render") == tmp_path / "blastbox-engine.email-render.toml"
+    assert find_contract(nested) is None
+
+
+def test_required_fields_on_embedded_resource_root(tmp_path: Path) -> None:
+    from blastbox.contract import EmbeddedResource
+    p = tmp_path / CONTRACT_FILENAME
+    p.write_text(CONTRACT.replace('root = "record"', 'root = "embedded_resource"')
+                 .replace('node_types = ["record", "page"]', 'node_types = ["embedded_resource", "record", "page"]'))
+    c = load_contract(p)
+    def res(meta: dict) -> DetonationResult:
+        root = EmbeddedResource(embedded_path="", content_type="message/rfc822", depth=0,
+                                metadata=Record(fields=meta))
+        return DetonationResult(payload=root, artifacts=[DeclaredArtifact(id="manifest", path="manifest.json", kind="file")],
+                                detected=DET)
+    assert check_result(c, res({"schema_version": "demo/1"})) == []
+    assert {v.code for v in check_result(c, res({}))} == {"missing_root_field", "schema_version"}
+
+
 def test_builtin_engines_ship_contracts() -> None:
     """Every engine bundled in blastbox has a contract next to it and the contract validates."""
     root = Path(__file__).resolve().parents[2] / "src" / "blastbox" / "engines"
