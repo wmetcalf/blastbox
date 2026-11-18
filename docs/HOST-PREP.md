@@ -43,7 +43,7 @@ which the dispatcher skips at startup.
 | Tier | Needs on the host | Preflight checks |
 |---|---|---|
 | **docker** (cold) | docker daemon, `runsc` registered as a docker runtime (fail-closed without it) | `docker`, `docker-runsc-runtime`, `runsc-host-root`, `sandbox-confinement` |
-| **gvisor** (warm C/R) | the `runsc` binary with checkpoint/restore (driven directly, no docker; root) | `runsc`, `gvisor-rootless`, `snapshot-age`, `runsc-host-root`, `sandbox-confinement` |
+| **gvisor** (warm C/R) | the `runsc` binary with checkpoint/restore (driven directly, no docker; root) | `runsc`, `gvisor-rootfs`, `gvisor-rootless`, `snapshot-age`, `runsc-host-root`, `sandbox-confinement` |
 | **firecracker** (warm/cold) | `/dev/kvm` read/write, `firecracker` ≥ 1.15.1, guest kernel + rootfs | `kvm`, `firecracker`, `fc-guest`, `snapshot-age`, `sandbox-confinement`, `fc-scratch` |
 | **remote** (static / AWS) | nothing runtime-specific locally; the remote box runs the worker image under its own runsc | common checks only (no docker: no cold path) |
 | every tier | a pool the dispatcher accepts, AppArmor state known, synced clock, CPU flags reviewed, scratch off `/tmp` | `pool-runtime`, `apparmor`, `bwrap-userns-restrict`, `userns`, `clock`, `cpu-flags`, `scratch` |

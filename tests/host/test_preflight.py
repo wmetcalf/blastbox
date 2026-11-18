@@ -104,7 +104,7 @@ def _healthy(**over) -> FakeHost:
             "/proc/cpuinfo": "processor\t: 0\nflags\t\t: fpu sse2 avx2 avx512f\n",
         },
         paths={"/dev/kvm", "/var/lib/blastbox/jobs", "/var/lib/blastbox/fc/vmlinux",
-               "/var/lib/blastbox/fc/rootfs.ext4"},
+               "/var/lib/blastbox/fc/rootfs.ext4", "/var/lib/blastbox/gvisor-rootfs/bin/sh"},
         rw={"/dev/kvm"},
         executables={
             "docker": "/usr/bin/docker",
@@ -1009,3 +1009,14 @@ def test_non_apparmor_label_says_no_apparmor_label_not_run_as_root():
 def test_empty_or_padded_gvisor_root_warns(value):
     c = _by_name(pf.run_preflight(_healthy(env={"BLASTBOX_GVISOR_ROOT": value}), ["gvisor"]))
     assert c["scratch"].status is Status.WARN
+
+
+def test_gvisor_rootfs_missing_fails_when_this_env_selects_gvisor():
+    env = {"BLASTBOX_POOL_RUNTIME": "gvisor"}
+    bare = {"paths": {"/var/lib/blastbox/jobs"}}
+    c = _by_name(pf.run_preflight(_healthy(env=env, **bare), ["gvisor"]))["gvisor-rootfs"]
+    assert c.status is Status.FAIL and "/var/lib/blastbox/gvisor-rootfs" in c.detail
+    assert _by_name(pf.run_preflight(_healthy(**bare), ["gvisor"]))["gvisor-rootfs"].status \
+        is Status.WARN
+    ok = _healthy(env=env, paths={"/var/lib/blastbox/gvisor-rootfs/bin/sh", "/var/lib/blastbox/jobs"})
+    assert _by_name(pf.run_preflight(ok, ["gvisor"]))["gvisor-rootfs"].status is Status.PASS

@@ -427,6 +427,21 @@ def _check_pool_runtime(host: HostView) -> Check | None:
     return Check("pool-runtime", Status.PASS, f"BLASTBOX_POOL_RUNTIME={pool}")
 
 
+def _check_gvisor_rootfs(host: HostView) -> Check:
+    """The exported rootfs tree the warm gVisor tier boots its base from (read exactly as
+    gvisor_snapshot_runtime does: raw, default /var/lib/blastbox/gvisor-rootfs)."""
+    doc = f"{DOC}#gvisor-runsc"
+    rootfs = host.env.get("BLASTBOX_GVISOR_ROOTFS", "/var/lib/blastbox/gvisor-rootfs")
+    entries = host.listdir(rootfs) if rootfs else None
+    if entries:
+        return Check("gvisor-rootfs", Status.PASS, f"rootfs {rootfs}")
+    selected = _primary_pool(host.env) == "gvisor"
+    return Check("gvisor-rootfs", Status.FAIL if selected else Status.WARN,
+                 f"gVisor rootfs {rootfs!r} is missing or empty: the warm tier cannot boot a base"
+                 + ("" if selected else " (check from the gVisor dispatcher's environment)"),
+                 doc)
+
+
 def _check_gvisor_rootless(host: HostView) -> Check | None:
     """The warm gVisor tier refuses BLASTBOX_GVISOR_ROOTLESS outright: it needs ``runsc
     restore``, which gVisor does not support rootless. No AppArmor/userns prep fixes that."""
@@ -955,6 +970,7 @@ def run_preflight(host: HostView, tiers: Sequence[str]) -> list[Check]:
         out.append(_check_docker_runsc(host))
     if "gvisor" in t:
         out.append(_check_runsc_binary(host))
+        out.append(_check_gvisor_rootfs(host))
         rootless = _check_gvisor_rootless(host)
         if rootless is not None:
             out.append(rootless)
