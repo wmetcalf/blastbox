@@ -374,6 +374,11 @@ def check_envelope(contract: EngineContract, envelope: Any, *, limits: Any = Non
         if parts and (parts[0] == "metadata.json" or parts[0].startswith(".metadata.json.")):
             caps.append(Violation("reserved_path", f"{a.id} at {a.path}: the seal refuses the "
                                   "reserved root metadata.json"))
+    for a in env.artifacts:
+        pp = PurePosixPath(a.path)
+        if pp.is_absolute() or ".." in pp.parts:
+            caps.append(Violation("unsealable", f"{a.id} at {a.path}: not confined to outdir (the "
+                                  "host re-seal refuses absolute and '..' paths)"))
     ids = [a.id for a in env.artifacts]
     dups = sorted({i for i in ids if ids.count(i) > 1})
     if dups:

@@ -971,3 +971,19 @@ def test_check_envelope_refuses_unresolved_refs_and_duplicate_ids(contract_path:
     data2 = _sealed_dict(_outdir(tmp_path / "b"), _result())
     data2["artifacts"].append(dict(data2["artifacts"][0]))
     assert "unsealable" in {v.code for v in check_envelope(c, data2)}
+
+
+@pytest.mark.parametrize("path", ["../outside.bin", "/tmp/outside.bin", "a/../../b"])
+def test_check_envelope_refuses_unconfined_paths(contract_path: Path, tmp_path: Path, path: str) -> None:
+    contract_path.write_text(CONTRACT.replace('''[[artifacts]]
+id = "manifest"''', '''[[artifacts]]
+id = "x"
+path = "*"
+kind = "file"
+max_count = 0
+
+[[artifacts]]
+id = "manifest"'''))
+    data = _sealed_dict(_outdir(tmp_path), _result())
+    data["artifacts"].append({"id": "x", "path": path, "kind": "file", "sha256": "0" * 64, "bytes": 1})
+    assert "unsealable" in {v.code for v in check_envelope(load_contract(contract_path), data)}
