@@ -465,7 +465,10 @@ registered a different one, in either boot order, including local-versus-remote.
 The dispatcher forwards its `BLASTBOX_MAX_METADATA`, `BLASTBOX_MAX_ARTIFACT`,
 `BLASTBOX_MAX_TOTAL_ARTIFACTS` and `BLASTBOX_MAX_ARTIFACTS` to every cold worker and remote agent
 (dispatcher-owned: a job param cannot set them), so an engine sizes its output to the cap the host
-trust gate enforces. Set them on the dispatcher.
+trust gate enforces. Set them on the dispatcher. The local **warm** tiers (gVisor / Firecracker
+snapshot slots) build their limits once from the guest env frozen into the base: set the same values
+there too (`BLASTBOX_GVISOR_EXTRA_ENV`, or the Firecracker guest `.env`), or warm and cold results
+of one engine can differ.
 
 ## Worker in-process sandbox + nono
 

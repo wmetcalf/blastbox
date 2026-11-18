@@ -2122,8 +2122,8 @@ def test_net_egress_env_reflects_personality(tmp_path, monkeypatch):
 
 def test_cold_worker_gets_the_hosts_output_caps(tmp_path):
     """The cold worker's harness builds Limits.from_env(): forward the host-owned output caps so an
-    engine sizes its payload/artifacts to the cap the host trust gate will enforce, and a job
-    param can't override them (dispatcher keys are merged last)."""
+    engine sizes its payload/artifacts to the cap the host trust gate will enforce. A job param
+    can't set them: the BLASTBOX_ prefix is reserved and dropped by _sanitize_params."""
     store = InMemoryJobStore()
     job = _make_job()
     job.input_sha256 = _INPUT_SHA
