@@ -4,7 +4,8 @@
     python3 keygen.py secret/gateway.key
 
 Writes the private key (base64url, no padding, of 32 raw bytes) to the given path with mode
-0400, refusing to overwrite an existing file, and prints ONLY the base64url public key: that
+0400, refusing to overwrite an existing file (a failed write removes the file and re-raises),
+and prints ONLY the base64url public key: that
 value is Loadout's ``LOADOUT_REA_GATEWAY_PUBKEY``. The private key is never printed. Needs
 ``cryptography``.
 """
@@ -36,8 +37,17 @@ def main(argv: list[str]) -> int:
     except FileExistsError:
         print(f"refusing to overwrite {path}", file=sys.stderr)
         return 1
-    with os.fdopen(fd, "w") as fh:
-        fh.write(b64u(raw) + "\n")
+    try:
+        data = (b64u(raw) + "\n").encode("ascii")
+        while data:
+            data = data[os.write(fd, data):]
+        os.fsync(fd)
+    except BaseException:
+        # Never leave a partial key behind: a truncated file would fail later, far from here.
+        os.close(fd)
+        os.unlink(path)
+        raise
+    os.close(fd)
     print(b64u(pub))
     return 0
 
