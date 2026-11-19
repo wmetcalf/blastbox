@@ -715,14 +715,60 @@ def test_cold_only_does_not_report_the_warm_runsc_binary():
     assert c.facts is not None and c.facts["host"]["runsc"] is None  # type: ignore[index]
 
 
-@pytest.mark.parametrize("env,blocked", [
-    ({}, False), ({"DOCKER_HOST": "unix:///var/run/docker.sock"}, False),
-    ({"DOCKER_HOST": "tcp://builder:2376"}, True), ({"DOCKER_HOST": "ssh://u@h"}, True),
-    ({"DOCKER_CONTEXT": "remote"}, True), ({"DOCKER_CONTEXT": "default"}, False),
+import hashlib as _hashlib  # noqa: E402
+
+_CFG = "/home/svc/.docker"
+
+
+def _ctx_meta(name: str, host: str) -> dict[str, str]:
+    d = _hashlib.sha256(name.encode()).hexdigest()
+    return {f"{_CFG}/contexts/meta/{d}/meta.json":
+            json.dumps({"Name": name, "Endpoints": {"docker": {"Host": host}}})}
+
+
+_DOCKER_FILES = {
+    **_ctx_meta("remote", "tcp://builder:2376"),
+    **_ctx_meta("rootless", "unix:///run/user/1000/docker.sock"),
+}
+
+
+@pytest.mark.parametrize("env,files,blocked", [
+    ({}, {}, False),
+    ({"DOCKER_HOST": "unix:///var/run/docker.sock"}, {}, False),
+    ({"DOCKER_HOST": "tcp://builder:2376"}, {}, True),
+    ({"DOCKER_HOST": "ssh://u@h"}, {}, True),
+    ({"DOCKER_CONTEXT": "remote"}, {}, True),
+    ({"DOCKER_CONTEXT": "default"}, {}, False),
+    ({"DOCKER_CONTEXT": "rootless"}, {}, False),          # a local unix endpoint
+    ({"DOCKER_CONTEXT": "gone"}, {}, True),              # unresolvable: cannot tell
+    # DOCKER_HOST wins over DOCKER_CONTEXT, as in the docker CLI
+    ({"DOCKER_HOST": "unix:///var/run/docker.sock", "DOCKER_CONTEXT": "remote"}, {}, False),
+    # `docker context use remote` persists currentContext in config.json
+    ({}, {f"{_CFG}/config.json": '{"currentContext": "remote"}'}, True),
+    ({}, {f"{_CFG}/config.json": '{"currentContext": "rootless"}'}, False),
+    ({"DOCKER_CONTEXT": "default"}, {f"{_CFG}/config.json": '{"currentContext": "remote"}'},
+     False),
 ])
-def test_cold_with_a_remote_docker_daemon_is_not_judged_from_this_host(env, blocked):
-    st = cf.probe(_host(UBUNTU), env=env)
+def test_cold_with_a_remote_docker_daemon_is_not_judged_from_this_host(env, files, blocked):
+    env = {"DOCKER_CONFIG": _CFG, **env}
+    host = _host({**UBUNTU, **_DOCKER_FILES, **files})
+    st = cf.probe(host, env=env)
     assert (st.would_use("cold") == "none") is blocked
     assert st.would_use("gvisor") == "apparmor"
-    d = cf.detect({**env, "BLASTBOX_CONFINEMENT": "auto"}, host=_host(UBUNTU), landlock=0)
+    d = cf.detect({**env, "BLASTBOX_CONFINEMENT": "auto"}, host=host, landlock=0)
     assert (d.state.would_use("cold") == "none") is blocked
+
+
+def test_docker_config_defaults_to_home():
+    meta = {k.replace(_CFG, "/root/.docker"): v
+            for k, v in _ctx_meta("remote", "tcp://b:1").items()}
+    host = _host({**UBUNTU, **meta, "/root/.docker/config.json": '{"currentContext": "remote"}'})
+    assert cf.probe(host, env={"HOME": "/root"}).would_use("cold") == "none"
+
+
+def test_overflow_gvisor_with_missing_rootfs_is_admitted_so_require_fails():
+    host = _healthy(files=AL2023, env=_OVERFLOW_ENV)
+    host.landlock_abi = lambda: 4    # type: ignore[method-assign]
+    host.paths.discard("/var/lib/blastbox/gvisor-rootfs/bin/sh")   # missing: booted anyway
+    cs = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False)
+    assert next(c for c in cs if c.name == "confinement").status is Status.FAIL

@@ -470,7 +470,9 @@ def _check_gvisor_rootfs(host: HostView) -> Check:
         # another release/arch/runtime is refused; an unstamped (legacy) one is allowed.
         problem = host.guest_problem(rootfs, "gvisor")
         if problem:
-            return Check("gvisor-rootfs", Status.FAIL, f"rootfs {rootfs}: {problem}", doc)
+            # facts["refused"]: the runtime refuses this tier at selection (a cascade drops it).
+            return Check("gvisor-rootfs", Status.FAIL, f"rootfs {rootfs}: {problem}", doc,
+                         {"refused": True})
         return Check("gvisor-rootfs", Status.PASS, f"rootfs {rootfs}")
     pool = host.env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower()
     selected = pool == "gvisor" or (pool == "cascade" and "gvisor" in _cascade_members(host.env))
@@ -1252,7 +1254,11 @@ def run_preflight(host: HostView, tiers: Sequence[str], *, explicit: bool = True
         out.append(_check_apparmor(host))
         out.append(_check_bwrap_stock_profile(host, t))
         out.append(_check_userns(host, t))
-    failed = {c.name for c in out if c.status is Status.FAIL}
+    # A tier check FAIL refuses the tier; of the soft checks only an explicit refusal does (a
+    # missing gVisor rootfs is admitted and booted anyway, see _is_startup_gate).
+    failed = {c.name for c in out if c.status is Status.FAIL and (
+        c.name not in {n for soft in _SOFT_CHECKS.values() for n in soft}
+        or (c.facts or {}).get("refused"))}
     skipped = {tier for tier in _overflow_only_tiers(host.env)
                if failed & {*_TIER_CHECKS[tier], *_SOFT_CHECKS[tier]}}
     if not explicit and host.env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower() in ("", "none"):

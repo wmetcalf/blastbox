@@ -234,8 +234,9 @@ reason and does not count: no securityfs to load AppArmor policy through, a call
 confined by another AppArmor profile (e.g. `docker-default`, which has no `change_profile`
 rule), or a read-only selinuxfs. `cold` is judged on the host's state alone, because dockerd
 (through a docker runtime wrapper) starts that runsc, not the dispatcher -- unless
-`DOCKER_HOST`/`DOCKER_CONTEXT` point the docker CLI at another daemon, in which case this host
-says nothing about it and `cold` counts as none.
+the docker CLI talks to another daemon (resolved as the CLI does: `DOCKER_HOST`, else
+`DOCKER_CONTEXT`, else the `docker context use` choice in `config.json`; only a `unix://`
+endpoint is local), in which case this host says nothing about it and `cold` counts as none.
 
 `BLASTBOX_CONFINEMENT=auto|require|off` (default `auto`). `require` makes `blastbox dispatch`
 refuse to start, and preflight FAIL, when a sandbox kind the dispatcher can run (including

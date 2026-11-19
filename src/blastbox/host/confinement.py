@@ -24,6 +24,8 @@ ENOSYS/EOPNOTSUPP (ABI 0); a missing tool is reported absent, never raised.
 from __future__ import annotations
 
 import ctypes
+import hashlib
+import json
 import os
 import re
 import subprocess
@@ -249,14 +251,37 @@ def _se_blocker(host: HostReader) -> str | None:
     return None
 
 
-def _cold_blocker(env: Mapping[str, str]) -> str | None:
+def _cold_blocker(env: Mapping[str, str], host: HostReader) -> str | None:
+    """Why the daemon the docker CLI will talk to is not known to be THIS host's, resolved the
+    way the CLI resolves it: DOCKER_HOST, else DOCKER_CONTEXT, else config.json currentContext;
+    a named context's endpoint from its meta.json. Only a unix:// endpoint is local."""
     docker_host = env.get("DOCKER_HOST", "").strip()
-    if docker_host and not docker_host.startswith("unix://"):
+    if docker_host:
+        if docker_host.startswith("unix://"):
+            return None
         return f"DOCKER_HOST={docker_host!r}: cold runsc runs on that daemon's host, not this one"
+    cfg = env.get("DOCKER_CONFIG", "").strip() or os.path.join(
+        env.get("HOME", "").strip() or os.path.expanduser("~"), ".docker")
     context = env.get("DOCKER_CONTEXT", "").strip()
-    if context and context != "default":
-        return f"DOCKER_CONTEXT={context!r}: cold runsc may run on another daemon's host"
-    return None
+    source = "DOCKER_CONTEXT"
+    if not context:
+        source = "docker config currentContext"
+        try:
+            context = str(json.loads(host.read(os.path.join(cfg, "config.json")) or "{}")
+                          .get("currentContext") or "").strip()
+        except (ValueError, AttributeError):
+            context = ""
+    if not context or context == "default":
+        return None
+    meta = os.path.join(cfg, "contexts", "meta",
+                        hashlib.sha256(context.encode()).hexdigest(), "meta.json")
+    try:
+        endpoint = str(json.loads(host.read(meta) or "{}")["Endpoints"]["docker"]["Host"])
+    except (ValueError, KeyError, TypeError):
+        return f"{source} {context!r}: endpoint unknown, cold runsc may run on another host"
+    if endpoint.startswith("unix://"):
+        return None
+    return f"{source} {context!r} -> {endpoint!r}: cold runsc runs on that daemon's host"
 
 
 def _parser_version(host: HostReader) -> str | None:
@@ -303,7 +328,7 @@ def probe(host: HostReader, *, env: Mapping[str, str] | None = None,
     empty ``kinds`` never spawns anything. ``landlock`` is the ABI (None = 0)."""
     env = os.environ if env is None else env
     state = _probe_lsm(host, landlock)
-    extra: dict[str, object] = {"cold_blocker": _cold_blocker(env)}
+    extra: dict[str, object] = {"cold_blocker": _cold_blocker(env, host)}
     if kinds and state.apparmor:
         extra["apparmor_parser"] = _parser_version(host)
     if "gvisor" in kinds:     # the warm tier's binary; cold runsc is dockerd's registered runtime
@@ -378,6 +403,6 @@ def detect(env: Mapping[str, str] | None = None, *, host: HostReader | None = No
     Raises ValueError on an invalid mode."""
     env = os.environ if env is None else env
     mode = mode_from_env(env)
-    state = _probe_lsm(_SysReader() if host is None else host,
-                       landlock_abi() if landlock is None else landlock)
-    return Detection(mode=mode, state=replace(state, cold_blocker=_cold_blocker(env)))
+    reader = _SysReader() if host is None else host
+    state = _probe_lsm(reader, landlock_abi() if landlock is None else landlock)
+    return Detection(mode=mode, state=replace(state, cold_blocker=_cold_blocker(env, reader)))
