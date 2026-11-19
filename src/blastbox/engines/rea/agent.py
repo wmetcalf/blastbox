@@ -101,9 +101,10 @@ time left holds at the measured rate)`` and is skipped below ``MIN_REPORT_TOKENS
 rate is completion tokens over seconds of this pass's calls that reported usage.
 
 Model failures never fail the job: ``model_status`` records ``unavailable``/``malformed``/
-``out_of_credit``/``key_rejected``/``refused`` (prior summary kept, ``more_pending=False``; the
-last three are not retried and stop the pass at once with no final answer, except a ``refused``
-turn after a good one, which is a failed turn: the one final-answer request still runs, and a
+``out_of_credit``/``key_rejected``/``grant_rejected``/``refused`` (prior summary kept,
+``more_pending=False``; ``grant_rejected`` is the model gateway refusing the per-job grant, told
+apart from a provider's 401 by its ``rea_grant_rejected`` code; the last four are not retried and
+stop the pass at once with no final answer, except a ``refused`` turn after a good one, which is a failed turn: the one final-answer request still runs, and a
 fatal failure of that seals its class) or ``budget`` (``more_pending=True``). A failed report
 call leaves ``model_status`` unchanged, except that an evidence-only pass (whose only call it is)
 seals a fatal kind as its status; after an accepted answer a fatal report failure keeps ``ok``

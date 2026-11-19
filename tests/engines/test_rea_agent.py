@@ -438,13 +438,19 @@ def test_model_client_errors(opener, kind):
     (403, b'{"error":{"code":403,"message":"Key disabled","metadata":{"provider_name":"x"}}}', "key_rejected"),
     (403, b'{"error":{"code":403,"message":"Key disabled","metadata":"reasons"}}', "key_rejected"),
     (403, b'{"error":"Key disabled"}', "key_rejected"),
+    # the model gateway's own rejection of the per-job grant, told apart from a provider's 401
+    (401, b'{"error":{"code":"rea_grant_rejected","message":"grant rejected"}}', "grant_rejected"),
+    (401, b'{"error":{"code":401,"message":"grant rejected"}}', "key_rejected"),
+    (401, b'{"error":"rea_grant_rejected"}', "key_rejected"),
+    (401, b"\xff not json", "key_rejected"),
+    (403, b'{"error":{"code":"rea_grant_rejected"}}', "key_rejected"),  # only a 401 is the gateway's
 ])
 def test_classify_http_error(code, body, kind):
     assert classify_http_error(code, body) == kind
 
 
 def test_fatal_kinds():
-    assert FATAL_KINDS == {"out_of_credit", "key_rejected", "refused"}
+    assert FATAL_KINDS == {"out_of_credit", "key_rejected", "refused", "grant_rejected"}
 
 
 def test_model_client_http_402_is_out_of_credit_and_hides_body():
@@ -3475,7 +3481,7 @@ def test_a_source_ground_stays_dropped_in_a_code_pass_without_an_installer_scrip
     assert '{"source"' not in call["messages"][-1]["content"].split("\n", 1)[0]
 
 
-@pytest.mark.parametrize("kind", ["out_of_credit", "key_rejected", "refused"])
+@pytest.mark.parametrize("kind", ["out_of_credit", "key_rejected", "refused", "grant_rejected"])
 def test_fatal_model_error_seals_its_class_without_retry(tmp_path, kind):
     cont = make_continuation(tmp_path)
     model = FakeModel([ModelError(kind, "http_402")] + [_final(summary="never")] * 3)
@@ -3484,6 +3490,23 @@ def test_fatal_model_error_seals_its_class_without_retry(tmp_path, kind):
     assert f["model_status"] == kind and f["more_pending"] is False
     assert not any(w.code == "model_retry" for w in res.warnings)
     assert len(model.calls) == 1
+
+
+def test_gateway_grant_rejection_through_the_client_seals_grant_rejected_without_retry(tmp_path):
+    body = b'{"error":{"code":"rea_grant_rejected","message":"grant rejected"}}'
+    op = FakeOpener(exc=urllib.error.HTTPError("http://gw/x", 401, "no", {}, io.BytesIO(body)))
+
+    class Via(FakeModel):
+        def factory(self, url, model, timeout_s):
+            return ModelClient(url, model, timeout_s, opener=op)
+
+    cont = make_continuation(tmp_path, todo=["0x140001420"])
+    res, _ = run(tmp_path, cont, Via([]), McpRig(tmp_path))
+    f = res.payload.fields
+    assert f["model_status"] == "grant_rejected" and f["more_pending"] is False
+    assert "model_grant_rejected" in _codes(res)
+    assert not any(w.code == "model_retry" for w in res.warnings)
+    assert len(op.requests) == 1  # no retry and no final-answer call
 
 
 def test_out_of_credit_after_good_turns_spends_no_final_call(tmp_path):
@@ -3496,7 +3519,7 @@ def test_out_of_credit_after_good_turns_spends_no_final_call(tmp_path):
     assert len(model.calls) == 2
 
 
-@pytest.mark.parametrize("kind", ["out_of_credit", "key_rejected", "refused"])
+@pytest.mark.parametrize("kind", ["out_of_credit", "key_rejected", "refused", "grant_rejected"])
 def test_fatal_error_on_final_answer_after_good_turns_seals_its_class(tmp_path, kind):
     cont = make_continuation(tmp_path, todo=["0x140001420", "0x140001500"], summary="prior summary")
     model = FakeModel([answer("prose, no tools"), ModelError(kind, "http_402"), _final(summary="never")])

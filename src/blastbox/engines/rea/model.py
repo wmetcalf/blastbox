@@ -14,7 +14,8 @@
   can therefore not stretch a call past the pass budget (Ruling Q).
 - Transport failures, timeouts and transient HTTP statuses (408, 429, 5xx) raise
   ``ModelError("unavailable")``; other HTTP errors are classified by
-  :func:`classify_http_error` (``out_of_credit``, ``key_rejected``, ``refused``; see
+  :func:`classify_http_error` (``out_of_credit``, ``key_rejected``, ``refused``,
+  ``grant_rejected`` for the gateway's own 401; see
   :data:`FATAL_KINDS`) from the status and a capped body prefix, which is never put in a
   message or log. An oversized, non-JSON or non-object body raises ``ModelError("malformed")``. Interpreting ``choices`` is the
   caller's job (the agent parses it defensively). Reasoning in the reply is never sent back:
@@ -54,10 +55,14 @@ MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
 _log = logging.getLogger("blastbox.engines.rea.model")
 
-ModelErrorKind = Literal["unavailable", "malformed", "out_of_credit", "key_rejected", "refused"]
+ModelErrorKind = Literal["unavailable", "malformed", "out_of_credit", "key_rejected", "refused",
+                         "grant_rejected"]
 
 #: Kinds that retrying the same endpoint cannot fix.
-FATAL_KINDS: frozenset[str] = frozenset({"out_of_credit", "key_rejected", "refused"})
+FATAL_KINDS: frozenset[str] = frozenset({"out_of_credit", "key_rejected", "refused", "grant_rejected"})
+
+#: ``error.code`` of the model gateway's own 401 (``model_gateway._GRANT_REJECTED``).
+GATEWAY_GRANT_REJECTED_CODE = "rea_grant_rejected"
 
 _ERROR_BODY_READ = 4096
 
@@ -65,7 +70,9 @@ _ERROR_BODY_READ = 4096
 def classify_http_error(code: int, body: bytes) -> ModelErrorKind:
     """Map an HTTP error status (and a bounded body prefix) to a :data:`ModelErrorKind`.
 
-    402 is out of credit; 401 is a rejected key; 403 is a rejected key only when the body is a
+    402 is out of credit; 401 is a rejected key, unless its body is the model gateway's own
+    rejection of the per-job grant (a JSON object whose ``error.code`` is
+    :data:`GATEWAY_GRANT_REJECTED_CODE`): ``grant_rejected``; 403 is a rejected key only when the body is a
     JSON object with an ``error`` key (a provider's answer), else it is a filter's refusal. A
     403 whose ``error.metadata`` holds ``reasons`` or ``flagged_input`` is OpenRouter's
     moderation refusing the input, not the key: ``refused``.
@@ -75,6 +82,13 @@ def classify_http_error(code: int, body: bytes) -> ModelErrorKind:
     if code == 402:
         return "out_of_credit"
     if code == 401:
+        try:
+            doc = json.loads(body.decode("utf-8", "replace"))
+        except Exception:
+            return "key_rejected"
+        err = doc.get("error") if isinstance(doc, dict) else None
+        if isinstance(err, dict) and err.get("code") == GATEWAY_GRANT_REJECTED_CODE:
+            return "grant_rejected"
         return "key_rejected"
     if code == 403:
         try:
