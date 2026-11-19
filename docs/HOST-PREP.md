@@ -233,10 +233,11 @@ itself, an LSM that is on but cannot be used from the dispatcher's context is re
 reason and does not count: no securityfs to load AppArmor policy through, a caller already
 confined by another AppArmor profile (e.g. `docker-default`, which has no `change_profile`
 rule), or a read-only selinuxfs. `cold` is judged on the host's state alone, because dockerd
-(through a docker runtime wrapper) starts that runsc, not the dispatcher -- unless
-the docker CLI talks to another daemon (resolved as the CLI does: `DOCKER_HOST`, else
-`DOCKER_CONTEXT`, else the `docker context use` choice in `config.json`; only a `unix://`
-endpoint is local, and not Docker Desktop's, whose daemon runs in a VM), in which case this host says nothing about it and `cold` counts as none.
+(through a docker runtime wrapper) starts that runsc, not the dispatcher -- but only with the
+default docker endpoint. Any other endpoint configuration counts as another daemon, and `cold`
+as none, without resolving where it points: `DOCKER_HOST`, `DOCKER_TLS_VERIFY`/`DOCKER_TLS`, a
+`DOCKER_CONTEXT` other than `default`, a `docker context use` choice in `config.json`, or a
+`config.json` that cannot be read.
 
 `BLASTBOX_CONFINEMENT=auto|require|off` (default `auto`). `require` makes `blastbox dispatch`
 refuse to start, and preflight FAIL, when a sandbox kind the dispatcher can run (including
@@ -259,9 +260,11 @@ startup). An available overflow tier is admitted, and then the dispatcher refuse
 - **runsc older than `release-20261012`** ships the Sentry inside the runsc binary, so AppArmor
   cannot give it a domain separate from the CLI and gofer ("single binary" in the report).
 
-Each signed receipt for a local runsc or firecracker run records
-`confinement: {mode, available, applied}`; `applied` stays `"none"` until enforcement lands.
-`off` omits the field, which keeps receipts readable by verifiers that predate it.
+The dispatcher logs its detection at startup (`confinement (detection only, nothing
+enforced): mode=..., cold=..., gvisor=..., firecracker=...`). Signed receipts do not carry it
+yet. `blastbox.client.verify` accepts an optional receipt `confinement: {mode, available,
+applied}` from this release on, so that the enforcement change can sign it. Verifiers older than
+that refuse unknown receipt fields: upgrade every verifier before any dispatcher signs it.
 
 ## AppArmor and user namespaces
 

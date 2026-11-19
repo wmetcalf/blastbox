@@ -148,12 +148,13 @@ def test_detect_never_spawns(monkeypatch):
     monkeypatch.setattr(cf.os, "posix_spawn", boom, raising=False)
     d = cf.detect({"BLASTBOX_CONFINEMENT": "auto"})
     assert d.state.runsc is None and d.state.apparmor_parser is None
-    assert set(d.receipt("gvisor") or {}) == {"mode", "available", "applied"}
+    assert d.summary(["gvisor"]).startswith("mode=auto, gvisor=")
 
 
 def test_detect_with_fixture_host():
     d = cf.detect({"BLASTBOX_CONFINEMENT": "auto"}, host=_host(ROCKY), landlock=0)
-    assert d.receipt("gvisor") == {"mode": "auto", "available": "selinux", "applied": "none"}
+    assert d.state.would_use("gvisor") == "selinux"
+    assert d.summary(["cold", "gvisor"]) == "mode=auto, cold=selinux, gvisor=selinux"
 
 
 def test_landlock_abi_is_a_harmless_int():
@@ -294,19 +295,24 @@ def test_preflight_spawns_only_read_only_queries():
     assert all(pf.is_read_only(argv) for argv in host.ran)
 
 
-# --- receipts -----------------------------------------------------------------------------
+# --- receipts: not carried yet (detection only); verifiers accept it ahead of time ------------
 
-def test_receipt_carries_confinement_and_omits_when_absent():
-    obs = dict(job_id="j", engine="e", input_sha256="a" * 64, worker_runtime="runsc",
-               worker_tier=None, started_at_ms=1, finished_at_ms=2)
-    plain = attest.build_receipt(attest.RunObservation(**obs), key_id="k" * 16,
-                                 metadata_sha256="c" * 64, host="h")
-    assert "confinement" not in plain
-    rec = {"mode": "auto", "available": "apparmor", "applied": "none"}
-    doc = attest.build_receipt(attest.RunObservation(**obs, confinement=rec), key_id="k" * 16,
-                               metadata_sha256="c" * 64, host="h")
-    assert doc["confinement"] == rec
-    attest.canonical(doc)    # no floats: signable
+def _attest_env_clean(monkeypatch):
+    import os
+    for k in list(os.environ):
+        if k.startswith("BLASTBOX_NETPOLICY_") or k in (
+                "BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", "BLASTBOX_ATTEST_KEY", "BLASTBOX_PKI_DIR"):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("BLASTBOX_HOST_ID", "dispatch-host")
+
+
+@pytest.fixture
+def _attest_env(monkeypatch):
+    _attest_env_clean(monkeypatch)
+
+
+def test_run_observation_has_no_confinement_field():
+    assert "confinement" not in attest.RunObservation.__dataclass_fields__
 
 
 def _cold_receipt(tmp_path, runtime: str, confinement):
@@ -340,66 +346,15 @@ def _cold_receipt(tmp_path, runtime: str, confinement):
     return _verify(key, json.loads(_receipt_path(tmp_path, job).read_bytes()))
 
 
-@pytest.fixture
-def _attest_env(monkeypatch):
-    import os
-    for k in list(os.environ):
-        if k.startswith("BLASTBOX_NETPOLICY_") or k in (
-                "BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", "BLASTBOX_ATTEST_KEY", "BLASTBOX_PKI_DIR"):
-            monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("BLASTBOX_HOST_ID", "dispatch-host")
-
-
-def test_cold_runsc_receipt_signs_detection(tmp_path, _attest_env):
+def test_receipts_do_not_carry_confinement_yet(tmp_path, _attest_env, caplog):
+    """Pre-field verifiers refuse unknown receipt fields, so the detection is logged, not
+    signed, until verifiers have upgraded (they accept the field from this release)."""
     det = cf.detect({}, host=_host(UBUNTU), landlock=0)
-    doc = _cold_receipt(tmp_path, "runsc", det)
-    assert doc["confinement"] == {"mode": "auto", "available": "apparmor", "applied": "none"}
-
-
-def test_cold_runc_receipt_has_no_confinement(tmp_path, _attest_env):
-    det = cf.detect({}, host=_host(UBUNTU), landlock=0)
-    assert "confinement" not in _cold_receipt(tmp_path, "runc", det)
-
-
-def test_undetected_dispatcher_omits_confinement(tmp_path, _attest_env):
-    assert "confinement" not in _cold_receipt(tmp_path, "runsc", None)
-
-
-def test_warm_gvisor_receipt_signs_detection(tmp_path, _attest_env):
-    from blastbox.host.dispatch import Dispatcher
-    from blastbox.host.jobs.base import JobStatus
-    from blastbox.host.jobs.memory import InMemoryJobStore
-    from tests.host.test_attest_dispatch import (
-        _ENGINE_NAME,
-        _INPUT_SHA,
-        _blobs,
-        _limits,
-        _queue,
-        _receipt_path,
-        _verify,
-    )
-    from tests.host.test_dispatch_warm import FakeWarmPool, _make_slot, _start_fake_worker
-    from tests.host.test_dispatch_warm import _engine_spec as _warm_engine
-    from tests.host.test_dispatch_warm import _fake_runtime as _warm_runtime
-    from tests.host.test_dispatch_warm import _make_valid_output_dir as _warm_out
-
-    key = attest.load_or_create_key(tmp_path / "keys" / "attest.key")
-    store = InMemoryJobStore()
-    job = _queue(tmp_path, store, net_policy="undeclared")
-    slot = _make_slot(tmp_path)
-    _start_fake_worker(slot, output_fn=lambda o: _warm_out(o, input_sha256=_INPUT_SHA))
-    d = Dispatcher(
-        job_store=store, engines={_ENGINE_NAME: _warm_engine()}, limits=_limits(),
-        job_root=tmp_path / "jobs", runtime_selector=_warm_runtime,
-        subprocess_runner=lambda *a, **kw: subprocess.CompletedProcess(a[0], 0, "", ""),
-        worker_timeout_s=10, pool=FakeWarmPool(slot), tier="gvisor",
-        warm_claim_timeout_s=0.5, warm_requeue_backoff_s=0.0, blob_store=_blobs(tmp_path),
-        attest_key=key, confinement=cf.detect({}, host=_host(AL2023), landlock=4))
-    assert d.dispatch_once() is True
-    assert store.get(job.job_id).status == JobStatus.DONE
-    doc = _verify(key, json.loads(_receipt_path(tmp_path, job).read_bytes()))
-    # permissive SELinux does not count, and Landlock cannot hold runsc
-    assert doc["confinement"] == {"mode": "auto", "available": "none", "applied": "none"}
+    with caplog.at_level("INFO", logger="blastbox.host.dispatch"):
+        doc = _cold_receipt(tmp_path, "runsc", det)
+    assert "confinement" not in doc
+    assert any("confinement (detection only" in r.getMessage() and "cold=apparmor" in
+               r.getMessage() for r in caplog.records)
 
 
 # --- dispatcher startup -------------------------------------------------------------------
@@ -436,7 +391,7 @@ def _start(monkeypatch, *, mode: str, files: dict[str, str]):
 
 def test_dispatch_cmd_passes_detection(monkeypatch):
     det = _start(monkeypatch, mode="auto", files=UBUNTU)["confinement"]
-    assert det.receipt("gvisor")["available"] == "apparmor"
+    assert det.state.would_use("gvisor") == "apparmor"
 
 
 def test_dispatch_cmd_require_refuses_cold_on_landlock_only_host(monkeypatch):
@@ -515,9 +470,9 @@ def test_preflight_notes_missing_apparmor_parser():
     assert "apparmor_parser not found" in c.detail
 
 
-def test_off_mode_omits_the_receipt_field():
+def test_off_mode_summary():
     d = cf.detect({"BLASTBOX_CONFINEMENT": "off"}, host=_host(UBUNTU), landlock=0)
-    assert d.receipt("gvisor") is None
+    assert d.summary(["cold"]) == "mode=off, cold=none"
 
 
 def test_preflight_validates_mode_on_remote_only():
@@ -606,8 +561,8 @@ def test_verified_signed_does_not_share_the_callers_confinement(tmp_path):
     from tests.client.test_verify import _body, _doc, _verify
     key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
     pinned = v.load_pinned_keys(key.public_key_pem)
-    body = json.loads(_body(key, _doc(key, net={"confinement": {
-        "mode": "auto", "available": "none", "applied": "none"}})))
+    body = json.loads(_body(key, _doc(key, confinement={
+        "mode": "auto", "available": "none", "applied": "none"})))
     r = _verify(body, pinned)
     body["attestation"]["confinement"]["available"] = "selinux"
     assert r.signed["confinement"]["available"] == "none"   # type: ignore[index]
@@ -683,9 +638,9 @@ def test_cold_runsc_is_judged_as_dockerd_launches_it_not_by_the_caller():
     assert _state(AL2023, abi=4).would_use("cold") == "none"      # Landlock never covers runsc
 
 
-def test_cold_receipt_uses_the_daemon_view(tmp_path, _attest_env):
+def test_cold_detection_uses_the_daemon_view():
     det = cf.detect({}, host=_host(CONTAINER_UNDER_DOCKER_DEFAULT), landlock=0)
-    assert _cold_receipt(tmp_path, "runsc", det)["confinement"]["available"] == "apparmor"
+    assert det.state.would_use("cold") == "apparmor"
 
 
 def test_no_pool_preview_judges_require_on_cold_only():
@@ -715,57 +670,6 @@ def test_cold_only_does_not_report_the_warm_runsc_binary():
     assert c.facts is not None and c.facts["host"]["runsc"] is None  # type: ignore[index]
 
 
-import hashlib as _hashlib  # noqa: E402
-
-_CFG = "/home/svc/.docker"
-
-
-def _ctx_meta(name: str, host: str) -> dict[str, str]:
-    d = _hashlib.sha256(name.encode()).hexdigest()
-    return {f"{_CFG}/contexts/meta/{d}/meta.json":
-            json.dumps({"Name": name, "Endpoints": {"docker": {"Host": host}}})}
-
-
-_DOCKER_FILES = {
-    **_ctx_meta("remote", "tcp://builder:2376"),
-    **_ctx_meta("rootless", "unix:///run/user/1000/docker.sock"),
-}
-
-
-@pytest.mark.parametrize("env,files,blocked", [
-    ({}, {}, False),
-    ({"DOCKER_HOST": "unix:///var/run/docker.sock"}, {}, False),
-    ({"DOCKER_HOST": "tcp://builder:2376"}, {}, True),
-    ({"DOCKER_HOST": "ssh://u@h"}, {}, True),
-    ({"DOCKER_CONTEXT": "remote"}, {}, True),
-    ({"DOCKER_CONTEXT": "default"}, {}, False),
-    ({"DOCKER_CONTEXT": "rootless"}, {}, False),          # a local unix endpoint
-    ({"DOCKER_CONTEXT": "gone"}, {}, True),              # unresolvable: cannot tell
-    # DOCKER_HOST wins over DOCKER_CONTEXT, as in the docker CLI
-    ({"DOCKER_HOST": "unix:///var/run/docker.sock", "DOCKER_CONTEXT": "remote"}, {}, False),
-    # `docker context use remote` persists currentContext in config.json
-    ({}, {f"{_CFG}/config.json": '{"currentContext": "remote"}'}, True),
-    ({}, {f"{_CFG}/config.json": '{"currentContext": "rootless"}'}, False),
-    ({"DOCKER_CONTEXT": "default"}, {f"{_CFG}/config.json": '{"currentContext": "remote"}'},
-     False),
-])
-def test_cold_with_a_remote_docker_daemon_is_not_judged_from_this_host(env, files, blocked):
-    env = {"DOCKER_CONFIG": _CFG, **env}
-    host = _host({**UBUNTU, **_DOCKER_FILES, **files})
-    st = cf.probe(host, env=env)
-    assert (st.would_use("cold") == "none") is blocked
-    assert st.would_use("gvisor") == "apparmor"
-    d = cf.detect({**env, "BLASTBOX_CONFINEMENT": "auto"}, host=host, landlock=0)
-    assert (d.state.would_use("cold") == "none") is blocked
-
-
-def test_docker_config_defaults_to_home():
-    meta = {k.replace(_CFG, "/root/.docker"): v
-            for k, v in _ctx_meta("remote", "tcp://b:1").items()}
-    host = _host({**UBUNTU, **meta, "/root/.docker/config.json": '{"currentContext": "remote"}'})
-    assert cf.probe(host, env={"HOME": "/root"}).would_use("cold") == "none"
-
-
 def test_overflow_gvisor_with_missing_rootfs_is_admitted_so_require_fails():
     host = _healthy(files=AL2023, env=_OVERFLOW_ENV)
     host.landlock_abi = lambda: 4    # type: ignore[method-assign]
@@ -774,86 +678,10 @@ def test_overflow_gvisor_with_missing_rootfs_is_admitted_so_require_fails():
     assert next(c for c in cs if c.name == "confinement").status is Status.FAIL
 
 
-@pytest.mark.parametrize("cfg_text", [
-    '{"CurrentContext": "remote"}',                       # Go matches keys case-insensitively
-    '{"currentContext": "remote"}}',                      # trailing data: Go reads one value
-    '{"CurrentContext": "default", "currentContext": "remote"}',         # last match wins
-    '{"currentContext":"remote","CurrentContext":"default","currentContext":"remote"}',
-])
-def test_docker_config_parsed_like_the_cli(cfg_text):
-    host = _host({**UBUNTU, **_DOCKER_FILES, f"{_CFG}/config.json": cfg_text})
-    assert cf.probe(host, env={"DOCKER_CONFIG": _CFG}).would_use("cold") == "none"
-
-
-@pytest.mark.parametrize("cfg_text", [
-    '{"currentContext":' + "[" * 10000 + "]" * 10000 + "}",
-    '{"currentContext": "\\ud800"}',
-    "not json at all",
-])
-def test_unresolvable_docker_config_fails_closed_without_raising(cfg_text):
-    host = _host({**UBUNTU, f"{_CFG}/config.json": cfg_text})
-    st = cf.probe(host, env={"DOCKER_CONFIG": _CFG})
-    assert st.would_use("cold") == "none" and st.cold_blocker
-
-
-def test_undecodable_docker_context_env_does_not_raise():
-    st = cf.probe(_host(UBUNTU), env={"DOCKER_CONTEXT": "\udcff"})
-    assert st.would_use("cold") == "none"
-
-
-def test_empty_home_uses_the_passwd_home(monkeypatch):
-    import pwd
-    monkeypatch.setattr(pwd, "getpwuid", lambda uid: type("P", (), {"pw_dir": "/srv/svc"})())
-    meta = {k.replace(_CFG, "/srv/svc/.docker"): v
-            for k, v in _ctx_meta("remote", "tcp://b:1").items()}
-    host = _host({**UBUNTU, **meta, "/srv/svc/.docker/config.json": '{"currentContext":"remote"}'})
-    assert cf.probe(host, env={"HOME": ""}).would_use("cold") == "none"
-
-
 def test_sys_reader_reads_a_large_docker_config(tmp_path):
     big = tmp_path / "config.json"
     big.write_text('{"auths": {"x": {"auth": "' + "a" * 200_000 + '"}}, "currentContext": "r"}')
     assert cf._SysReader().read(str(big)).endswith('"r"}')   # type: ignore[union-attr]
-
-
-def test_docker_desktop_socket_is_a_vm_not_this_host():
-    files = {**UBUNTU, **_ctx_meta("desktop-linux", "unix:///home/u/.docker/desktop/docker.sock"),
-             f"{_CFG}/config.json": '{"currentContext": "desktop-linux"}'}
-    assert cf.probe(_host(files), env={"DOCKER_CONFIG": _CFG}).would_use("cold") == "none"
-    st = cf.probe(_host(UBUNTU), env={"DOCKER_HOST": "unix:///home/u/.docker/desktop/docker.sock"})
-    assert st.would_use("cold") == "none"
-
-
-@pytest.mark.parametrize("cfg_text", ["", "  \n", "null", '{"currentContext": null}'])
-def test_empty_docker_config_is_the_default_context(cfg_text):
-    host = _host({**UBUNTU, f"{_CFG}/config.json": cfg_text})
-    assert cf.probe(host, env={"DOCKER_CONFIG": _CFG}).would_use("cold") == "apparmor"
-
-
-def test_last_matching_current_context_key_wins_like_go():
-    cfg = '{"currentContext": "default", "CurrentContext": "remote"}'
-    host = _host({**UBUNTU, **_DOCKER_FILES, f"{_CFG}/config.json": cfg})
-    assert cf.probe(host, env={"DOCKER_CONFIG": _CFG}).would_use("cold") == "none"
-    cfg = '{"CurrentContext": "remote", "currentContext": "default"}'
-    host = _host({**UBUNTU, **_DOCKER_FILES, f"{_CFG}/config.json": cfg})
-    assert cf.probe(host, env={"DOCKER_CONFIG": _CFG}).would_use("cold") == "apparmor"
-
-
-def test_bom_config_is_malformed_not_silently_parsed():
-    # Go does not skip a BOM: the CLI calls it malformed. Malformed fails closed here.
-    host = _host({**UBUNTU, f"{_CFG}/config.json": '\ufeff{"currentContext": "default"}'})
-    st = cf.probe(host, env={"DOCKER_CONFIG": _CFG})
-    assert st.cold_blocker and st.would_use("cold") == "none"
-
-
-def test_meta_host_key_matched_like_go():
-    d = _hashlib.sha256(b"remote").hexdigest()
-    meta = {f"{_CFG}/contexts/meta/{d}/meta.json":
-            '{"Endpoints": {"docker": {"Host": "unix:///var/run/docker.sock", '
-            '"host": "tcp://127.0.0.1:1"}}}'}
-    host = _host({**UBUNTU, **meta})
-    assert cf.probe(host, env={"DOCKER_CONFIG": _CFG, "DOCKER_CONTEXT": "remote"}).would_use(
-        "cold") == "none"
 
 
 def test_sys_reader_reads_proc_sys():
@@ -861,56 +689,75 @@ def test_sys_reader_reads_proc_sys():
     assert v is not None and v.strip() == "Linux"
 
 
-def test_endpoints_map_key_is_exact_like_go():
-    """Endpoints is a Go map: 'Docker' is a different key from 'docker'."""
-    d = _hashlib.sha256(b"remote").hexdigest()
-    meta = {f"{_CFG}/contexts/meta/{d}/meta.json":
-            '{"Endpoints": {"docker": {"Host": "tcp://127.0.0.1:1"}, '
-            '"Docker": {"Host": "unix:///var/run/docker.sock"}}}'}
-    host = _host({**UBUNTU, **meta})
-    assert cf.probe(host, env={"DOCKER_CONFIG": _CFG, "DOCKER_CONTEXT": "remote"}).would_use(
-        "cold") == "none"
+# --- cold: any non-default docker endpoint configuration counts as none (conservative) -----
+
+_CFG = "/home/svc/.docker"
 
 
-def test_array_config_is_malformed_not_an_object():
-    host = _host({**UBUNTU, **_DOCKER_FILES,
-                  f"{_CFG}/config.json": '[["currentContext", "remote"]]'})
-    st = cf.probe(host, env={"DOCKER_CONFIG": _CFG})
-    assert st.cold_blocker and "not resolvable" in st.cold_blocker
+def _cfg(text: str) -> dict[str, str]:
+    return {f"{_CFG}/config.json": text}
 
 
-def test_long_s_folds_like_go():
-    d = _hashlib.sha256(b"remote").hexdigest()
-    meta = {f"{_CFG}/contexts/meta/{d}/meta.json":
-            '{"Endpoints": {"docker": {"Host": "unix:///var/run/docker.sock", '
-            '"Ho\\u017ft": "tcp://127.0.0.1:1"}}}'}
-    host = _host({**UBUNTU, **meta})
-    assert cf.probe(host, env={"DOCKER_CONFIG": _CFG, "DOCKER_CONTEXT": "remote"}).would_use(
-        "cold") == "none"
+@pytest.mark.parametrize("env,files,blocked", [
+    # the default endpoint: judged on this host's LSM
+    ({}, {}, False),
+    ({"DOCKER_HOST": "  "}, {}, False),                    # whitespace: the CLI trims it away
+    ({"DOCKER_CONTEXT": "default"}, _cfg('{"currentContext": "remote"}'), False),
+    ({}, _cfg(""), False),
+    ({}, _cfg("  \n"), False),
+    ({}, _cfg("null"), False),
+    ({}, _cfg('{"currentContext": null}'), False),
+    ({}, _cfg('{"currentContext": ""}'), False),
+    ({}, _cfg('{"currentContext": "default", "auths": {}}'), False),
+    # anything else: not resolved, counted as another daemon
+    ({"DOCKER_HOST": "unix:///var/run/docker.sock"}, {}, True),
+    ({"DOCKER_HOST": "tcp://builder:2376"}, {}, True),
+    ({"DOCKER_TLS_VERIFY": "0"}, {}, True),
+    ({"DOCKER_TLS": "1"}, {}, True),
+    ({"DOCKER_CONTEXT": "rootless"}, {}, True),
+    ({"DOCKER_CONTEXT": " default"}, {}, True),
+    ({}, _cfg('{"currentContext": "rootless"}'), True),
+    ({}, _cfg('{"CurrentContext": "remote"}'), True),
+    ({}, _cfg('{"currentContext": "remote", "currentContext": "default"}'), True),
+    ({}, _cfg('{"currentContext": 7}'), True),
+    ({}, _cfg("not json"), True),
+    ({}, _cfg('\ufeff{"currentContext": "default"}'), True),
+    ({}, _cfg("[]"), True),
+    ({}, _cfg('{"currentContext":' + "[" * 10000 + "]" * 10000 + "}"), True),
+])
+def test_cold_counts_any_non_default_docker_endpoint_as_none(env, files, blocked):
+    env = {"DOCKER_CONFIG": _CFG, **env}
+    host = _host({**UBUNTU, **files})
+    st = cf.probe(host, env=env)
+    assert (st.would_use("cold") == "none") is blocked
+    assert bool(st.cold_blocker) is blocked
+    assert st.would_use("gvisor") == "apparmor"          # the warm kinds are unaffected
+    d = cf.detect({**env, "BLASTBOX_CONFINEMENT": "auto"}, host=host, landlock=0)
+    assert (d.state.would_use("cold") == "none") is blocked
 
 
-def test_config_read_at_the_cap_fails_closed():
-    host = _host({**UBUNTU, f"{_CFG}/config.json": " " * cf._READ_CAP})
+def test_docker_config_cap_fails_closed():
+    host = _host({**UBUNTU, **_cfg(" " * cf._READ_CAP)})
     assert cf.probe(host, env={"DOCKER_CONFIG": _CFG}).would_use("cold") == "none"
 
 
-@pytest.mark.parametrize("env", [
-    {"DOCKER_CONTEXT": "remote "}, {"DOCKER_CONTEXT": " remote"}, {"DOCKER_CONTEXT": "lo�c"},
-])
-def test_noncanonical_context_names_fail_closed(env):
-    st = cf.probe(_host({**UBUNTU, **_DOCKER_FILES}), env={"DOCKER_CONFIG": _CFG, **env})
-    assert st.would_use("cold") == "none"
+def test_docker_config_defaults_to_home():
+    host = _host({**UBUNTU, "/root/.docker/config.json": '{"currentContext": "remote"}'})
+    assert cf.probe(host, env={"HOME": "/root"}).would_use("cold") == "none"
 
 
-def test_docker_config_used_verbatim():
-    files = {**UBUNTU, **{k.replace(_CFG, _CFG + " "): v for k, v in _DOCKER_FILES.items()},
-             f"{_CFG} /config.json": '{"currentContext": "remote"}'}
-    assert cf.probe(_host(files), env={"DOCKER_CONFIG": _CFG + " "}).would_use("cold") == "none"
+def test_empty_home_uses_the_passwd_home(monkeypatch):
+    import pwd
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: type("P", (), {"pw_dir": "/srv/svc"})())
+    host = _host({**UBUNTU, "/srv/svc/.docker/config.json": '{"currentContext": "remote"}'})
+    assert cf.probe(host, env={"HOME": ""}).would_use("cold") == "none"
 
 
-@pytest.mark.parametrize("var", ["DOCKER_TLS_VERIFY", "DOCKER_TLS"])
-def test_tls_default_context_dials_tcp_localhost(var):
-    assert cf.probe(_host(UBUNTU), env={var: "0"}).would_use("cold") == "none"
-    # an explicit unix DOCKER_HOST still wins
-    assert cf.probe(_host(UBUNTU), env={var: "1", "DOCKER_HOST": "unix:///var/run/docker.sock"}
-                    ).would_use("cold") == "apparmor"
+def test_undecodable_docker_context_env_does_not_raise():
+    assert cf.probe(_host(UBUNTU), env={"DOCKER_CONTEXT": "\udcff"}).would_use("cold") == "none"
+
+
+def test_require_refuses_cold_on_a_remote_daemon():
+    st = cf.probe(_host(UBUNTU), env={"DOCKER_HOST": "tcp://builder:2376"})
+    with pytest.raises(cf.ConfinementUnavailable, match="DOCKER_HOST"):
+        cf.check_required(st, "require", ["cold"])

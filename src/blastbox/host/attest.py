@@ -20,12 +20,6 @@ with the DSN) can write:
     net_downgraded   true when the applied args failed the run closed to --network=none
                      (net_exit is then "none"); absent otherwise
     net_inspect      true when the run was routed through the TLS-MITM inspect gateway
-    confinement      {"mode", "available", "applied"}: the BLASTBOX_CONFINEMENT mode, the host
-                     LSM the sandbox's HOST processes would be confined with (selinux /
-                     apparmor / landlock / none), and the one actually applied ("none" until
-                     the confinement tier enforces), as detected when the dispatcher started.
-                     Local runsc/firecracker runs only; absent elsewhere, under
-                     BLASTBOX_CONFINEMENT=off, and when the dispatcher did not detect it
     started_at_ms / finished_at_ms / issued_at_ms   integer epoch ms, its own clock
 
 The receipt is written as ``attestation.json`` beside ``metadata.json`` in the sealed output
@@ -340,8 +334,6 @@ class RunObservation:
     # The APPLIED posture differs from the personality's declaration:
     net_downgraded: bool = False    # the network args failed the run closed to --network=none
     net_inspect: bool = False       # the run was routed through the TLS-MITM inspect gateway
-    # Host-LSM confinement of the sandbox's HOST processes (host/confinement.py); None = omitted.
-    confinement: Mapping[str, object] | None = None
 
 
 def sha256_file(path: Path) -> str:
@@ -382,8 +374,6 @@ def build_receipt(obs: RunObservation, *, key_id: str, metadata_sha256: str,
         "finished_at_ms": int(obs.finished_at_ms),
         "issued_at_ms": now_ms() if issued_at_ms is None else int(issued_at_ms),
     }
-    if obs.confinement is not None:
-        doc["confinement"] = dict(obs.confinement)
     if obs.net_policy_effective is not None:
         doc["net_policy_effective"] = obs.net_policy_effective
         doc["net_exit"] = obs.net_exit

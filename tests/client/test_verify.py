@@ -645,7 +645,7 @@ _CONF = {"mode": "auto", "available": "apparmor", "applied": "none"}
 
 
 def test_a_confinement_record_verifies_and_is_reported(key, pinned):
-    r = _verify(_body(key, _doc(key, net={"confinement": _CONF})), pinned)
+    r = _verify(_body(key, _doc(key, confinement=_CONF)), pinned)
     assert r.confinement == v.AttestedConfinement("auto", "apparmor", "none")
     assert r.as_dict()["confinement"] == _CONF
 

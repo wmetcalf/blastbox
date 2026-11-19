@@ -514,8 +514,8 @@ class Dispatcher:
         claim_untargeted_after_s: float = 0.0,
         confinement: "_confinement.Detection | None" = None,
     ) -> None:
-        # Host-LSM confinement detection (host/confinement.py), fixed at startup and signed into
-        # each local receipt. None = not detected (embedders/tests): the receipt omits it.
+        # Host-LSM confinement detection (host/confinement.py), fixed at startup. Detection only:
+        # it gates BLASTBOX_CONFINEMENT=require and is logged; receipts do not carry it yet.
         self._confinement = confinement
         # Execution-receipt signing key (host/attest.py): an AttestKey, None (no receipts), or
         # FROM_ENV (BLASTBOX_ATTEST_KEY only -- strictly opt-in; unset = no receipts). A
@@ -743,10 +743,11 @@ class Dispatcher:
         if self._confinement is None and _confinement.mode_from_env() == "require":
             self._confinement = _confinement.detect()
         if self._confinement is not None:
-            _confinement.check_required(
-                self._confinement.state, self._confinement.mode,
-                _confinement.kinds_for_tiers(
-                    reachable_tiers(self._pool, self._tier, self._warm_only)))
+            kinds = _confinement.kinds_for_tiers(
+                reachable_tiers(self._pool, self._tier, self._warm_only))
+            _log.info("confinement (detection only, nothing enforced): %s",
+                      self._confinement.summary(kinds))
+            _confinement.check_required(self._confinement.state, self._confinement.mode, kinds)
         # OPT-IN engine scoping for SHARED multi-dispatcher stores: when set, claim only jobs for
         # engines this dispatcher handles, so it can't grab (and fail "unknown engine") a job that a
         # co-resident VM/other-engine dispatcher owns. Default OFF preserves the single-dispatcher
@@ -2178,7 +2179,6 @@ class Dispatcher:
             observation = None if receipt_input_sha256 is None else _attest.RunObservation(
                 job_id=job.job_id, engine=job.engine, input_sha256=receipt_input_sha256,
                 worker_runtime="warm", worker_tier=signed_tier,
-                confinement=self._confinement_receipt(signed_tier),
                 net_policy_effective=warm_personality.name,
                 net_exit=warm_personality.exit_driver,
                 started_at_ms=started_at_ms, finished_at_ms=finished_at_ms)
@@ -2872,8 +2872,6 @@ class Dispatcher:
         observation = None if receipt_input_sha256 is None else _attest.RunObservation(
             job_id=job.job_id, engine=job.engine, input_sha256=receipt_input_sha256,
             worker_runtime=runtime.runtime, worker_tier=None,
-            confinement=self._confinement_receipt(
-                "cold" if runtime.runtime == "runsc" else None),
             started_at_ms=started_at_ms, finished_at_ms=finished_at_ms,
             **self._verified_net_claim(personality, network_args, gateway_health))
 
@@ -3175,13 +3173,6 @@ class Dispatcher:
             verdict = False
         cache[network] = (verdict, now)
         return verdict
-
-    def _confinement_receipt(self, kind: str | None) -> dict[str, object] | None:
-        """The receipt's ``confinement`` record for a local run of sandbox ``kind`` (None for a
-        kind the confinement tier does not cover, e.g. cold runc, or when not detected)."""
-        if self._confinement is None or kind not in _confinement.KINDS:
-            return None
-        return self._confinement.receipt(kind)
 
     def _verified_net_claim(self, personality, network_args: list[str],
                             gateway_health) -> dict:

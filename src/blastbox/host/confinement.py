@@ -4,7 +4,7 @@ The confinement tier (later PRs) will put the HOST-side sandbox processes -- run
 and sentry; firecracker -- into blastbox's own LSM policy, because runsc ignores the OCI
 ``apparmorProfile``/``selinuxLabel`` and firecracker has no LSM hook. Nothing here enters a
 domain, loads a policy or changes the host: it answers "what does this host offer, and which LSM
-WOULD each sandbox kind be confined with", for ``blastbox preflight`` and for the signed receipt.
+WOULD each sandbox kind be confined with", for ``blastbox preflight`` and the dispatcher's log.
 
 Selection, per sandbox kind ("gvisor" | "firecracker"):
 
@@ -24,7 +24,6 @@ ENOSYS/EOPNOTSUPP (ABI 0); a missing tool is reported absent, never raised.
 from __future__ import annotations
 
 import ctypes
-import hashlib
 import json
 import os
 import re
@@ -118,7 +117,7 @@ def kinds_for_tiers(tiers: Iterable[str]) -> list[str]:
 
 @dataclass(frozen=True)
 class HostLsm:
-    """What the host offers. Tool fields are None when not probed (the dispatcher's receipt
+    """What the host offers. Tool fields are None when not probed (the dispatcher's startup
     probe reads /sys only and never spawns)."""
 
     lsms: tuple[str, ...] | None        # /sys/kernel/security/lsm; None = securityfs unreadable
@@ -253,24 +252,19 @@ def _se_blocker(host: HostReader) -> str | None:
 
 
 def _cold_blocker(env: Mapping[str, str], host: HostReader) -> str | None:
-    """Why the daemon the docker CLI will talk to is not known to be THIS host's, resolved the
-    way the CLI resolves it: DOCKER_HOST, else DOCKER_CONTEXT, else config.json currentContext;
-    a named context's endpoint from its meta.json. Only a unix:// endpoint is local (not
-    Docker Desktop's, which fronts a VM). Anything
-    that cannot be resolved is a blocker (fail closed), never an exception."""
+    """Why the daemon the docker CLI talks to is not known to be THIS host's default one.
+    Deliberately conservative: ANY non-default endpoint configuration -- DOCKER_HOST,
+    DOCKER_TLS(_VERIFY), a non-default DOCKER_CONTEXT or config.json currentContext, or a
+    config that cannot be read -- counts, without resolving where it points."""
     try:
         return _resolve_cold_blocker(env, host)
     except Exception as exc:  # noqa: BLE001 -- never raise on host state
-        return f"docker endpoint not resolvable ({type(exc).__name__}): cold runsc host unknown"
-
-
-#: `docker context create`'s own name rule; anything else is not a context the CLI made.
-_CONTEXT_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.+-]+")
+        return f"docker endpoint config not readable ({type(exc).__name__})"
 
 
 def _docker_config_dir(env: Mapping[str, str]) -> str:
-    cfg = env.get("DOCKER_CONFIG", "")      # verbatim, as the CLI uses it
-    if cfg:
+    cfg = env.get("DOCKER_CONFIG", "")
+    if cfg.strip():
         return cfg
     home = env.get("HOME", "").strip()
     if not home:
@@ -281,81 +275,40 @@ def _docker_config_dir(env: Mapping[str, str]) -> str:
     return os.path.join(home, ".docker")
 
 
-_GO_WS = " \t\n\r"   # the only whitespace Go's JSON decoder skips (no BOM, no NBSP)
-
-
-class _Obj(list):  # type: ignore[type-arg]
-    """A decoded JSON object: its (key, value) pairs in document order, duplicates kept."""
-
-
-def _first_json(text: str) -> object:
-    """The first JSON value, as Go's json.Decoder reads it: trailing data ignored, every key
-    pair kept in order (so duplicate keys are not collapsed)."""
-    return json.JSONDecoder(object_pairs_hook=_Obj).raw_decode(text.lstrip(_GO_WS))[0]
-
-
-def _go_field(obj: object, name: str, *, exact: bool = False) -> object:
-    """A value as Go's decoder fills it, the last matching key winning and JSON null leaving
-    it unset (None): a struct field matches case-insensitively, a map key (``exact``) only
-    exactly."""
-    if obj is None:
-        return None
-    if not isinstance(obj, _Obj):
-        raise ValueError(f"expected an object around {name!r}")
-    found: object = None
-    for key, value in obj:
-        # Go's EqualFold for these ASCII names: ASCII case plus the two runes that fold onto
-        # ASCII letters (U+017F long s, U+212A Kelvin -- the latter already lower()s to k).
-        if (key == name if exact else key.replace("\u017f", "s").lower() == name.lower()) \
-                and value is not None:
-            found = value
-    return found
-
-
-def _local_endpoint(endpoint: str) -> bool:
-    """A unix socket on this host -- except Docker Desktop's, whose daemon runs in a VM."""
-    return endpoint.startswith("unix://") and "/.docker/desktop/" not in endpoint
+class _Pairs(list):  # type: ignore[type-arg]
+    """A decoded JSON object as its (key, value) pairs, duplicates kept."""
 
 
 def _resolve_cold_blocker(env: Mapping[str, str], host: HostReader) -> str | None:
-    docker_host = env.get("DOCKER_HOST", "")     # verbatim, as the CLI uses it
-    if docker_host:
-        if _local_endpoint(docker_host):
+    if env.get("DOCKER_HOST", "").strip():
+        return "DOCKER_HOST is set: cold runsc may run on another daemon's host"
+    for var in ("DOCKER_TLS_VERIFY", "DOCKER_TLS"):
+        if env.get(var, ""):
+            return f"{var} is set: the docker CLI dials tcp://localhost:2376, not the socket"
+    context = env.get("DOCKER_CONTEXT", "")
+    if context.strip():
+        if context == "default":
             return None
-        return f"DOCKER_HOST={docker_host!r}: cold runsc runs on that daemon's host, not this one"
-    cfg = _docker_config_dir(env)
-    context = env.get("DOCKER_CONTEXT", "")       # verbatim, as the CLI uses it
-    source = "DOCKER_CONTEXT"
-    if not context:
-        source = "docker config currentContext"
-        raw = host.read(os.path.join(cfg, "config.json"))
-        if raw is not None and len(raw) >= _READ_CAP:
-            raise ValueError("config.json at the read cap (truncated)")
-        if raw is not None and raw.strip(_GO_WS):   # an empty file is the CLI's default config
-            value = _go_field(_first_json(raw), "currentContext")
-            if value is not None and not isinstance(value, str):
-                raise ValueError("currentContext is not a string")
-            context = value or ""
-    if not context or context == "default":
-        if env.get("DOCKER_TLS_VERIFY", "") or env.get("DOCKER_TLS", ""):
-            # The CLI's default endpoint under TLS is tcp://localhost:2376, not the socket.
-            return "DOCKER_TLS(_VERIFY) set: the default endpoint is tcp://localhost:2376"
-        return None
-    if not _CONTEXT_NAME.fullmatch(context):
-        return f"{source} {context!r} is not a valid docker context name"
-    meta = os.path.join(cfg, "contexts", "meta",
-                        hashlib.sha256(context.encode()).hexdigest(), "meta.json")
+        return f"DOCKER_CONTEXT={context!r}: cold runsc may run on another daemon's host"
+    raw = host.read(os.path.join(_docker_config_dir(env), "config.json"))
+    if raw is not None and len(raw) >= _READ_CAP:
+        return "docker config.json too large to read whole: current context unknown"
+    if raw is None or not raw.strip():
+        return None                      # no config, or an empty one: the default context
     try:
-        # Endpoints is a map (exact key); the struct fields around it fold case.
-        endpoint = _go_field(_go_field(_go_field(_first_json(host.read(meta) or ""),
-                                                 "Endpoints"), "docker", exact=True), "Host")
-        if not isinstance(endpoint, str) or not endpoint:
-            raise ValueError("no docker endpoint")
-    except (ValueError, KeyError, TypeError):
-        return f"{source} {context!r}: endpoint unknown, cold runsc may run on another host"
-    if _local_endpoint(endpoint):
+        doc = json.loads(raw, object_pairs_hook=_Pairs)
+    except ValueError:
+        return "docker config.json is not valid JSON: current context unknown"
+    if doc is None:
         return None
-    return f"{source} {context!r} -> {endpoint!r}: cold runsc runs on that daemon's host"
+    if not isinstance(doc, _Pairs):
+        return "docker config.json is not an object: current context unknown"
+    for key, value in doc:
+        # Any spelling the CLI might take for currentContext (it folds case), any occurrence.
+        if key.lower() == "currentcontext" and value not in (
+                None, "", "default"):
+            return f"docker config currentContext {value!r}: cold runsc may run elsewhere"
+    return None
 
 
 def _parser_version(host: HostReader) -> str | None:
@@ -439,15 +392,18 @@ class Detection:
     mode: str
     state: HostLsm
 
-    def receipt(self, kind: str) -> dict[str, object] | None:
-        """The signed-receipt record for a run of ``kind``. Strings only (the canonicaliser
-        rejects floats). ``applied`` is "none" until the tier enforces: this release only
-        detects. None under ``off``: the receipt keeps its old shape, the opt-out for
-        verifiers that predate the field."""
-        if self.mode == "off":
-            return None
-        return {"mode": self.mode, "available": self.state.would_use(kind, self.mode),
-                "applied": "none"}
+    def summary(self, kinds: Iterable[str]) -> str:
+        """One log line: the mode and, per kind, the LSM it would be confined with (and why
+        not, for a kind left with none)."""
+        st = self.state
+        parts = [f"mode={self.mode}"]
+        for kind in kinds:
+            use = st.would_use(kind, self.mode)
+            why = [] if use != "none" or self.mode == "off" else [
+                b for b in ((st.cold_blocker,) if kind == "cold" else
+                            (st.selinux_blocker, st.apparmor_blocker)) if b]
+            parts.append(f"{kind}={use}" + (f" ({'; '.join(why)})" if why else ""))
+        return ", ".join(parts)
 
 
 class _SysReader:

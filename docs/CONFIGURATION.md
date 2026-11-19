@@ -220,12 +220,11 @@ network-style cascade — all run by `VmJobDispatcher`) omits the posture: its e
 declaration, not something the dispatcher enforces. Timestamps are integer epoch milliseconds;
 the signed JSON contains no floats.
 
-A local runsc (cold or warm gVisor) or Firecracker run also carries
-`confinement: {mode, available, applied}` -- `BLASTBOX_CONFINEMENT`, the host LSM the sandbox's
-host processes would be confined with, and the one applied (`"none"` until the confinement tier
-enforces; see [HOST-PREP.md](HOST-PREP.md#confinement-tier)). Verifiers older than this field
-refuse it as unknown: upgrade verifiers before dispatchers, or set `BLASTBOX_CONFINEMENT=off`
-(which omits the field) until they are.
+Verifiers accept, and `VerifiedReceipt.confinement` exposes, an optional
+`confinement: {mode, available, applied}` record (`BLASTBOX_CONFINEMENT`, the host LSM the
+sandbox's host processes are confined with, the one applied). Dispatchers do not sign it yet;
+the confinement tier's enforcement change will ([HOST-PREP.md](HOST-PREP.md#confinement-tier)).
+Older verifiers refuse unknown fields, so verifiers must be upgraded before that ships.
 
 **What it does not prove:** that detections are true (the envelope is still the worker's account).
 And, plainly: **any pinned key whose holder can write the shared results prefix can attach a
