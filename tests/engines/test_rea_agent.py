@@ -25,7 +25,13 @@ from blastbox.engines.rea.continuation import State, pack, unpack
 from blastbox.engines.rea.mcp_client import MAX_RESPONSE, McpError, McpStdioClient
 from blastbox.engines.rea.report import ReportInvalid, report_addresses, validate_report
 from blastbox.engines.rea.sufficiency import Gap, Sufficiency
-from blastbox.engines.rea.model import MAX_RESPONSE_BYTES, ModelClient, ModelError
+from blastbox.engines.rea.model import (
+    FATAL_KINDS,
+    MAX_RESPONSE_BYTES,
+    ModelClient,
+    ModelError,
+    classify_http_error,
+)
 from blastbox.limits import Limits
 
 HERE = Path(__file__).resolve().parent
@@ -412,6 +418,35 @@ def test_model_client_errors(opener, kind):
     with pytest.raises(ModelError) as ei:
         m.chat([{"role": "user", "content": "q"}], [], 16)
     assert ei.value.kind == kind
+
+
+@pytest.mark.parametrize("code,body,kind", [
+    (402, b'{"error":{"message":"Insufficient credits","code":402}}', "out_of_credit"),
+    (401, b'{"error":{"message":"No auth credentials found"}}', "key_rejected"),
+    (403, b'{"error":{"message":"Key disabled"}}', "key_rejected"),
+    (403, b"<html><body>Filtered</body></html>", "refused"),   # our tinyproxy URL filter
+    (400, b'{"error":{"message":"`temperature` is deprecated for this model."}}', "refused"),
+    (404, b"", "refused"),
+    (429, b"", "unavailable"), (408, b"", "unavailable"), (500, b"x", "unavailable"), (503, b"", "unavailable"),
+    (402, b"\xff" * 100_000, "out_of_credit"),
+    (403, b"\xff\xfe not json", "refused"),
+])
+def test_classify_http_error(code, body, kind):
+    assert classify_http_error(code, body) == kind
+
+
+def test_fatal_kinds():
+    assert FATAL_KINDS == {"out_of_credit", "key_rejected", "refused"}
+
+
+def test_model_client_http_402_is_out_of_credit_and_hides_body():
+    err = urllib.error.HTTPError("http://x", 402, "pay", {}, io.BytesIO(b'{"error":{"message":"SECRET-BODY"}}'))
+    m = ModelClient("http://m:1/v1", "x", 5, opener=FakeOpener(exc=err))
+    with pytest.raises(ModelError) as ei:
+        m.chat([{"role": "user", "content": "q"}], [], 16)
+    assert ei.value.kind == "out_of_credit"
+    assert str(ei.value) == "out_of_credit: http_402"
+    assert "SECRET-BODY" not in str(ei.value)
 
 
 def test_model_client_default_opener_honours_proxy_env(monkeypatch):

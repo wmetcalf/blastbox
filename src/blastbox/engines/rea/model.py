@@ -49,7 +49,37 @@ MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
 _log = logging.getLogger("blastbox.engines.rea.model")
 
-ModelErrorKind = Literal["unavailable", "malformed"]
+ModelErrorKind = Literal["unavailable", "malformed", "out_of_credit", "key_rejected", "refused"]
+
+#: Kinds that retrying the same endpoint cannot fix.
+FATAL_KINDS: frozenset[str] = frozenset({"out_of_credit", "key_rejected", "refused"})
+
+_ERROR_BODY_READ = 4096
+
+
+def classify_http_error(code: int, body: bytes) -> ModelErrorKind:
+    """Map an HTTP error status (and a bounded body prefix) to a :data:`ModelErrorKind`.
+
+    402 is out of credit; 401 is a rejected key; 403 is a rejected key only when the body is a
+    JSON object with an ``error`` key (a provider's answer), else it is a filter's refusal.
+    408, 429 and 5xx are transient. Every other 4xx, including 400, is a refusal. (Anthropic's
+    error docs state no credit-too-low 400 text, so none is matched.)
+    """
+    if code == 402:
+        return "out_of_credit"
+    if code == 401:
+        return "key_rejected"
+    if code == 403:
+        try:
+            doc = json.loads(body.decode("utf-8", "replace"))
+        except Exception:
+            return "refused"
+        return "key_rejected" if isinstance(doc, dict) and "error" in doc else "refused"
+    if code in (408, 429) or code >= 500:
+        return "unavailable"
+    if 400 <= code < 500:
+        return "refused"
+    return "unavailable"
 
 
 DIALECTS = ("vllm", "openrouter")
@@ -196,7 +226,14 @@ class ModelClient:
         exc = box.get("exc")
         if isinstance(exc, urllib.error.HTTPError):
             _log.warning("model endpoint returned HTTP %s", exc.code)
-            raise ModelError("unavailable", f"http_{exc.code}") from None
+            try:
+                err_body = exc.read(_ERROR_BODY_READ)
+            except Exception:
+                err_body = b""
+            if not isinstance(err_body, bytes):
+                err_body = b""
+            raise ModelError(classify_http_error(exc.code, err_body[:_ERROR_BODY_READ]),
+                             f"http_{exc.code}") from None
         if isinstance(exc, (urllib.error.URLError, OSError, ValueError, http.client.HTTPException)):
             _log.warning("model endpoint unreachable: %s", type(exc).__name__)
             raise ModelError("unavailable", type(exc).__name__) from None
