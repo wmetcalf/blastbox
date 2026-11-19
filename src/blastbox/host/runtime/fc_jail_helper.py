@@ -603,19 +603,49 @@ class FdSink:
         self._proc: "subprocess.Popen[bytes] | None" = None
         self._sock: "socket.socket | None" = None
         self._pending = 0           # batches handed over whose "D" has not arrived
+        self._spare_lock = threading.Lock()
+        self._spare: "tuple[socket.socket, subprocess.Popen[bytes]] | None" = None
+        self._closed = False
 
-    def _start(self) -> None:
+    def _spawn_sink(self) -> "tuple[socket.socket, subprocess.Popen[bytes]]":
         a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         try:
-            self._proc = self._popen(
+            proc = self._popen(
                 [sys.executable, "-I", "-c", _SINK_CODE, str(b.fileno())],
                 pass_fds=(b.fileno(),), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, close_fds=True, env={})
+        except BaseException:
+            a.close()
+            raise
         finally:
             b.close()
-        a.settimeout(2.0)
-        self._sock = a
+        a.settimeout(2.0)            # only the ACK wait uses it: a fresh sink answers at once
+        return a, proc
+
+    def _refill_spare(self) -> None:
+        """Keep one sink started ahead of need, off the caller's path: replacing a wedged sink
+        must cost a swap, not a Python start-up under the lock every client shares."""
+        def _run() -> None:
+            try:
+                spare = self._spawn_sink()
+            except Exception:  # noqa: BLE001 - the synchronous path starts one if needed
+                return
+            with self._spare_lock:
+                if self._spare is None and not self._closed:
+                    self._spare = spare
+                    return
+            spare[0].close()
+            _reap_async(spare[1])
+        threading.Thread(target=_run, daemon=True, name="fcj-sink-spare").start()
+
+    def _start(self) -> None:
+        with self._spare_lock:
+            spare, self._spare = self._spare, None
+        if spare is None:
+            spare = self._spawn_sink()
+        self._sock, self._proc = spare
         self._pending = 0
+        self._refill_spare()
 
     def _kill(self) -> None:
         if self._sock is not None:
@@ -623,20 +653,22 @@ class FdSink:
             self._sock.close()
             self._sock = None
         if self._proc is not None:
+            # SIGKILL ends a lingering close; reaping happens off this thread.
             with contextlib.suppress(OSError):
                 self._proc.kill()
-            with contextlib.suppress(Exception):
-                self._proc.wait(timeout=5)
+            _reap_async(self._proc)
             self._proc = None
 
     def _settle(self) -> None:
-        """Collect "D"s without blocking; a sink with work outstanding is replaced."""
+        """Collect "D"s WITHOUT blocking (poll with a zero timeout: the socket itself has a
+        timeout, which would make a MSG_DONTWAIT recv wait for it); a sink with work still
+        outstanding is presumed wedged and replaced."""
         assert self._sock is not None
-        while self._pending:
+        poller = select.poll()
+        poller.register(self._sock.fileno(), select.POLLIN)
+        while self._pending and poller.poll(0):
             try:
-                got = self._sock.recv(16, socket.MSG_DONTWAIT)
-            except BlockingIOError:
-                break
+                got = self._sock.recv(16)
             except OSError:
                 got = b""
             if not got:
@@ -655,16 +687,16 @@ class FdSink:
             for start in range(0, len(fds), SCM_MAX_FD):
                 batch = fds[start:start + SCM_MAX_FD]
                 for _attempt in range(2):
-                    if self._sock is not None:
-                        self._settle()
-                    if self._sock is None:
-                        self._start()
-                    assert self._sock is not None
                     try:
+                        if self._sock is not None:
+                            self._settle()
+                        if self._sock is None:
+                            self._start()       # EAGAIN/ENOMEM here must not escape
+                        assert self._sock is not None
                         socket.send_fds(self._sock, [b"F"], batch)
                         if self._sock.recv(16) != b"A":
                             raise OSError("sink did not acknowledge")
-                    except OSError:
+                    except Exception:  # noqa: BLE001 - OSError, SubprocessError: try a new sink
                         self._kill()
                         continue
                     for fd in batch:        # not the last reference: the sink holds them
@@ -683,6 +715,18 @@ class FdSink:
     def close(self) -> None:
         with self._lock:
             self._kill()
+            with self._spare_lock:
+                self._closed = True
+                spare, self._spare = self._spare, None
+            if spare is not None:
+                spare[0].close()
+                with contextlib.suppress(OSError):
+                    spare[1].kill()
+                _reap_async(spare[1])
+
+
+def _reap_async(proc: "subprocess.Popen[bytes]") -> None:
+    threading.Thread(target=lambda: proc.wait(), daemon=True, name="fcj-sink-reap").start()
 
 # --------------------------------------------------------------------------- the helper
 SO_PEERPIDFD = getattr(socket, "SO_PEERPIDFD", 77)
@@ -1141,7 +1185,7 @@ class Helper:
                 "cpu.max": f"{(req['vcpus'] + 1) * 100000} 100000",
             }
             argv = jailer_argv(cfg, jail.id, jail.uid, exec_file=exec_src, cgroups=cgroups,
-                               netns_path=str(self._netns_dir / jail.netns),
+                               netns_path=_jp(str(self._netns_dir), jail.netns),
                            fsize=max(jail.outdisk_bytes, (jail.mem_mib << 20) + (1 << 20)))
             proc = self._popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, env={}, cwd="/", close_fds=True,
@@ -1558,11 +1602,9 @@ class Helper:
                     if not busy_peer:
                         self._release_peer(peer)
                     # Overloaded: SAY so (the client retries "busy"); a silent close is
-                    # indistinguishable from a refused uid. Drain first (closing with unread data
-                    # resets the client before it reads "busy") -- and drain WITHOUT blocking:
-                    # this is the accept thread.
-                    # Read the queued request (non-blocking) so "busy" is what the client reads;
-                    # its descriptors and the connection itself go to the sink.
+                    # indistinguishable from a refused uid. Read the queued request first
+                    # (non-blocking: this is the accept thread) so "busy" is what the client
+                    # reads; its descriptors and the connection itself go to the sink.
                     taken: list[int] = []
                     with contextlib.suppress(OSError):
                         _, taken, _, _ = socket.recv_fds(conn, MAX_MSG + 1, SCM_MAX_FD,
@@ -1579,7 +1621,13 @@ class Helper:
                     finally:
                         slots.release()
                         self._release_peer(p)
-                threading.Thread(target=_run, daemon=True, name="fcj-conn").start()
+                try:
+                    threading.Thread(target=_run, daemon=True, name="fcj-conn").start()
+                except Exception as exc:  # noqa: BLE001 - "can't start new thread": shed it
+                    _log.error("fc_jail.conn_thread_failed: %s", exc)
+                    slots.release()
+                    self._release_peer(peer)
+                    self._sink.release([conn.detach()])
         finally:
             srv.close()
             self._sink.close()

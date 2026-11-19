@@ -982,3 +982,30 @@ def test_reaping_skips_a_jail_whose_publish_holds_its_lock(env):
         jail.lock.release()
     env.helper._destroy(jail, wait=False)
     assert jail.destroyed
+
+
+def test_a_sink_that_cannot_start_never_raises_into_the_helper():
+    def no_processes(*a, **kw):
+        raise OSError(11, "Resource temporarily unavailable")
+    sink = h.FdSink(popen=no_processes)
+    r, w = os.pipe()
+    sink.release([r])                  # logged and kept, never raised
+    os.close(w)
+
+
+def test_replacing_a_wedged_sink_is_a_swap_not_a_two_second_stall():
+    c, peer, srv = _lingering_socket()
+    sink = h.FdSink()
+    try:
+        sink.release([os.open("/dev/null", os.O_RDONLY)])     # starts a sink (+ a spare)
+        sink.release([c.detach()])                            # wedges it in a lingering close
+        deadline = time.monotonic() + 5
+        while sink._spare is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        t0 = time.monotonic()
+        sink.release([os.open("/dev/null", os.O_RDONLY)])
+        assert time.monotonic() - t0 < 0.5
+    finally:
+        sink.close()
+        peer.close()
+        srv.close()

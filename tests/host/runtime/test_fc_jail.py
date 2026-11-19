@@ -830,3 +830,50 @@ def test_a_stalled_output_copy_is_host_io(tmp_path, monkeypatch):
         JailedProcess(jail, JID).copy_outdisk(tmp_path / "o.ext4")
     gate.set()
     assert exc.value.host_io
+
+
+def test_healthy_concurrent_output_copies_are_never_refused(tmp_path, monkeypatch):
+    from blastbox.host.runtime import fc_jail as fj
+
+    jail = _FakeJail(tmp_path)
+    jail.alive[JID] = True
+    jail.outdisk_bytes = b"x" * 4096
+    monkeypatch.setattr(fj, "_ABANDONED", [])
+    real = fj.sparse_copy
+    monkeypatch.setattr(fj, "sparse_copy", lambda s, d, n: (time.sleep(0.2), real(s, d, n)))
+    import concurrent.futures as cf
+    import time
+    with cf.ThreadPoolExecutor(12) as ex:
+        futs = [ex.submit(JailedProcess(jail, JID).copy_outdisk, tmp_path / f"o{i}.ext4")
+                for i in range(12)]
+        for f in futs:
+            f.result()                         # none refused as "stuck"
+
+
+def test_retrying_parked_destroys_never_waits_on_the_spawn_path(tmp_path):
+    from blastbox.host.runtime import fc_snapshot_launcher as fl
+
+    class _Stubborn:                           # kill delivered, never honoured (D-state VMM)
+        jail_id = "stubborn"
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            time.sleep(timeout or 0)
+            raise subprocess.TimeoutExpired("x", timeout)
+
+        def destroy(self):
+            raise JailError("alive", "x")
+    import time
+    p = _Stubborn()
+    with fl._STRANDED_LOCK:
+        fl._PENDING_DESTROY.extend([p, p, p])
+    t0 = time.monotonic()
+    fl._retry_pending_destroys()
+    assert time.monotonic() - t0 < 1.0
+    with fl._STRANDED_LOCK:
+        fl._PENDING_DESTROY[:] = [x for x in fl._PENDING_DESTROY if x is not p]
