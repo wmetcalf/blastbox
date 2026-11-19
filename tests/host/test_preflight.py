@@ -1468,3 +1468,15 @@ def test_gvisor_userns_symlink_in_a_private_dir_fails():
     host.stats = {"/home/coz": (0o40750, 1000, 1000, False)}
     c = _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-userns"]
     assert c.status is Status.FAIL and "/home/coz " in c.detail
+
+
+def test_gvisor_userns_split_reservation_of_one_owner_counts_whole():
+    split = "blastbox:2000000:30000\nblastbox:2030000:35536\n"
+    host = _healthy(env=_UNS, files={**_SUBIDS, "/etc/subuid": split})
+    assert _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-userns"].status is Status.PASS
+
+
+def test_gvisor_userns_foreign_pool_partly_inside_the_range_is_a_collision():
+    host = _healthy(env=_UNS, files={**_SUBIDS, "/etc/subuid": "dockremap:2030000:65536\n"})
+    c = _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-userns"]
+    assert c.status is Status.WARN and "shared with another" in c.detail and "dockremap" in c.detail

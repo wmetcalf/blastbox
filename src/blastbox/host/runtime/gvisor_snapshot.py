@@ -428,21 +428,54 @@ def _real_path_stat(path: str) -> PathStat | None:
     return st.st_mode, st.st_uid, st.st_gid, acl
 
 
-def _path_chain(path: str) -> list[str]:
-    """``/``, then each prefix of the absolute, lexically normalised ``path``."""
-    parts = [p for p in os.path.normpath(path).split("/") if p]
-    return ["/"] + ["/" + "/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+def _readlink_or_none(path: str) -> str | None:
+    try:
+        return os.readlink(path)
+    except OSError:
+        return None
+
+
+_MAX_LINK_HOPS = 40               # the kernel's own limit (ELOOP)
+
+
+def _walked_dirs(path: str, readlink: Callable[[str], str | None]) -> list[str]:
+    """Every directory a kernel path walk of ``path`` searches, in order: each component of the
+    path AND of every symlink target met on the way (``..`` taken physically, as the kernel
+    does). Every entry is symlink-free, so ``stat`` on it is the directory actually walked."""
+    todo = [p for p in os.path.abspath(path).split("/") if p]
+    cur, out, hops = "/", ["/"], 0
+    while todo:
+        name = todo.pop(0)
+        if name == ".":
+            continue
+        if name == "..":
+            cur = os.path.dirname(cur) or "/"
+            continue
+        nxt = os.path.join(cur, name)
+        target = readlink(nxt)
+        if target is not None:
+            hops += 1
+            if hops > _MAX_LINK_HOPS:
+                break
+            if target.startswith("/"):
+                cur = "/"
+            todo = [p for p in target.split("/") if p] + todo
+            continue
+        cur = nxt
+        out.append(cur)
+    return list(dict.fromkeys(out))
 
 
 def userns_rootfs_problem(rootfs: str, base: int, *,
                           stat: Callable[[str], PathStat | None] = _real_path_stat,
                           realpath: Callable[[str], str] = os.path.realpath,
+                          readlink: Callable[[str], str | None] = _readlink_or_none,
                           groups: Collection[int] = (),
                           ) -> tuple[bool | None, str]:
     """Whether the user-namespaced gofer (host uid/gid ``base``, guest root) can reach
     ``rootfs``: search (x) on every directory the bind walks. runsc mounts ``rootfs`` as
-    configured (no symlink resolution) and then chroots into it, so that is every component of
-    the configured path (a symlinked one checked at its target) plus the resolved path's chain.
+    configured and the kernel resolves it, so that is every component of the configured path
+    and of every symlink target met on the way (:func:`_walked_dirs`).
     Read on the rootfs is not needed (lisafs falls back to O_PATH).
 
     The gofer's capabilities are scoped to its namespace, so they override DAC only on inodes
@@ -457,10 +490,10 @@ def userns_rootfs_problem(rootfs: str, base: int, *,
     ACL, which can grant or deny past the mode bits) -- unknown is never treated as a denial,
     but a later component whose mode bits plainly deny it still is."""
     resolved = realpath(rootfs)
-    chain = list(dict.fromkeys([*_path_chain(os.path.abspath(rootfs)), *_path_chain(resolved)]))
+    chain = _walked_dirs(rootfs, readlink)
     unknown = ""
     for path in chain:
-        st = stat(path)            # follows symlinks: a linked component is checked at its target
+        st = stat(path)
         if st is None:
             return None, f"cannot stat {path}"
         mode, uid, gid, acl = st
@@ -1156,11 +1189,11 @@ class GvisorSnapshotBackend:
                 "`restore`, which gVisor does not support rootless (it fails with 'Rootless "
                 "mode not supported with \"restore\"'). Run this tier as root, or use a "
                 "non-snapshot gVisor tier.")
-        if cfg.userns_problem:
+        if getattr(cfg, "userns_problem", ""):
             raise GvisorCommandError(
                 f"{cfg.userns_problem}; refusing to start the warm-snapshot tier without the user "
                 "namespace it asks for (its sandbox would run as real host root). Fix or unset it.")
-        if cfg.userns_host_base is not None and not (
+        if getattr(cfg, "userns_host_base", None) is not None and not (
                 0 <= cfg.uid < USERNS_SIZE and 0 <= cfg.gid < USERNS_SIZE):
             # The worker's guest uid/gid must be inside the 0..65535 map, or runsc cannot set it.
             raise GvisorCommandError(
@@ -1186,7 +1219,9 @@ class GvisorSnapshotBackend:
         Under a user namespace runsc denies setgroups, so its sentry and gofer keep runsc's own
         supplementary groups -- the dispatcher's (gid 0 via sudo/initgroups, docker, disk, ...)
         -- and an escape would land with them. Start runsc with none."""
-        return {"extra_groups": []} if self._cfg.userns_host_base is not None else {}
+        # getattr: callers (and tests) hand duck-typed configs, as for image_rootfs elsewhere.
+        return {"extra_groups": []} if getattr(self._cfg, "userns_host_base", None) is not None \
+            else {}
 
     def available(self) -> bool:
         # `probe` is a full override (tests/embedders); honor it verbatim.

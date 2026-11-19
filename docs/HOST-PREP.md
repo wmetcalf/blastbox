@@ -201,7 +201,7 @@ blastbox preflight --tier gvisor
   when it cannot decide) and by the runtime at startup, which refuses the tier with the offending
   directory named instead of failing the first boot after the readiness wait. runsc binds the
   path **as configured**, so a symlink left at an old path (e.g. under a 0750 home) still needs
-  its own directories searchable; both the configured path and the link target are checked.
+  its own directories searchable; the check walks the path as the kernel does, through every symlink hop.
 - **No supplementary groups.** runsc denies `setgroups` in the namespace, so its Sentry and gofer
   would keep runsc's own supplementary groups (the dispatcher's: gid 0 via sudo, `docker`,
   `disk`, ...) and an escape would land with them. blastbox starts the sandbox-starting runsc calls

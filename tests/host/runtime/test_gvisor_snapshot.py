@@ -1966,3 +1966,47 @@ def test_userns_rootfs_acl_is_unknown_even_when_mode_bits_allow():
     ok, why = userns_rootfs_problem("/srv/r", 2_000_000, stat=lambda p: tree.get(p),
                                     realpath=lambda p: p)
     assert ok is None and "/srv" in why and "ACL" in why
+
+
+@pytest.mark.parametrize("userns", [None, 2_000_000])
+def test_runsc_run_and_restore_actually_spawn_without_supplementary_groups(tmp_path, userns):
+    """Drives boot_base/restore_in: the kwargs reaching the spawn, not the helper's return."""
+    seen: dict[str, dict] = {}
+
+    def run(argv, **kw):
+        for verb in ("run", "restore", "checkpoint", "exec"):
+            if verb in argv:
+                seen.setdefault(verb, kw)
+        return 0
+
+    be = GvisorSnapshotBackend(_cfg(tmp_path, userns_host_base=userns), run=run,
+                               ready_wait=lambda d, t: None)
+    boot = be.boot_base()
+    boot.wait_ready(5.0)
+    art = boot.checkpoint(tmp_path / "ckpt")
+    wd = tmp_path / "slots" / "s1"
+    wd.mkdir(parents=True)
+    be.restore_in(wd, art)
+    for verb in ("run", "restore"):
+        if userns is None:
+            assert "extra_groups" not in seen[verb]
+        else:
+            assert seen[verb]["extra_groups"] == []
+
+
+def test_userns_rootfs_walk_follows_every_symlink_hop():
+    """The kernel searches the directories of INTERMEDIATE link targets too."""
+    from blastbox.host.runtime.gvisor_snapshot import userns_rootfs_problem
+
+    links = {"/var/lib/blastbox": "/home/coz/bb", "/home/coz/bb/gvisor-rootfs": "../../../srv/r"}
+    modes = {"/home/coz": (0o40750, 1000, 1000, False)}
+    ok, why = userns_rootfs_problem(
+        "/var/lib/blastbox/gvisor-rootfs", 2_000_000,
+        stat=lambda p: modes.get(p, (0o40755, 0, 0, False)),
+        readlink=links.get, realpath=lambda p: "/srv/r")
+    assert ok is False and "/home/coz " in why
+    modes.clear()
+    assert userns_rootfs_problem(
+        "/var/lib/blastbox/gvisor-rootfs", 2_000_000,
+        stat=lambda p: modes.get(p, (0o40755, 0, 0, False)),
+        readlink=links.get, realpath=lambda p: "/srv/r")[0] is True

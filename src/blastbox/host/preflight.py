@@ -134,6 +134,10 @@ class HostView:
         """``(st_mode, st_uid, st_gid, has_posix_acl)`` following symlinks; None if unstat-able."""
         raise NotImplementedError
 
+    def readlink(self, path: str) -> str | None:
+        """The target of a symlink; None when ``path`` is not one (or cannot be read)."""
+        raise NotImplementedError
+
 
 class RealHost(HostView):
     def __init__(self) -> None:
@@ -197,6 +201,12 @@ class RealHost(HostView):
         from blastbox.host.runtime.gvisor_snapshot import _real_path_stat  # noqa: PLC0415
 
         return _real_path_stat(path)
+
+    def readlink(self, path: str) -> str | None:
+        try:
+            return os.readlink(path)
+        except OSError:
+            return None
 
     def run(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str] | None:
         if not is_read_only(argv):
@@ -577,7 +587,8 @@ def _check_gvisor_userns(host: HostView) -> Check | None:
     ids = f"{base}..{base + USERNS_SIZE - 1}"
     span = f"guest 0..{USERNS_SIZE - 1} -> host {ids}"
     rootfs = host.env.get("BLASTBOX_GVISOR_ROOTFS", "/var/lib/blastbox/gvisor-rootfs")
-    ok, why = userns_rootfs_problem(rootfs, base, stat=host.stat_path, realpath=host.realpath)
+    ok, why = userns_rootfs_problem(rootfs, base, stat=host.stat_path, realpath=host.realpath,
+                                    readlink=host.readlink)
     if ok is False:
         return Check("gvisor-userns", Status.FAIL,
                      f"{_USERNS_UNREACHABLE}: {why}; the warm tier refuses to start", doc)
@@ -604,7 +615,8 @@ def _check_gvisor_userns(host: HostView) -> Check | None:
         if len(cover) > 1 or (cover and overlap):
             # Two owners of the range: another user/daemon allocates these ids too.
             overlap = [*cover, *overlap]
-        if overlap == overlap[:1] and not cover and overlap:
+        if overlap == overlap[:1] and not cover and overlap \
+                and overlap[0] not in _FOREIGN_SUBID_OWNERS:
             warnings.append(f"{path}: {overlap[0]} reserves only part of {ids}")
         elif overlap:
             warnings.append(f"{path}: {', '.join(overlap)} each allocate ids in {ids} "
