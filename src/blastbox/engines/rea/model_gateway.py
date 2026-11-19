@@ -14,14 +14,20 @@ grant's model, an OpenRouter ``models`` fallback list is allowed only as exactly
 never spend its key on another model or on paid plugins. Bodies holding NaN or
 Infinity are refused (400) rather than re-serialised as invalid JSON.
 
-Nothing secret is ever logged: one line per request carries method, route, status
-and elapsed milliseconds, and nothing else.
+Every 401 the gateway answers itself has the fixed body
+``{"error":{"code":"rea_grant_rejected","message":"grant rejected"}}`` so the agent can tell
+it from a provider's 401 (``model.classify_http_error``).
+
+Nothing secret is ever logged: one line per request carries method, route, status and
+elapsed milliseconds, plus ``job=<id>`` on the grant path (the job id is not secret; a
+value outside ``[A-Za-z0-9._:-]{1,128}`` is logged as ``?``), and nothing else.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import re
 import ssl
 import stat
 import sys
@@ -58,9 +64,13 @@ OPERATOR_KEY_ENV = {
 REQUIRE_GRANT_ENV = "REA_GW_REQUIRE_GRANT"
 # Body fields that would let a grant reach models or paid features it does not name.
 _UNPINNED_FIELDS = ("route", "plugins")
+_LOGGABLE_JOB = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 _LOGGED_METHODS = frozenset({"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"})
 
-_GRANT_REJECTED = b'{"error":{"message":"grant rejected"}}'
+# Every 401 the gateway itself answers (bad, expired or mismatched grant, no private key, no
+# grant when one is required or no operator key). The code tells it apart from a provider's 401
+# (model.classify_http_error -> "grant_rejected").
+_GRANT_REJECTED = b'{"error":{"code":"rea_grant_rejected","message":"grant rejected"}}'
 _MODEL_NOT_GRANTED = b'{"error":{"message":"model not granted"}}'
 _BAD_BODY = b'{"error":{"message":"invalid request body"}}'
 _FORBIDDEN = b'{"error":{"message":"forbidden"}}'
@@ -208,6 +218,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def handle_one_request(self) -> None:
         self._status = 0
+        self._job: str | None = None
         self._t0 = time.monotonic()
         try:
             super().handle_one_request()
@@ -217,7 +228,11 @@ class _Handler(BaseHTTPRequestHandler):
                 path = (getattr(self, "path", "") or "").split("?", 1)[0]
                 route = path if path in ROUTES else "-"
                 ms = int((time.monotonic() - self._t0) * 1000)
-                log.info("%s %s %d %dms", method, route, self._status, ms)
+                if self._job is None:
+                    log.info("%s %s %d %dms", method, route, self._status, ms)
+                else:
+                    job = self._job if _LOGGABLE_JOB.fullmatch(self._job) else "?"
+                    log.info("%s %s %d %dms job=%s", method, route, self._status, ms, job)
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("do_"):
@@ -251,6 +266,7 @@ class _Handler(BaseHTTPRequestHandler):
             except GrantRejected:
                 self._reply(401, _GRANT_REJECTED)
                 return
+            self._job = grant.job
             if grant.provider != provider:
                 self._reply(401, _GRANT_REJECTED)
                 return

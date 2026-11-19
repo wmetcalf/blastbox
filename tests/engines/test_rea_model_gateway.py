@@ -22,6 +22,8 @@ SYN_ANTH_KEY = "sk-ant-SYNTHETIC-grant-key-0002"
 SYN_OP_KEY = "sk-or-v1-SYNTHETIC-operator-key-0003"
 OR_PATH = "/api/v1/chat/completions"
 AN_PATH = "/anthropic/v1/chat/completions"
+# The gateway's own rejection, byte for byte: the agent tells it from a provider 401 by the code.
+GRANT_REJECTED = b'{"error":{"code":"rea_grant_rejected","message":"grant rejected"}}'
 
 
 def _b64e(b: bytes) -> str:
@@ -213,7 +215,7 @@ def test_bad_grant_is_401_and_never_uses_operator_key(gw, token):
     port = gw(op, {"openrouter": SYN_OP_KEY})
     st, out = _call(port, body=_body(), grant=tok)
     assert st == 401
-    assert json.loads(out) == {"error": {"message": "grant rejected"}}
+    assert out == GRANT_REJECTED
     assert op.requests == []
 
 
@@ -221,7 +223,7 @@ def test_grant_without_private_key_is_401(gw):
     op = FakeOpener()
     port = gw(op, {"openrouter": SYN_OP_KEY}, private_key=None)
     st, out = _call(port, body=_body(), grant=_grant())
-    assert st == 401 and json.loads(out) == {"error": {"message": "grant rejected"}}
+    assert st == 401 and out == GRANT_REJECTED
     assert op.requests == []
 
 
@@ -239,7 +241,7 @@ def test_no_grant_no_operator_key_is_401(gw):
     op = FakeOpener()
     port = gw(op, {"anthropic": "sk-ant-SYNTHETIC-op"})
     st, out = _call(port, body=_body())
-    assert st == 401 and json.loads(out) == {"error": {"message": "grant rejected"}}
+    assert st == 401 and out == GRANT_REJECTED
     assert op.requests == []
 
 
@@ -325,6 +327,23 @@ def test_logs_carry_no_secret(gw, caplog, capsys):
         assert secret not in logs
 
 
+def test_request_log_names_the_grant_job_and_nothing_secret(gw, caplog):
+    caplog.set_level(logging.INFO, logger="blastbox.rea.model_gateway")
+    op = FakeOpener()
+    port = gw(op, {"openrouter": SYN_OP_KEY})
+    tok = _seal({"v": 1, "job": "job-77", "provider": "openrouter",
+                 "model": "vendor/model-a", "key": SYN_GRANT_KEY, "exp": NOW + 60})
+    assert _call(port, body=_body(), grant=tok)[0] == 200
+    assert _call(port, body=_body())[0] == 200
+    lines = [r.getMessage() for r in caplog.records
+             if r.name == "blastbox.rea.model_gateway"]
+    assert len(lines) == 2
+    assert lines[0].startswith(f"POST {OR_PATH} 200 ") and lines[0].endswith(" job=job-77")
+    assert "job=" not in lines[1]  # operator path: no grant, no job
+    for line in lines:
+        assert tok not in line and SYN_GRANT_KEY not in line and SYN_OP_KEY not in line
+
+
 def test_operator_key_file_hardening(tmp_path, monkeypatch):
     good = tmp_path / "or.key"
     good.write_text(SYN_OP_KEY + "\n")
@@ -389,7 +408,7 @@ def test_require_grant_refuses_operator_fallback(gw):
     op = FakeOpener()
     port = gw(op, {"openrouter": SYN_OP_KEY}, require_grant=True)
     st, out = _call(port, body=_body())
-    assert st == 401 and json.loads(out) == {"error": {"message": "grant rejected"}}
+    assert st == 401 and out == GRANT_REJECTED
     assert op.requests == []
     st2, _ = _call(port, body=_body(), grant=_grant())
     assert st2 == 200
