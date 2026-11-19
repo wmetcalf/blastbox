@@ -219,30 +219,40 @@ def test_every_network_allow_in_the_profile_actually_survives_compilation(
 _MOUNT_CLASS = 0x7    # AA_CLASS_MOUNT: the policy DFA's first byte for mount/umount/pivot_root
 
 
-def _policy_start_classes(text: str) -> set[int]:
-    """The class bytes the compiled POLICY DFA's start state has a transition for
-    (`--dump=dfa-states`; the policy DFA is dumped LAST, after the xmatch DFA of a profile with
-    an attachment and the file DFA). The
-    kernel mediates a class only if that transition exists (RULE_MEDIATES): without it, every
-    operation of the class is allowed, whatever the rules say."""
+def _policy_start_classes(text: str) -> list[set[int]]:
+    """Per compiled POLICY DFA in `--dump=dfa-states` (one per profile, hat or child), the
+    class bytes its start state has a transition for. The kernel mediates a class only if that
+    transition exists (RULE_MEDIATES): without it, every operation of the class is allowed,
+    whatever the rules say. File and xmatch DFAs are told apart by their start state: it
+    transitions on path bytes ('/'), a policy DFA's on class bytes."""
     res = subprocess.run(
         ["apparmor_parser", "-Q", "-K", "--skip-cache", "--dump=dfa-states", "-S"],
         input=text.encode(), capture_output=True, timeout=120,
     )
     assert res.returncode == 0, res.stderr.decode()
     lines = res.stderr.decode().splitlines()
-    starts = [i for i, ln in enumerate(lines) if "<== " in ln]
-    assert len(starts) >= 2, "expected a file DFA and a policy DFA in the dump"
-    policy = lines[starts[-1]:]
-    first = next(i for i, ln in enumerate(policy) if ln.startswith("{1} perms"))
-    classes: set[int] = set()
-    for ln in policy[first + 1:]:
-        if ln.startswith("{"):
-            break
-        m = re.search(r"\b0x([0-9a-f]+) ->", ln)
-        if m:
-            classes.add(int(m.group(1), 16))
-    return classes
+    starts = [i for i, ln in enumerate(lines) if "<== " in ln] + [len(lines)]
+    policies: list[set[int]] = []
+    for lo, hi in zip(starts, starts[1:]):
+        section = lines[lo:hi]
+        first = next((i for i, ln in enumerate(section) if ln.startswith("{1} perms")), None)
+        if first is None:
+            continue
+        classes: set[int] = set()
+        for ln in section[first + 1:]:
+            if ln.startswith("{"):
+                break
+            m = re.search(r"\b0x([0-9a-fA-F]+) ->", ln)
+            if m:
+                classes.add(int(m.group(1), 16))
+        if 0x2F not in classes:                  # not a file / xmatch DFA
+            policies.append(classes)
+    assert policies, "no policy DFA in the dump"
+    return policies
+
+
+def _mediates_mount(text: str) -> bool:
+    return all(_MOUNT_CLASS in classes for classes in _policy_start_classes(text))
 
 
 _PARSER = pytest.mark.skipif(shutil.which("apparmor_parser") is None,
@@ -260,7 +270,7 @@ def test_the_child_profile_mediates_the_mount_class() -> None:
     the old profile let a confined process mount and umount; this one denies both (EACCES).
     The check is on the compiled DFA, so it catches every spelling."""
     text = (_PROFILE_DIR / "blastbox-sandbox").read_text()
-    assert _MOUNT_CLASS in _policy_start_classes(text), (
+    assert _mediates_mount(text), (
         "the compiled child profile does not mediate the mount class: a umount deny is matching "
         "the empty mountpoint -- spell it with a path (`audit deny umount /,` and "
         "`audit deny umount /**,`)"
@@ -273,7 +283,7 @@ def _parser_has_the_marker_bug() -> bool:
     above any rule ("a deny rule wiping these out could result in the dfa allowing stuff as
     unmediated"), so that spelling is harmless there."""
     probe = "abi <abi/3.0>,\nprofile bb-probe {\n  /tmp/bb-probe r,\n  audit deny umount,\n}\n"
-    return _MOUNT_CLASS not in _policy_start_classes(probe)
+    return not _mediates_mount(probe)
 
 
 @_PARSER
@@ -291,15 +301,21 @@ def test_the_mediation_check_tells_the_spellings_apart(extra: str, mediated: boo
     text = (_PROFILE_DIR / "blastbox-sandbox").read_text().replace(
         "  network netlink raw,", "  network netlink raw,\n" + extra if extra else
         "  network netlink raw,")
-    assert (_MOUNT_CLASS in _policy_start_classes(text)) is mediated
+    assert _mediates_mount(text) is mediated
 
 
 def test_umount_denies_are_spelled_with_a_path() -> None:
-    """The text-level guard for hosts without apparmor_parser (the compiled check above is the
-    real one): no umount deny that matches the empty mountpoint."""
+    """The text-level guard, for hosts without apparmor_parser AND for parsers >= 4.1, where
+    the compiled check cannot see the bug: no umount deny that matches the empty mountpoint."""
     rules = [ln.split("#", 1)[0].strip() for ln in
              (_PROFILE_DIR / "blastbox-sandbox").read_text().splitlines()]
-    assert not any(re.fullmatch(r"(audit\s+)?deny\s+umount\s*(\*\*?)?\s*,", r) for r in rules)
+    # Every umount deny names an explicit absolute mountpoint, on one line: anything else
+    # (bare, `*`, `**`, conditionals only, a rule split over lines) can match the empty
+    # mountpoint and unmediate the class on apparmor_parser <= 4.0.x.
+    umount = [r for r in rules if re.match(r"(audit\s+)?deny\s+umount\b", r)]
+    bad = [r for r in umount
+           if not re.fullmatch(r"(audit\s+)?deny\s+umount\s+(\S+=\S+\s+)*/\S*\s*,", r)]
+    assert not bad, f"umount denies without an explicit mountpoint: {bad}"
     assert "audit deny umount /," in rules and "audit deny umount /**," in rules
 
 
@@ -361,4 +377,15 @@ def test_the_oracle_reads_the_policy_dfa_of_a_profile_with_an_attachment() -> No
     """An attachment adds an xmatch DFA in front of the file DFA; the policy DFA is still last."""
     text = (_PROFILE_DIR / "blastbox-sandbox").read_text().replace(
         "profile blastbox-sandbox flags=", "profile blastbox-sandbox /opt/detonate/run flags=")
-    assert _MOUNT_CLASS in _policy_start_classes(text)
+    assert _mediates_mount(text)
+
+
+@_PARSER
+def test_the_oracle_checks_every_profile_in_the_file() -> None:
+    """A child, hat or second profile adds its own policy DFA; the parent's must still count."""
+    bare = (_PROFILE_DIR / "blastbox-sandbox").read_text().replace(
+        "  audit deny umount /,\n  audit deny umount /**,", "  audit deny umount,")
+    if not _parser_has_the_marker_bug():
+        pytest.skip("this apparmor_parser compiles mediation markers above any deny (>= 4.1)")
+    child = bare.rstrip().rstrip("}") + "  profile helper {\n    /usr/bin/true rix,\n  }\n}\n"
+    assert not _mediates_mount(bare) and not _mediates_mount(child)
