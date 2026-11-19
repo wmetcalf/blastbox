@@ -327,7 +327,11 @@ descriptors, never as paths.
   snapshots in RAM, put it on tmpfs (`BLASTBOX_SNAPSHOT_MEM_DIR` / `_TMPFS` are refused under the
   jailer: the snapshot files are no longer the dispatcher's).
 - **Memory cap:** the unit's `MemoryMax=` (and `--jails-memory-max`, default 75% of RAM) bound all
-  jails together; each jail is capped at `BLASTBOX_FC_MEM_MIB + 256 MiB` (`--jail-mem-overhead-mib`).
+  jails together. Each jail is capped at guest RAM + its output disk + 256 MiB
+  (`--jail-mem-overhead-mib`), plus guest RAM again for a boot jail (a warm base dumps a
+  guest-RAM-sized memory file): on a tmpfs chroot base the files a jail writes are charged to
+  it, and the helper's own copies (assets, generations, restore disks) to the unit -- size
+  `MemoryMax=` for those too.
 - **Uids:** `--uid-min`/`--uid-max` (default 200000-200999) must not overlap real users or any
   container's user-namespace mapping; one is used per live microVM.
 - **Lifetime:** jails and generations belong to the dispatcher process that created them; when it

@@ -959,3 +959,18 @@ def test_a_spawn_whose_reply_was_lost_is_torn_down(tmp_path, monkeypatch, code, 
     with pytest.raises(JailError):
         client.spawn(JID, mode="boot", mem_mib=64, vcpus=1, kernel="a" * 33, rootfs="a" * 33)
     assert (parked == [JID]) is cleaned
+
+
+def test_an_unreachable_helper_is_undecided_so_a_cascade_retries_the_tier(monkeypatch, tmp_path):
+    from blastbox.host.runtime import cascade
+    from blastbox.host.runtime import firecracker as fc
+
+    monkeypatch.delenv("BLASTBOX_FC_JAILER", raising=False)
+    monkeypatch.setenv("BLASTBOX_FC_JAIL_SOCKET", str(tmp_path / "not-up-yet.sock"))
+    with pytest.raises(fc.FCHelperNoVerdict) as exc:
+        fc._jail_client()
+    assert cascade._is_undecided_availability(exc.value)
+    wrapped = fc.FCUnavailable("refused")          # how the selectors re-raise it
+    wrapped.__cause__ = exc.value
+    assert cascade._is_undecided_availability(wrapped)
+    assert not cascade._is_undecided_availability(fc.FCUnavailable("a decided refusal"))

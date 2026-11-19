@@ -35,7 +35,9 @@ ExecStart=/usr/bin/python3 -I /usr/local/libexec/blastbox/fc_jail_helper.py \
 Delegate=yes
 KillMode=control-group
 # Host-level cap over every jailed microVM (guest RAM + VMM overhead). Size it for
-# (sum of warm/ceiling slots across every FC dispatcher) x (BLASTBOX_FC_MEM_MIB + 256 MiB).
+# (sum of warm/ceiling slots across every FC dispatcher) x (BLASTBOX_FC_MEM_MIB + 256 MiB),
+# and -- with --chroot-base on tmpfs -- add every slot's output disk, each warm generation's
+# memory file + disk, and the kernel/rootfs copies (tmpfs pages are charged here).
 MemoryMax=64G
 LimitNOFILE=65536
 Restart=on-failure

@@ -1285,7 +1285,7 @@ class Helper:
                 self._run([cfg.apparmor_parser, "-r", "-K", "-q"], input=text.encode(),
                           check=True, capture_output=True, timeout=30)
             cgroups = {
-                "memory.max": str((jail.mem_mib + cfg.jail_mem_overhead_mib) << 20),
+                "memory.max": str(_jail_memory_max(jail, cfg.jail_mem_overhead_mib)),
                 "memory.swap.max": "0",
                 "pids.max": str(cfg.jail_pids_max),
                 # One CPU per vCPU thread PLUS one for the VMM's own threads (device emulation,
@@ -1697,9 +1697,14 @@ class Helper:
     # ------------------------------------------------------------------ socket loop
     def serve(self, *, ready: "Callable[[], None] | None" = None) -> None:
         cfg = self.cfg
-        cfg.socket_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lchown(cfg.socket_path.parent, 0, cfg.socket_gid)
-        os.chmod(cfg.socket_path.parent, 0o750)
+        parent = cfg.socket_path.parent
+        if not parent.exists():
+            # Ours: make it the dispatcher group's (0750) so the socket can be bind-mounted.
+            parent.mkdir(parents=True)
+            self._lchown(parent, 0, cfg.socket_gid)
+            os.chmod(parent, 0o750)
+        # An EXISTING directory is never re-owned or re-moded: it may be shared (/run itself, or
+        # another helper instance's), and taking it over would lock its other users out.
         with contextlib.suppress(FileNotFoundError):
             cfg.socket_path.unlink()
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -1902,6 +1907,18 @@ def _status_fields(text: str) -> "dict[str, str]":
         key, _, value = line.partition(":")
         out[key.strip()] = value.strip()
     return out
+
+
+def _jail_memory_max(jail: Jail, overhead_mib: int) -> int:
+    """Guest RAM + VMM overhead + what the jail itself WRITES into its root: on a tmpfs
+    --chroot-base (the documented way to keep snapshots in RAM) those pages are charged to the
+    writer's memcg and cannot be reclaimed (swap.max=0) -- the output disk the guest fills, and
+    for a boot jail (a warm base) the guest-RAM-sized memory snapshot it dumps. Sized for guest
+    RAM alone, a base was OOM-killed mid-snapshot on tmpfs. On a disk-backed base this is only
+    headroom: the extra pages are reclaimable page cache."""
+    mem = jail.mem_mib << 20
+    extra = jail.outdisk_bytes + (mem if jail.mode == "boot" else 0)
+    return mem + extra + (overhead_mib << 20)
 
 
 def _jp(*parts: str) -> str:

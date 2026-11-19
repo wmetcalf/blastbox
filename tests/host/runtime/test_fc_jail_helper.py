@@ -1285,3 +1285,29 @@ def test_the_chroot_base_check_follows_symlink_chains(tmp_path, monkeypatch):
     monkeypatch.setattr(h.os, "lstat", faked)
     with pytest.raises(RuntimeError, match=str(w)):
         h._check_root_dir(base)
+
+
+def test_a_jails_memory_cap_covers_what_it_writes_on_a_tmpfs_chroot_base(env):
+    jail, _ = env.boot(listener=False)
+    argv = env.argvs[-1]
+    cap = int([a for a in argv if a.startswith("memory.max=")][0].split("=")[1])
+    # boot jail: guest RAM (64 MiB) + memory snapshot (64 MiB) + outdisk (16 MiB) + overhead
+    assert cap == ((64 + 64 + 16) << 20) + (env.cfg.jail_mem_overhead_mib << 20)
+
+
+def test_serve_never_reowns_an_existing_socket_directory(tmp_path):
+    shared = tmp_path / "run"
+    shared.mkdir(mode=0o755)
+    cfg = _cfg(tmp_path, socket_path=shared / "h.sock")
+    chowned = []
+    helper = h.Helper(cfg, apparmor_enabled=False,
+                      lchown=lambda p, u, g: chowned.append(str(p)))
+    for d in (cfg.chroot_base, cfg.assets_dir, cfg.gens_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    ready = threading.Event()
+    t = threading.Thread(target=helper.serve, kwargs={"ready": ready.set}, daemon=True)
+    t.start()
+    assert ready.wait(5)
+    helper._stop.set()
+    t.join(5)
+    assert shared.stat().st_mode & 0o777 == 0o755 and str(shared) not in chowned

@@ -197,7 +197,15 @@ def _jail_client() -> Any:
     try:
         return require_jail()
     except JailError as exc:
+        if getattr(exc, "host_io", False):
+            # The helper could not be ASKED (not up yet after a reboot, restarting): undecided,
+            # so a cascade defers and retries the tier instead of dropping it for good.
+            raise FCHelperNoVerdict(str(exc)) from exc
         raise FCUnavailable(str(exc)) from exc
+
+
+class FCHelperNoVerdict(FCUnavailable):
+    """The jail helper could not be reached: unknown, not unusable (cascade retries it)."""
 
 
 # ---------------------------------------------------------------------------
