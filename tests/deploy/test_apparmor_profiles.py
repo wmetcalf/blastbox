@@ -216,6 +216,44 @@ def test_every_network_allow_in_the_profile_actually_survives_compilation(
     )
 
 
+def _rule_exprs(profile: Path) -> list[str]:
+    """The compiled rule expressions (`--dump=rule-exprs`), one per `rule:` line."""
+    res = subprocess.run(
+        ["apparmor_parser", "-Q", "-K", "--skip-cache", "--dump=rule-exprs", "-S", str(profile)],
+        capture_output=True, timeout=120,
+    )
+    assert res.returncode == 0, res.stderr.decode()
+    return [ln.split("rule: ", 1)[1].split("  ->", 1)[0]
+            for ln in res.stderr.decode().splitlines() if ln.startswith("rule: ")]
+
+
+@pytest.mark.skipif(shutil.which("apparmor_parser") is None,
+                    reason="apparmor_parser not installed on this host")
+def test_no_umount_deny_covers_the_whole_mount_class() -> None:
+    """A bare `audit deny umount,` compiles to a deny over the whole mount class prefix
+    (`\\x07[^\\000]*`), which covers the class's own mediation marker. Paired with
+    `audit deny mount,` on apparmor_parser 4.0.1, that made BOTH deny rules dead: measured live
+    (kernel 7.0), a process under this profile with `capability sys_admin, mount, umount,`
+    allows added could mount and umount freely, and with the path-qualified umount denies below
+    it could do neither. The shipped profile has no mount allow, so default-deny still held --
+    but its explicit denies were decoration, and any future allow (here or in an included
+    abstraction) would have gone straight through."""
+    exprs = _rule_exprs(_PROFILE_DIR / "blastbox-sandbox")
+    assert r"\x07[^\000]*" not in exprs, (
+        "a mount-class deny over the bare class prefix: spell umount denies with a path "
+        "(`audit deny umount /,` and `audit deny umount /**,`), never bare"
+    )
+    assert any(e.startswith(r"\x07/") for e in exprs), "the umount denies did not compile"
+
+
+def test_umount_denies_are_spelled_with_a_path() -> None:
+    """The text-level guard for hosts without apparmor_parser (see the compiled check above)."""
+    rules = [ln.split("#", 1)[0].strip() for ln in
+             (_PROFILE_DIR / "blastbox-sandbox").read_text().splitlines()]
+    assert not any(re.fullmatch(r"(audit\s+)?deny\s+umount\s*,", r) for r in rules)
+    assert "audit deny umount /," in rules and "audit deny umount /**," in rules
+
+
 def test_the_child_profile_loads_on_the_oldest_supported_apparmor() -> None:
     """The child profile must compile on an AppArmor 3.x parser, and only it.
 
