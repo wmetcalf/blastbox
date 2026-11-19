@@ -3484,3 +3484,13 @@ def test_out_of_credit_after_good_turns_spends_no_final_call(tmp_path):
     assert res.payload.fields["model_status"] == "out_of_credit"
     assert res.payload.fields["more_pending"] is False
     assert len(model.calls) == 2
+
+
+@pytest.mark.parametrize("kind", ["out_of_credit", "key_rejected", "refused"])
+def test_fatal_error_on_final_answer_after_good_turns_seals_its_class(tmp_path, kind):
+    cont = make_continuation(tmp_path, todo=["0x140001420", "0x140001500"], summary="prior summary")
+    model = FakeModel([answer("prose, no tools"), ModelError(kind, "http_402"), _final(summary="never")])
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
+    f = res.payload.fields
+    assert f["model_status"] == kind and f["more_pending"] is False
+    assert len(model.calls) == 2

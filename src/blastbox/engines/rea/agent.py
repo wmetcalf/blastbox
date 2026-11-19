@@ -101,8 +101,9 @@ time left holds at the measured rate)`` and is skipped below ``MIN_REPORT_TOKENS
 rate is completion tokens over seconds of this pass's calls that reported usage.
 
 Model failures never fail the job: ``model_status`` records ``unavailable``/``malformed``/
-``out_of_credit``/``key_rejected``/``refused`` (prior summary kept, ``more_pending=False``; the last
-three stop the pass at once, with no retry and no final answer; a failed report leaves it unchanged) or ``budget`` (``more_pending=True``). ``skipped`` means the
+``out_of_credit``/``key_rejected``/``refused`` (prior summary kept, ``more_pending=False``; the
+last three stop the pass at once, with no retry and no final answer; a failed report leaves it
+unchanged) or ``budget`` (``more_pending=True``). ``skipped`` means the
 model was not consulted because no Ghidra project or MCP session could be had.
 """
 
