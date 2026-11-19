@@ -201,9 +201,11 @@ blastbox preflight --tier gvisor
   the namespace. The tier refuses to start, and preflight's `gvisor-userns` FAILs.
 - runsc must be **release-20241108 or newer** (gofer opens volumes from the initial user namespace):
   older builds fail every boot binding the 0700 per-slot dirs. Preflight WARNs on an older version.
-- The rootfs reachability is checked twice, read-only: by preflight (`gvisor-userns` FAIL; WARN
-  when it cannot decide) and by the runtime at startup, which refuses the tier with the offending
-  directory named instead of failing the first boot after the readiness wait. runsc binds the
+- The rootfs reachability is checked read-only by preflight (`gvisor-userns` FAIL; WARN when it
+  cannot decide), by the runtime at startup, which refuses the tier with the offending directory
+  named instead of failing the first boot after the readiness wait, and again at every base boot
+  and every restore, where the rootfs is bound: a re-pointed link or tightened parent after startup
+  fails that build or restore by name (counted like any build/restore failure). runsc binds the
   path **as configured**, so a symlink left at an old path (e.g. under a 0750 home) still needs
   its own directories searchable; the check walks the path as the kernel does, through every symlink hop
   (a symlink loop is refused: the kernel cannot resolve it either). The path must be absolute: runsc resolves a relative one against its
@@ -317,7 +319,8 @@ environment actually configures something that needs a user namespace on a tier 
 are visibly loaded (securityfs is root-only; run preflight as root to confirm). `max_user_namespaces=0`
 or `unprivileged_userns_clone=0` switches user namespaces off outright: a FAIL only when something
 configured needs one, otherwise a fine hardening choice (PASS). `BLASTBOX_GVISOR_USERNS_HOST_BASE`
-needs one even though runsc runs as root: `max_user_namespaces` binds root too.
+needs one even though runsc runs as root: `max_user_namespaces` binds root too. That case is gated by
+`gvisor-userns`, and the `userns` check's detail points there.
 
 AppArmor itself should be **enabled** (`/sys/module/apparmor/parameters/enabled` = `Y`): without it
 docker-default is not applied to runsc/worker processes and the `blastbox-sandbox` child profile

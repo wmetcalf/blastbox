@@ -1435,7 +1435,10 @@ class GvisorSnapshotBackend:
             self._rootfs_pin().check_restore(artifact)
         except RootfsStampError as exc:
             raise SnapshotStale(str(exc)) from exc
-        self._userns_reachability_gate(GvisorCommandError)
+        # Raised as the restore failure it is (the manager's SnapshotError branch unpins and
+        # removes the slot workdir; it would also wrap any other exception the same way).
+        from blastbox.host.runtime.fc_snapshot import SnapshotRestoreError
+        self._userns_reachability_gate(SnapshotRestoreError)
         wd = Path(slot_workdir)
         _prepare_slot_dirs(self._cfg, wd)
         cid = f"slot-{uuid.uuid4().hex[:12]}"

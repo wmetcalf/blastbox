@@ -2120,7 +2120,10 @@ def test_userns_rootfs_is_rechecked_where_it_is_bound(tmp_path, monkeypatch, ver
                                ready_wait=lambda d, t: None)
     monkeypatch.setattr(gs, "userns_rootfs_problem",
                         lambda r, b, **kw: (False, f"{r} unreachable"))
-    with pytest.raises(Exception, match="unreachable"):
+    from blastbox.host.runtime.fc_snapshot import SnapshotError
+
+    # typed as the snapshot build/restore failure it is
+    with pytest.raises(SnapshotError, match="unreachable"):
         if verb == "boot":
             be.boot_base()
         else:

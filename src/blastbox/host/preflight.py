@@ -641,21 +641,26 @@ def _check_gvisor_userns(host: HostView) -> Check | None:
     if len(uid_owner) == 1 and len(gid_owner) == 1 and uid_owner != gid_owner:
         warnings.append(f"/etc/subuid reserves {ids} for {uid_owner[0]} but /etc/subgid for "
                         f"{gid_owner[0]}: one of them is another account's ids")
-    if warnings:
-        return Check("gvisor-userns", Status.WARN, f"{span}; " + "; ".join(warnings), doc)
     owners = sorted({*uid_owner, *gid_owner})
-    accounts = {line.split(":", 1)[0] for line in (host.read("/etc/passwd") or "").splitlines()}
+    # subuid(5) owners are login names OR numeric uids; either names a real account.
+    accounts: set[str] = set()
+    for line in (host.read("/etc/passwd") or "").splitlines():
+        fields = line.split(":")
+        accounts.add(fields[0])
+        if len(fields) > 2:
+            accounts.add(fields[2].strip())
     real = [o for o in owners if o in accounts]
     if real:
         # newuidmap/newgidmap authorise the NAMED account to map these ids into its own userns:
         # that account could become host uid BASE and signal the warm sandbox processes.
-        return Check("gvisor-userns", Status.WARN,
-                     f"{span}; reserved for {', '.join(real)}, a real account in /etc/passwd: "
-                     "newuidmap lets it map these ids, i.e. become the sandbox's host uid; "
-                     "reserve them under a name no account has", doc)
+        warnings.append(f"reserved for {', '.join(real)}, a real account in /etc/passwd: "
+                        "newuidmap lets it map these ids, i.e. become the sandbox's host uid; "
+                        "reserve them under a name no account has")
+    if warnings:
+        return Check("gvisor-userns", Status.WARN, f"{span}; " + "; ".join(warnings), doc)
     return Check("gvisor-userns", Status.PASS,
                  f"{span}, reserved for {', '.join(owners)} in /etc/subuid + /etc/subgid "
-                 f"(no such account), rootfs {rootfs} reachable")
+                 f"(not an /etc/passwd account), rootfs {rootfs} reachable")
 
 
 _KVM_MISSING = "/dev/kvm missing"
@@ -877,17 +882,18 @@ def _check_userns(host: HostView, tiers: Collection[str] = ("docker",)) -> Check
         ("max_user_namespaces", max_ns),
         ("unprivileged_userns_clone", clone)) if v is not None) or "no userns sysctls readable"
     needs = _needs_userns(host.env, tiers, cold_runc="docker" in tiers and _cold_runs_runc(host))
-    if max_ns == "0" and "gvisor" in tiers and \
-            host.env.get("BLASTBOX_GVISOR_USERNS_HOST_BASE", "").strip():
-        # The limit binds root too, so rootful runsc cannot create the warm sandbox's namespace.
-        needs = [*needs, "BLASTBOX_GVISOR_USERNS_HOST_BASE (runsc creates the warm sandbox's "
-                 "user namespace; this limit binds root too)"]
     if max_ns == "0" or clone == "0":
         status = Status.FAIL if needs else Status.PASS
+        # The warm opt-in is gated (and overflow-downgraded) by gvisor-userns; just say so here
+        # rather than PASS this sysctl as harmless next to that FAIL.
+        warm = (" -- max_user_namespaces=0 also stops rootful runsc creating the warm sandbox's "
+                "user namespace: see gvisor-userns"
+                if max_ns == "0" and "gvisor" in tiers
+                and host.env.get("BLASTBOX_GVISOR_USERNS_HOST_BASE", "").strip() else "")
         return Check("userns", status,
                      f"{shown}: unprivileged user namespaces are off; nsjail/bwrap inner "
-                     f"sandboxes cannot start" + (f" ({'; '.join(needs)})" if needs else ""),
-                     doc)
+                     f"sandboxes cannot start" + (f" ({'; '.join(needs)})" if needs else "")
+                     + warm, doc)
     if restrict == "1" and needs:
         loaded = _loaded_profiles(host)
         sandbox = host.env.get("BLASTBOX_SANDBOX", "").strip().lower()

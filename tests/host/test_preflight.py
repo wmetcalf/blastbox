@@ -1505,9 +1505,29 @@ def test_gvisor_userns_reservation_owned_by_a_real_account_warns():
     assert c.status is Status.WARN and "real account" in c.detail and "newuidmap" in c.detail
 
 
-def test_userns_check_fails_max_user_namespaces_zero_when_warm_userns_is_opted_in():
+def test_userns_check_points_max_user_namespaces_zero_at_the_warm_gate():
+    """One gate (gvisor-userns, overflow-aware); the userns check names it instead of PASSing
+    the sysctl as harmless."""
     files = {**_SUBIDS, "/proc/sys/user/max_user_namespaces": "0\n"}
     by = _by_name(pf.run_preflight(_healthy(env=_UNS, files=files), ["gvisor"]))
-    assert by["userns"].status is Status.FAIL and "USERNS_HOST_BASE" in by["userns"].detail
-    plain = _by_name(pf.run_preflight(_healthy(files=files), ["gvisor"]))["userns"]
-    assert plain.status is Status.PASS
+    assert by["gvisor-userns"].status is Status.FAIL
+    assert "see gvisor-userns" in by["userns"].detail
+    env = {**_UNS, "BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "firecracker:2,gvisor:2"}
+    host = _healthy(env=env, files=files)
+    checks = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False)
+    assert pf.exit_code(checks) == 0     # skipped overflow tier: nothing FAILs
+
+
+def test_gvisor_userns_numeric_subuid_owner_of_a_real_uid_warns():
+    files = {"/etc/subuid": "998:2000000:65536\n", "/etc/subgid": "998:2000000:65536\n",
+             "/etc/passwd": "root:x:0:0::/root:/bin/sh\nsvc:x:998:998::/:/x\n"}
+    c = _by_name(pf.run_preflight(_healthy(env=_UNS, files=files), ["gvisor"]))["gvisor-userns"]
+    assert c.status is Status.WARN and "real account" in c.detail
+
+
+def test_gvisor_userns_real_account_owner_reported_alongside_other_warnings():
+    files = {**_SUBIDS, "/etc/passwd": "blastbox:x:998:998::/:/x\n"}
+    host = _healthy(env=_UNS, files=files)
+    host.stats = {"/var/lib/blastbox": (0o40755, 0, 0, True)}      # an undecidable ACL warning
+    c = _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-userns"]
+    assert c.status is Status.WARN and "ACL" in c.detail and "real account" in c.detail
