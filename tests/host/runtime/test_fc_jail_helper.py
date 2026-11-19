@@ -1155,3 +1155,64 @@ def test_a_batch_stuck_closing_is_caught_even_while_later_batches_complete():
         sink.close()
         peer.close()
         srv.close()
+
+
+def test_descriptors_a_full_sink_could_not_install_go_to_a_fresh_sink():
+    """The kernel installs only what fits and drops the rest: the helper must not close its
+    copies of those (that close would be their final release) -- they go to a new sink."""
+    import resource
+
+    def small_sink(argv, **kw):
+        kw["preexec_fn"] = lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (16, 16))
+        return subprocess.Popen(argv, **kw)
+    sink = h.FdSink(popen=small_sink)
+    pipes = [os.pipe() for _ in range(40)]
+    try:
+        sink.release([w for _, w in pipes])           # 40 write ends: no sink can take them all
+        deadline = time.monotonic() + 10
+        for r, _ in pipes:                             # EOF on every read end: every copy closed
+            os.set_blocking(r, False)
+            while True:
+                try:
+                    if os.read(r, 1) == b"":
+                        break
+                except BlockingIOError:
+                    assert time.monotonic() < deadline, "a write end was never closed"
+                    time.sleep(0.02)
+    finally:
+        for r, _ in pipes:
+            os.close(r)
+        sink.close()
+
+
+def test_dropping_an_asset_never_waits_for_a_registration_holding_its_stripe(env):
+    aid = env.asset("kernel", b"K" * 10)
+    env.owner.assets.clear()
+    stripe = env.helper._asset_locks[int(aid[1:9], 16) % len(env.helper._asset_locks)]
+    with stripe:
+        t0 = time.monotonic()
+        env.helper._maybe_drop_asset(aid)
+        assert time.monotonic() - t0 < 0.5 and aid in env.helper._assets
+    env.helper.monitor_once()                          # swept on a later tick
+    assert aid not in env.helper._assets
+
+
+def test_a_lingering_socket_beyond_a_full_sinks_table_never_closes_in_the_helper():
+    import resource
+
+    def small_sink(argv, **kw):
+        kw["preexec_fn"] = lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (16, 16))
+        return subprocess.Popen(argv, **kw)
+    c, peer, srv = _lingering_socket()
+    sink = h.FdSink(popen=small_sink)
+    pipes = [os.pipe() for _ in range(20)]
+    try:
+        t0 = time.monotonic()
+        sink.release([w for _, w in pipes] + [c.detach()])   # the socket lands past the limit
+        assert time.monotonic() - t0 < 5.0
+    finally:
+        for r, _ in pipes:
+            os.close(r)
+        sink.close()
+        peer.close()
+        srv.close()

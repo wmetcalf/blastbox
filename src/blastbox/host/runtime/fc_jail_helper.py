@@ -585,7 +585,9 @@ while True:
         break
     if not data or data[:1] != b"F":
         break
-    s.send(b"A")                       # holding them: the helper may drop its copies now
+    # HOW MANY it holds: with a full fd table the kernel installs only some and drops the rest;
+    # the helper must not drop its copies of those (its close would be their final release).
+    s.send(b"A" + len(fds).to_bytes(4, "big"))
     try:
         s.recv(16)                     # "G": the helper's copies are gone
     except OSError:
@@ -598,6 +600,9 @@ while True:
 
 #: How long a handed-over batch may stay un-closed before its sink is presumed wedged.
 _SINK_GRACE_S = 0.5
+#: Most client descriptors one sink may hold at once (stuck closes included): far below its
+#: RLIMIT_NOFILE, so it is replaced before the kernel ever has to drop a batch's tail.
+_SINK_MAX_HELD = 4096
 
 
 class FdSink:
@@ -622,6 +627,7 @@ class FdSink:
         # not a count: closes finish out of order, and a count would let later batches' "D"s
         # hide a batch stuck closing forever.
         self._outstanding: "dict[int, float]" = {}
+        self._counts: "dict[int, int]" = {}    # descriptors each outstanding batch holds
         self._seq = 0
         self._spare_lock = threading.Lock()
         self._spare: "tuple[socket.socket, subprocess.Popen[bytes]] | None" = None
@@ -666,6 +672,7 @@ class FdSink:
             spare = self._spawn_sink()
         self._sock, self._proc = spare
         self._outstanding.clear()
+        self._counts.clear()
         self._refill_spare()
 
     def _kill(self) -> None:
@@ -708,49 +715,69 @@ class FdSink:
         """Account a "D<seq>" message; False for anything else (a broken or foreign sink)."""
         if len(msg) != 9 or msg[:1] != b"D":
             return False
-        self._outstanding.pop(int.from_bytes(msg[1:], "big"), None)
+        seq = int.from_bytes(msg[1:], "big")
+        self._outstanding.pop(seq, None)
+        self._counts.pop(seq, None)
         return True
 
     def release(self, fds: "list[int]") -> None:
         """Take ownership of ``fds``. Never blocks on anything a client controls."""
-        fds = [fd for fd in fds if fd >= 0]
-        if not fds:
-            return
+        todo = [fd for fd in fds if fd >= 0]
         with self._lock:
-            for start in range(0, len(fds), SCM_MAX_FD):
-                batch = fds[start:start + SCM_MAX_FD]
-                for _attempt in range(2):
-                    try:
-                        if self._sock is not None:
-                            self._settle()
-                        if self._sock is None:
-                            self._start()       # EAGAIN/ENOMEM here must not escape
-                        assert self._sock is not None
-                        self._seq += 1
-                        seq = self._seq
-                        socket.send_fds(self._sock, [b"F" + seq.to_bytes(8, "big")], batch)
-                        while True:
-                            # An earlier batch's "D" may arrive ahead of this batch's "A".
-                            got = self._sock.recv(16)
-                            if got == b"A":
-                                break
-                            if not self._done(got):
-                                raise OSError("sink did not acknowledge")
-                    except Exception:  # noqa: BLE001 - OSError, SubprocessError: try a new sink
-                        self._kill()
-                        continue
-                    for fd in batch:        # not the last reference: the sink holds them
-                        with contextlib.suppress(OSError):
-                            os.close(fd)
-                    with contextlib.suppress(OSError):
-                        self._sock.send(b"G")
-                    self._outstanding[seq] = time.monotonic()
-                    break
-                else:
-                    # Two fresh sinks could not take them (no processes left?). Keep them open
-                    # rather than risk the release here; logged, and the host is in trouble.
-                    _log.error("fc_jail.fd_sink_failed: leaking %d client descriptors",
-                               len(batch))
+            failures = 0
+            while todo:
+                batch = todo[:SCM_MAX_FD]
+                try:
+                    taken = self._hand_over(batch)
+                except Exception:  # noqa: BLE001 - OSError, SubprocessError: try a new sink
+                    self._kill()
+                    taken = 0
+                if taken < len(batch):
+                    # The sink did not take all of them (its fd table is full, or it failed):
+                    # those copies are still ours, and closing them could be their FINAL
+                    # release. Retire this sink and hand the rest to a fresh one.
+                    self._kill()
+                    # Count only attempts that made NO progress: a full sink still took a
+                    # prefix, and the next one takes more.
+                    failures = failures + 1 if taken == 0 else 0
+                    if failures > 2:
+                        _log.error("fc_jail.fd_sink_failed: keeping %d client descriptors",
+                                   len(todo) - taken)
+                        return
+                todo = todo[taken:]
+
+    def _hand_over(self, batch: "list[int]") -> int:
+        """Send ``batch``; return how many (a prefix) the sink installed -- those copies are
+        closed here, safely, since the sink still holds each one."""
+        if self._sock is not None:
+            self._settle()
+        if self._sock is not None and self._held() + len(batch) > _SINK_MAX_HELD:
+            self._kill()            # replace a sink BEFORE its fd table can fill
+        if self._sock is None:
+            self._start()           # EAGAIN/ENOMEM here must not escape (caller catches)
+        assert self._sock is not None
+        self._seq += 1
+        seq = self._seq
+        socket.send_fds(self._sock, [b"F" + seq.to_bytes(8, "big")], batch)
+        while True:
+            # An earlier batch's "D" may arrive ahead of this batch's "A".
+            got = self._sock.recv(16)
+            if len(got) == 5 and got[:1] == b"A":
+                taken = min(int.from_bytes(got[1:], "big"), len(batch))
+                break
+            if not self._done(got):
+                raise OSError("sink did not acknowledge")
+        for fd in batch[:taken]:    # not the last reference: the sink holds them
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        with contextlib.suppress(OSError):
+            self._sock.send(b"G")
+        self._outstanding[seq] = time.monotonic()
+        self._counts[seq] = taken
+        return taken
+
+    def _held(self) -> int:
+        return sum(self._counts.get(q, 0) for q in self._outstanding)
 
     def close(self) -> None:
         with self._lock:
@@ -955,8 +982,12 @@ class Helper:
                 self.reap_owner(owner)
         with self._lock:
             stale = [g for g in self._gens.values() if g.retired and not g.refs]
+            loose = [a for a, x in self._assets.items()
+                     if x.refs <= 0 and not self._asset_pinned(a)]
         for gen in stale:
             self._remove_gen(gen)         # a previous removal failed: retry it
+        for aid in loose:
+            self._maybe_drop_asset(aid)   # a drop skipped while its stripe was busy
         for jail in jails:
             if jail.proc is not None:
                 jail.proc.poll()          # reap the zombie promptly
@@ -1071,7 +1102,13 @@ class Helper:
         # Under the asset's stripe lock, like registration: otherwise a registration of the
         # same file could recreate the path between our registry removal and the unlink, and
         # the unlink would delete the NEW copy out from under its pinned entry.
-        with self._asset_locks[int(aid[1:9], 16) % len(self._asset_locks)]:
+        # NON-blocking: a registration can hold the stripe for a whole copy (up to the copy
+        # timeout) and callers include the monitor; an unreferenced asset left behind is swept
+        # by the monitor on a later tick.
+        stripe = self._asset_locks[int(aid[1:9], 16) % len(self._asset_locks)]
+        if not stripe.acquire(blocking=False):
+            return
+        try:
             with self._lock:
                 asset = self._assets.get(aid)
                 if asset is None or asset.refs > 0 or self._asset_pinned(aid):
@@ -1079,6 +1116,8 @@ class Helper:
                 del self._assets[aid]
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(asset.path)
+        finally:
+            stripe.release()
 
     def _unpin_asset(self, aid: str) -> None:
         self._maybe_drop_asset(aid)
