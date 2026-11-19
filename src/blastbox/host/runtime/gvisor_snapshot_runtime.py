@@ -401,6 +401,34 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
             raise GvisorUnavailable(f"gVisor C/R warm tier refused: {problem}")
         _log.error("select_gvisor_snapshot_runtime: %s", problem)
         return None
+    # The user-namespaced gofer binds the rootfs as an unprivileged host uid. An unreachable
+    # rootfs only fails at the first boot, as a bare `binding rootfs ... permission denied`
+    # from runsc after the readiness wait; refuse it here, by name, instead.
+    if gcfg.userns_host_base is not None:
+        from blastbox.host.runtime.gvisor_snapshot import USERNS_ENV, userns_rootfs_problem
+        # user.max_user_namespaces=0 binds root too: runsc could never create the namespace.
+        if _user_namespaces_disabled():
+            msg = (f"gVisor C/R warm tier refused: {USERNS_ENV} is set but "
+                   "user.max_user_namespaces=0, so runsc cannot create the sandbox's user "
+                   "namespace")
+            if require_available:
+                raise GvisorUnavailable(msg)
+            _log.error("select_gvisor_snapshot_runtime: %s", msg)
+            return None
+        # No supplementary groups: the backend starts runsc with none (_sandbox_spawn_kw).
+        ok, why = userns_rootfs_problem(str(gcfg.image_rootfs), gcfg.userns_host_base)
+        if ok is False:
+            msg = (f"gVisor C/R warm tier refused: {USERNS_ENV}={gcfg.userns_host_base}, but {why}. "
+                   "Move the rootfs (e.g. under /var/lib/blastbox, not via a symlink from the old path) "
+                   "or grant search on every directory on the way "
+                   "(see docs/HOST-PREP.md#warm-gvisor-in-a-user-namespace)")
+            if require_available:
+                raise GvisorUnavailable(msg)
+            _log.error("select_gvisor_snapshot_runtime: %s", msg)
+            return None
+        if ok is None:
+            _log.warning("select_gvisor_snapshot_runtime: could not verify the user-namespaced "
+                         "gofer can reach rootfs %s: %s", gcfg.image_rootfs, why)
     # RAM-preload (COW-image-to-RAM): the runsc checkpoint image holds the guest's memory pages
     # (~guest RAM with soffice live) and dominates restore cost. Holding the checkpoint dir on
     # tmpfs (/dev/shm) pins it in RAM, so every per-slot restore pages the COW-shared base in from
@@ -475,8 +503,33 @@ def _int_env(env, key: str, default: int) -> int:
         return default
 
 
+_MAX_USER_NAMESPACES = "/proc/sys/user/max_user_namespaces"
+
+
+def _user_namespaces_disabled(path: str = _MAX_USER_NAMESPACES) -> bool:
+    try:
+        with open(path, encoding="ascii") as fh:
+            return fh.read(64).strip() == "0"
+    except OSError:
+        return False
+
+
+def _userns_host_base(env) -> "tuple[int | None, str]":
+    """BLASTBOX_GVISOR_USERNS_HOST_BASE: ``(base, problem)``. Unset = ``(None, "")``, no user
+    namespace. An unusable value (not an integer, or a range that could hold host root) comes
+    back as ``(None, why)``, and the backend REFUSES the tier on it: silently running as host
+    root after the operator asked for a namespace is the failure this knob exists to prevent."""
+    from blastbox.host.runtime.gvisor_snapshot import USERNS_ENV, parse_userns_host_base
+
+    base, problem = parse_userns_host_base(env.get(USERNS_ENV, ""))
+    if problem:
+        _log.error("%s; the gVisor warm tier refuses to start", problem)
+    return base, problem
+
+
 def _gvisor_config_from_env(env):
     import json
+    userns_base, userns_problem = _userns_host_base(env)
     from blastbox.host.runtime.gvisor_snapshot import GvisorConfig
     root = env.get("BLASTBOX_GVISOR_ROOT", "/var/lib/blastbox/gvisor-root")
     rootfs = env.get("BLASTBOX_GVISOR_ROOTFS", "/var/lib/blastbox/gvisor-rootfs")
@@ -531,6 +584,8 @@ def _gvisor_config_from_env(env):
                   in ("1", "true", "yes", "on")),
         warm_argv=warm_argv,
         extra_env=extra_env,
+        userns_host_base=userns_base,
+        userns_problem=userns_problem,
         ld_preload=env.get("BLASTBOX_GVISOR_LD_PRELOAD") or None,
         platform=env.get("BLASTBOX_GVISOR_PLATFORM") or None,
         cpu_features_annotation=env.get("BLASTBOX_GVISOR_CPUFEATURES") or None,

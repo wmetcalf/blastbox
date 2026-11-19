@@ -1798,3 +1798,352 @@ class TestRootlessIsOptInAndPlacedCorrectly:
         from blastbox.host.runtime.gvisor_snapshot import GvisorSnapshotBackend
 
         assert GvisorSnapshotBackend(_cfg(tmp_path)) is not None
+
+
+def test_oci_config_userns_host_base_adds_user_namespace(tmp_path):
+    from blastbox.host.runtime.gvisor_snapshot import GvisorConfig, _oci_config
+
+    base = dict(runsc_bin="runsc", root=tmp_path / "s", image_rootfs=tmp_path / "r",
+                network="none", warm_argv=["/w"])
+    plain = _oci_config(GvisorConfig(**base), tmp_path, in_ro=True)
+    assert {"type": "user"} not in plain["linux"]["namespaces"]
+    assert "uidMappings" not in plain["linux"]
+    spec = _oci_config(GvisorConfig(**base, userns_host_base=2_000_000), tmp_path, in_ro=True)
+    assert {"type": "user"} in spec["linux"]["namespaces"]
+    want = [{"containerID": 0, "hostID": 2_000_000, "size": 65536}]
+    assert spec["linux"]["uidMappings"] == want and spec["linux"]["gidMappings"] == want
+    # the in-sandbox uid drop is kept (unlike rootless, which pins guest uid 0)
+    assert spec["process"]["user"] == {"uid": 65532, "gid": 65532}
+
+
+def test_userns_host_base_env_parsing():
+    from blastbox.host.runtime.gvisor_snapshot_runtime import _userns_host_base
+
+    assert _userns_host_base({}) == (None, "")
+    assert _userns_host_base({"BLASTBOX_GVISOR_USERNS_HOST_BASE": "2000000"}) == (2_000_000, "")
+    for bad in ("x", "0", "1000", str(2**32 - 10)):
+        base, why = _userns_host_base({"BLASTBOX_GVISOR_USERNS_HOST_BASE": bad})
+        assert base is None and why
+
+
+def test_unusable_userns_value_refuses_the_tier_instead_of_running_as_host_root(tmp_path):
+    """Fail CLOSED: the operator asked for a namespace; a typo must not yield host-root sandboxes."""
+    from blastbox.host.runtime.gvisor_snapshot import GvisorCommandError, GvisorSnapshotBackend
+    from blastbox.host.runtime.gvisor_snapshot_runtime import _gvisor_config_from_env
+
+    cfg = _gvisor_config_from_env({"BLASTBOX_GVISOR_USERNS_HOST_BASE": "2,000,000",
+                                   "BLASTBOX_GVISOR_ROOTFS": str(tmp_path)})
+    assert cfg.userns_host_base is None and cfg.userns_problem
+    with pytest.raises(GvisorCommandError, match="refusing to start"):
+        GvisorSnapshotBackend(cfg)
+    assert GvisorSnapshotBackend(_gvisor_config_from_env(
+        {"BLASTBOX_GVISOR_ROOTFS": str(tmp_path)})) is not None
+
+
+@pytest.mark.parametrize("userns", [None, 2_000_000])
+def test_sandbox_starting_runsc_calls_drop_supplementary_groups_under_userns(tmp_path, userns):
+    """runsc denies setgroups in the namespace, so sentry/gofer keep runsc's groups: start it
+    with none, or an escape lands with the dispatcher's gid 0 / docker / disk."""
+    from blastbox.host.runtime.gvisor_snapshot import GvisorConfig, GvisorSnapshotBackend
+
+    cfg = GvisorConfig(runsc_bin="runsc", root=tmp_path / "s", image_rootfs=tmp_path / "r",
+                       network="none", warm_argv=["/w"], userns_host_base=userns)
+    kw = GvisorSnapshotBackend(cfg)._sandbox_spawn_kw()
+    assert kw == ({"extra_groups": []} if userns else {})
+
+
+def test_userns_env_parse_bounds():
+    from blastbox.host.runtime.gvisor_snapshot import parse_userns_host_base
+
+    assert parse_userns_host_base(None) == (None, "")
+    assert parse_userns_host_base(" 65536 ") == (65536, "")
+    top = 2**32 - 2 - 65536 + 1          # last id of the range is 2**32-2, never (uid_t)-1
+    assert parse_userns_host_base(str(top)) == (top, "")
+    for bad in ("65535", str(top + 1), "-1", "2e6"):
+        base, why = parse_userns_host_base(bad)
+        assert base is None and "BLASTBOX_GVISOR_USERNS_HOST_BASE" in why
+
+
+def _stats(table):
+    return lambda p: table.get(p)
+
+
+def _nolink(path):
+    """Hermetic: the host's own symlinks (/home -> var/home on ostree) must not leak in."""
+    return None
+
+
+def test_userns_rootfs_reachability_follows_mode_bits():
+    from blastbox.host.runtime.gvisor_snapshot import userns_rootfs_problem
+
+    B = 2_000_000
+    ident = lambda p: p  # noqa: E731
+    ok_tree = {"/": (0o40755, 0, 0, False), "/var": (0o40755, 0, 0, False),
+               "/var/lib": (0o40755, 0, 0, False), "/var/lib/r": (0o40755, 0, 0, False)}
+    assert userns_rootfs_problem("/var/lib/r", B, stat=_stats(ok_tree), realpath=ident, readlink=_nolink) == (True, "")
+    # the measured failure: a rootfs under a 0750 home
+    home = {"/": (0o40755, 0, 0, False), "/home": (0o40755, 0, 0, False),
+            "/home/coz": (0o40750, 1000, 1000, False), "/home/coz/r": (0o40755, 0, 0, False)}
+    ok, why = userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident, readlink=_nolink)
+    assert ok is False and "/home/coz " in why and "0750" in why
+    # search-only (0711) is enough everywhere, the rootfs included (lisafs falls back to O_PATH)
+    home["/home/coz"] = (0o40711, 1000, 1000, False)
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident, readlink=_nolink)[0] is True
+    home["/home/coz/r"] = (0o40711, 0, 0, False)
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident, readlink=_nolink)[0] is True
+    # the gofer is started with no supplementary groups: a g+x-only root:root dir is closed
+    home["/home/coz/r"] = (0o40750, 0, 0, False)
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident, readlink=_nolink)[0] is False
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident, readlink=_nolink,
+                                 groups=[0])[0] is True
+    # group bits apply when the dir's group is the mapped gid; owner bits when it is the uid
+    home["/home/coz/r"] = (0o40710, 0, B, False)
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident, readlink=_nolink)[0] is True
+    home["/home/coz/r"] = (0o40107, B, 0, False)
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident, readlink=_nolink)[0] is True
+    # in-namespace owner AND group: namespace caps override DAC; owner alone does not
+    home["/home/coz/r"] = (0o40700, B + 5, B + 5, False)
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident, readlink=_nolink)[0] is True
+    home["/home/coz/r"] = (0o40700, B + 5, 0, False)
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident, readlink=_nolink,
+                                 groups=[])[0] is False
+    # undecidable is never a denial: an ACL, or an unstat-able component...
+    home["/home/coz/r"] = (0o40755, 0, 0, False)
+    home["/home/coz"] = (0o40750, 1000, 1000, True)
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident, readlink=_nolink)[0] is None
+    # ...but a later component the plain mode bits deny still is
+    home["/home/coz/r"] = (0o40700, 0, 0, False)    # group and other agree: no membership doubt
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident, readlink=_nolink)[0] is False
+    home["/home/coz/r"] = (0o40755, 0, 0, False)
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident, readlink=_nolink)[0] is None
+    del home["/home/coz"]
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident, readlink=_nolink)[0] is None
+    # runsc binds the CONFIGURED path: its directories AND the link target's are walked
+    linked = {**ok_tree, "/srv": (0o40700, 0, 0, False), "/var/lib/r": (0o40755, 0, 0, False)}
+    ok, why = userns_rootfs_problem("/srv/r", B, stat=_stats(linked), realpath=ident,
+                                    readlink={"/srv/r": "/var/lib/r"}.get)
+    assert ok is False and "/srv " in why
+    linked["/srv"] = (0o40755, 0, 0, False)
+    assert userns_rootfs_problem("/srv/r", B, stat=_stats(linked), realpath=ident,
+                                 readlink={"/srv/r": "/var/lib/r"}.get)[0] is True
+    # a relative rootfs can never boot: runsc resolves it against the bundle dir
+    ok, why = userns_rootfs_problem("rootfs", B, stat=_stats(ok_tree), realpath=ident,
+                                    readlink=_nolink)
+    assert ok is False and "absolute" in why
+
+
+def test_userns_refuses_worker_ids_outside_the_map(tmp_path):
+    from blastbox.host.runtime.gvisor_snapshot import (
+        GvisorCommandError, GvisorConfig, GvisorSnapshotBackend)
+
+    base = dict(runsc_bin="runsc", root=tmp_path / "s", image_rootfs=tmp_path / "r",
+                network="none", warm_argv=["/w"], userns_host_base=2_000_000)
+    assert GvisorSnapshotBackend(GvisorConfig(**base)) is not None
+    with pytest.raises(GvisorCommandError, match="outside that map"):
+        GvisorSnapshotBackend(GvisorConfig(**base, uid=70000))
+
+
+def test_unreachable_userns_rootfs_is_refused_at_selection(tmp_path, monkeypatch):
+    from blastbox.host.runtime import gvisor_snapshot as gs
+    from blastbox.host.runtime import gvisor_snapshot_runtime as gr
+
+    monkeypatch.setattr(gs.GvisorSnapshotBackend, "available", lambda self: True)
+    home = tmp_path / "home"
+    (home / "r").mkdir(parents=True)
+    real = gs.userns_rootfs_problem
+
+    def fake_stat(p):   # the parent is a 0700 home owned by someone else
+        return (0o40700, 4242, 4242, False) if p == str(home) else (0o40755, 0, 0, False)
+
+    monkeypatch.setattr(gs, "userns_rootfs_problem",
+                        lambda r, b, **kw: real(r, b, **{**kw, "stat": fake_stat}))
+    monkeypatch.setattr(gr, "_user_namespaces_disabled", lambda: False)   # hermetic
+    cfg = gr._gvisor_config_from_env({"BLASTBOX_GVISOR_ROOTFS": str(home / "r"),
+                                      "BLASTBOX_GVISOR_RUNSC": "/bin/true",
+                                      "BLASTBOX_GVISOR_USERNS_HOST_BASE": "2000000"})
+    assert cfg.userns_host_base == 2_000_000
+    assert gr.select_gvisor_snapshot_runtime(cfg=cfg) is None
+    with pytest.raises(gr.GvisorUnavailable, match="cannot reach rootfs"):
+        gr.select_gvisor_snapshot_runtime(cfg=cfg, require_available=True)
+
+
+def test_userns_rootfs_acl_is_unknown_even_when_mode_bits_allow():
+    """A named-user ACL entry can DENY host uid BASE what the other bits grant."""
+    from blastbox.host.runtime.gvisor_snapshot import userns_rootfs_problem
+
+    tree = {"/": (0o40755, 0, 0, False), "/srv": (0o40755, 0, 0, True),
+            "/srv/r": (0o40755, 0, 0, False)}
+    ok, why = userns_rootfs_problem("/srv/r", 2_000_000, stat=lambda p: tree.get(p),
+                                    realpath=lambda p: p, readlink=_nolink)
+    assert ok is None and "/srv" in why and "ACL" in why
+
+
+@pytest.mark.parametrize("userns", [None, 2_000_000])
+def test_runsc_run_and_restore_actually_spawn_without_supplementary_groups(tmp_path, userns,
+                                                                           monkeypatch):
+    """Drives boot_base/restore_in: the kwargs reaching the spawn, not the helper's return."""
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    # tmp_path sits under a 0700 pytest dir the mapped uid could not search: not under test here
+    monkeypatch.setattr(gs, "userns_rootfs_problem", lambda r, b, **kw: (True, ""))
+    seen: dict[str, dict] = {}
+
+    def run(argv, **kw):
+        for verb in ("run", "restore", "checkpoint", "exec"):
+            if verb in argv:
+                seen.setdefault(verb, kw)
+        return 0
+
+    be = GvisorSnapshotBackend(_cfg(tmp_path, userns_host_base=userns), run=run,
+                               ready_wait=lambda d, t: None)
+    boot = be.boot_base()
+    boot.wait_ready(5.0)
+    art = boot.checkpoint(tmp_path / "ckpt")
+    wd = tmp_path / "slots" / "s1"
+    wd.mkdir(parents=True)
+    be.restore_in(wd, art)
+    for verb in ("run", "restore"):
+        if userns is None:
+            assert "extra_groups" not in seen[verb]
+        else:
+            assert seen[verb]["extra_groups"] == []
+
+
+def test_userns_rootfs_walk_follows_every_symlink_hop():
+    """The kernel searches the directories of INTERMEDIATE link targets too."""
+    from blastbox.host.runtime.gvisor_snapshot import userns_rootfs_problem
+
+    links = {"/var/lib/blastbox": "/home/coz/bb", "/home/coz/bb/gvisor-rootfs": "../../../srv/r"}
+    modes = {"/home/coz": (0o40750, 1000, 1000, False)}
+    ok, why = userns_rootfs_problem(
+        "/var/lib/blastbox/gvisor-rootfs", 2_000_000,
+        stat=lambda p: modes.get(p, (0o40755, 0, 0, False)),
+        readlink=links.get, realpath=lambda p: "/srv/r")
+    assert ok is False and "/home/coz " in why
+    modes.clear()
+    assert userns_rootfs_problem(
+        "/var/lib/blastbox/gvisor-rootfs", 2_000_000,
+        stat=lambda p: modes.get(p, (0o40755, 0, 0, False)),
+        readlink=links.get, realpath=lambda p: "/srv/r")[0] is True
+
+
+def test_userns_rootfs_walk_searches_directories_before_dotdot():
+    """`/root/../var/r` still searches /root: no lexical normalisation of the configured path."""
+    from blastbox.host.runtime.gvisor_snapshot import userns_rootfs_problem
+
+    modes = {"/root": (0o40700, 0, 0, False)}
+    ok, why = userns_rootfs_problem("/root/../var/r", 2_000_000,
+                                    stat=lambda p: modes.get(p, (0o40755, 0, 0, False)),
+                                    readlink=lambda p: None, realpath=lambda p: "/var/r")
+    assert ok is False and "/root " in why
+
+
+def test_userns_rootfs_walk_takes_dotdot_after_a_symlink_physically():
+    """`/a/link/../r` with link -> /x/y is /x/r to the kernel, not /a/r (PR #211 review)."""
+    from blastbox.host.runtime.gvisor_snapshot import _walked_dirs
+
+    assert _walked_dirs("/a/link/../r", {"/a/link": "/x/y"}.get) == [
+        "/", "/a", "/x", "/x/y", "/x/r"]
+
+
+def test_userns_rootfs_walk_follows_a_chain_and_resolves_relative_links_from_their_dir():
+    """Mutants that stop after one hop, or resolve a relative target from / or from the link
+    path itself, must fail: the denial sits on the SECOND hop's target, behind a sibling link."""
+    from blastbox.host.runtime.gvisor_snapshot import _walked_dirs, userns_rootfs_problem
+
+    links = {"/var/lib/blastbox/gvisor-rootfs": "rootfs.v2",          # relative sibling
+             "/var/lib/blastbox/rootfs.v2": "/opt/rfs",
+             "/opt/rfs": "/home/coz/rfs"}
+    assert _walked_dirs("/var/lib/blastbox/gvisor-rootfs", links.get) == [
+        "/", "/var", "/var/lib", "/var/lib/blastbox", "/opt", "/home", "/home/coz",
+        "/home/coz/rfs"]
+    modes = {"/home/coz": (0o40750, 1000, 1000, False)}
+    ok, why = userns_rootfs_problem("/var/lib/blastbox/gvisor-rootfs", 2_000_000,
+                                    stat=lambda p: modes.get(p, (0o40755, 0, 0, False)),
+                                    readlink=links.get, realpath=lambda p: p)
+    assert ok is False and "/home/coz " in why
+
+
+def test_userns_rootfs_symlink_loop_is_refused_not_reachable():
+    from blastbox.host.runtime.gvisor_snapshot import userns_rootfs_problem
+
+    loop = {"/srv/a": "/srv/b", "/srv/b": "/srv/a"}
+    ok, why = userns_rootfs_problem("/srv/a/r", 2_000_000, stat=lambda p: (0o40755, 0, 0, False),
+                                    readlink=loop.get, realpath=lambda p: p)
+    assert ok is False and "ELOOP" in why
+
+
+def test_userns_tier_refused_when_the_host_disables_user_namespaces(tmp_path, monkeypatch):
+    from blastbox.host.runtime import gvisor_snapshot as gs
+    from blastbox.host.runtime import gvisor_snapshot_runtime as gr
+
+    monkeypatch.setattr(gs.GvisorSnapshotBackend, "available", lambda self: True)
+    monkeypatch.setattr(gr, "_user_namespaces_disabled", lambda: True)
+    (tmp_path / "r").mkdir()
+    cfg = gr._gvisor_config_from_env({"BLASTBOX_GVISOR_ROOTFS": str(tmp_path / "r"),
+                                      "BLASTBOX_GVISOR_RUNSC": "/bin/true",
+                                      "BLASTBOX_GVISOR_USERNS_HOST_BASE": "2000000"})
+    with pytest.raises(gr.GvisorUnavailable, match="max_user_namespaces=0"):
+        gr.select_gvisor_snapshot_runtime(cfg=cfg, require_available=True)
+
+
+def test_userns_refuses_worker_gid_outside_the_map(tmp_path):
+    from blastbox.host.runtime.gvisor_snapshot import (
+        GvisorCommandError, GvisorConfig, GvisorSnapshotBackend)
+
+    with pytest.raises(GvisorCommandError, match="outside that map"):
+        GvisorSnapshotBackend(GvisorConfig(
+            runsc_bin="runsc", root=tmp_path / "s", image_rootfs=tmp_path / "r",
+            network="none", warm_argv=["/w"], userns_host_base=2_000_000, gid=70000))
+
+
+def test_user_namespaces_disabled_reads_the_sysctl(tmp_path):
+    from blastbox.host.runtime.gvisor_snapshot_runtime import _user_namespaces_disabled
+
+    f = tmp_path / "max"
+    f.write_text("0\n")
+    assert _user_namespaces_disabled(str(f)) is True
+    f.write_text("63367\n")
+    assert _user_namespaces_disabled(str(f)) is False
+    assert _user_namespaces_disabled(str(tmp_path / "absent")) is False
+
+
+@pytest.mark.parametrize("verb", ["boot", "restore"])
+def test_userns_rootfs_is_rechecked_where_it_is_bound(tmp_path, monkeypatch, verb):
+    """Selection checked it once; a re-pointed link or tightened parent later must be named at
+    the boot/restore that binds it, not surface as a bare runsc permission error."""
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    ran: list = []
+    be = GvisorSnapshotBackend(_cfg(tmp_path, userns_host_base=2_000_000),
+                               run=lambda argv, **kw: ran.append(argv) or 0,
+                               ready_wait=lambda d, t: None)
+    monkeypatch.setattr(gs, "userns_rootfs_problem",
+                        lambda r, b, **kw: (False, f"{r} unreachable"))
+    from blastbox.host.runtime.fc_snapshot import SnapshotError
+
+    # typed as the snapshot build/restore failure it is
+    with pytest.raises(SnapshotError, match="unreachable"):
+        if verb == "boot":
+            be.boot_base()
+        else:
+            wd = tmp_path / "slots" / "s1"
+            wd.mkdir(parents=True)
+            be.restore_in(wd, str(tmp_path / "ckpt"))
+    assert not any("run" in a or "restore" in a for a in ran)   # refused before any spawn
+
+
+def test_userns_fields_do_not_shift_gvisor_config_positional_order(tmp_path):
+    """Positional callers written before the userns fields must keep meaning the same thing."""
+    import dataclasses
+
+    from blastbox.host.runtime.gvisor_snapshot import GvisorConfig
+
+    positional = [f.name for f in dataclasses.fields(GvisorConfig) if not f.kw_only]
+    # exactly the order GvisorConfig had before the userns fields existed
+    assert positional == ["runsc_bin", "root", "image_rootfs", "network", "warm_argv",
+                          "ignore_cgroups", "rootless", "platform", "ld_preload",
+                          "cpu_features_annotation", "extra_env", "uid", "gid", "cli_timeout_s",
+                          "rlimit_nproc", "rlimit_nofile"]
+    cfg = GvisorConfig("runsc", tmp_path, tmp_path, "none", ["/w"], True, False, "systrap")
+    assert cfg.platform == "systrap" and cfg.userns_host_base is None

@@ -100,6 +100,7 @@ reads the following env vars (all optional, defaults shown):
 | `BLASTBOX_GVISOR_ROOTFS` | _(image rootfs)_ | OCI rootfs path for the warm container |
 | `BLASTBOX_GVISOR_NETWORK` | `none` | `none` or `sandbox` (use `none` for the warm tier) |
 | `BLASTBOX_GVISOR_ROOTLESS` | off | Drive `runsc` without host root (`-rootless`). **Refused by the warm-snapshot tier**: gVisor does not support `restore` rootless (`Rootless mode not supported with "restore"`), so that tier fails at construction rather than on its first job. **No current tier can run rootless**: the snapshot tier is the only one that reads this, and the docker `--runtime=runsc` worker path ignores it — so today setting it only produces that refusal. The measured groundwork for a future non-snapshot tier: it pins the worker to **guest uid 0** — gVisor's gofer runs as the calling user and cannot create bind-mount files as an unmapped uid (the failure is `EINVAL` on `/ctrl/.ready.tmp`). The trade: rootful keeps the in-sandbox uid drop but runs runsc as host root, so an escape lands as root; rootless gives up the drop, but guest uid 0 is the unprivileged launching user. On Ubuntu 24.04+ it also needs `deploy/apparmor/blastbox-runsc` loaded. |
+| `BLASTBOX_GVISOR_USERNS_HOST_BASE` | _(unset)_ | Run the sandbox + gofer in a user namespace (guest 0..65535 -> host `BASE..BASE+65535`, BASE >= 65536) while runsc stays rootful, so checkpoint/restore still work and an escape no longer lands as host root. Every directory on the way to `BLASTBOX_GVISOR_ROOTFS` must be searchable by host uid BASE, so keep the rootfs out of a 0750 home (`deploy/redeploy-warm.sh`'s ClippyShot default `GVISOR_DIR=/home/coz/clippyshot-gvisor` is under a home dir); the tier refuses to start otherwise. Setup: [HOST-PREP.md](../../docs/HOST-PREP.md#warm-gvisor-in-a-user-namespace) |
 | `BLASTBOX_GVISOR_WARM_ARGV` | `["python3","/opt/blastbox/run_warm.py"]` | JSON list; argv of the warm entrypoint (see below). Must be a non-empty list of strings or it falls back to the default. **venv-based engine images** (e.g. clippyshot installs into `/opt/clippyshot`) must point this at the venv interpreter — `["/opt/clippyshot/bin/python3", …]` — because the default bare `python3` resolves on the spec `PATH` to the *system* interpreter, which can't `import blastbox`/the engine package (silent `ModuleNotFoundError` → never reaches READY → ready-timeout) |
 | `BLASTBOX_GVISOR_LD_PRELOAD` | _(unset)_ | Set to `/opt/clippyshot/accept-retry.so` for the soffice warm container |
 | `BLASTBOX_GVISOR_EXTRA_ENV` | `[]` | JSON array of `"KEY=VALUE"` strings appended to the worker's OCI `process.env`. Engine-agnostic passthrough for env the image can't bake (the OCI spec is built from scratch; image `ENV` is dropped). Malformed input is ignored, not fatal. ClippyShot needs `CLIPPYSHOT_SANDBOX=container` + `CLIPPYSHOT_WARN_ON_INSECURE=1` here (see recipe below) |
@@ -175,8 +176,9 @@ process under a host memory cgroup (the spec's cgroup is intentionally ignored).
 Per-slot `out/` + `ctrl/` are mode `0o777` (shared cross-uid scratch between the non-root worker
 and the host services) but live inside a **`0o700`** slot dir created atomically — another local
 user can't traverse into it to reach them, independent of the deploy parent. blastbox additionally
-**warns** if the deploy state parent (`/var/lib/blastbox/...`) is group/other-writable; lock it to
-root-owned `0o700`.
+**warns** if the deploy state parent (`/var/lib/blastbox/...`) is group/other-writable; make it
+root-owned and not group/other-writable (`0o755`; `0o700` only when the gVisor rootfs is not under
+it, because `BLASTBOX_GVISOR_USERNS_HOST_BASE` needs search on every directory to the rootfs).
 
 ## Snapshot sensitivity
 

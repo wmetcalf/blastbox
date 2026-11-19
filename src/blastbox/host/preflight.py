@@ -135,6 +135,14 @@ class HostView:
         """Landlock ABI (a VERSION query; creates no ruleset). 0 = unavailable."""
         return 0
 
+    def stat_path(self, path: str) -> tuple[int, int, int, bool] | None:
+        """``(st_mode, st_uid, st_gid, has_posix_acl)`` following symlinks; None if unstat-able."""
+        raise NotImplementedError
+
+    def readlink(self, path: str) -> str | None:
+        """The target of a symlink; None when ``path`` is not one (or cannot be read)."""
+        raise NotImplementedError
+
 
 class RealHost(HostView):
     def __init__(self) -> None:
@@ -198,6 +206,17 @@ class RealHost(HostView):
         from blastbox.host.runtime.firecracker import guest_kernel_version  # noqa: PLC0415
 
         return guest_kernel_version(path)
+
+    def stat_path(self, path: str) -> tuple[int, int, int, bool] | None:
+        from blastbox.host.runtime.gvisor_snapshot import _real_path_stat  # noqa: PLC0415
+
+        return _real_path_stat(path)
+
+    def readlink(self, path: str) -> str | None:
+        try:
+            return os.readlink(path)
+        except OSError:
+            return None
 
     def run(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str] | None:
         if not is_read_only(argv):
@@ -494,6 +513,168 @@ def _check_gvisor_rootless(host: HostView) -> Check | None:
                  "Run it rootful (unset BLASTBOX_GVISOR_ROOTLESS)", f"{DOC}#gvisor-runsc")
 
 
+#: subuid owners that are container runtimes' own pools: a range inside one is theirs to hand out.
+_FOREIGN_SUBID_OWNERS = frozenset({"root", "containers", "dockremap", "lxd", "incus"})
+
+
+def _subid_cover(text: str | None, base: int, size: int) -> tuple[list[str], list[str]]:
+    """``(covering, overlapping)`` owners in an /etc/subuid-style file, each owner's lines merged
+    first (``usermod --add-subuids`` can split one reservation): owners whose ranges hold all of
+    ``base..base+size-1``, and owners that share only part of it."""
+    spans: dict[str, list[tuple[int, int]]] = {}
+    for line in (text or "").splitlines():
+        fields = line.strip().split(":")
+        if len(fields) != 3 or line.lstrip().startswith("#"):
+            continue
+        try:
+            start, count = int(fields[1]), int(fields[2])
+        except ValueError:
+            continue
+        if count > 0:
+            spans.setdefault(fields[0], []).append((start, start + count))
+    cover: list[str] = []
+    overlap: list[str] = []
+    end = base + size
+    for owner, ranges in spans.items():
+        merged: list[list[int]] = []
+        for lo, hi in sorted(ranges):
+            if merged and lo <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], hi)
+            else:
+                merged.append([lo, hi])
+        if any(lo <= base and end <= hi for lo, hi in merged):
+            cover.append(owner)
+        elif any(lo < end and base < hi for lo, hi in merged):
+            overlap.append(owner)
+    return cover, overlap
+
+
+_USERNS_UNREACHABLE = "rootfs unreachable by the user-namespaced gofer"
+#: gVisor 3c4b2ad ("gofer: open volumes from the initial userns", 2024-11-08): before it the
+#: namespaced gofer opened bind sources itself and could not reach the 0700 per-slot dirs.
+_USERNS_MIN_RUNSC = 20241108
+
+
+def _runsc_older_than_userns_volumes(host: HostView) -> str:
+    name = host.env.get("BLASTBOX_GVISOR_RUNSC", "runsc")
+    path = host.which(name) if name and name == name.strip() else None
+    proc = host.run([path, "--version"]) if path else None
+    m = re.search(r"release-(\d{8})", (proc.stdout + proc.stderr) if proc else "")
+    if m and int(m.group(1)) < _USERNS_MIN_RUNSC:
+        return (f"runsc release-{m.group(1)} predates release-{_USERNS_MIN_RUNSC} (gofer opens "
+                "volumes from the initial userns): every base boot fails binding the 0700 "
+                "per-slot dirs; upgrade runsc")
+    return ""
+
+
+def _ids_in_range(text: str | None, base: int, size: int) -> list[str]:
+    """``name:id`` of /etc/passwd- or /etc/group-style entries whose id falls in the range."""
+    out = []
+    for line in (text or "").splitlines():
+        fields = line.split(":")
+        if len(fields) >= 3 and fields[2].strip().isdigit() and \
+                base <= int(fields[2]) < base + size:
+            out.append(f"{fields[0]}:{fields[2]}")
+    return out
+
+
+def _check_gvisor_userns(host: HostView) -> Check | None:
+    """BLASTBOX_GVISOR_USERNS_HOST_BASE (warm tier): the value the runtime accepts, the id range
+    reserved in /etc/subuid + /etc/subgid, and the rootfs reachable by the mapped uid."""
+    from blastbox.host.runtime.gvisor_snapshot import (  # noqa: PLC0415
+        USERNS_ENV,
+        USERNS_SIZE,
+        parse_userns_host_base,
+        userns_rootfs_problem,
+    )
+
+    doc = f"{DOC}#warm-gvisor-in-a-user-namespace"
+    if not host.env.get(USERNS_ENV, "").strip():
+        return None
+    base, problem = parse_userns_host_base(host.env[USERNS_ENV])
+    if base is None:
+        return Check("gvisor-userns", Status.FAIL,
+                     f"{problem}: the warm tier refuses to start (it will not fall back to a "
+                     "sandbox running as real host root)", doc)
+    ids = f"{base}..{base + USERNS_SIZE - 1}"
+    span = f"guest 0..{USERNS_SIZE - 1} -> host {ids}"
+    rootfs = host.env.get("BLASTBOX_GVISOR_ROOTFS", "/var/lib/blastbox/gvisor-rootfs")
+    if _sysctl(host, "/proc/sys/user/max_user_namespaces") == "0":
+        # The limit applies to uid 0 too (user_namespaces(7)): rootful runsc cannot create it.
+        return Check("gvisor-userns", Status.FAIL,
+                     "user.max_user_namespaces=0: runsc cannot create the sandbox's user "
+                     "namespace (the limit binds root too); the warm tier refuses to start", doc)
+    ok, why = userns_rootfs_problem(rootfs, base, stat=host.stat_path, realpath=host.realpath,
+                                    readlink=host.readlink)
+    if ok is False:
+        return Check("gvisor-userns", Status.FAIL,
+                     f"{_USERNS_UNREACHABLE}: {why}; the warm tier refuses to start", doc)
+    warnings: list[str] = []
+    old_runsc = _runsc_older_than_userns_volumes(host)
+    if old_runsc:
+        warnings.append(old_runsc)
+    for path, kind in (("/etc/passwd", "user"), ("/etc/group", "group")):
+        inside = _ids_in_range(host.read(path), base, USERNS_SIZE)
+        if inside:
+            # Owner AND group in the range = the sandbox's namespace caps override DAC on them.
+            warnings.append(f"{path} has {kind}(s) inside {ids}: {', '.join(inside[:5])} "
+                            "(an escape's namespace capabilities reach files they own; directory-"
+                            "service ids are not checked)")
+    if ok is None:
+        warnings.append(f"cannot verify rootfs {rootfs} is reachable by host uid {base} ({why}; "
+                        "run preflight as root)")
+    holders: dict[str, list[str]] = {}
+    for path in ("/etc/subuid", "/etc/subgid"):
+        text = host.read(path)
+        if text is None:
+            warnings.append(f"{path} unreadable")
+            continue
+        cover, overlap = _subid_cover(text, base, USERNS_SIZE)
+        holders[path] = cover
+        if len(cover) > 1 or (cover and overlap):
+            # Two owners of the range: another user/daemon allocates these ids too.
+            overlap = [*cover, *overlap]
+        if overlap == overlap[:1] and not cover and overlap \
+                and overlap[0] not in _FOREIGN_SUBID_OWNERS:
+            warnings.append(f"{path}: {overlap[0]} holds only part of {ids} (if that is the "
+                            "blastbox reservation, extend it; otherwise those ids are shared "
+                            "with another user/daemon)")
+        elif overlap:
+            warnings.append(f"{path}: {', '.join(overlap)} each allocate ids in {ids} "
+                            "(ids shared with another user/daemon)")
+        elif cover and cover[0] in _FOREIGN_SUBID_OWNERS:
+            warnings.append(f"{path}: {ids} lies inside {cover[0]}'s range, a container "
+                            "runtime's pool it hands out (reserve a separate range)")
+        elif not cover:
+            warnings.append(f"{path} reserves no range holding {ids} (rootful "
+                            "runsc maps it anyway, but useradd/podman/a remapped dockerd may hand "
+                            "the same ids out)")
+    uid_owner, gid_owner = holders.get("/etc/subuid", []), holders.get("/etc/subgid", [])
+    if len(uid_owner) == 1 and len(gid_owner) == 1 and uid_owner != gid_owner:
+        warnings.append(f"/etc/subuid reserves {ids} for {uid_owner[0]} but /etc/subgid for "
+                        f"{gid_owner[0]}: one of them is another account's ids")
+    owners = sorted({*uid_owner, *gid_owner})
+    # subuid(5) owners are login names OR numeric uids; either names a real account.
+    accounts: set[str] = set()
+    for line in (host.read("/etc/passwd") or "").splitlines():
+        fields = line.split(":")
+        accounts.add(fields[0])
+        if len(fields) > 2:
+            accounts.add(fields[2].strip())
+    real = [o for o in owners if o in accounts]
+    if real:
+        # newuidmap/newgidmap authorise the NAMED account to map these ids into its own userns:
+        # that account could become host uid BASE and signal the warm sandbox processes.
+        warnings.append(f"reserved for {', '.join(real)}, a real account in /etc/passwd: "
+                        "newuidmap lets it map these ids, i.e. become the sandbox's host uid; "
+                        "reserve them under a name no account has")
+    if warnings:
+        return Check("gvisor-userns", Status.WARN, f"{span}; " + "; ".join(warnings), doc)
+    return Check("gvisor-userns", Status.PASS,
+                 f"{span}, reserved for {', '.join(owners)} in /etc/subuid + /etc/subgid "
+                 f"(not an /etc/passwd account), rootfs {rootfs} reachable")
+
+
 _KVM_MISSING = "/dev/kvm missing"
 
 
@@ -715,10 +896,16 @@ def _check_userns(host: HostView, tiers: Collection[str] = ("docker",)) -> Check
     needs = _needs_userns(host.env, tiers, cold_runc="docker" in tiers and _cold_runs_runc(host))
     if max_ns == "0" or clone == "0":
         status = Status.FAIL if needs else Status.PASS
+        # The warm opt-in is gated (and overflow-downgraded) by gvisor-userns; just say so here
+        # rather than PASS this sysctl as harmless next to that FAIL.
+        warm = (" -- max_user_namespaces=0 also stops rootful runsc creating the warm sandbox's "
+                "user namespace: see gvisor-userns"
+                if max_ns == "0" and "gvisor" in tiers
+                and host.env.get("BLASTBOX_GVISOR_USERNS_HOST_BASE", "").strip() else "")
         return Check("userns", status,
                      f"{shown}: unprivileged user namespaces are off; nsjail/bwrap inner "
-                     f"sandboxes cannot start" + (f" ({'; '.join(needs)})" if needs else ""),
-                     doc)
+                     f"sandboxes cannot start" + (f" ({'; '.join(needs)})" if needs else "")
+                     + warm, doc)
     if restrict == "1" and needs:
         loaded = _loaded_profiles(host)
         sandbox = host.env.get("BLASTBOX_SANDBOX", "").strip().lower()
@@ -738,7 +925,9 @@ def _check_userns(host: HostView, tiers: Collection[str] = ("docker",)) -> Check
         return Check("userns", Status.WARN,
                      f"{shown}; {'; '.join(needs)} needs the scoped deploy/apparmor profiles "
                      f"({state})", doc)
-    note = " (fine: rootful runsc and firecracker do not use host user namespaces)" \
+    note = (" (fine: rootful runsc and firecracker do not use host user namespaces"
+            + ("; BLASTBOX_GVISOR_USERNS_HOST_BASE does, as root: see gvisor-userns)"
+               if host.env.get("BLASTBOX_GVISOR_USERNS_HOST_BASE", "").strip() else ")")) \
         if restrict == "1" else ""
     return Check("userns", Status.PASS, shown + note)
 
@@ -972,9 +1161,10 @@ def _check_runsc_host_root(host: HostView, procs: Sequence[_Proc]) -> Check:
         return Check("runsc-host-root", Status.WARN,
                      f"{len(root)} runsc process(es) run as real host root (identity uid_map, "
                      f"uid 0): {shown}. A sandbox escape lands as host root with those "
-                     "capabilities; a user-namespace-remapped setup (a separate remapped docker "
-                     "daemon, or containerd per-container mappings) is recommended, pending a "
-                     "spike", doc)
+                     "capabilities. Run them user-namespace-mapped: warm gVisor tier, set "
+                     "BLASTBOX_GVISOR_USERNS_HOST_BASE; cold docker tier, a separate userns-remap "
+                     "dockerd (documented, not automated)",
+                     doc)
     if unknown:
         return Check("runsc-host-root", Status.WARN,
                      f"{_UNKNOWN}: cannot read uid_map/status of {_pids(unknown)}", doc)
@@ -1139,7 +1329,7 @@ def _check_confinement(host: HostView, tiers: Collection[str],
 
 _TIER_CHECKS = {
     "firecracker": ("kvm", "firecracker", "fc-guest"),
-    "gvisor": ("runsc", "gvisor-rootless"),
+    "gvisor": ("runsc", "gvisor-rootless", "gvisor-userns"),
 }
 #: Per-tier checks that are not startup gates (see _is_startup_gate) but are moot once the tier
 #: is skipped for another reason.
@@ -1232,6 +1422,9 @@ def run_preflight(host: HostView, tiers: Sequence[str], *, explicit: bool = True
         rootless = _check_gvisor_rootless(host)
         if rootless is not None:
             out.append(rootless)
+        userns = _check_gvisor_userns(host)
+        if userns is not None:
+            out.append(userns)
     if "firecracker" in t:
         out.append(_check_kvm(host))
         out.append(_check_firecracker(host))
