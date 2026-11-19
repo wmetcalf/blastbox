@@ -1,8 +1,10 @@
 """OpenAI-compatible chat-completions client for the rea-agent model (DeepSeek on vLLM).
 
-- POSTs ``<url>/chat/completions`` with only ``Content-Type``/``Accept`` headers. No
-  ``Authorization`` header is ever sent, and no key is read from the environment (the
-  endpoint is open on the DMZ; any key-like env variable is ignored).
+- POSTs ``<url>/chat/completions`` with ``Content-Type``/``Accept`` headers, plus ``X-Rea-Grant``
+  when ``REA_MODEL_GRANT`` is set. No ``Authorization`` header is ever sent, and no provider key
+  is read from the environment (any key-like env variable is ignored). The grant is an opaque
+  token sealed to the gateway's key by Loadout: it is not a key, the agent cannot open it, and it
+  is never put in a message, warning, log line, transcript or pass field.
 - The default opener is ``urllib``'s, so ``HTTP(S)_PROXY`` from *this* process's env is
   honoured (the sealed route is an allowlisting proxy). Redirects are not followed.
 - The response body is capped at :data:`MAX_RESPONSE_BYTES` while reading.
@@ -19,8 +21,8 @@
   the agent writes it to the pass transcript only (``agent._reasoning``, ``reasoning_policy``).
 - ``REA_MODEL_DIALECT`` (baked into the agent image; default ``vllm``) says how the "thinking
   off" switch is spelled: ``vllm`` sends ``chat_template_kwargs``; ``openrouter`` sends
-  ``reasoning: {"enabled": false}`` (OpenRouter ignores ``chat_template_kwargs``). Credentials
-  for a hosted endpoint live in the operator's gateway, never here.
+  ``reasoning: {"enabled": false}`` (OpenRouter ignores ``chat_template_kwargs``). Provider
+  credentials for a hosted endpoint live in the gateway (operator files or a sealed grant), never here.
 - OpenRouter serves one model id from many hosts, and they differ: some write a schema's keys
   in schema order and some alphabetically, and some ignore the thinking switch. Two image
   settings, both off by default and both refused under ``vllm``, narrow the choice:
@@ -160,6 +162,8 @@ class ModelClient:
         if self.dialect not in DIALECTS:
             raise ValueError(f"REA_MODEL_DIALECT must be one of {', '.join(DIALECTS)}: {self.dialect!r}")
         self._routing = _routing(self.dialect)
+        # Opaque sealed token (see module docstring); sent as a header only, never stored elsewhere.
+        self._grant = (os.environ.get("REA_MODEL_GRANT") or "").strip()
         self.model = model
         self.timeout_s = timeout_s
         # Built per client (not at import) so the proxy env in force at job time applies.
@@ -189,8 +193,10 @@ class ModelClient:
             body["provider"] = self._routing
         # ensure_ascii: lone surrogates in hostile evidence survive as escapes, never break encoding.
         data = json.dumps(body, ensure_ascii=True).encode("ascii")
-        req = urllib.request.Request(self.url, data=data, method="POST",
-                                     headers={"Content-Type": "application/json", "Accept": "application/json"})
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if self._grant:
+            headers["X-Rea-Grant"] = self._grant
+        req = urllib.request.Request(self.url, data=data, method="POST", headers=headers)
         timeout = self.timeout_s if timeout_s is None else max(1.0, min(self.timeout_s, timeout_s))
         raw = self._exchange(req, timeout)
         if len(raw) > MAX_RESPONSE_BYTES:

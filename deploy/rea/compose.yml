@@ -35,8 +35,10 @@ x-host-env: &host-env
   # every REA_* knob is reserved besides. Operator values are baked into the worker images
   # (Dockerfile.stack-worker explains why DEFAULT_PARAMS cannot hold them).
   BLASTBOX_ENGINE_REA_PARAM_KEYS: ""
-  BLASTBOX_ENGINE_REA_AGENT_PARAM_KEYS: ""
-  BLASTBOX_ENGINE_REA_RESERVED_KEYS: &rea-reserved REA_MODEL_URL,REA_MODEL_ID,REA_MODEL_DIALECT,REA_MODEL_PROVIDERS,REA_MODEL_REQUIRE_PARAMETERS,REA_BIN,REA_GHIDRA_SCRIPTS,REA_ANALYSIS_PROVIDER,REA_GHIDRA_PROJECT_PATH,REA_GHIDRA_PROGRAM_NAME,REA_GHIDRA_SWEEP_S,REA_INSPECT_TIMEOUT_S,REA_CAPA_TIMEOUT_S,REA_EMULATE_TIMEOUT_S,REA_EMULATE_MAX_API,REA_EMULATE_MAX_INSTRUCTIONS,REA_PASS_WALL_S,REA_MAX_STEPS,REA_MAX_PASSES,REA_MAX_COMPLETION_TOKENS,REA_TURN_MAX_TOKENS,REA_MODEL_TOKENS_PER_S,REA_FINAL_THINKING,REA_RETAIN_REASONING,REA_COMMIT,REA_TOOLS_SHA256,REA_REPORT_MAX_TOKENS,REA_REPORT_TEMPERATURE,REA_RESERVE_TOKENS,REA_MODEL_TIMEOUT_S,REA_TOOL_TIMEOUT_S,REA_MAX_UNPACK_BYTES,GHIDRA_INSTALL_DIR,JAVA_TOOL_OPTIONS,_JAVA_OPTIONS,JDK_JAVA_OPTIONS,HTTP_PROXY,HTTPS_PROXY,http_proxy,https_proxy,NO_PROXY,no_proxy,HOME,TMPDIR,NODE_OPTIONS,REA_GW_LISTEN,REA_GW_PRIVATE_KEY_FILE,REA_GW_OPERATOR_KEY_FILE_OPENROUTER,REA_GW_OPERATOR_KEY_FILE_ANTHROPIC,REA_GW_REQUIRE_GRANT
+  # rea-agent takes exactly three params: the sealed per-job grant (opaque to the agent; Loadout
+  # seals it to the gateway's key) and the model id + dialect the grant was issued for.
+  BLASTBOX_ENGINE_REA_AGENT_PARAM_KEYS: REA_MODEL_GRANT,REA_MODEL_ID,REA_MODEL_DIALECT
+  BLASTBOX_ENGINE_REA_RESERVED_KEYS: &rea-reserved REA_MODEL_URL,REA_MODEL_PROVIDERS,REA_MODEL_REQUIRE_PARAMETERS,REA_BIN,REA_GHIDRA_SCRIPTS,REA_ANALYSIS_PROVIDER,REA_GHIDRA_PROJECT_PATH,REA_GHIDRA_PROGRAM_NAME,REA_GHIDRA_SWEEP_S,REA_INSPECT_TIMEOUT_S,REA_CAPA_TIMEOUT_S,REA_EMULATE_TIMEOUT_S,REA_EMULATE_MAX_API,REA_EMULATE_MAX_INSTRUCTIONS,REA_PASS_WALL_S,REA_MAX_STEPS,REA_MAX_PASSES,REA_MAX_COMPLETION_TOKENS,REA_TURN_MAX_TOKENS,REA_MODEL_TOKENS_PER_S,REA_FINAL_THINKING,REA_RETAIN_REASONING,REA_COMMIT,REA_TOOLS_SHA256,REA_REPORT_MAX_TOKENS,REA_REPORT_TEMPERATURE,REA_RESERVE_TOKENS,REA_MODEL_TIMEOUT_S,REA_TOOL_TIMEOUT_S,REA_MAX_UNPACK_BYTES,GHIDRA_INSTALL_DIR,JAVA_TOOL_OPTIONS,_JAVA_OPTIONS,JDK_JAVA_OPTIONS,HTTP_PROXY,HTTPS_PROXY,http_proxy,https_proxy,NO_PROXY,no_proxy,HOME,TMPDIR,NODE_OPTIONS,REA_GW_LISTEN,REA_GW_PRIVATE_KEY_FILE,REA_GW_OPERATOR_KEY_FILE_OPENROUTER,REA_GW_OPERATOR_KEY_FILE_ANTHROPIC,REA_GW_REQUIRE_GRANT
   BLASTBOX_ENGINE_REA_AGENT_RESERVED_KEYS: *rea-reserved
 
 services:
@@ -170,9 +172,15 @@ services:
         ipv4_address: 10.231.201.2
 
   rea-model-gw:
-    # nginx 1.27-alpine: holds the OpenRouter key (model-gw/secret/auth.conf, 0400) and forwards one
-    # path to openrouter.ai over verified TLS. Reached only via rea-model-proxy on model-gw.
-    image: nginx@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+    # Python model gateway (blastbox.engines.rea.model_gateway; README.md "Hosted model"): opens the
+    # per-job grant in X-Rea-Grant, forces OpenRouter ZDR, injects the provider key and forwards
+    # over verified TLS. Keys are 0400 files in ./model-gw/secret (uid 1000). Reached only via
+    # rea-model-proxy on model-gw. REA_GW_REQUIRE_GRANT is deliberately NOT set here (rollout
+    # compatibility: no grant -> the operator key); see README.md before turning it on.
+    build:
+      context: ../..
+      dockerfile: deploy/rea/model-gw/Dockerfile
+    image: blastbox-rea-model-gw:dev
     container_name: rea-model-gw
     restart: unless-stopped
     user: "1000:1000"
@@ -180,9 +188,15 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     tmpfs: ["/tmp:rw,nosuid,noexec,size=64m"]
+    environment:
+      REA_GW_LISTEN: 0.0.0.0:8080
+      REA_GW_PRIVATE_KEY_FILE: /run/model-gw/gateway.key
+      REA_GW_OPERATOR_KEY_FILE_OPENROUTER: /run/model-gw/openrouter.key
+      # Uncomment once model-gw/secret/anthropic.key exists: a set path that cannot be read stops
+      # the gateway at start (fail closed), so this is off until the file is there.
+      # REA_GW_OPERATOR_KEY_FILE_ANTHROPIC: /run/model-gw/anthropic.key
     volumes:
-      - ./model-gw/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./model-gw/secret:/etc/nginx/secret:ro
+      - ./model-gw/secret:/run/model-gw:ro
     networks:
       model-gw:
         ipv4_address: 10.231.201.3

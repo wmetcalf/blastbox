@@ -2409,7 +2409,9 @@ def test_every_rea_knob_the_engines_read_is_a_reserved_compose_key():
     compose = (HERE.parents[1] / "deploy" / "rea" / "compose.yml").read_text()
     reserved = set(re.search(r"RESERVED_KEYS: &rea-reserved (\S+)", compose).group(1).split(","))
     assert "REA_REPORT_MAX_TOKENS" in read
-    assert read - reserved == set()
+    # The three job params rea-agent accepts (compose PARAM_KEYS) are deliberately not reserved.
+    assert read - reserved - {"REA_MODEL_GRANT", "REA_MODEL_ID", "REA_MODEL_DIALECT"} == set()
+    assert not reserved & {"REA_MODEL_GRANT", "REA_MODEL_ID", "REA_MODEL_DIALECT"}
 
 
 def test_report_prompt_ties_observed_to_the_programs_own_code():
@@ -3583,3 +3585,85 @@ def test_http_error_body_read_failure_is_an_empty_body():
     with pytest.raises(ModelError) as ei:
         m.chat([{"role": "user", "content": "q"}], [], 16)
     assert ei.value.kind == "refused"
+
+
+# ------------------------------------------------------------------ per-job grant
+
+GRANT_SENTINEL = "g1.SENTINEL-grant-not-a-key-0123456789"
+_OK_BODY = json.dumps({"choices": [{"message": {"content": "{}"}}]}).encode()
+
+
+def _hdrs(req):
+    return {k.lower(): v for k, v in req.header_items()}
+
+
+def test_grant_header_sent_when_env_set(monkeypatch):
+    monkeypatch.setenv("REA_MODEL_GRANT", GRANT_SENTINEL)
+    op = FakeOpener(_OK_BODY)
+    ModelClient("http://10.231.201.3:8080/api/v1", "m", 30, opener=op).chat(
+        [{"role": "user", "content": "hi"}], [], 64)
+    h = _hdrs(op.requests[0])
+    assert h["x-rea-grant"] == GRANT_SENTINEL
+    assert "authorization" not in h
+    assert GRANT_SENTINEL not in op.requests[0].data.decode()
+
+
+def test_no_grant_no_header(monkeypatch):
+    monkeypatch.delenv("REA_MODEL_GRANT", raising=False)
+    op = FakeOpener(_OK_BODY)
+    ModelClient("http://10.231.201.3:8080/api/v1", "m", 30, opener=op).chat([], [], 64)
+    assert "x-rea-grant" not in _hdrs(op.requests[0])
+    monkeypatch.setenv("REA_MODEL_GRANT", "")
+    op = FakeOpener(_OK_BODY)
+    ModelClient("http://10.231.201.3:8080/api/v1", "m", 30, opener=op).chat([], [], 64)
+    assert "x-rea-grant" not in _hdrs(op.requests[0])
+
+
+def test_grant_never_in_pass_payload(tmp_path, monkeypatch):
+    monkeypatch.setenv("REA_MODEL_GRANT", GRANT_SENTINEL)
+    ops: list[FakeOpener] = []
+
+    class Wrapped(FakeModel):
+        def factory(self, url, model, timeout_s):
+            self.ctor = (url, model, timeout_s)
+            op = FakeOpener(b"")
+
+            def _open(req, timeout=None, _op=op):
+                _op.requests.append(req)
+                return _Resp(json.dumps(self.chat(
+                    json.loads(req.data)["messages"], [], 1)).encode())
+            op.open = _open  # type: ignore[method-assign]
+            ops.append(op)
+            return ModelClient(url, model, timeout_s, opener=op)
+
+    cont = make_continuation(tmp_path, todo=["0x140001420"], explored=[])
+    rig = McpRig(tmp_path, {"procedure_pseudo_code": {"text": DECOMP}})
+    model = Wrapped([
+        tc(("procedure_pseudo_code", {"procedure": "0x140001420"}, "call_a")),
+        answer("done exploring"),
+        answer({"summary": "s", "functions": [], "iocs": [], "todo": [], "done": True}),
+    ])
+    res, out = run(tmp_path, cont, model, rig)
+    assert res.status == "ok"
+    sent = [r for op in ops for r in op.requests]
+    assert sent and all(_hdrs(r)["x-rea-grant"] == GRANT_SENTINEL for r in sent)
+    assert GRANT_SENTINEL not in res.payload.model_dump_json()
+    assert all(GRANT_SENTINEL not in json.dumps([w.code, w.message]) for w in res.warnings)
+    assert GRANT_SENTINEL not in (out / "transcript.jsonl").read_text()
+    for r in sent:
+        assert GRANT_SENTINEL not in r.data.decode()
+
+
+def test_rea_agent_param_keys_allow_grant():
+    import yaml
+    doc = yaml.safe_load((Path(__file__).resolve().parents[2] / "deploy/rea/compose.yml").read_text())
+    env = doc["x-host-env"]
+    keys = {"REA_MODEL_GRANT", "REA_MODEL_ID", "REA_MODEL_DIALECT"}
+    assert set(env["BLASTBOX_ENGINE_REA_AGENT_PARAM_KEYS"].split(",")) == keys
+    assert env["BLASTBOX_ENGINE_REA_PARAM_KEYS"] == ""
+    for name in ("BLASTBOX_ENGINE_REA_RESERVED_KEYS", "BLASTBOX_ENGINE_REA_AGENT_RESERVED_KEYS"):
+        assert not keys & set(env[name].split(","))
+    # The grant must fit the dispatcher's per-value cap (it truncates, which would break the token).
+    from blastbox.host.dispatch import _MAX_ENV_VALUE_LEN
+    from blastbox.engines.rea.grant import MAX_GRANT_CHARS
+    assert MAX_GRANT_CHARS <= _MAX_ENV_VALUE_LEN

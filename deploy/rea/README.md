@@ -102,8 +102,9 @@ Three things in the plan's Step 2 cannot work as written. Each was found live:
    never reach the worker that way. Also, a forwardable key is job-overridable (`{**defaults, **params}`):
    `REA_MODEL_URL` as a default would let a job re-point the model. A reserved key is dropped
    entirely, default included. So the operator values are baked into two derived images
-   (`Dockerfile.stack-worker`). The stack sets `_PARAM_KEYS=""` (the empty allowlist blocks every
-   client param and every default) and lists every `REA_*`/JVM/proxy/HOME knob in `_RESERVED_KEYS`.
+   (`Dockerfile.stack-worker`). The stack sets `rea`'s `_PARAM_KEYS=""` (the empty allowlist blocks every
+   client param and every default) and `rea-agent`'s to exactly `REA_MODEL_GRANT,REA_MODEL_ID,REA_MODEL_DIALECT`
+   (the per-job grant and the model it was issued for; see "Hosted model"), and lists every `REA_*`/JVM/proxy/HOME knob in `_RESERVED_KEYS`.
    `BLASTBOX_ENGINES` therefore names two tags (`rea=blastbox-rea-sweep:…`,
    `rea-agent=blastbox-rea-agent:…`), not `blastbox-rea:dev` twice.
 3. **Worker Limits and scratch.** The cold worker's `Limits` come only from the image env (the
@@ -247,16 +248,44 @@ With `FilterURLs On`, tinyproxy matches the full request URL (`http://host:port/
 the Host header for origin-form requests), so the regex pins scheme, host and port. Requests on
 port 8888 can use any path.
 
-### Hosted model (OpenRouter) through `rea-model-gw`
+### Hosted model through `rea-model-gw`
 
-The engine never holds a hosted-model key. `rea-model-gw` (nginx, pinned by digest, read-only,
-no capabilities) is the only holder: it sits on `model-gw`, an `--internal` /29 shared only with
-`rea-model-proxy` (10.231.201.2), and on `model-egress` for the outbound leg. It serves exactly
-`POST /api/v1/chat/completions` on 10.231.201.3:8080 (anything else is 403), adds the
-`Authorization` header from `model-gw/secret/auth.conf` and forwards to openrouter.ai over
-verified TLS with SNI, stripping client identity headers. tinyproxy gets one more filter line,
-`^http://10\.231\.201\.3:8080/api/v1/chat/completions$`, so a slot can reach that one URL and
-nothing else on the gateway.
+The engine never holds a hosted-model key. `rea-model-gw` is the only holder: the Python gateway
+`blastbox.engines.rea.model_gateway`, built by `model-gw/Dockerfile` (python slim pinned by digest,
+`cryptography` hash-locked in `model-gw/requirements.txt`, only `grant.py` and `model_gateway.py`
+copied in, uid 1000, read-only, no capabilities). It sits on `model-gw`, an `--internal` /29 shared
+only with `rea-model-proxy` (10.231.201.2), and on `model-egress` for the outbound leg. Routes
+(anything else is refused): `POST /api/v1/chat/completions` (OpenRouter) and
+`POST /anthropic/v1/chat/completions` (Anthropic), on 10.231.201.3:8080. tinyproxy has one filter
+line per route, so a slot can reach those URLs and nothing else on the gateway. Build it with
+`docker compose -p rea-bb -f compose.yml build rea-model-gw` (context is the repo root).
+
+Credentials, all in `model-gw/secret/` (mounted read-only at `/run/model-gw`; never committed, see
+`model-gw/.gitignore`). Each file is mode 0400 and owned by uid 1000; the gateway refuses a file
+with any group or other permission:
+
+```text
+gateway.key      REA_GW_PRIVATE_KEY_FILE                  X25519 private key (base64url of 32 bytes)
+openrouter.key   REA_GW_OPERATOR_KEY_FILE_OPENROUTER      bare OpenRouter key, one line
+anthropic.key    REA_GW_OPERATOR_KEY_FILE_ANTHROPIC       bare Anthropic key, one line (optional)
+```
+
+Make the gateway key with `python3 model-gw/keygen.py model-gw/secret/gateway.key`. It writes the
+0400 file and prints only the public key, which is Loadout's `LOADOUT_REA_GATEWAY_PUBKEY`. Then
+`chown 1000:1000` the files. A key-file path that is set in compose but unreadable stops the gateway
+at start, so the Anthropic path stays commented out in `compose.yml` until `anthropic.key` exists.
+The old nginx `auth.conf` is gone: put the bare key (no `proxy_set_header` wrapper) in `openrouter.key`.
+
+Per-job grants. Loadout seals a grant (provider, model, key, expiry) to `gateway.key`'s public key
+and passes it to `rea-agent` as the job param `REA_MODEL_GRANT` (the agent's PARAM_KEYS are exactly
+`REA_MODEL_GRANT,REA_MODEL_ID,REA_MODEL_DIALECT`; the `rea` sweep engine takes none). The agent sends
+it only as `X-Rea-Grant`; it is opaque to the agent and is a token, not a key. The gateway opens it,
+pins the request to the granted model, forces `provider.zdr: true` and `data_collection: "deny"` on
+OpenRouter, injects the granted key, and never logs bodies or credential headers. A bad grant is
+401, never a fall back to the operator key. A request with no grant uses the operator key for its
+route, so rollout is compatible: nothing changes until Loadout sends grants. `REA_GW_REQUIRE_GRANT=1`
+turns that fall back off (no grant answers 401 even with an operator key set). It is not set in
+`compose.yml`; add it to the gateway's environment once every Loadout caller sends grants.
 
 Agent images for it are built with `--build-arg REA_MODEL_URL=http://10.231.201.3:8080/api/v1
 --build-arg REA_MODEL_ID=deepseek/deepseek-v4.1-flash --build-arg REA_MODEL_DIALECT=openrouter`
@@ -273,13 +302,6 @@ setting turns that off: only hosts that neither retain nor train on prompts are 
 control run, three of the eighteen hosts serving the model (Alibaba, Baidu, StreamLake) refuse zero
 retention. A model that no such host serves fails with HTTP 404 ("No endpoints found matching your
 data policy").
-
-The key file is one line, mode 0400, owned by the gateway's uid (1000), never committed
-(`model-gw/.gitignore`):
-
-```text
-proxy_set_header Authorization "Bearer <key>";
-```
 
 ### Gate inside the dispatcher
 
