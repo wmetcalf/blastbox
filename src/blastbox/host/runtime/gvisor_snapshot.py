@@ -81,10 +81,11 @@ class GvisorConfig:
     # under a 0750 home dir fails with `binding rootfs ... permission denied`. Output files land
     # owned by userns_host_base + guest uid (e.g. 2065532 for uid 65532); the warm tier runs as
     # root, so host-side cleanup is unaffected. None = no user namespace (today's behaviour).
-    userns_host_base: int | None = None
+    # kw_only: inserted mid-class, so it must not shift the positional order of later fields.
+    userns_host_base: int | None = field(default=None, kw_only=True)
     # Set when BLASTBOX_GVISOR_USERNS_HOST_BASE was given but is unusable: the backend REFUSES
     # the tier rather than silently run the sandbox as real host root the operator opted out of.
-    userns_problem: str = ""
+    userns_problem: str = field(default="", kw_only=True)
     platform: str | None = None
     ld_preload: str | None = None                 # soffice tier: /opt/clippyshot/accept-retry.so
     cpu_features_annotation: str | None = None     # dev.gvisor.internal.cpufeatures (pinning)

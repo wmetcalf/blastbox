@@ -2131,3 +2131,19 @@ def test_userns_rootfs_is_rechecked_where_it_is_bound(tmp_path, monkeypatch, ver
             wd.mkdir(parents=True)
             be.restore_in(wd, str(tmp_path / "ckpt"))
     assert not any("run" in a or "restore" in a for a in ran)   # refused before any spawn
+
+
+def test_userns_fields_do_not_shift_gvisor_config_positional_order(tmp_path):
+    """Positional callers written before the userns fields must keep meaning the same thing."""
+    import dataclasses
+
+    from blastbox.host.runtime.gvisor_snapshot import GvisorConfig
+
+    positional = [f.name for f in dataclasses.fields(GvisorConfig) if not f.kw_only]
+    # exactly the order GvisorConfig had before the userns fields existed
+    assert positional == ["runsc_bin", "root", "image_rootfs", "network", "warm_argv",
+                          "ignore_cgroups", "rootless", "platform", "ld_preload",
+                          "cpu_features_annotation", "extra_env", "uid", "gid", "cli_timeout_s",
+                          "rlimit_nproc", "rlimit_nofile"]
+    cfg = GvisorConfig("runsc", tmp_path, tmp_path, "none", ["/w"], True, False, "systrap")
+    assert cfg.platform == "systrap" and cfg.userns_host_base is None
