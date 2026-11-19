@@ -62,8 +62,8 @@ fbbbaaf, merge commit 0def6b2). It is not pushed. The host image needs it for th
 # worker (context = repo root at feat/rea-engine)
 docker tag blastbox-rea:dev blastbox-rea:dev-prev
 docker build -f deploy/docker/Dockerfile.rea-cold-worker -t blastbox-rea:dev .
-# toolz2 runs the hosted model: add the three OpenRouter --build-arg lines from "Hosted model"
-# to both stack-worker builds below.
+# toolz2 runs the hosted model: add the OpenRouter --build-arg lines from "Hosted model"
+# (incl. REA_MODEL_GRANT_URL) to both stack-worker builds below.
 # A digest BASE_IMAGE for a freshly built local image failed to resolve on toolz2 (buildkit tried
 # docker.io). After checking that blastbox-rea:dev has the pinned id, pass the tag instead:
 docker build -f deploy/rea/Dockerfile.stack-worker -t blastbox-rea-sweep:or2 --build-arg BASE_IMAGE=blastbox-rea:dev \
@@ -288,8 +288,24 @@ turns that fall back off (no grant answers 401 even with an operator key set). I
 `compose.yml`; add it to the gateway's environment once every Loadout caller sends grants.
 
 Agent images for it are built with `--build-arg REA_MODEL_URL=http://10.231.201.3:8080/api/v1
+--build-arg REA_MODEL_GRANT_URL=http://10.231.201.3:8080/api/v1
 --build-arg REA_MODEL_ID=deepseek/deepseek-v4.1-flash --build-arg REA_MODEL_DIALECT=openrouter`
 (OpenRouter ignores `chat_template_kwargs`; the `openrouter` dialect sends `reasoning` instead).
+`REA_MODEL_ID` and `REA_MODEL_DIALECT` are now only defaults: Loadout sets both per job (they are
+`rea-agent` job params), so the image's values apply only to a job that does not send them.
+
+`REA_MODEL_GRANT_URL` is reserved and baked into the image, empty by default. The agent sends a
+grant as `X-Rea-Grant` only when it is non-empty and equal to `REA_MODEL_URL` (trailing `/`
+ignored); a job with a grant on any other image fails its first model call as `refused`
+(`grant_url_mismatch`) without sending anything, so a grant never reaches a host that is not the
+gateway. Building the hosted agent image therefore requires both
+`--build-arg REA_MODEL_URL=http://10.231.201.3:8080/api/v1` and
+`--build-arg REA_MODEL_GRANT_URL=http://10.231.201.3:8080/api/v1`, with `REA_MODEL_PROVIDERS`
+empty or valid for every model the chosen Loadout model service allows (a host list that serves
+none of a granted model fails the call). Loadout's `LOADOUT_REA_MODEL_SERVICE` must only be set
+against such an image. A gateway rejection of the grant answers 401 with
+`{"error":{"code":"rea_grant_rejected","message":"grant rejected"}}`, which the agent seals as
+`model_status: "grant_rejected"`, distinct from a provider's 401 (`key_rejected`).
 
 OpenRouter serves that one model id from many hosts (thirteen in one 20-sample run), and they
 do not behave alike. Two more build args narrow the choice, both empty by default:

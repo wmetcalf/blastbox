@@ -30,6 +30,9 @@ ARG REA_MODEL_DIALECT=vllm
 # every parameter of a request (model.py).
 ARG REA_MODEL_PROVIDERS=
 ARG REA_MODEL_REQUIRE_PARAMETERS=
+# The only base URL the per-job grant (X-Rea-Grant) may be sent to; empty refuses every grant.
+# Set it to REA_MODEL_URL for an image that talks to rea-model-gw (README "Hosted model").
+ARG REA_MODEL_GRANT_URL=
 
 # BLASTBOX_WORK_DIR=/tmp: the cold dispatcher gives the worker a read-only rootfs and one
 # writable tmpfs, /tmp (nosuid,noexec,512m; docker.py _DEFAULT_TMPFS). Ghidra + REA run fine on
@@ -49,6 +52,7 @@ ENV BLASTBOX_ENGINE=${ENGINE_CLASS} \
     REA_MODEL_DIALECT=${REA_MODEL_DIALECT} \
     REA_MODEL_PROVIDERS=${REA_MODEL_PROVIDERS} \
     REA_MODEL_REQUIRE_PARAMETERS=${REA_MODEL_REQUIRE_PARAMETERS} \
+    REA_MODEL_GRANT_URL=${REA_MODEL_GRANT_URL} \
     REA_PASS_WALL_S=540 \
     REA_GHIDRA_SWEEP_S=420 \
     REA_MAX_STEPS=16

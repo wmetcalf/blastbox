@@ -1,7 +1,10 @@
 """OpenAI-compatible chat-completions client for the rea-agent model (DeepSeek on vLLM).
 
 - POSTs ``<url>/chat/completions`` with ``Content-Type``/``Accept`` headers, plus ``X-Rea-Grant``
-  when ``REA_MODEL_GRANT`` is set. No ``Authorization`` header is ever sent, and no provider key
+  when ``REA_MODEL_GRANT`` is set and ``REA_MODEL_GRANT_URL`` (baked into the image, reserved, empty
+  by default) is non-empty and equals ``url`` (both without a trailing ``/``). A grant with any
+  other URL never leaves the process: every ``chat`` raises ``ModelError("refused",
+  "grant_url_mismatch")`` before sending anything. No ``Authorization`` header is ever sent, and no provider key
   is read from the environment (any key-like env variable is ignored). The grant is an opaque
   token sealed to the gateway's key by Loadout: it is not a key, the agent cannot open it, and it
   is never put in a message, warning, log line, transcript or pass field.
@@ -177,7 +180,12 @@ class ModelClient:
             raise ValueError(f"REA_MODEL_DIALECT must be one of {', '.join(DIALECTS)}: {self.dialect!r}")
         self._routing = _routing(self.dialect)
         # Opaque sealed token (see module docstring); sent as a header only, never stored elsewhere.
-        self._grant = (os.environ.get("REA_MODEL_GRANT") or "").strip()
+        # It may only travel to the gateway the image names (REA_MODEL_GRANT_URL, baked, reserved):
+        # a grant with any other base URL is dropped here and the first chat is refused unsent.
+        grant = (os.environ.get("REA_MODEL_GRANT") or "").strip()
+        grant_url = (os.environ.get("REA_MODEL_GRANT_URL") or "").strip().rstrip("/")
+        self._grant_url_mismatch = bool(grant) and (not grant_url or grant_url != url.rstrip("/"))
+        self._grant = "" if self._grant_url_mismatch else grant
         self.model = model
         self.timeout_s = timeout_s
         # Built per client (not at import) so the proxy env in force at job time applies.
@@ -187,6 +195,8 @@ class ModelClient:
              response_format: dict[str, Any] | None = None, timeout_s: float | None = None,
              chat_template_kwargs: dict[str, Any] | None = None,
              temperature: float | None = None) -> dict[str, Any]:
+        if self._grant_url_mismatch:
+            raise ModelError("refused", "grant_url_mismatch")
         body: dict[str, Any] = {"model": self.model, "messages": messages, "max_tokens": int(max_tokens)}
         if temperature is not None:  # unset: the server's default sampling
             body["temperature"] = float(temperature)

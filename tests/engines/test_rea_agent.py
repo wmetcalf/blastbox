@@ -2420,6 +2420,12 @@ def test_every_rea_knob_the_engines_read_is_a_reserved_compose_key():
     assert not reserved & {"REA_MODEL_GRANT", "REA_MODEL_ID", "REA_MODEL_DIALECT"}
 
 
+def test_grant_url_is_baked_into_the_stack_worker_image_empty_by_default():
+    df = (HERE.parents[1] / "deploy" / "rea" / "Dockerfile.stack-worker").read_text()
+    assert re.search(r"^ARG REA_MODEL_GRANT_URL=$", df, re.M)
+    assert re.search(r"^\s+REA_MODEL_GRANT_URL=\$\{REA_MODEL_GRANT_URL\}", df, re.M)
+
+
 def test_report_prompt_ties_observed_to_the_programs_own_code():
     # Live G3 (dotnet): "network" came back observed while its text said no network calls.
     sysmsg = prompts._REPORT_SYSTEM
@@ -3620,8 +3626,12 @@ def _hdrs(req):
     return {k.lower(): v for k, v in req.header_items()}
 
 
+GW_URL = "http://10.231.201.3:8080/api/v1"
+
+
 def test_grant_header_sent_when_env_set(monkeypatch):
     monkeypatch.setenv("REA_MODEL_GRANT", GRANT_SENTINEL)
+    monkeypatch.setenv("REA_MODEL_GRANT_URL", GW_URL + "/")  # normalised like the client's url
     op = FakeOpener(_OK_BODY)
     ModelClient("http://10.231.201.3:8080/api/v1", "m", 30, opener=op).chat(
         [{"role": "user", "content": "hi"}], [], 64)
@@ -3631,8 +3641,30 @@ def test_grant_header_sent_when_env_set(monkeypatch):
     assert GRANT_SENTINEL not in op.requests[0].data.decode()
 
 
+@pytest.mark.parametrize("grant_url", [
+    None,                                   # not baked into the image
+    "",                                     # baked empty
+    "http://model.invalid:8888/v1",         # another host
+    "http://10.231.201.3:8080/anthropic/v1",  # the gateway, but another route
+])
+def test_grant_with_a_mismatched_grant_url_is_refused_before_any_request(monkeypatch, grant_url):
+    monkeypatch.setenv("REA_MODEL_GRANT", GRANT_SENTINEL)
+    if grant_url is None:
+        monkeypatch.delenv("REA_MODEL_GRANT_URL", raising=False)
+    else:
+        monkeypatch.setenv("REA_MODEL_GRANT_URL", grant_url)
+    op = FakeOpener(_OK_BODY)
+    m = ModelClient(GW_URL, "m", 30, opener=op)
+    with pytest.raises(ModelError) as ei:
+        m.chat([{"role": "user", "content": "hi"}], [], 64)
+    assert ei.value.kind == "refused" and str(ei.value) == "refused: grant_url_mismatch"
+    assert op.requests == []
+    assert GRANT_SENTINEL not in str(ei.value) and GRANT_SENTINEL not in repr(vars(m))
+
+
 def test_no_grant_no_header(monkeypatch):
     monkeypatch.delenv("REA_MODEL_GRANT", raising=False)
+    monkeypatch.setenv("REA_MODEL_GRANT_URL", "http://elsewhere.invalid/v1")  # ignored without a grant
     op = FakeOpener(_OK_BODY)
     ModelClient("http://10.231.201.3:8080/api/v1", "m", 30, opener=op).chat([], [], 64)
     assert "x-rea-grant" not in _hdrs(op.requests[0])
@@ -3644,6 +3676,7 @@ def test_no_grant_no_header(monkeypatch):
 
 def test_grant_never_in_pass_payload(tmp_path, monkeypatch):
     monkeypatch.setenv("REA_MODEL_GRANT", GRANT_SENTINEL)
+    monkeypatch.setenv("REA_MODEL_GRANT_URL", "http://model.invalid:8888/v1")
     ops: list[FakeOpener] = []
 
     class Wrapped(FakeModel):
