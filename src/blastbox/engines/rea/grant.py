@@ -14,12 +14,15 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import stat
 from dataclasses import dataclass, field
 
 GRANT_INFO = b"rea-model-grant/1"
 MAX_GRANT_CHARS = 4096
 _PROVIDERS = frozenset({"openrouter", "anthropic"})
+_MAX_TTL = 172800
+_B64URL = re.compile(r"[A-Za-z0-9_-]+")
 _CLAIMS = frozenset({"v", "job", "provider", "model", "key", "exp"})
 
 
@@ -40,14 +43,42 @@ class GrantRejected(Exception):
 
 
 def _b64d(s: str) -> bytes:
-    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+    """Strict unpadded base64url: canonical encodings only."""
+    if not _B64URL.fullmatch(s) or len(s) % 4 == 1:
+        raise ValueError
+    out = base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+    if base64.urlsafe_b64encode(out).rstrip(b"=").decode("ascii") != s:
+        raise ValueError
+    return out
+
+
+def _no_dup_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    d: dict[str, object] = {}
+    for k, v in pairs:
+        if k in d:
+            raise ValueError
+        d[k] = v
+    return d
+
+
+def _clean(s: object) -> bool:
+    return (
+        isinstance(s, str)
+        and s != ""
+        and all(ord(c) >= 32 and ord(c) != 127 for c in s)
+    )
 
 
 def open_grant(token: str, private_key: bytes, now: int) -> Grant:
+    grant: Grant | None = None
     try:
-        return _open(token, private_key, now)
+        grant = _open(token, private_key, now)
     except Exception:
-        raise GrantRejected() from None
+        pass
+    if grant is None:
+        # Raised outside the except block so no frame data is chained.
+        raise GrantRejected()
+    return grant
 
 
 def _open(token: str, private_key: bytes, now: int) -> Grant:
@@ -75,16 +106,18 @@ def _open(token: str, private_key: bytes, now: int) -> Grant:
     )
     shared = priv.exchange(X25519PublicKey.from_public_bytes(epk))
     k = HKDF(hashes.SHA256(), 32, epk + gw_pub, GRANT_INFO).derive(shared)
-    claims = json.loads(AESGCM(k).decrypt(nonce, ct, GRANT_INFO))
+    claims = json.loads(
+        AESGCM(k).decrypt(nonce, ct, GRANT_INFO), object_pairs_hook=_no_dup_pairs
+    )
     if not isinstance(claims, dict) or set(claims) != _CLAIMS:
         raise ValueError
     v, exp = claims["v"], claims["exp"]
-    if type(v) is not int or v != 1 or type(exp) is not int or exp <= now:
+    if type(v) is not int or v != 1 or type(exp) is not int or exp <= now or exp - now > _MAX_TTL:
         raise ValueError
     if claims["provider"] not in _PROVIDERS:
         raise ValueError
     for name in ("job", "provider", "model", "key"):
-        if not isinstance(claims[name], str):
+        if not _clean(claims[name]):
             raise ValueError
     return Grant(
         job=claims["job"],
@@ -95,12 +128,32 @@ def _open(token: str, private_key: bytes, now: int) -> Grant:
     )
 
 
+def _read_key_file(path: str) -> bytes | None:
+    fd = -1
+    try:
+        fd = os.open(
+            path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        )
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o077:
+            return None
+        data = os.read(fd, 129)
+    except OSError:
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(data) > 128 or any(b >= 128 for b in data):
+        return None
+    try:
+        return _b64d(data.strip().decode("ascii"))
+    except Exception:
+        return None
+
+
 def load_private_key(path: str) -> bytes:
-    """Read base64url of 32 raw bytes; refuse group/other-accessible files."""
-    if os.stat(path).st_mode & (stat.S_IRWXG | stat.S_IRWXO):
-        raise ValueError("private key file must not be group/other accessible")
-    with open(path, encoding="ascii") as fh:
-        key = _b64d(fh.read().strip())
-    if len(key) != 32:
-        raise ValueError("private key must decode to 32 bytes")
+    """Read base64url of 32 raw bytes from a private regular file."""
+    key = _read_key_file(path)
+    if key is None or len(key) != 32:
+        raise ValueError("invalid private key file")
     return key
