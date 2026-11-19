@@ -438,13 +438,14 @@ def _readlink_or_none(path: str) -> str | None:
 _MAX_LINK_HOPS = 40               # the kernel's own limit (ELOOP)
 
 
-def _walked_dirs(path: str, readlink: Callable[[str], str | None]) -> list[str]:
+def _walked_dirs(path: str, readlink: Callable[[str], str | None]) -> list[str] | None:
     """Every directory a kernel path walk of ``path`` searches, in order: each component of the
     path AND of every symlink target met on the way (``..`` taken physically, as the kernel
-    does). Every entry is symlink-free, so ``stat`` on it is the directory actually walked."""
+    does). Every entry is symlink-free, so ``stat`` on it is the directory actually walked.
+    None when the walk exceeds the kernel's symlink limit (it would fail with ELOOP)."""
     # NOT abspath/normpath: those drop `x/..` lexically, but the kernel still searches x.
     full = path if path.startswith("/") else os.path.join(os.getcwd(), path)
-    todo = [p for p in full.split("/") if p]
+    todo = [p for p in full.split("/") if p]  # (callers pass absolute paths; see above)
     cur, out, hops = "/", ["/"], 0
     while todo:
         name = todo.pop(0)
@@ -458,7 +459,7 @@ def _walked_dirs(path: str, readlink: Callable[[str], str | None]) -> list[str]:
         if target is not None:
             hops += 1
             if hops > _MAX_LINK_HOPS:
-                break
+                return None
             if target.startswith("/"):
                 cur = "/"
             todo = [p for p in target.split("/") if p] + todo
@@ -491,8 +492,15 @@ def userns_rootfs_problem(rootfs: str, base: int, *,
     ``(None, why)`` when it cannot be decided (a component cannot be stat'd, or carries a POSIX
     ACL, which can grant or deny past the mode bits) -- unknown is never treated as a denial,
     but a later component whose mode bits plainly deny it still is."""
+    if not rootfs.startswith("/"):
+        # runsc resolves a relative root.path against the -bundle dir (a per-build/per-slot
+        # directory), never the dispatcher's cwd: no relative value can boot.
+        return False, (f"rootfs {rootfs!r} is relative; runsc resolves it against the bundle "
+                       "directory, not the dispatcher's cwd: set an absolute path")
     resolved = realpath(rootfs)
     chain = _walked_dirs(rootfs, readlink)
+    if chain is None:
+        return None, f"rootfs {rootfs} has more than {_MAX_LINK_HOPS} symlink hops (ELOOP)"
     unknown = ""
     for path in chain:
         st = stat(path)

@@ -617,7 +617,9 @@ def _check_gvisor_userns(host: HostView) -> Check | None:
             overlap = [*cover, *overlap]
         if overlap == overlap[:1] and not cover and overlap \
                 and overlap[0] not in _FOREIGN_SUBID_OWNERS:
-            warnings.append(f"{path}: {overlap[0]} reserves only part of {ids}")
+            warnings.append(f"{path}: {overlap[0]} holds only part of {ids} (if that is the "
+                            "blastbox reservation, extend it; otherwise those ids are shared "
+                            "with another user/daemon)")
         elif overlap:
             warnings.append(f"{path}: {', '.join(overlap)} each allocate ids in {ids} "
                             "(ids shared with another user/daemon)")
@@ -630,8 +632,11 @@ def _check_gvisor_userns(host: HostView) -> Check | None:
                             "the same ids out)")
     if warnings:
         return Check("gvisor-userns", Status.WARN, f"{span}; " + "; ".join(warnings), doc)
+    owners = sorted({o for text in (host.read("/etc/subuid"), host.read("/etc/subgid"))
+                     for o in _subid_cover(text, base, USERNS_SIZE)[0]})
     return Check("gvisor-userns", Status.PASS,
-                 f"{span}, reserved in /etc/subuid + /etc/subgid, rootfs {rootfs} reachable")
+                 f"{span}, reserved for {', '.join(owners)} in /etc/subuid + /etc/subgid "
+                 f"(make sure that owner is blastbox's), rootfs {rootfs} reachable")
 
 
 _KVM_MISSING = "/dev/kvm missing"

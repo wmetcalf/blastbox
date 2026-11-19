@@ -1386,7 +1386,7 @@ def test_gvisor_userns_unverifiable_rootfs_warns_never_fails():
 
 @pytest.mark.parametrize("subuid,why", [
     ("coz:100000:65536\n", "reserves no range"),
-    ("blastbox:2000000:65535\n", "reserves only part"),       # one id short
+    ("blastbox:2000000:65535\n", "holds only part"),          # one id short
     ("dockremap:1999000:2000\nblastbox:2000000:65536\n", "dockremap"),
     ("root:1000000:1000000000\n", "container runtime's pool"),     # Incus/LXD pool
     ("blastbox:2000000:65536\nroot:1000000:1000000000\n", "root"),
