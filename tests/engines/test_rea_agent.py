@@ -7,6 +7,7 @@ speaking stdio JSON-RPC, logging every message it receives) and the model is scr
 import copy
 import hashlib
 import io
+import logging
 import json
 import re
 import sys
@@ -3708,6 +3709,43 @@ def test_grant_never_in_pass_payload(tmp_path, monkeypatch):
     assert GRANT_SENTINEL not in (out / "transcript.jsonl").read_text()
     for r in sent:
         assert GRANT_SENTINEL not in r.data.decode()
+
+
+@pytest.mark.parametrize("body", [
+    b'{"error":{"code":"rea_grant_rejected","message":"grant rejected"}}',  # the gateway's own
+    b'{"error":{"message":"No auth credentials found"}}',                   # a provider's 401
+])
+def test_grant_never_leaks_when_the_gateway_answers_401(tmp_path, monkeypatch, caplog, body):
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setenv("REA_MODEL_GRANT", GRANT_SENTINEL)
+    monkeypatch.setenv("REA_MODEL_GRANT_URL", "http://model.invalid:8888/v1")
+    op = FakeOpener(exc=urllib.error.HTTPError("http://model.invalid:8888/v1/chat/completions", 401,
+                                               "no", {}, io.BytesIO(body)))
+    errors: list[ModelError] = []
+
+    class Via(FakeModel):
+        def factory(self, url, model, timeout_s):
+            client = ModelClient(url, model, timeout_s, opener=op)
+            real = client.chat
+
+            def chat(*a, **kw):
+                try:
+                    return real(*a, **kw)
+                except ModelError as exc:
+                    errors.append(exc)
+                    raise
+            client.chat = chat  # type: ignore[method-assign]
+            return client
+
+    cont = make_continuation(tmp_path, todo=["0x140001420"])
+    res, out = run(tmp_path, cont, Via([]), McpRig(tmp_path))
+    assert len(op.requests) == 1 and _hdrs(op.requests[0])["x-rea-grant"] == GRANT_SENTINEL
+    assert res.payload.fields["model_status"] in ("grant_rejected", "key_rejected")
+    assert errors and all(GRANT_SENTINEL not in f"{e} {e!r} {e.args}" for e in errors)
+    assert GRANT_SENTINEL not in res.payload.model_dump_json()
+    assert all(GRANT_SENTINEL not in f"{w.code} {w.message}" for w in res.warnings)
+    assert GRANT_SENTINEL not in (out / "transcript.jsonl").read_text()
+    assert GRANT_SENTINEL not in caplog.text
 
 
 def test_rea_agent_param_keys_allow_grant():
