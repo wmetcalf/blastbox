@@ -946,3 +946,16 @@ def test_wait_and_tick_probes_never_use_the_default_helper_timeout(tmp_path):
     p.vsock_present()
     p.poll()
     assert seen and all(t is not None and t <= fc_jail._TICK_BUDGET_S for t in seen)
+
+
+@pytest.mark.parametrize("code,cleaned", [("timeout", True), ("protocol", True),
+                                          ("unknown_asset", False), ("exhausted", False)])
+def test_a_spawn_whose_reply_was_lost_is_torn_down(tmp_path, monkeypatch, code, cleaned):
+    client = JailClient(str(tmp_path / "x.sock"))
+    monkeypatch.setattr(client, "call", lambda *a, **k: (_ for _ in ()).throw(JailError(code, "x")))
+    parked = []
+    from blastbox.host.runtime import fc_snapshot_launcher as fl
+    monkeypatch.setattr(fl, "_park_or_destroy", lambda proc: parked.append(proc.jail_id))
+    with pytest.raises(JailError):
+        client.spawn(JID, mode="boot", mem_mib=64, vcpus=1, kernel="a" * 33, rootfs="a" * 33)
+    assert (parked == [JID]) is cleaned

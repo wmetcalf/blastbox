@@ -68,6 +68,9 @@ _SLOW_OPS = {"asset": 900.0, "spawn": 900.0, "publish": 900.0}
 #: Budget for the cheap status probes the pool runs on its tick (poll/is_ready/vsock): a stalled
 #: helper must cost the tick seconds, not the 60 s default -- it then reads as UNKNOWN.
 _TICK_BUDGET_S = 5.0
+#: spawn errors the helper raises before the jail is registered: nothing to clean up.
+_REFUSED_BEFORE_REGISTRATION = frozenset({"unknown_asset", "unknown_gen", "exists", "exhausted",
+                                          "bad_request", "unknown_jail"})
 _BUSY_RETRIES = 6
 
 
@@ -254,9 +257,19 @@ class JailClient:
               outdisk_mib: int = 16, kernel: "str | None" = None, rootfs: "str | None" = None,
               gen: "str | None" = None, ready_listener: bool = False) -> "socket.socket | None":
         """Start a jailed firecracker (API socket mode). Returns the READY listener when asked."""
-        reply, fds = self.call("spawn", jail=jail_id, mode=mode, kernel=kernel, rootfs=rootfs,
-                               gen=gen, outdisk_mib=outdisk_mib, mem_mib=mem_mib, vcpus=vcpus,
-                               ready_listener=ready_listener)
+        try:
+            reply, fds = self.call("spawn", jail=jail_id, mode=mode, kernel=kernel,
+                                   rootfs=rootfs, gen=gen, outdisk_mib=outdisk_mib,
+                                   mem_mib=mem_mib, vcpus=vcpus, ready_listener=ready_listener)
+        except JailError as exc:
+            if exc.code not in _REFUSED_BEFORE_REGISTRATION:
+                # The helper may have STARTED the jail and only the reply was lost (a timeout,
+                # a truncated reply when our fd table is full): nobody else would ever destroy
+                # it, since its owner -- this process -- is alive. Tear it down, or park it.
+                from blastbox.host.runtime.fc_snapshot_launcher import _park_or_destroy
+
+                _park_or_destroy(JailedProcess(self, jail_id))
+            raise
         if ready_listener:
             if len(fds) != 1:
                 for fd in fds:
