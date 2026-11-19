@@ -584,6 +584,10 @@ while True:
 """
 
 
+#: How long a handed-over batch may stay un-closed before its sink is presumed wedged.
+_SINK_GRACE_S = 0.5
+
+
 class FdSink:
     """Where every client-supplied file is finally released: a disposable child process.
 
@@ -603,6 +607,7 @@ class FdSink:
         self._proc: "subprocess.Popen[bytes] | None" = None
         self._sock: "socket.socket | None" = None
         self._pending = 0           # batches handed over whose "D" has not arrived
+        self._sent: "deque[float]" = deque()   # when each pending batch was handed over
         self._spare_lock = threading.Lock()
         self._spare: "tuple[socket.socket, subprocess.Popen[bytes]] | None" = None
         self._closed = False
@@ -636,7 +641,8 @@ class FdSink:
                     return
             spare[0].close()
             _reap_async(spare[1])
-        threading.Thread(target=_run, daemon=True, name="fcj-sink-spare").start()
+        with contextlib.suppress(RuntimeError):   # no spare this time: started on demand
+            threading.Thread(target=_run, daemon=True, name="fcj-sink-spare").start()
 
     def _start(self) -> None:
         with self._spare_lock:
@@ -645,6 +651,7 @@ class FdSink:
             spare = self._spawn_sink()
         self._sock, self._proc = spare
         self._pending = 0
+        self._sent.clear()
         self._refill_spare()
 
     def _kill(self) -> None:
@@ -654,10 +661,10 @@ class FdSink:
             self._sock = None
         if self._proc is not None:
             # SIGKILL ends a lingering close; reaping happens off this thread.
+            proc, self._proc = self._proc, None
             with contextlib.suppress(OSError):
-                self._proc.kill()
-            _reap_async(self._proc)
-            self._proc = None
+                proc.kill()
+            _reap_async(proc)
 
     def _settle(self) -> None:
         """Collect "D"s WITHOUT blocking (poll with a zero timeout: the socket itself has a
@@ -674,9 +681,15 @@ class FdSink:
             if not got:
                 self._kill()
                 return
-            self._pending -= got.count(b"D")
-        if self._pending:
-            self._kill()            # still closing an earlier batch: presumed wedged
+            for _ in range(got.count(b"D")):
+                if self._pending:
+                    self._pending -= 1
+                    self._sent.popleft()
+        # Wedged only if a batch has been outstanding for longer than closing a handful of
+        # descriptors can take: a "D" merely not here YET is the normal case on a busy helper,
+        # and replacing a healthy sink on it re-forked an interpreter every few requests.
+        if self._pending and time.monotonic() - self._sent[0] > _SINK_GRACE_S:
+            self._kill()
 
     def release(self, fds: "list[int]") -> None:
         """Take ownership of ``fds``. Never blocks on anything a client controls."""
@@ -694,8 +707,15 @@ class FdSink:
                             self._start()       # EAGAIN/ENOMEM here must not escape
                         assert self._sock is not None
                         socket.send_fds(self._sock, [b"F"], batch)
-                        if self._sock.recv(16) != b"A":
-                            raise OSError("sink did not acknowledge")
+                        while True:
+                            # A "D" for an earlier batch may arrive ahead of this batch's "A".
+                            got = self._sock.recv(16)
+                            if got == b"A":
+                                break
+                            if got != b"D" or not self._pending:
+                                raise OSError("sink did not acknowledge")
+                            self._pending -= 1
+                            self._sent.popleft()
                     except Exception:  # noqa: BLE001 - OSError, SubprocessError: try a new sink
                         self._kill()
                         continue
@@ -705,6 +725,7 @@ class FdSink:
                     with contextlib.suppress(OSError):
                         self._sock.send(b"G")
                     self._pending += 1
+                    self._sent.append(time.monotonic())
                     break
                 else:
                     # Two fresh sinks could not take them (no processes left?). Keep them open
@@ -726,7 +747,13 @@ class FdSink:
 
 
 def _reap_async(proc: "subprocess.Popen[bytes]") -> None:
-    threading.Thread(target=lambda: proc.wait(), daemon=True, name="fcj-sink-reap").start()
+    try:
+        threading.Thread(target=lambda: proc.wait(), daemon=True, name="fcj-sink-reap").start()
+    except RuntimeError:
+        # No thread to spare: leave the (SIGKILLed) child for the next poll -- subprocess reaps
+        # finished children when new ones are spawned. Never raise into a release.
+        with contextlib.suppress(Exception):
+            proc.poll()
 
 # --------------------------------------------------------------------------- the helper
 SO_PEERPIDFD = getattr(socket, "SO_PEERPIDFD", 77)
@@ -813,6 +840,12 @@ class Helper:
         limit = cfg.jails_memory_max or _default_memory_cap()
         (parent / "memory.max").write_text(str(limit))
         _log.info("fc_jail.cgroup parent=%s memory.max=%d", parent, limit)
+        sup = parent.parent / "supervisor"
+        if sup.is_dir():
+            # The helper and its fd sinks: a client forcing sink replacements (each a fresh
+            # interpreter) must not take more than this much root CPU from the microVMs.
+            with contextlib.suppress(OSError):
+                (sup / "cpu.max").write_text("200000 100000")
 
     def cleanup_leftovers(self) -> None:
         """Remove what a previous instance of THIS helper left: its jail cgroups, trees, and the
@@ -1612,7 +1645,7 @@ class Helper:
                     with contextlib.suppress(OSError):
                         conn.send(encode({"ok": False, "error": "busy", "detail": "overloaded"}),
                                   socket.MSG_DONTWAIT)
-                    self._sink.release([*taken, conn.detach()])
+                    self._release_safely([*taken, conn.detach()])
                     continue
 
                 def _run(c: socket.socket = conn, p: int = peer) -> None:
@@ -1627,10 +1660,18 @@ class Helper:
                     _log.error("fc_jail.conn_thread_failed: %s", exc)
                     slots.release()
                     self._release_peer(peer)
-                    self._sink.release([conn.detach()])
+                    self._release_safely([conn.detach()])
         finally:
             srv.close()
             self._sink.close()
+
+    def _release_safely(self, fds: "list[int]") -> None:
+        """FdSink.release from the ACCEPT thread: nothing may escape the loop (an exception
+        there ends serve() and main() would shut down every tenant's microVMs)."""
+        try:
+            self._sink.release(fds)
+        except Exception as exc:  # noqa: BLE001
+            _log.error("fc_jail.fd_sink_release_failed: %s (descriptors kept)", exc)
 
     def _release_peer(self, peer: int) -> None:
         with self._lock:

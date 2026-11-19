@@ -843,9 +843,11 @@ def test_healthy_concurrent_output_copies_are_never_refused(tmp_path, monkeypatc
     monkeypatch.setattr(fj, "sparse_copy", lambda s, d, n: (time.sleep(0.2), real(s, d, n)))
     import concurrent.futures as cf
     import time
+    futs = []
     with cf.ThreadPoolExecutor(12) as ex:
-        futs = [ex.submit(JailedProcess(jail, JID).copy_outdisk, tmp_path / f"o{i}.ext4")
-                for i in range(12)]
+        for i in range(12):                    # STAGGERED: each starts while the others run
+            futs.append(ex.submit(JailedProcess(jail, JID).copy_outdisk, tmp_path / f"o{i}.ext4"))
+            time.sleep(0.01)
         for f in futs:
             f.result()                         # none refused as "stuck"
 

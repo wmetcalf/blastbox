@@ -999,6 +999,7 @@ def test_replacing_a_wedged_sink_is_a_swap_not_a_two_second_stall():
     try:
         sink.release([os.open("/dev/null", os.O_RDONLY)])     # starts a sink (+ a spare)
         sink.release([c.detach()])                            # wedges it in a lingering close
+        time.sleep(h._SINK_GRACE_S + 0.1)
         deadline = time.monotonic() + 5
         while sink._spare is None and time.monotonic() < deadline:
             time.sleep(0.02)
@@ -1009,3 +1010,38 @@ def test_replacing_a_wedged_sink_is_a_swap_not_a_two_second_stall():
         sink.close()
         peer.close()
         srv.close()
+
+
+def test_no_thread_to_reap_a_sink_never_raises_into_a_release(monkeypatch):
+    sink = h.FdSink()
+    try:
+        sink.release([os.open("/dev/null", os.O_RDONLY)])
+        real = threading.Thread.start
+
+        def no_threads(self):
+            raise RuntimeError("can't start new thread")
+        monkeypatch.setattr(threading.Thread, "start", no_threads)
+        sink._pending = 1                     # looks wedged: it will be killed and replaced
+        sink._sent.append(time.monotonic() - 10)
+        sink.release([os.open("/dev/null", os.O_RDONLY)])
+        monkeypatch.setattr(threading.Thread, "start", real)
+    finally:
+        sink.close()
+
+
+def test_ordinary_traffic_does_not_replace_a_healthy_sink():
+    sink = h.FdSink()
+    started = []
+    real = sink._spawn_sink
+
+    def counting():
+        started.append(1)
+        return real()
+    sink._spawn_sink = counting
+    try:
+        for _ in range(200):
+            sink.release([os.open("/dev/null", os.O_RDONLY)])
+        time.sleep(0.3)
+        assert len(started) <= 2               # the first sink and its spare
+    finally:
+        sink.close()
