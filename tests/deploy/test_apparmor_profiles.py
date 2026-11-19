@@ -221,7 +221,8 @@ _MOUNT_CLASS = 0x7    # AA_CLASS_MOUNT: the policy DFA's first byte for mount/um
 
 def _policy_start_classes(text: str) -> set[int]:
     """The class bytes the compiled POLICY DFA's start state has a transition for
-    (`--dump=dfa-states`; the second DFA dumped is the policy one, after the file DFA). The
+    (`--dump=dfa-states`; the policy DFA is dumped LAST, after the xmatch DFA of a profile with
+    an attachment and the file DFA). The
     kernel mediates a class only if that transition exists (RULE_MEDIATES): without it, every
     operation of the class is allowed, whatever the rules say."""
     res = subprocess.run(
@@ -232,7 +233,7 @@ def _policy_start_classes(text: str) -> set[int]:
     lines = res.stderr.decode().splitlines()
     starts = [i for i, ln in enumerate(lines) if "<== " in ln]
     assert len(starts) >= 2, "expected a file DFA and a policy DFA in the dump"
-    policy = lines[starts[1]:]
+    policy = lines[starts[-1]:]
     first = next(i for i, ln in enumerate(policy) if ln.startswith("{1} perms"))
     classes: set[int] = set()
     for ln in policy[first + 1:]:
@@ -266,6 +267,15 @@ def test_the_child_profile_mediates_the_mount_class() -> None:
     )
 
 
+def _parser_has_the_marker_bug() -> bool:
+    """apparmor_parser <= 4.0.x adds the class mediation markers as ordinary allows, so a deny
+    matching the empty mountpoint wipes the mount one; >= 4.1 adds them at an internal priority
+    above any rule ("a deny rule wiping these out could result in the dfa allowing stuff as
+    unmediated"), so that spelling is harmless there."""
+    probe = "abi <abi/3.0>,\nprofile bb-probe {\n  /tmp/bb-probe r,\n  audit deny umount,\n}\n"
+    return _MOUNT_CLASS not in _policy_start_classes(probe)
+
+
 @_PARSER
 @pytest.mark.parametrize("extra,mediated", [
     ("", True),
@@ -274,7 +284,10 @@ def test_the_child_profile_mediates_the_mount_class() -> None:
     ("  umount,", True),                      # an ALLOW keeps the class mediated
 ])
 def test_the_mediation_check_tells_the_spellings_apart(extra: str, mediated: bool) -> None:
-    """The oracle above, pinned against the spellings it must distinguish."""
+    """The oracle above, pinned against the spellings it must distinguish. The unmediated cases
+    are a property of the parser (<= 4.0.x), so they are checked only where it has the bug."""
+    if not mediated and not _parser_has_the_marker_bug():
+        pytest.skip("this apparmor_parser compiles mediation markers above any deny (>= 4.1)")
     text = (_PROFILE_DIR / "blastbox-sandbox").read_text().replace(
         "  network netlink raw,", "  network netlink raw,\n" + extra if extra else
         "  network netlink raw,")
@@ -341,3 +354,11 @@ def test_the_snake_case_rule_is_actually_enforced() -> None:
 
     ignored = cfg["tool"]["ruff"]["lint"]["per-file-ignores"]["tests/**"]
     assert "N802" in ignored, "the deliberate emphasis in test names lost its exemption"
+
+
+@_PARSER
+def test_the_oracle_reads_the_policy_dfa_of_a_profile_with_an_attachment() -> None:
+    """An attachment adds an xmatch DFA in front of the file DFA; the policy DFA is still last."""
+    text = (_PROFILE_DIR / "blastbox-sandbox").read_text().replace(
+        "profile blastbox-sandbox flags=", "profile blastbox-sandbox /opt/detonate/run flags=")
+    assert _MOUNT_CLASS in _policy_start_classes(text)
