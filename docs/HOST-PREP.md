@@ -335,8 +335,9 @@ descriptors, never as paths.
   (they are in its cgroup); dispatchers rebuild their warm base on the next spawn.
 - **Shared capacity (residual):** dispatchers cannot touch each other's microVMs, but they share
   the helper's capacity -- `--max-jails`, the uid range, the memory cap and the chroot base. Limits
-  per client process (`max_jails_per_owner` 256, 4 live generations, 8 concurrent requests, 64
-  client processes) bound a misbehaving or compromised dispatcher, but it can still exhaust what
+  per client process (`max_jails_per_owner` 256, 4 live generations, 32 concurrent requests, 64
+  client processes; `--max-jails-per-owner`, `--max-gens-per-owner`, `--max-conns-per-peer`,
+  `--max-conns` (128 helper-wide), `--max-owners`) bound a misbehaving or compromised dispatcher, but it can still exhaust what
   is shared and deny service to the others. Size the caps for the stacks you run.
 - **Without AppArmor** (`--apparmor off`, or `auto` on a kernel without it) a VMM a guest escaped
   into is still chrooted, uid-isolated and capped per file (`fsize`), but it can create files in its

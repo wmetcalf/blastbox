@@ -80,6 +80,8 @@ PROTOCOL_VERSION = 1
 MAX_MSG = 16 * 1024
 #: Most fds one request may attach (``asset`` passes exactly one).
 MAX_REQUEST_FDS = 1
+#: The kernel's per-message SCM_RIGHTS maximum: the helper always makes room for all of them.
+SCM_MAX_FD = 253
 
 #: Names INSIDE a jail. The jailer pivot_root()s into the jail and firecracker's cwd is ``/``.
 JAIL_KERNEL = "vmlinux"
@@ -481,7 +483,7 @@ class Owner:
 class Asset:
     id: str
     kind: str
-    path: Path
+    path: str        # a plain string: see _copy_asset
     key: "tuple[int, int, int, int]"
     refs: int = 0
 
@@ -797,8 +799,11 @@ class Helper:
 
     def _copy_asset(self, aid: str, kind: str, src: int, st: os.stat_result,
                     key: "tuple[int, int, int, int]") -> Asset:
-        path = self.cfg.assets_dir / aid
-        tmp = self.cfg.assets_dir / f".{aid}.{secrets.token_hex(4)}"
+        # Plain strings: pathlib interns every component (immortal in 3.12), and these names are
+        # client-driven -- one per distinct file registered.
+        base = str(self.cfg.assets_dir)
+        path = os.path.join(base, aid)
+        tmp = os.path.join(base, f".{aid}.{secrets.token_hex(4)}")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
         try:
             try:
@@ -818,7 +823,8 @@ class Helper:
                 os.close(fd)
             os.replace(tmp, path)
         except BaseException:
-            tmp.unlink(missing_ok=True)
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp)
             raise
         asset = Asset(id=aid, kind=kind, path=path, key=key)
         with self._lock:
@@ -834,7 +840,8 @@ class Helper:
             if asset is None or asset.refs > 0 or self._asset_pinned(aid):
                 return
             del self._assets[aid]
-        asset.path.unlink(missing_ok=True)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(asset.path)
 
     def _unpin_asset(self, aid: str) -> None:
         self._maybe_drop_asset(aid)
@@ -1162,8 +1169,15 @@ class Helper:
 
     def op_outdisk(self, owner: Owner, req: "dict[str, Any]", fds: "list[int]") -> "tuple[dict[str, Any], list[int]]":
         jail = self._jail_of(owner, req["jail"])
-        if jail.outdisk_fd is None:
-            raise HelperError("no_outdisk", jail.id)
+        # UNDER the jail lock: _destroy closes outdisk_fd under it, and a number closed between
+        # the size check and the /proc reopen could be reused by another owner's file.
+        with jail.lock:
+            if jail.destroyed or jail.outdisk_fd is None:
+                raise HelperError("no_outdisk", jail.id)
+            return self._outdisk_locked(jail)
+
+    def _outdisk_locked(self, jail: Jail) -> "tuple[dict[str, Any], list[int]]":
+        assert jail.outdisk_fd is not None
         st = os.fstat(jail.outdisk_fd)
         if st.st_size != jail.outdisk_bytes:
             # A compromised VMM grew (or shrank) the image past what was staged: never hand the
@@ -1192,7 +1206,10 @@ class Helper:
                 raise HelperError("exhausted", "too many live generations; discard one first")
             owner.publishing += 1
         try:
-            return self._publish(owner, jail)
+            with jail.lock:              # outdisk_fd must not be closed by a racing destroy
+                if jail.destroyed:
+                    raise HelperError("unknown_jail", jail.id)
+                return self._publish(owner, jail)
         finally:
             with self._lock:
                 owner.publishing -= 1
@@ -1399,18 +1416,14 @@ class Helper:
                 if busy_peer or not slots.acquire(blocking=False):
                     if not busy_peer:
                         self._release_peer(peer)
-                    # DRAIN the already-queued request first: closing with unread data makes the
-                    # client's next recv/send fail ECONNRESET/EPIPE instead of seeing "busy".
-                    with contextlib.suppress(OSError):
-                        _, junk, _, _ = socket.recv_fds(conn, MAX_MSG + 1, MAX_REQUEST_FDS + 1,
-                                                        socket.MSG_DONTWAIT)
-                        for fd in junk:
-                            self._close_client_fd(fd)
                     # Overloaded: SAY so (the client retries "busy"); a silent close is
-                    # indistinguishable from a refused uid.
+                    # indistinguishable from a refused uid. Drain first (closing with unread data
+                    # resets the client before it reads "busy") -- and drain WITHOUT blocking:
+                    # this is the accept thread.
+                    self._drain(conn)
                     with contextlib.suppress(OSError):
-                        conn.settimeout(1.0)
-                        conn.send(encode({"ok": False, "error": "busy", "detail": "overloaded"}))
+                        conn.send(encode({"ok": False, "error": "busy", "detail": "overloaded"}),
+                                  socket.MSG_DONTWAIT)
                     conn.close()
                     continue
 
@@ -1462,7 +1475,10 @@ class Helper:
             if uid not in self.cfg.allowed_uids or pid <= 0:
                 _log.warning("fc_jail.refused_peer uid=%d pid=%d", uid, pid)
                 return
-            data, fds, flags, _ = socket.recv_fds(conn, MAX_MSG + 1, MAX_REQUEST_FDS + 1)
+            # Room for the kernel's per-message maximum: descriptors that do not fit are
+            # released BY THE KERNEL inside recvmsg, where a lingering socket's close blocks this
+            # thread -- every one must be installed so _close_client_fd can make it abortive.
+            data, fds, flags, _ = socket.recv_fds(conn, MAX_MSG + 1, SCM_MAX_FD)
             if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC) or len(data) > MAX_MSG:
                 self._reply(conn, {"ok": False, "error": "protocol", "detail": "truncated"}, [])
                 return
@@ -1504,7 +1520,26 @@ class Helper:
             for fd in out_fds:
                 with contextlib.suppress(OSError):
                     os.close(fd)
+            self._drain(conn)
             conn.close()
+
+    def _drain(self, conn: socket.socket) -> None:
+        """Make close() of ``conn`` unable to block: stop the client queueing more (SHUT_RD --
+        its sends now fail EPIPE), then receive every queued message without blocking and close
+        each descriptor abortively. Otherwise close() releases queued descriptors in THIS thread,
+        and a lingering socket among them blocks it for as long as the client likes."""
+        with contextlib.suppress(OSError):
+            conn.shutdown(socket.SHUT_RD)
+        for _ in range(1024):           # bounded by what was queued before the shutdown
+            try:
+                data, fds, _, _ = socket.recv_fds(conn, MAX_MSG + 1, SCM_MAX_FD,
+                                                  socket.MSG_DONTWAIT)
+            except OSError:
+                return
+            for fd in fds:
+                self._close_client_fd(fd)
+            if not data and not fds:
+                return
 
     def _abandon(self, owner: Owner, jail_id: str) -> None:
         with self._lock:

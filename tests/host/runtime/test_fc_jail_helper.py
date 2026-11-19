@@ -9,6 +9,7 @@ itself) replaced, so they run unprivileged.
 from __future__ import annotations
 
 import ast
+import threading
 import os
 import signal
 import socket
@@ -282,8 +283,8 @@ def env(tmp_path):
 def test_an_asset_is_copied_from_the_descriptor_and_made_read_only(env):
     aid = env.asset("rootfs", b"x" * 5000)
     asset = env.helper._assets[aid]
-    assert asset.path.read_bytes() == b"x" * 5000
-    assert asset.path.stat().st_mode & 0o777 == 0o444
+    assert Path(asset.path).read_bytes() == b"x" * 5000
+    assert Path(asset.path).stat().st_mode & 0o777 == 0o444
     assert aid in env.owner.assets
 
 
@@ -797,7 +798,7 @@ def test_an_asset_is_read_through_the_clients_own_descriptor(env, tmp_path, monk
         assert os.lseek(fd, 0, os.SEEK_CUR) == 123          # the client's offset is untouched
     finally:
         os.close(fd)
-    assert env.helper._assets[aid].path.read_bytes() == b"K" * 9000
+    assert Path(env.helper._assets[aid].path).read_bytes() == b"K" * 9000
 
 
 def test_client_processes_and_generations_are_capped(env):
@@ -838,7 +839,7 @@ def test_a_sparse_asset_stays_sparse_and_the_client_offset_is_restored(env, tmp_
         assert os.lseek(fd, 0, os.SEEK_CUR) == 77
     finally:
         os.close(fd)
-    copy = env.helper._assets[aid].path
+    copy = Path(env.helper._assets[aid].path)
     assert copy.stat().st_size == 256 << 20 and copy.stat().st_blocks * 512 < 16 << 20
 
 
@@ -876,3 +877,75 @@ def test_concurrent_publishes_cannot_exceed_the_generation_cap(env):
     env.owner.publishing = 0
     env.helper.op_publish(env.owner, {"op": "publish", "jail": JID}, [])
     assert env.owner.publishing == 0
+
+
+def test_outdisk_reads_the_descriptor_under_the_jail_lock(env):
+    """A destroy closing outdisk_fd between the size check and the reopen would let the number
+    be reused by another owner's file."""
+    jail, _ = env.boot(listener=False)
+    held = []
+
+    class _Rec:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __enter__(self):
+            self.inner.acquire()
+            held.append(True)
+
+        def __exit__(self, *a):
+            held.append(False)
+            self.inner.release()
+    jail.lock = _Rec(threading.Lock())
+    real = env.helper._outdisk_locked
+
+    def check(j):
+        assert held and held[-1] is True, "outdisk_fd used without the jail lock"
+        return real(j)
+    env.helper._outdisk_locked = check
+    _, fds = env.helper.op_outdisk(env.owner, {"op": "outdisk", "jail": JID}, [])
+    os.close(fds[0])
+    jail.lock = threading.Lock()
+    env.kill(jail)
+    env.helper.op_destroy(env.owner, {"op": "destroy", "jail": JID}, [])
+
+
+def _lingering_socket():
+    import struct
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    c = socket.create_connection(srv.getsockname())
+    peer, _ = srv.accept()
+    c.setblocking(False)
+    try:
+        while True:
+            c.send(b"x" * 65536)
+    except BlockingIOError:
+        pass
+    c.setblocking(True)
+    c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 30))
+    return c, peer, srv
+
+
+@pytest.mark.parametrize("shape", ["excess-fds", "second-message"])
+def test_a_lingering_socket_the_kernel_would_release_cannot_pin_the_helper(env, shape):
+    c, peer, srv = _lingering_socket()
+    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    r, w = os.pipe()
+    try:
+        if shape == "excess-fds":
+            socket.send_fds(a, [h.encode({"op": "hello"})], [r, w, c.fileno()])
+        else:
+            a.send(h.encode({"op": "hello"}))
+            socket.send_fds(a, [b"x"], [c.fileno()])
+        c.close()
+        os.close(r)
+        os.close(w)
+        t0 = time.monotonic()
+        env.helper.serve_conn(b)
+        assert time.monotonic() - t0 < 2.0
+    finally:
+        a.close()
+        peer.close()
+        srv.close()

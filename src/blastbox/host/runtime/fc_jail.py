@@ -17,6 +17,7 @@ seccomp filters verified on every thread). This module is the dispatcher's whole
 """
 from __future__ import annotations
 
+import contextlib
 import errno
 import logging
 import os
@@ -27,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from blastbox.errors import HostDiskTimeout
 from blastbox.host.runtime.fc_jail_helper import (
     JAIL_API_SOCK,
     MAX_MSG,
@@ -403,11 +405,21 @@ class JailedProcess:
                 # Bounded like the other host disk work: a stalled disk must not pin the
                 # dispatch thread (the helper already refused a size other than the staged one).
                 _copy_bounded(fd, out, size)
+            except BaseException:
+                # A partial image is worse than none (rdump would parse it), and an abandoned
+                # worker may still be writing: unlink the name; its writes land in a dead inode.
+                with contextlib.suppress(OSError):
+                    dest.unlink()
+                raise
             finally:
                 os.close(out)
         except OSError as exc:
             if exc.errno in (errno.ENOSPC, errno.EIO, errno.EROFS, errno.EDQUOT):
                 exc.host_io = True  # type: ignore[attr-defined]
+            raise
+        except HostDiskTimeout as exc:
+            # A stalled disk (ours or the helper's) is a host outage, not the guest's fault.
+            exc.host_io = True  # type: ignore[attr-defined]
             raise
         finally:
             os.close(fd)
@@ -419,6 +431,11 @@ class JailedProcess:
                            connector=self.connect_api)
 
 
+_MAX_ABANDONED = 8
+_ABANDONED: "list[threading.Thread]" = []
+_ABANDONED_LOCK = threading.Lock()
+
+
 def _copy_bounded(src: int, dst: int, size: int) -> None:
     """sparse_copy in a worker JOINED with the disk deadline: checking the clock between
     chunks is only cooperative, and a stalled filesystem blocks inside a single call. This
@@ -427,6 +444,12 @@ def _copy_bounded(src: int, dst: int, size: int) -> None:
     from blastbox.host.runtime.firecracker import disk_timeout_s
 
     timeout = disk_timeout_s()
+    with _ABANDONED_LOCK:
+        _ABANDONED[:] = [t for t in _ABANDONED if t.is_alive()]
+        if len(_ABANDONED) >= _MAX_ABANDONED:
+            # Bounded: a wedged filesystem must not cost a thread and two fds per job forever.
+            raise HostDiskTimeout(cmd=f"copy jailed output disk (refused: {len(_ABANDONED)} "
+                                      "earlier copies still stuck)", timeout=timeout)
     s2, d2 = os.dup(src), os.dup(dst)
     done: "list[BaseException | None]" = []
 
@@ -440,6 +463,8 @@ def _copy_bounded(src: int, dst: int, size: int) -> None:
             os.close(s2)
             os.close(d2)
     worker = threading.Thread(target=_run, daemon=True, name="fc-jail-outdisk-copy")
+    with _ABANDONED_LOCK:
+        _ABANDONED.append(worker)
     worker.start()
     worker.join(timeout)
     if not done:

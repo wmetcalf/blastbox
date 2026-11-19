@@ -1638,14 +1638,9 @@ class FirecrackerSlotRuntime:
                     with contextlib.suppress(Exception):
                         cleanup(slot)
             if proc is not None:
-                gone = False
-                with contextlib.suppress(Exception):
-                    proc.kill()
-                    proc.wait(timeout=5.0)
-                    gone = True
-                if gone:
-                    with contextlib.suppress(Exception):
-                        proc.destroy()
+                from blastbox.host.runtime.fc_snapshot_launcher import _park_or_destroy
+
+                _park_or_destroy(proc)
             shutil.rmtree(slot_dir, ignore_errors=True)
             raise
         _log.info("fc.spawn_jailed slot_id=%s", slot_id)

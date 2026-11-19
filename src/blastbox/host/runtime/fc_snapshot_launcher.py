@@ -433,6 +433,25 @@ class _Handle:
 _PENDING_DESTROY: "list[Any]" = []
 
 
+def _park_or_destroy(proc: Any) -> None:
+    """Tear down a jailed microVM nobody else holds a handle to -- or park it for retry.
+
+    A failed spawn's handle is dropped by its caller; if the kill or the destroy cannot be
+    confirmed now (the helper is briefly unavailable) the jail must not be forgotten, since the
+    helper only reclaims a LIVE dispatcher's jails when asked."""
+    try:
+        gone = _terminate_proc(proc)
+    except Exception:  # noqa: BLE001
+        gone = False
+    try:
+        if not gone:
+            raise RuntimeError("unconfirmed")
+        proc.destroy()
+    except Exception:  # noqa: BLE001
+        with _STRANDED_LOCK:
+            _PENDING_DESTROY.append(proc)
+
+
 def _retry_pending_destroys() -> None:
     with _STRANDED_LOCK:
         batch = list(_PENDING_DESTROY)
@@ -440,6 +459,11 @@ def _retry_pending_destroys() -> None:
     still = []
     for proc in batch:
         try:
+            # Entries may still be RUNNING (a failed spawn whose kill could not be confirmed):
+            # kill again first; destroy() itself refuses a live jail.
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5.0)
             proc.destroy()
         except Exception:  # noqa: BLE001 - retried again later
             still.append(proc)
@@ -843,9 +867,7 @@ class FcSnapshotLauncher:
         except BaseException:
             if listener is not None:
                 listener.close()
-            if _terminate_proc(proc):
-                with contextlib.suppress(Exception):
-                    proc.destroy()
+            _park_or_destroy(proc)
             raise
         handle = _Handle(proc, api, str(nominal), ready_check=ready, mem_dir=self._mem_dir,
                          stranded=self._stranded_partials, ack_generation=ack_gen,

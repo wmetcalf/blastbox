@@ -147,7 +147,7 @@ def test_client_hello_and_asset_round_trip_over_the_real_socket(live_helper, tmp
     aid, key = client.asset("rootfs", str(f))
     st = f.stat()
     assert key == (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
-    assert helper._assets[aid].path.read_bytes() == b"R" * 4096
+    assert Path(helper._assets[aid].path).read_bytes() == b"R" * 4096
     assert client.asset("rootfs", str(f))[0] == aid          # cached by identity
     with pytest.raises(JailError) as exc:
         client.status(JID)
@@ -689,19 +689,25 @@ def test_a_peer_the_helper_drops_unread_is_a_host_side_refusal(tmp_path, monkeyp
     srv.bind(str(path))
     srv.listen(8)
 
+    seen = []
+    srv.settimeout(5)
+
     def drop():
         for _ in range(fj._BUSY_RETRIES + 1):   # every (retried) attempt is dropped
-            c, _ = srv.accept()
-            time.sleep(0.05)
+            try:
+                c, _ = srv.accept()
+            except TimeoutError:
+                return
+            seen.append(1)
             c.close()                   # unread: the client sees ECONNRESET, not EOF
-    import time
     t = threading.Thread(target=drop)
     t.start()
     with pytest.raises(JailError) as exc:
         JailClient(str(path)).call("status", jail=JID)
-    t.join()
+    t.join(10)
     srv.close()
     assert exc.value.code in ("refused", "busy") and exc.value.host_io
+    assert len(seen) == fj._BUSY_RETRIES + 1          # a dropped request IS retried
 
 
 def test_a_cold_reap_whose_vm_is_gone_but_destroy_fails_is_not_quarantined(tmp_path):
@@ -749,12 +755,77 @@ def test_a_jail_helper_failure_at_signal_go_is_not_worker_evidence(tmp_path):
 
 def test_an_overloaded_real_helper_is_retried_not_refused(live_helper, monkeypatch):
     helper, path = live_helper
-    helper.cfg = h.HelperConfig(**{**helper.cfg.__dict__, "max_conns_per_peer": 0})
     from blastbox.host.runtime import fc_jail as fj
-    monkeypatch.setattr(fj, "_BUSY_RETRIES", 2)
-    monkeypatch.setattr(fj.time, "sleep", lambda s: None)
+
+    capped = h.HelperConfig(**{**helper.cfg.__dict__, "max_conns_per_peer": 0})
+    open_ = h.HelperConfig(**{**helper.cfg.__dict__, "max_conns_per_peer": 32})
+    helper.cfg = capped
+    monkeypatch.setattr(fj, "_BUSY_RETRIES", 0)
     with pytest.raises(JailError) as exc:
         JailClient(path).hello()
-    assert exc.value.code in ("busy", "refused") and exc.value.host_io
-    helper.cfg = h.HelperConfig(**{**helper.cfg.__dict__, "max_conns_per_peer": 32})
-    assert JailClient(path).hello()["protocol"] == h.PROTOCOL_VERSION
+    assert exc.value.code == "busy" and exc.value.host_io      # drained, so "busy" arrives
+    monkeypatch.setattr(fj, "_BUSY_RETRIES", 6)
+    threading.Timer(0.2, lambda: setattr(helper, "cfg", open_)).start()
+    assert JailClient(path).hello()["protocol"] == h.PROTOCOL_VERSION   # ...and is retried
+
+
+def test_a_failed_cold_spawn_whose_kill_is_unconfirmed_is_parked_not_forgotten(tmp_path):
+    from blastbox.host.runtime import fc_snapshot_launcher as fl
+
+    jail = _DownJail(tmp_path)
+
+    def bad_seal(jail_id):
+        jail.down = True                         # the helper becomes unreachable mid-cleanup
+        raise JailError("unconfined", "x")
+    jail.seal = bad_seal
+    rt = _cold(tmp_path, jail)
+    with pytest.raises(JailError):
+        rt.spawn()
+    parked = [p for p in fl._PENDING_DESTROY if getattr(p, "_client", None) is jail]
+    assert len(parked) == 1
+    jail.down = False
+    fl._retry_pending_destroys()
+    assert jail.alive == {}
+    assert not [p for p in fl._PENDING_DESTROY if getattr(p, "_client", None) is jail]
+
+
+def test_a_timed_out_output_copy_leaves_no_partial_image_and_abandoned_copies_are_capped(
+        tmp_path, monkeypatch):
+    from blastbox.errors import HostDiskTimeout
+    from blastbox.host.runtime import fc_jail as fj
+    from blastbox.host.runtime import firecracker as fc
+
+    jail = _FakeJail(tmp_path)
+    jail.alive[JID] = True
+    jail.outdisk_bytes = b"x" * 4096
+    gate = threading.Event()
+    monkeypatch.setattr(fj, "sparse_copy", lambda s, d, n: gate.wait(10))
+    monkeypatch.setattr(fc, "disk_timeout_s", lambda: 0.05)
+    monkeypatch.setattr(fj, "_MAX_ABANDONED", 2)
+    monkeypatch.setattr(fj, "_ABANDONED", [])
+    dest = tmp_path / "o.ext4"
+    for _ in range(2):
+        with pytest.raises(HostDiskTimeout):
+            JailedProcess(jail, JID).copy_outdisk(dest)
+        assert not dest.exists()
+    with pytest.raises(HostDiskTimeout, match="refused"):
+        JailedProcess(jail, JID).copy_outdisk(dest)
+    gate.set()
+
+
+def test_a_stalled_output_copy_is_host_io(tmp_path, monkeypatch):
+    from blastbox.errors import HostDiskTimeout
+    from blastbox.host.runtime import fc_jail as fj
+    from blastbox.host.runtime import firecracker as fc
+
+    jail = _FakeJail(tmp_path)
+    jail.alive[JID] = True
+    jail.outdisk_bytes = b"x"
+    gate = threading.Event()
+    monkeypatch.setattr(fj, "sparse_copy", lambda s, d, n: gate.wait(10))
+    monkeypatch.setattr(fc, "disk_timeout_s", lambda: 0.05)
+    monkeypatch.setattr(fj, "_ABANDONED", [])
+    with pytest.raises(HostDiskTimeout) as exc:
+        JailedProcess(jail, JID).copy_outdisk(tmp_path / "o.ext4")
+    gate.set()
+    assert exc.value.host_io
