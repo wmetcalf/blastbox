@@ -406,10 +406,13 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
     # from runsc after the readiness wait; refuse it here, by name, instead.
     if gcfg.userns_host_base is not None:
         from blastbox.host.runtime.gvisor_snapshot import USERNS_ENV, userns_rootfs_problem
-        ok, why = userns_rootfs_problem(str(gcfg.image_rootfs), gcfg.userns_host_base)
+        # The gofer keeps THIS process's supplementary groups (runsc denies setgroups).
+        ok, why = userns_rootfs_problem(str(gcfg.image_rootfs), gcfg.userns_host_base,
+                                        groups=os.getgroups())
         if ok is False:
             msg = (f"gVisor C/R warm tier refused: {USERNS_ENV}={gcfg.userns_host_base}, but {why}. "
-                   "Move the rootfs (e.g. under /var/lib/blastbox) or grant search on its parents "
+                   "Move the rootfs (e.g. under /var/lib/blastbox, not via a symlink from the old path) "
+                   "or grant search on every directory on the way "
                    "(see docs/HOST-PREP.md#warm-gvisor-in-a-user-namespace)")
             if require_available:
                 raise GvisorUnavailable(msg)

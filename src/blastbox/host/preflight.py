@@ -134,6 +134,11 @@ class HostView:
         """``(st_mode, st_uid, st_gid, has_posix_acl)`` following symlinks; None if unstat-able."""
         raise NotImplementedError
 
+    def dispatcher_groups(self) -> list[int] | None:
+        """Supplementary gids the root dispatcher would hand the user-namespaced gofer, taken as
+        this process's when preflight runs as root (as the dispatcher does); None otherwise."""
+        raise NotImplementedError
+
 
 class RealHost(HostView):
     def __init__(self) -> None:
@@ -197,6 +202,9 @@ class RealHost(HostView):
         from blastbox.host.runtime.gvisor_snapshot import _real_path_stat  # noqa: PLC0415
 
         return _real_path_stat(path)
+
+    def dispatcher_groups(self) -> list[int] | None:
+        return os.getgroups() if self.euid == 0 else None
 
     def run(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str] | None:
         if not is_read_only(argv):
@@ -491,12 +499,15 @@ def _check_gvisor_rootless(host: HostView) -> Check | None:
                  "Run it rootful (unset BLASTBOX_GVISOR_ROOTLESS)", f"{DOC}#gvisor-runsc")
 
 
+#: subuid owners that are container runtimes' own pools: a range inside one is theirs to hand out.
+_FOREIGN_SUBID_OWNERS = frozenset({"root", "containers", "dockremap", "lxd", "incus"})
+
+
 def _subid_cover(text: str | None, base: int, size: int) -> tuple[list[str], list[str]]:
-    """``(covering, overlapping)`` owner names in an /etc/subuid-style file: entries whose
-    ``name:start:count`` range holds all of ``base..base+size-1``, and entries that share only
-    part of it (another tool's ids in the same range)."""
-    cover: list[str] = []
-    overlap: list[str] = []
+    """``(covering, overlapping)`` owners in an /etc/subuid-style file, each owner's lines merged
+    first (``usermod --add-subuids`` can split one reservation): owners whose ranges hold all of
+    ``base..base+size-1``, and owners that share only part of it."""
+    spans: dict[str, list[tuple[int, int]]] = {}
     for line in (text or "").splitlines():
         fields = line.strip().split(":")
         if len(fields) != 3 or line.lstrip().startswith("#"):
@@ -505,12 +516,22 @@ def _subid_cover(text: str | None, base: int, size: int) -> tuple[list[str], lis
             start, count = int(fields[1]), int(fields[2])
         except ValueError:
             continue
-        if count <= 0:
-            continue
-        if start <= base and base + size <= start + count:
-            cover.append(fields[0])
-        elif start < base + size and base < start + count:
-            overlap.append(f"{fields[0]}:{start}:{count}")
+        if count > 0:
+            spans.setdefault(fields[0], []).append((start, start + count))
+    cover: list[str] = []
+    overlap: list[str] = []
+    end = base + size
+    for owner, ranges in spans.items():
+        merged: list[list[int]] = []
+        for lo, hi in sorted(ranges):
+            if merged and lo <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], hi)
+            else:
+                merged.append([lo, hi])
+        if any(lo <= base and end <= hi for lo, hi in merged):
+            cover.append(owner)
+        elif any(lo < end and base < hi for lo, hi in merged):
+            overlap.append(owner)
     return cover, overlap
 
 
@@ -538,7 +559,8 @@ def _check_gvisor_userns(host: HostView) -> Check | None:
     ids = f"{base}..{base + USERNS_SIZE - 1}"
     span = f"guest 0..{USERNS_SIZE - 1} -> host {ids}"
     rootfs = host.env.get("BLASTBOX_GVISOR_ROOTFS", "/var/lib/blastbox/gvisor-rootfs")
-    ok, why = userns_rootfs_problem(rootfs, base, stat=host.stat_path, realpath=host.realpath)
+    ok, why = userns_rootfs_problem(rootfs, base, stat=host.stat_path, realpath=host.realpath,
+                                    groups=host.dispatcher_groups())
     if ok is False:
         return Check("gvisor-userns", Status.FAIL,
                      f"{_USERNS_UNREACHABLE}: {why}; the warm tier refuses to start", doc)
@@ -552,9 +574,17 @@ def _check_gvisor_userns(host: HostView) -> Check | None:
             warnings.append(f"{path} unreadable")
             continue
         cover, overlap = _subid_cover(text, base, USERNS_SIZE)
-        if overlap:
-            warnings.append(f"{path}: {', '.join(overlap)} overlaps {ids} "
+        if len(cover) > 1 or (cover and overlap):
+            # Two owners of the range: another user/daemon allocates these ids too.
+            overlap = [*cover, *overlap]
+        if overlap == overlap[:1] and not cover and overlap:
+            warnings.append(f"{path}: {overlap[0]} reserves only part of {ids}")
+        elif overlap:
+            warnings.append(f"{path}: {', '.join(overlap)} each allocate ids in {ids} "
                             "(ids shared with another user/daemon)")
+        elif cover and cover[0] in _FOREIGN_SUBID_OWNERS:
+            warnings.append(f"{path}: {ids} lies inside {cover[0]}'s range, a container "
+                            "runtime's pool it hands out (reserve a separate range)")
         elif not cover:
             warnings.append(f"{path} reserves no range holding {ids} (rootful "
                             "runsc maps it anyway, but useradd/podman/a remapped dockerd may hand "
@@ -1192,7 +1222,12 @@ def _downgrade_overflow(checks: list[Check], env: Mapping[str, str]) -> list[Che
             c = Check(c.name, Status.WARN,
                       f"{c.detail} -- {tier} is an overflow tier of this cascade, so the "
                       "dispatcher skips it at startup and runs without it", c.doc)
-        elif tier in warm and c.status is Status.FAIL:
+        elif tier in warm and c.status is Status.FAIL and not (
+                c.name == "gvisor-userns" and not _is_startup_gate(c)
+                and not any(o is not c and names.get(o.name) == tier and o.status is Status.FAIL
+                            for o in checks)):
+            # (An ignored userns value is not a never-ready cause: the tier builds and serves as
+            # host root, so that FAIL stands unless something else keeps the tier from serving.)
             # Admitted, but its warm base never builds: the cascade never spawns there and
             # serves on the other tiers.
             c = Check(c.name, Status.WARN,

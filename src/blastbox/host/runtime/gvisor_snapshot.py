@@ -19,6 +19,7 @@ import uuid
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Collection
 from typing import Any, Callable
 
 from blastbox.worker.warm import AckCapability
@@ -424,45 +425,70 @@ def _real_path_stat(path: str) -> PathStat | None:
     return st.st_mode, st.st_uid, st.st_gid, acl
 
 
+def _path_chain(path: str) -> list[str]:
+    """``/``, then each prefix of the absolute, lexically normalised ``path``."""
+    parts = [p for p in os.path.normpath(path).split("/") if p]
+    return ["/"] + ["/" + "/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+
+
 def userns_rootfs_problem(rootfs: str, base: int, *,
                           stat: Callable[[str], PathStat | None] = _real_path_stat,
                           realpath: Callable[[str], str] = os.path.realpath,
+                          groups: "Collection[int] | None" = None,
                           ) -> tuple[bool | None, str]:
-    """Whether the user-namespaced sentry/gofer (host uid/gid ``base``, guest root) can reach
-    ``rootfs``: search (x) on every ancestor and read+search on the rootfs dir itself. Its
-    capabilities are scoped to its namespace, so they override DAC only on inodes whose owner
-    and group both map into it (``base..base+65535``); everywhere else plain mode bits decide (no
-    supplementary groups). Measured: a rootfs under a 0750 home fails ``binding rootfs ...
-    permission denied``, and only at the first boot.
+    """Whether the user-namespaced gofer (host uid/gid ``base``, guest root) can reach
+    ``rootfs``: search (x) on every directory the bind walks. runsc mounts ``rootfs`` as
+    configured (no symlink resolution) and then chroots into it, so that is every component of
+    the configured path (a symlinked one checked at its target) plus the resolved path's chain.
+    Read on the rootfs is not needed (lisafs falls back to O_PATH).
+
+    The gofer's capabilities are scoped to its namespace, so they override DAC only on inodes
+    whose owner AND group both map into it (``base..base+65535``); everywhere else plain mode
+    bits decide. runsc starts the gofer with setgroups denied, so it KEEPS the launching
+    process's supplementary groups: pass them as ``groups`` (``os.getgroups()`` in the
+    dispatcher). ``None`` (preflight, which is not the dispatcher process) makes a component
+    whose verdict hinges on group membership undecidable. Measured: a rootfs under a 0750 home
+    fails ``binding rootfs ... permission denied``, and only at the first boot.
 
     Returns ``(True, "")`` when reachable, ``(False, why)`` when the mode bits deny it, and
-    ``(None, why)`` when it cannot be decided (a component cannot be stat'd, or carries a POSIX
-    ACL that might grant what the mode bits deny) -- unknown is never treated as a denial."""
+    ``(None, why)`` when it cannot be decided (a component cannot be stat'd, carries a POSIX
+    ACL, or turns on unknown group membership) -- unknown is never treated as a denial, but a
+    later component whose mode bits plainly deny it still is."""
     resolved = realpath(rootfs)
-    parts = [p for p in resolved.split("/") if p]
-    chain = ["/"] + ["/" + "/".join(parts[:i]) for i in range(1, len(parts) + 1)]
-    for i, path in enumerate(chain):
-        need = 0o5 if i == len(chain) - 1 else 0o1      # r-x on the rootfs, --x on ancestors
-        st = stat(path)
+    chain = list(dict.fromkeys([*_path_chain(os.path.abspath(rootfs)), *_path_chain(resolved)]))
+    unknown = ""
+    for path in chain:
+        st = stat(path)            # follows symlinks: a linked component is checked at its target
         if st is None:
             return None, f"cannot stat {path}"
         mode, uid, gid, acl = st
         if base <= uid < base + USERNS_SIZE and base <= gid < base + USERNS_SIZE:
             continue      # owner AND group map in: namespace caps override DAC (kernel rule)
+        shown = f"{path} (mode {mode & 0o7777:04o}, owner {uid}:{gid})"
+        group_ok, other_ok = bool(mode & 0o010), bool(mode & 0o001)
         if uid == base:
-            bits = (mode >> 6) & 0o7
-        elif gid == base:
-            bits = (mode >> 3) & 0o7
+            ok: bool | None = bool(mode & 0o100)
+        elif gid == base or (groups is not None and gid in groups):
+            ok = group_ok
+        elif groups is None and group_ok != other_ok:
+            ok = None
         else:
-            bits = mode & 0o7
-        if bits & need != need:
-            what = "read+search" if need == 0o5 else "search"
-            if acl:
-                return None, (f"{path} (mode {mode & 0o7777:04o}, owner {uid}:{gid}) has a POSIX "
-                              f"ACL; cannot tell whether host id {base} has {what} on it")
-            return False, (f"{path} (mode {mode & 0o7777:04o}, owner {uid}:{gid}) does not grant "
-                           f"{what} to host uid/gid {base}: the user-namespaced sentry/gofer "
-                           f"cannot reach rootfs {resolved}")
+            ok = other_ok
+        if acl:
+            # A named-user/group entry can grant what the bits deny, or deny what they grant.
+            unknown = unknown or (f"{shown} has a POSIX ACL; cannot tell whether host id {base} "
+                                  "can search it")
+            continue
+        if ok is None:
+            unknown = unknown or (f"{shown}: search for host id {base} depends on whether the "
+                                  f"dispatcher's supplementary groups include {gid}")
+            continue
+        if not ok:
+            return False, (f"{shown} does not grant search to host uid/gid {base}: the "
+                           f"user-namespaced gofer cannot reach rootfs {rootfs}"
+                           + (f" (-> {resolved})" if resolved != rootfs else ""))
+    if unknown:
+        return None, unknown
     return True, ""
 
 

@@ -182,10 +182,10 @@ Prepare the host:
 #    Rootful runsc writes the map itself, so this is a reservation, not a permission.
 echo 'blastbox:2000000:65536' | sudo tee -a /etc/subuid /etc/subgid
 
-# 2. The rootfs and EVERY parent directory must be searchable by host uid 2000000. A rootfs under
-#    a 0750 home fails at the first boot with `binding rootfs ... permission denied`.
+# 2. The rootfs and EVERY directory on the way to it must be searchable by host uid 2000000. A
+#    rootfs under a 0750 home fails at the first boot with `binding rootfs ... permission denied`.
 sudo mkdir -p /var/lib/blastbox && sudo chmod 0755 /var/lib/blastbox
-namei -l /var/lib/blastbox/gvisor-rootfs     # every component needs o+x (the rootfs o+rx)
+namei -l /var/lib/blastbox/gvisor-rootfs     # every component needs o+x (search; read not needed)
 
 # 3. Opt in (in the gVisor dispatcher's environment), then check.
 export BLASTBOX_GVISOR_USERNS_HOST_BASE=2000000
@@ -196,13 +196,21 @@ blastbox preflight --tier gvisor
   end below `4294967295`. A value the runtime cannot use is **ignored with a warning** and the tier
   runs as before (real host root); preflight's `gvisor-userns` check FAILs it so it is not missed.
 - The rootfs reachability is checked twice, read-only: by preflight (`gvisor-userns` FAIL; WARN
-  when a component cannot be stat'd as this user or carries a POSIX ACL) and by the runtime at
-  startup, which refuses the tier with the offending directory named instead of failing the first
-  boot after the readiness wait. A symlinked rootfs is checked at its resolved path.
+  when it cannot decide) and by the runtime at startup, which refuses the tier with the offending
+  directory named instead of failing the first boot after the readiness wait. runsc binds the
+  path **as configured**, so a symlink left at an old path (e.g. under a 0750 home) still needs
+  its own directories searchable; both the configured path and the link target are checked.
+- The gofer keeps the dispatcher's **supplementary groups** (runsc denies `setgroups` in the
+  namespace), so a directory searchable only through one of them (e.g. `root:root 0750` with a
+  root dispatcher) is reachable. The runtime uses its own groups; preflight uses its own only
+  when run as root (as the dispatcher is), and otherwise WARNs where membership decides it.
+  A POSIX ACL on any component also makes it a WARN (an ACL can grant or deny past the mode bits).
 - Output files land owned by `BASE+65532`. The dispatcher runs as root, so host-side cleanup is
   unaffected; anything else reading job output directly needs read access by other/group.
 - Preflight `gvisor-userns` WARNs when `/etc/subuid` or `/etc/subgid` reserves no entry holding the
-  whole range, or when an entry for another user overlaps it.
+  whole range (one owner's split lines count together), when a second owner also allocates ids in
+  it, or when the only owner holding it is a container runtime's pool (`root`, `containers`,
+  `dockremap`, `lxd`, `incus`; e.g. Incus's `root:1000000:1000000000`).
 - After the next base boot, `runsc-host-root` should PASS for the warm tier's processes (their
   `uid_map` is `0 BASE 65536`, not the identity map).
 

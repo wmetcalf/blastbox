@@ -1852,32 +1852,52 @@ def test_userns_rootfs_reachability_follows_mode_bits():
     # the measured failure: a rootfs under a 0750 home
     home = {"/": (0o40755, 0, 0, False), "/home": (0o40755, 0, 0, False),
             "/home/coz": (0o40750, 1000, 1000, False), "/home/coz/r": (0o40755, 0, 0, False)}
-    ok, why = userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)
+    ok, why = userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident,
+                                    groups=[0])
     assert ok is False and "/home/coz " in why and "0750" in why
-    # search-only (0711) parents are enough; the rootfs itself needs read too
+    # search-only (0711) is enough everywhere, the rootfs included (lisafs falls back to O_PATH)
     home["/home/coz"] = (0o40711, 1000, 1000, False)
     assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is True
     home["/home/coz/r"] = (0o40711, 0, 0, False)
-    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is False
-    # group bits apply when the dir's group is the mapped gid; owner bits when it is the uid
-    home["/home/coz/r"] = (0o40750, 0, B, False)
     assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is True
-    home["/home/coz/r"] = (0o40507, B, 0, False)
+    home["/home/coz/r"] = (0o40750, 0, 0, False)
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident,
+                                 groups=[])[0] is False
+    # the gofer keeps the dispatcher's supplementary groups: a g+x-only dir is reachable by them
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident,
+                                 groups=[0])[0] is True
+    # ...and with unknown groups, a verdict that hinges on membership is undecidable
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is None
+    # group bits apply when the dir's group is the mapped gid; owner bits when it is the uid
+    home["/home/coz/r"] = (0o40710, 0, B, False)
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is True
+    home["/home/coz/r"] = (0o40107, B, 0, False)
     assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is True
     # in-namespace owner AND group: namespace caps override DAC; owner alone does not
     home["/home/coz/r"] = (0o40700, B + 5, B + 5, False)
     assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is True
     home["/home/coz/r"] = (0o40700, B + 5, 0, False)
-    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is False
-    # undecidable is never a denial: an ACL, or an unstat-able component
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident,
+                                 groups=[])[0] is False
+    # undecidable is never a denial: an ACL, or an unstat-able component...
+    home["/home/coz/r"] = (0o40755, 0, 0, False)
     home["/home/coz"] = (0o40750, 1000, 1000, True)
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is None
+    # ...but a later component the plain mode bits deny still is
+    home["/home/coz/r"] = (0o40700, 0, 0, False)    # group and other agree: no membership doubt
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is False
+    home["/home/coz/r"] = (0o40755, 0, 0, False)
     assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is None
     del home["/home/coz"]
     assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is None
-    # the RESOLVED path is what the gofer binds
-    ok, why = userns_rootfs_problem("/srv/r", B, stat=_stats(ok_tree),
-                                    realpath=lambda p: "/var/lib/r")
-    assert ok is True
+    # runsc binds the CONFIGURED path: its directories AND the link target's are walked
+    linked = {**ok_tree, "/srv": (0o40700, 0, 0, False), "/srv/r": (0o40755, 0, 0, False)}
+    ok, why = userns_rootfs_problem("/srv/r", B, stat=_stats(linked),
+                                    realpath=lambda p: "/var/lib/r", groups=[])
+    assert ok is False and "/srv " in why
+    linked["/srv"] = (0o40755, 0, 0, False)
+    assert userns_rootfs_problem("/srv/r", B, stat=_stats(linked),
+                                 realpath=lambda p: "/var/lib/r", groups=[])[0] is True
 
 
 def test_userns_refuses_worker_ids_outside_the_map(tmp_path):
@@ -1900,11 +1920,11 @@ def test_unreachable_userns_rootfs_is_refused_at_selection(tmp_path, monkeypatch
     (home / "r").mkdir(parents=True)
     real = gs.userns_rootfs_problem
 
-    def fake_stat(p):   # the parent is a 0750 home owned by someone else
-        return (0o40750, 1000, 1000, False) if p == str(home) else (0o40755, 0, 0, False)
+    def fake_stat(p):   # the parent is a 0700 home owned by someone else
+        return (0o40700, 4242, 4242, False) if p == str(home) else (0o40755, 0, 0, False)
 
     monkeypatch.setattr(gs, "userns_rootfs_problem",
-                        lambda r, b, **kw: real(r, b, stat=fake_stat))
+                        lambda r, b, **kw: real(r, b, **{**kw, "stat": fake_stat}))
     cfg = gr._gvisor_config_from_env({"BLASTBOX_GVISOR_ROOTFS": str(home / "r"),
                                       "BLASTBOX_GVISOR_RUNSC": "/bin/true",
                                       "BLASTBOX_GVISOR_USERNS_HOST_BASE": "2000000"})
@@ -1912,3 +1932,14 @@ def test_unreachable_userns_rootfs_is_refused_at_selection(tmp_path, monkeypatch
     assert gr.select_gvisor_snapshot_runtime(cfg=cfg) is None
     with pytest.raises(gr.GvisorUnavailable, match="cannot reach rootfs"):
         gr.select_gvisor_snapshot_runtime(cfg=cfg, require_available=True)
+
+
+def test_userns_rootfs_acl_is_unknown_even_when_mode_bits_allow():
+    """A named-user ACL entry can DENY host uid BASE what the other bits grant."""
+    from blastbox.host.runtime.gvisor_snapshot import userns_rootfs_problem
+
+    tree = {"/": (0o40755, 0, 0, False), "/srv": (0o40755, 0, 0, True),
+            "/srv/r": (0o40755, 0, 0, False)}
+    ok, why = userns_rootfs_problem("/srv/r", 2_000_000, stat=lambda p: tree.get(p),
+                                    realpath=lambda p: p)
+    assert ok is None and "/srv" in why and "ACL" in why
