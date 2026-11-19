@@ -189,9 +189,9 @@ def _probe_lsm(host: HostReader, landlock: int | None) -> HostLsm:
     if lsms is not None and "selinux" not in lsms:
         selinux = "absent"
     elif enforce is None:
-        # No selinuxfs: absent on a host; inside a container (no securityfs either) it is
-        # simply not visible -- and not usable from here either way.
-        selinux = "absent" if lsms is not None else "unknown"
+        # Listed (or stack unreadable) but no selinuxfs here, e.g. a container: not visible,
+        # so "unknown" rather than "absent" -- and not usable from here either way.
+        selinux = "unknown"
     else:
         selinux = "enforcing" if enforce.strip() == "1" else "permissive"
     # A listed-but-absent landlock is authoritative; an unreadable list still asks the kernel.
@@ -204,7 +204,8 @@ def _probe_lsm(host: HostReader, landlock: int | None) -> HostLsm:
 def _aa_blocker(host: HostReader, lsms: tuple[str, ...] | None) -> str | None:
     if lsms is None:
         # /sys/module shows the HOST's flag; without securityfs no policy can be loaded here.
-        return "securityfs not mounted (container?): no AppArmor policy can be loaded from here"
+        return ("securityfs not readable (not mounted in a container, or denied by the "
+                "caller's profile): no AppArmor policy can be loaded from here")
     label = host.read(_AA_SELF[0])
     if label is None:
         # attr/current is the stacked LSMs' slot; only read it as AppArmor's when it looks so.

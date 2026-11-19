@@ -237,7 +237,11 @@ def test_preflight_al2023_permissive():
 def test_preflight_require_fails_where_unmet():
     c = _pf(AL2023, abi=4, env={"BLASTBOX_CONFINEMENT": "require"})
     assert c.status is Status.FAIL and "require unmet for gvisor" in c.detail
-    ok = _pf(AL2023, abi=4, env={"BLASTBOX_CONFINEMENT": "require"}, tiers=("firecracker",))
+    # --tier firecracker still reaches the cold fallback (gVisor) unless warm-only
+    cold = _pf(AL2023, abi=4, env={"BLASTBOX_CONFINEMENT": "require"}, tiers=("firecracker",))
+    assert cold.status is Status.FAIL and "gvisor" in cold.detail
+    ok = _pf(AL2023, abi=4, env={"BLASTBOX_CONFINEMENT": "require",
+                                 "BLASTBOX_DISPATCH_WARM_ONLY": "1"}, tiers=("firecracker",))
     assert ok.status is Status.PASS
 
 
@@ -596,11 +600,10 @@ def test_runsc_empty_env_means_no_binary_like_the_runtime():
     assert st.runsc is None
 
 
-def test_verified_signed_does_not_share_the_callers_confinement():
+def test_verified_signed_does_not_share_the_callers_confinement(tmp_path):
     from blastbox.client import verify as v
     from tests.client.test_verify import _body, _doc, _verify
-    key = attest.load_or_create_key(__import__("pathlib").Path(
-        __import__("tempfile").mkdtemp()) / "k" / "attest.key")
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
     pinned = v.load_pinned_keys(key.public_key_pem)
     body = json.loads(_body(key, _doc(key, net={"confinement": {
         "mode": "auto", "available": "none", "applied": "none"}})))
@@ -636,3 +639,19 @@ def test_label_mode_not_name_decides(label, usable):
     st = _state({**UBUNTU, "/proc/self/attr/apparmor/current": label + "\n"})
     assert (st.would_use("gvisor") == "apparmor") is usable
     assert pf._is_unconfined(label) is usable      # agrees with sandbox-confinement's reading
+
+
+def test_listed_selinux_without_selinuxfs_is_unknown_not_absent():
+    st = _state({"/sys/kernel/security/lsm": "lockdown,capability,yama,selinux,bpf,landlock"})
+    assert st.selinux == "unknown" and st.would_use("gvisor") == "none"
+
+
+def test_require_unmet_only_by_an_overflow_tier_is_a_warn():
+    env = {"BLASTBOX_CONFINEMENT": "require", "BLASTBOX_POOL_RUNTIME": "cascade",
+           "BLASTBOX_POOL_TIERS": "firecracker:4,gvisor:2", "BLASTBOX_DISPATCH_WARM_ONLY": "1"}
+    c = _pf(AL2023, abi=4, env=env, tiers=("gvisor", "firecracker"))
+    assert c.status is Status.WARN and "overflow" in c.detail
+
+
+def test_preflight_says_whose_context_it_judged():
+    assert "as seen by this process" in _pf(UBUNTU).detail

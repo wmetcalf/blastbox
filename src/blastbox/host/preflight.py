@@ -1076,11 +1076,19 @@ def _check_confinement(host: HostView, tiers: Collection[str]) -> Check:
         mode = cf.mode_from_env(host.env)
     except ValueError as exc:
         return Check("confinement", Status.FAIL, f"{exc}; the dispatcher refuses to start", doc)
-    kinds = cf.kinds_for_tiers(tiers)
+    # The kinds the DISPATCHER can reach (dispatch.reachable_tiers): a file-handshake warm tier
+    # also cold-falls-back to docker (runsc) unless warm-only.
+    reach = set(tiers)
+    warm_only = host.env.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower() in (
+        "1", "true", "yes", "on")
+    if reach & {"gvisor", "firecracker"} and not warm_only:
+        reach.add("docker")
+    kinds = cf.kinds_for_tiers(reach)
     st = cf.probe(host, env=host.env, kinds=kinds, landlock=host.landlock_abi())
     would = {k: st.would_use(k, mode) for k in kinds}
     facts = {"mode": mode, "enforced": False, "host": st.as_dict(), "would_use": would}
-    head = (f"mode={mode}; lsm={','.join(st.lsms) if st.lsms is not None else 'unknown'} "
+    head = (f"mode={mode} (as seen by this process, uid {host.euid}; run where the dispatcher "
+            f"runs); lsm={','.join(st.lsms) if st.lsms is not None else 'unknown'} "
             f"selinux={st.selinux} apparmor={'on' if st.apparmor else 'off'}"
             + (f" (parser {st.apparmor_parser})" if st.apparmor_parser else "")
             + f" landlock_abi={st.landlock_abi}")
@@ -1103,8 +1111,17 @@ def _check_confinement(host: HostView, tiers: Collection[str]) -> Check:
     parts.append("detection only, nothing enforced yet")
     missing = cf.unmet(st, mode, kinds)
     if missing:
-        return Check("confinement", Status.FAIL,
-                     "; ".join(parts) + f"; require unmet for {', '.join(missing)}", doc, facts)
+        # A kind reachable only through cascade OVERFLOW tiers: the dispatcher skips an
+        # overflow tier that is unavailable at startup (as _downgrade_overflow models).
+        overflow = _overflow_only_tiers(host.env)
+        hard = [k for k in missing
+                if not {t for t in reach if cf.kinds_for_tiers({t}) == [k]} <= overflow]
+        msg = "; ".join(parts) + f"; require unmet for {', '.join(missing)}"
+        if hard:
+            return Check("confinement", Status.FAIL, msg, doc, facts)
+        return Check("confinement", Status.WARN,
+                     msg + " -- only via cascade overflow tiers, which the dispatcher skips if "
+                     "unavailable at startup (refuses to start if they are available)", doc, facts)
     if st.flags:
         return Check("confinement", Status.WARN,
                      "; ".join(parts) + "; apparmor_parser 4.0.1 compiles `audit deny umount` "

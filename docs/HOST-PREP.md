@@ -50,7 +50,7 @@ which the dispatcher skips at startup.
 | **gvisor** (warm C/R) | the `runsc` binary with checkpoint/restore (driven directly, no docker; root) | `runsc`, `gvisor-rootfs`, `gvisor-rootless`, `snapshot-age`, `runsc-host-root`, `sandbox-confinement` |
 | **firecracker** (warm/cold) | `/dev/kvm` read/write, `firecracker` ≥ 1.15.1, guest kernel + rootfs | `kvm`, `firecracker`, `fc-guest`, `snapshot-age` (with `BLASTBOX_POOL_WARM_SNAPSHOT`), `sandbox-confinement`, `fc-scratch` |
 | **remote** (static / AWS) | nothing runtime-specific locally; the remote box runs the worker image under its own runsc | common checks only (no docker: no cold path) |
-| every tier | a pool the dispatcher accepts, synced clock, scratch off `/tmp` | `pool-runtime`, `clock`, `scratch` |
+| every tier | a pool the dispatcher accepts, synced clock, scratch off `/tmp`, a valid `BLASTBOX_CONFINEMENT` | `pool-runtime`, `confinement`, `clock`, `scratch` |
 | every local tier | AppArmor state known, CPU flags reviewed | `apparmor`, `bwrap-userns-restrict`, `userns`, `cpu-flags` |
 
 Prefer the **warm Firecracker** tier where KVM exists: it is the stronger boundary and, with
@@ -235,7 +235,11 @@ counts as gVisor) has no usable LSM. Any other value is refused rather than read
 
 Preflight's `confinement` check prints the LSM stack, SELinux mode, AppArmor state and
 `apparmor_parser` version, the Landlock ABI, the runsc release, and firecracker/jailer presence;
-`--json` carries the same as `facts`. Two conditions it calls out:
+`--json` carries the same as `facts`. Usability is judged from the process that runs the check
+(its AppArmor label, what it can see of `/sys`), so run preflight where the dispatcher runs:
+inside its container, or under its unit's profile. A kind reached only through cascade overflow
+tiers is a WARN, not a FAIL, since the dispatcher skips an overflow tier that is unavailable at
+startup. Two conditions it calls out:
 
 - **apparmor_parser 4.0.1** (WARN): pairing `audit deny umount,` with another `audit deny`
   mount-class rule compiles to ALLOW mount (measured with kernel 6.8). This matters today, not
@@ -373,7 +377,7 @@ Preflight reads `/proc/cpuinfo` and warns on flags with operational consequences
 
 ## AWS and static workers
 
-A `remote` dispatcher host needs only the common checks (pool-runtime, clock, scratch; preflight
+A `remote` dispatcher host needs only the common checks (pool-runtime, confinement, clock, scratch; preflight
 skips the AppArmor, userns and CPU-flag checks there) plus network reach to its
 workers. Each static box or cloud worker is its own host: prepare it as a **docker + gVisor** host
 (the worker image runs under runsc there) and run `blastbox preflight --tier docker` on it. AWS
