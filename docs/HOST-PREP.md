@@ -47,7 +47,7 @@ which the dispatcher skips at startup.
 | Tier | Needs on the host | Preflight checks |
 |---|---|---|
 | **docker** (cold) | docker daemon, `runsc` registered as a docker runtime (fail-closed without it) | `docker`, `docker-runsc-runtime`, `runsc-host-root`, `sandbox-confinement` |
-| **gvisor** (warm C/R) | the `runsc` binary with checkpoint/restore (driven directly, no docker; root) | `runsc`, `gvisor-rootfs`, `gvisor-rootless`, `snapshot-age`, `runsc-host-root`, `sandbox-confinement` |
+| **gvisor** (warm C/R) | the `runsc` binary with checkpoint/restore (driven directly, no docker; root) | `runsc`, `gvisor-rootfs`, `gvisor-rootless`, `gvisor-userns` (when opted in), `snapshot-age`, `runsc-host-root`, `sandbox-confinement` |
 | **firecracker** (warm/cold) | `/dev/kvm` read/write, `firecracker` ≥ 1.15.1, guest kernel + rootfs | `kvm`, `firecracker`, `fc-guest`, `snapshot-age` (with `BLASTBOX_POOL_WARM_SNAPSHOT`), `sandbox-confinement`, `fc-scratch` |
 | **remote** (static / AWS) | nothing runtime-specific locally; the remote box runs the worker image under its own runsc | common checks only (no docker: no cold path) |
 | every tier | a pool the dispatcher accepts, synced clock, scratch off `/tmp` | `pool-runtime`, `clock`, `scratch` |
@@ -152,15 +152,107 @@ With docker's stock (non-remapped) setup, the host-side `runsc-sandbox` (Sentry)
 `runsc-gofer` processes are **real host root**: their `/proc/<pid>/uid_map` is the identity map
 `0 0 4294967295` and `Uid` is 0, with capabilities such as `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH`
 (sandbox) and `CAP_SYS_CHROOT` (gofer). gVisor is the boundary, but a Sentry or gofer escape then
-lands as host root. Preflight's `runsc-host-root` check warns when it sees this. The recommended
-direction is a **user-namespace-remapped** setup: a separate docker daemon with `userns-remap`
-for the blastbox runtime, or containerd per-container uid/gid mappings. This is pending a spike
-(warm checkpoint/restore under a remapped daemon is unverified), so treat the warning as known
-residual risk until then; do not flip `userns-remap` on a shared daemon, which remaps every
-existing container and its volumes.
+lands as host root. Preflight's `runsc-host-root` check warns when it sees this. The fix is to
+run them in a **user namespace**:
+
+- **Warm gVisor tier:** set `BLASTBOX_GVISOR_USERNS_HOST_BASE` (opt-in; see
+  [Warm gVisor in a user namespace](#warm-gvisor-in-a-user-namespace)).
+- **Cold docker tier:** not automated. It needs a *separate* docker daemon with `userns-remap`
+  (see [Cold docker tier: a remapped dockerd](#cold-docker-tier-a-remapped-dockerd)); do not flip
+  `userns-remap` on a shared daemon, which remaps every existing container and its volumes.
 
 Reading another user's `/proc/<pid>/uid_map`/`status` can need privileges; preflight then says
 `unknown (run as root)` and does not fail.
+
+### Warm gVisor in a user namespace
+
+`BLASTBOX_GVISOR_USERNS_HOST_BASE=<BASE>` makes the warm tier put a user namespace in the OCI spec
+it hands runsc: guest ids `0..65535` map to host `BASE..BASE+65535` for both uids and gids.
+runsc itself stays **rootful** (so `checkpoint`/`restore` keep working, unlike
+`BLASTBOX_GVISOR_ROOTLESS`), but the `runsc-sandbox` (Sentry) and `runsc-gofer` it starts run as
+host uid `BASE` with capabilities scoped to their namespace instead of real host root. The
+in-sandbox uid drop is kept: the worker is guest `65532`, i.e. host `BASE+65532`. Off (unset) by
+default. Measured on toolz2 (runsc release-20261012.0, the ClippyShot warm worker): boot,
+checkpoint and four restores green, byte-identical output, restore ~117 ms either way.
+
+Prepare the host:
+
+```sh
+# 1. Reserve the id range so nothing else hands it out (useradd, podman, a remapped dockerd).
+#    Rootful runsc writes the map itself and needs no entry. But an entry IS a permission for
+#    the named account (newuidmap/newgidmap let it map those ids into its own namespace, i.e.
+#    become the sandbox's host uid), so use a name NO account has -- not the dispatcher's user.
+echo 'blastbox-userns:2000000:65536' | sudo tee -a /etc/subuid /etc/subgid
+
+# 2. The rootfs and EVERY directory on the way to it must be searchable by host uid 2000000. A
+#    rootfs under a 0750 home fails at the first boot with `binding rootfs ... permission denied`.
+sudo mkdir -p /var/lib/blastbox && sudo chmod 0755 /var/lib/blastbox
+namei -l /var/lib/blastbox/gvisor-rootfs     # every component needs o+x (search; read not needed)
+
+# 3. Opt in (in the gVisor dispatcher's environment), then check.
+export BLASTBOX_GVISOR_USERNS_HOST_BASE=2000000
+blastbox preflight --tier gvisor
+```
+
+- `BASE` must be `>= 65536` (the range never holds host root or ordinary users) and the range must
+  end below `4294967295`. A value the runtime cannot use makes the tier **refuse to start** (it never
+  falls back to a sandbox running as real host root); preflight's `gvisor-userns` FAILs it too.
+- `user.max_user_namespaces` must not be `0`: that limit binds root too, so runsc could not create
+  the namespace. The tier refuses to start, and preflight's `gvisor-userns` FAILs.
+- runsc must be **release-20241108 or newer** (gofer opens volumes from the initial user namespace):
+  older builds fail every boot binding the 0700 per-slot dirs. Preflight WARNs on an older version.
+- The rootfs reachability is checked read-only by preflight (`gvisor-userns` FAIL; WARN when it
+  cannot decide), by the runtime at startup, which refuses the tier with the offending directory
+  named instead of failing the first boot after the readiness wait, and again at every base boot
+  and every restore, where the rootfs is bound: a re-pointed link or tightened parent after startup
+  fails that build or restore by name (counted like any build/restore failure). runsc binds the
+  path **as configured**, so a symlink left at an old path (e.g. under a 0750 home) still needs
+  its own directories searchable; the check walks the path as the kernel does, through every symlink hop
+  (a symlink loop is refused: the kernel cannot resolve it either). The path must be absolute: runsc resolves a relative one against its
+  per-build bundle directory, so the tier refuses it.
+- **No supplementary groups.** runsc denies `setgroups` in the namespace, so its Sentry and gofer
+  would keep runsc's own supplementary groups (the dispatcher's: gid 0 via sudo, `docker`,
+  `disk`, ...) and an escape would land with them. blastbox starts the sandbox-starting runsc calls
+  (`run`, `restore`) with none, so group bits only count for gid `BASE`: a `root:root 0750`
+  directory on the way to the rootfs blocks it. A POSIX ACL on any component makes the check a
+  WARN (an ACL can grant or deny past the mode bits).
+- Preflight also WARNs on local accounts (`/etc/passwd`, `/etc/group`) whose ids fall inside the
+  range: the Sentry/gofer's namespace capabilities reach files owned by such an id. Directory-
+  service ids (sssd/FreeIPA) are not checked; pick a `BASE` outside their ranges.
+- Output files land owned by `BASE+65532`. The dispatcher runs as root, so host-side cleanup is
+  unaffected; anything else reading job output directly needs read access by other/group.
+- Preflight `gvisor-userns` WARNs when `/etc/subuid` or `/etc/subgid` reserves no entry holding the
+  whole range (one owner's split lines count together), when a second owner also allocates ids in
+  it, or when the only owner holding it is a container runtime's pool (`root`, `containers`,
+  `dockremap`, `lxd`, `incus`; e.g. Incus's `root:1000000:1000000000`), or when `/etc/subuid` and
+  `/etc/subgid` reserve it for different accounts. A PASS names the owner it counted; an owner that is a real account in `/etc/passwd` is a WARN (newuidmap would let it map the ids).
+- After the next base boot, `runsc-host-root` should PASS for the warm tier's processes (their
+  `uid_map` is `0 BASE 65536`, not the identity map).
+
+What it does **not** change:
+
+- **AppArmor:** runsc's host processes are still not confined by a blastbox profile
+  (`sandbox-confinement` keeps warning: `unconfined`). The user namespace limits what an escape
+  lands as; it is not a MAC policy.
+- **The cold docker tier:** docker's `--runtime=runsc` workers are started by dockerd, not by this
+  knob, and stay real host root. See below.
+
+### Cold docker tier: a remapped dockerd
+
+Documented, not implemented or automated. The cold tier can get the same property from a
+**second** docker daemon that runs with `userns-remap` and serves only blastbox workers:
+
+- its own `--data-root`, `--exec-root`, `--pidfile` and socket (e.g. `/run/docker-blastbox.sock`),
+  with `"userns-remap": "blastbox-cold"` and `runsc` registered, pointed at by the cold
+  dispatcher's `DOCKER_HOST`;
+- a **separate** subordinate range for it in `/etc/subuid` and `/etc/subgid` (e.g.
+  `blastbox-cold:2100000:65536`), split from the warm tier's `BASE` range so a cold escape and a
+  warm escape do not land as the same host ids;
+- images re-pulled/loaded into that daemon (a remapped daemon has its own image store).
+
+Never enable `userns-remap` on the host's shared daemon: it remaps every existing container and
+its volumes. Until this is set up, `runsc-host-root` keeps warning for cold workers; treat that as
+known residual risk.
 
 ## Firecracker
 
@@ -226,7 +318,9 @@ environment actually configures something that needs a user namespace on a tier 
 `BLASTBOX_GVISOR_ROOTLESS` is the `gvisor-rootless` check's concern), and passes when the scoped profiles
 are visibly loaded (securityfs is root-only; run preflight as root to confirm). `max_user_namespaces=0`
 or `unprivileged_userns_clone=0` switches user namespaces off outright: a FAIL only when something
-configured needs one, otherwise a fine hardening choice (PASS).
+configured needs one, otherwise a fine hardening choice (PASS). `BLASTBOX_GVISOR_USERNS_HOST_BASE`
+needs one even though runsc runs as root: `max_user_namespaces` binds root too. That case is gated by
+`gvisor-userns`, and the `userns` check's detail points there.
 
 AppArmor itself should be **enabled** (`/sys/module/apparmor/parameters/enabled` = `Y`): without it
 docker-default is not applied to runsc/worker processes and the `blastbox-sandbox` child profile
@@ -312,7 +406,7 @@ Preflight reads `/proc/cpuinfo` and warns on flags with operational consequences
   padded value.
 - Without `--tier`, a local tier that a cascade lists only as an **overflow** member is skipped by the dispatcher
   when its startup gate fails, so those FAILs (`kvm` when `/dev/kvm` is missing, `firecracker`,
-  `fc-guest`, `runsc`, `gvisor-rootless`) are reported as WARNs saying so. A non-rw `/dev/kvm` or a
+  `fc-guest`, `runsc`, `gvisor-rootless`, `gvisor-userns`) are reported as WARNs saying so. A non-rw `/dev/kvm` or a
   missing gVisor rootfs is not a startup gate: a warm overflow tier is admitted but its base never
   builds, so the cascade runs without it (WARN); a cold Firecracker overflow tier really spawns
   there and every spawn fails (FAIL). With `--tier <that tier>` its prerequisites gate as usual.

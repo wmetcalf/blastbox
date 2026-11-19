@@ -19,6 +19,7 @@ import uuid
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Collection
 from typing import Any, Callable
 
 from blastbox.worker.warm import AckCapability
@@ -70,6 +71,21 @@ class GvisorConfig:
     # uid 0 is NOT host root, it is the unprivileged user that launched runsc -- and an escape
     # lands as that user instead. The isolation boundary is gVisor either way; this only moves
     # what is on the far side of it.
+    # Run the sandbox + gofer inside a USER NAMESPACE while runsc itself stays rootful (so
+    # `checkpoint`/`restore` keep working -- unlike `rootless`). Guest uid 0..65535 map to host
+    # userns_host_base..+65535, so the sentry and gofer run as an unprivileged, unmapped-to-root
+    # host uid (their capabilities are scoped to that namespace) instead of real host root.
+    # Measured on toolz2 2026-11-19 (runsc release-20261012.0, clippyshot warm tier): boot,
+    # checkpoint and restore all work, output bytes identical, restore latency unchanged.
+    # REQUIREMENT: the rootfs (and its parents) must be traversable by the mapped uid -- a rootfs
+    # under a 0750 home dir fails with `binding rootfs ... permission denied`. Output files land
+    # owned by userns_host_base + guest uid (e.g. 2065532 for uid 65532); the warm tier runs as
+    # root, so host-side cleanup is unaffected. None = no user namespace (today's behaviour).
+    # kw_only: inserted mid-class, so it must not shift the positional order of later fields.
+    userns_host_base: int | None = field(default=None, kw_only=True)
+    # Set when BLASTBOX_GVISOR_USERNS_HOST_BASE was given but is unusable: the backend REFUSES
+    # the tier rather than silently run the sandbox as real host root the operator opted out of.
+    userns_problem: str = field(default="", kw_only=True)
     platform: str | None = None
     ld_preload: str | None = None                 # soffice tier: /opt/clippyshot/accept-retry.so
     cpu_features_annotation: str | None = None     # dev.gvisor.internal.cpufeatures (pinning)
@@ -373,6 +389,149 @@ def _runsc(cfg: GvisorConfig) -> list[str]:
 
 _WARN_ON_INSECURE = "BLASTBOX_WARN_ON_INSECURE"
 
+#: Ids mapped into the warm tier's user namespace (guest 0..65535).
+USERNS_SIZE = 65536
+_MAX_HOST_ID = 2**32 - 2          # (uid_t)-1 is "no id", never a mappable one
+USERNS_ENV = "BLASTBOX_GVISOR_USERNS_HOST_BASE"
+
+
+def parse_userns_host_base(raw: str | None) -> tuple[int | None, str]:
+    """``(base, problem)`` for BLASTBOX_GVISOR_USERNS_HOST_BASE. Unset/blank = ``(None, "")``
+    (no user namespace). A value that is not an integer, or whose 65536-id range would include
+    host root or the ordinary-user range below 65536, or run past the largest uid, is
+    ``(None, why)``. Pure: the runtime logs ``why``, preflight reports it."""
+    text = (raw or "").strip()
+    if not text:
+        return None, ""
+    try:
+        base = int(text)
+    except ValueError:
+        return None, f"{USERNS_ENV}={text!r} is not an integer"
+    if base < USERNS_SIZE or base + USERNS_SIZE - 1 > _MAX_HOST_ID:
+        return None, (f"{USERNS_ENV}={text!r} is out of range (need {USERNS_SIZE} <= base <= "
+                      f"{_MAX_HOST_ID - USERNS_SIZE + 1}, so the range never maps host root)")
+    return base, ""
+
+
+#: (st_mode, st_uid, st_gid, has_posix_acl) for one path, or None if it cannot be stat'd.
+PathStat = tuple[int, int, int, bool]
+
+
+def _real_path_stat(path: str) -> PathStat | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    try:
+        acl = "system.posix_acl_access" in os.listxattr(path)
+    except OSError:
+        acl = False
+    return st.st_mode, st.st_uid, st.st_gid, acl
+
+
+def _readlink_or_none(path: str) -> str | None:
+    try:
+        return os.readlink(path)
+    except OSError:
+        return None
+
+
+_MAX_LINK_HOPS = 40               # the kernel's own limit (ELOOP)
+
+
+def _walked_dirs(path: str, readlink: Callable[[str], str | None]) -> list[str] | None:
+    """Every directory a kernel path walk of ``path`` searches, in order: each component of the
+    path AND of every symlink target met on the way (``..`` taken physically, as the kernel
+    does). Every entry is symlink-free, so ``stat`` on it is the directory actually walked.
+    None when the walk exceeds the kernel's symlink limit (it would fail with ELOOP)."""
+    # NOT abspath/normpath: those drop `x/..` lexically, but the kernel still searches x.
+    full = path if path.startswith("/") else os.path.join(os.getcwd(), path)
+    todo = [p for p in full.split("/") if p]  # (callers pass absolute paths; see above)
+    cur, out, hops = "/", ["/"], 0
+    while todo:
+        name = todo.pop(0)
+        if name == ".":
+            continue
+        if name == "..":
+            cur = os.path.dirname(cur) or "/"
+            continue
+        nxt = os.path.join(cur, name)
+        target = readlink(nxt)
+        if target is not None:
+            hops += 1
+            if hops > _MAX_LINK_HOPS:
+                return None
+            if target.startswith("/"):
+                cur = "/"
+            todo = [p for p in target.split("/") if p] + todo
+            continue
+        cur = nxt
+        out.append(cur)
+    return list(dict.fromkeys(out))
+
+
+def userns_rootfs_problem(rootfs: str, base: int, *,
+                          stat: Callable[[str], PathStat | None] = _real_path_stat,
+                          realpath: Callable[[str], str] = os.path.realpath,
+                          readlink: Callable[[str], str | None] = _readlink_or_none,
+                          groups: Collection[int] = (),
+                          ) -> tuple[bool | None, str]:
+    """Whether the user-namespaced gofer (host uid/gid ``base``, guest root) can reach
+    ``rootfs``: search (x) on every directory the bind walks. runsc mounts ``rootfs`` as
+    configured and the kernel resolves it, so that is every component of the configured path
+    and of every symlink target met on the way (:func:`_walked_dirs`).
+    Read on the rootfs is not needed (lisafs falls back to O_PATH).
+
+    The gofer's capabilities are scoped to its namespace, so they override DAC only on inodes
+    whose owner AND group both map into it (``base..base+65535``); everywhere else plain mode
+    bits decide. ``groups`` are the gofer's supplementary host gids: runsc denies setgroups in
+    the namespace, so the gofer keeps whatever runsc was started with, and the backend starts it
+    with none (``extra_groups=[]``). Measured: a rootfs under a 0750 home fails ``binding rootfs
+    ... permission denied``, and only at the first boot.
+
+    Returns ``(True, "")`` when reachable, ``(False, why)`` when the mode bits deny it, and
+    ``(None, why)`` when it cannot be decided (a component cannot be stat'd, or carries a POSIX
+    ACL, which can grant or deny past the mode bits) -- unknown is never treated as a denial,
+    but a later component whose mode bits plainly deny it still is."""
+    if not rootfs.startswith("/"):
+        # runsc resolves a relative root.path against the -bundle dir (a per-build/per-slot
+        # directory), never the dispatcher's cwd: no relative value can boot.
+        return False, (f"rootfs {rootfs!r} is relative; runsc resolves it against the bundle "
+                       "directory, not the dispatcher's cwd: set an absolute path")
+    resolved = realpath(rootfs)
+    chain = _walked_dirs(rootfs, readlink)
+    if chain is None:
+        # The kernel fails this walk with ELOOP: nothing (root or not) can bind it.
+        return False, (f"rootfs {rootfs} has more than {_MAX_LINK_HOPS} symlink hops (ELOOP); "
+                       "runsc cannot bind it")
+    unknown = ""
+    for path in chain:
+        st = stat(path)
+        if st is None:
+            return None, f"cannot stat {path}"
+        mode, uid, gid, acl = st
+        if base <= uid < base + USERNS_SIZE and base <= gid < base + USERNS_SIZE:
+            continue      # owner AND group map in: namespace caps override DAC (kernel rule)
+        shown = f"{path} (mode {mode & 0o7777:04o}, owner {uid}:{gid})"
+        if acl:
+            # A named-user/group entry can grant what the bits deny, or deny what they grant.
+            unknown = unknown or (f"{shown} has a POSIX ACL; cannot tell whether host id {base} "
+                                  "can search it")
+            continue
+        if uid == base:
+            ok = bool(mode & 0o100)
+        elif gid == base or gid in groups:
+            ok = bool(mode & 0o010)
+        else:
+            ok = bool(mode & 0o001)
+        if not ok:
+            return False, (f"{shown} does not grant search to host uid/gid {base}: the "
+                           f"user-namespaced gofer cannot reach rootfs {rootfs}"
+                           + (f" (-> {resolved})" if resolved != rootfs else ""))
+    if unknown:
+        return None, unknown
+    return True, ""
+
 
 def _oci_config(cfg: GvisorConfig, workdir: Path, *, in_ro: bool) -> dict:
     """A self-contained OCI spec (config.json) for the warm/restore container with
@@ -467,6 +626,11 @@ def _oci_config(cfg: GvisorConfig, workdir: Path, *, in_ro: bool) -> dict:
         rlimits.append({"type": "RLIMIT_NOFILE", "hard": cfg.rlimit_nofile, "soft": cfg.rlimit_nofile})
     if rlimits:
         spec["process"]["rlimits"] = rlimits
+    if cfg.userns_host_base is not None:
+        idmap = [{"containerID": 0, "hostID": cfg.userns_host_base, "size": USERNS_SIZE}]
+        spec["linux"]["namespaces"].append({"type": "user"})
+        spec["linux"]["uidMappings"] = idmap
+        spec["linux"]["gidMappings"] = list(idmap)
     if cfg.cpu_features_annotation:
         spec["annotations"] = {"dev.gvisor.internal.cpufeatures": cfg.cpu_features_annotation}
     return spec
@@ -486,7 +650,8 @@ def _warn_if_lax_parent(workdir: Path) -> None:
     """One-time warning if the slot dir's parent is group/other-writable. The 0o700 slot leaf
     already blocks other local users from reaching the 0o777 out/ctrl scratch (you can't traverse
     INTO a 0o700 dir you don't own), so this is defense-in-depth/observability — it surfaces a lax
-    deploy (the parent should be root-owned 0700) instead of letting the old comment-only
+    deploy (the parent should be root-owned and not group/other-writable: 0755, or 0700 only when
+    the gVisor rootfs is not under it) instead of letting the old comment-only
     assumption pass silently."""
     parent = workdir.parent
     key = str(parent)
@@ -500,7 +665,9 @@ def _warn_if_lax_parent(workdir: Path) -> None:
         _warned_lax_parents.add(key)
         _log.warning(
             "gVisor warm state parent %s is group/other-writable (mode %o); slot dirs are 0o700 "
-            "so this is not an exposure, but lock the deploy parent to root-owned 0700.",
+            "so this is not an exposure, but make the deploy parent root-owned and not "
+            "group/other-writable (0755; 0700 only if the gVisor rootfs is not under it, since "
+            "BLASTBOX_GVISOR_USERNS_HOST_BASE needs search on the rootfs path).",
             parent, mode,
         )
 
@@ -1036,6 +1203,16 @@ class GvisorSnapshotBackend:
                 "`restore`, which gVisor does not support rootless (it fails with 'Rootless "
                 "mode not supported with \"restore\"'). Run this tier as root, or use a "
                 "non-snapshot gVisor tier.")
+        if getattr(cfg, "userns_problem", ""):
+            raise GvisorCommandError(
+                f"{cfg.userns_problem}; refusing to start the warm-snapshot tier without the user "
+                "namespace it asks for (its sandbox would run as real host root). Fix or unset it.")
+        if getattr(cfg, "userns_host_base", None) is not None and not (
+                0 <= cfg.uid < USERNS_SIZE and 0 <= cfg.gid < USERNS_SIZE):
+            # The worker's guest uid/gid must be inside the 0..65535 map, or runsc cannot set it.
+            raise GvisorCommandError(
+                f"{USERNS_ENV} maps guest ids 0..{USERNS_SIZE - 1}, but the worker runs as "
+                f"{cfg.uid}:{cfg.gid}, which is outside that map")
         self._cfg = cfg
         self._run = run
         self._run_text = run_text
@@ -1050,6 +1227,28 @@ class GvisorSnapshotBackend:
         # Durable across boot handles: SnapshotManager kills and abandons a handle after a failed
         # checkpoint, so a retry list held on the handle is discarded with it (PR #82).
         self._stranded_partials: list[str] = []
+
+    def _userns_reachability_gate(self, exc_type: type[Exception]) -> None:
+        """Re-check, where the rootfs is BOUND (every boot and restore), that the user-namespaced
+        gofer can still reach it: selection checked it once, but a re-pointed symlink or a
+        tightened parent after startup would otherwise surface as a bare runsc
+        ``binding rootfs ... permission denied``. A dozen stats; undecidable passes."""
+        base = getattr(self._cfg, "userns_host_base", None)
+        if base is None:
+            return
+        rootfs = str(getattr(self._cfg, "image_rootfs", "") or "")
+        ok, why = userns_rootfs_problem(rootfs, base)
+        if ok is False:
+            raise exc_type(f"{USERNS_ENV}={base}, but {why}")
+
+    def _sandbox_spawn_kw(self) -> dict[str, Any]:
+        """Extra spawn args for the runsc calls that START sandbox processes (run, restore).
+        Under a user namespace runsc denies setgroups, so its sentry and gofer keep runsc's own
+        supplementary groups -- the dispatcher's (gid 0 via sudo/initgroups, docker, disk, ...)
+        -- and an escape would land with them. Start runsc with none."""
+        # getattr: callers (and tests) hand duck-typed configs, as for image_rootfs elsewhere.
+        return {"extra_groups": []} if getattr(self._cfg, "userns_host_base", None) is not None \
+            else {}
 
     def available(self) -> bool:
         # `probe` is a full override (tests/embedders); honor it verbatim.
@@ -1079,6 +1278,7 @@ class GvisorSnapshotBackend:
             rootfs_key = self._rootfs_pin().before_boot()
         except RootfsStampError as exc:
             raise SnapshotBuildError(str(exc)) from exc
+        self._userns_reachability_gate(SnapshotBuildError)
         # BEFORE `runsc run` -- see GvisorBootHandle.__init__. The generation that is current when
         # the build STARTS is the one this base can honestly speak for; anything sampled after the
         # launch may already belong to the base that replaced it.
@@ -1112,6 +1312,7 @@ class GvisorSnapshotBackend:
             try:
                 self._run(
                     [*_runsc(self._cfg), "run", "-detach", "-bundle", str(base), cid],
+                    **self._sandbox_spawn_kw(),
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=_sink.write_fd,
@@ -1235,6 +1436,10 @@ class GvisorSnapshotBackend:
             self._rootfs_pin().check_restore(artifact)
         except RootfsStampError as exc:
             raise SnapshotStale(str(exc)) from exc
+        # Raised as the restore failure it is (the manager's SnapshotError branch unpins and
+        # removes the slot workdir; it would also wrap any other exception the same way).
+        from blastbox.host.runtime.fc_snapshot import SnapshotRestoreError
+        self._userns_reachability_gate(SnapshotRestoreError)
         wd = Path(slot_workdir)
         _prepare_slot_dirs(self._cfg, wd)
         cid = f"slot-{uuid.uuid4().hex[:12]}"
@@ -1249,6 +1454,7 @@ class GvisorSnapshotBackend:
                 self._run(
                     [*_runsc(self._cfg), "restore", "-image-path", str(artifact),
                      "-detach", "-bundle", str(wd), cid],
+                    **self._sandbox_spawn_kw(),
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=_sink.write_fd,
