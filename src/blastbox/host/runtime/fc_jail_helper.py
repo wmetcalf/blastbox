@@ -486,6 +486,7 @@ class Asset:
     path: str        # a plain string: see _copy_asset
     key: "tuple[int, int, int, int]"
     refs: int = 0
+    dropping: bool = False      # being unlinked: no new references
 
 
 @dataclass
@@ -859,11 +860,14 @@ class Helper:
         base = self.cfg.chroot_base
         base.mkdir(parents=True, exist_ok=True)
         _check_root_dir(base)
-        os.chmod(base, 0o711)
+        # ROOT-ONLY, like everything under it: asset copies and generations are 0444 for the
+        # jails (which reach them through hard links in their own roots, never through these
+        # directories), and a private 0600 rootfs must not become readable host-wide.
+        os.chmod(base, 0o700)
         self.cleanup_leftovers()
         for d in (self.cfg.assets_dir, self.cfg.gens_dir, self.cfg.bin_dir):
-            d.mkdir(mode=0o711, exist_ok=True)
-            os.chmod(d, 0o711)
+            d.mkdir(mode=0o700, exist_ok=True)
+            os.chmod(d, 0o700)
         # The binary every jail gets a hard link of (same filesystem as the jail tree, so the
         # per-jail exec-file name costs one link, not a copy).
         master = self.cfg.bin_dir / "firecracker"
@@ -1114,11 +1118,24 @@ class Helper:
         try:
             with self._lock:
                 asset = self._assets.get(aid)
-                if asset is None or asset.refs > 0 or self._asset_pinned(aid):
+                if (asset is None or asset.refs > 0 or asset.dropping
+                        or self._asset_pinned(aid)):
                     return
-                del self._assets[aid]
-            with contextlib.suppress(FileNotFoundError):
+                asset.dropping = True       # spawns now treat it as gone
+            try:
                 os.unlink(asset.path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                # Still TRACKED (and retried by the monitor's sweep): forgetting it now would
+                # strand a file of up to max_asset_bytes that nothing could ever reclaim.
+                _log.error("fc_jail.asset_unlink_failed asset=%s: %s (retried)", aid, exc)
+                with self._lock:
+                    asset.dropping = False
+                return
+            with self._lock:
+                if self._assets.get(aid) is asset:
+                    del self._assets[aid]
         finally:
             stripe.release()
 
@@ -1147,7 +1164,8 @@ class Helper:
                     raise HelperError("bad_request", "boot takes kernel+rootfs and no gen")
                 for aid, kind in ((req["kernel"], "kernel"), (req["rootfs"], "rootfs")):
                     asset = self._assets.get(aid)
-                    if asset is None or asset.kind != kind or aid not in owner.assets:
+                    if (asset is None or asset.kind != kind or asset.dropping
+                            or aid not in owner.assets):
                         raise HelperError("unknown_asset", aid)
                     assets.append(aid)
                 mem_mib = req["mem_mib"]
@@ -1498,7 +1516,7 @@ class Helper:
     def _publish(self, owner: Owner, jail: Jail) -> "tuple[dict[str, Any], list[int]]":
         gid = "g" + secrets.token_hex(16)
         gdir = _jp(str(self.cfg.gens_dir), gid)
-        os.mkdir(gdir, 0o711)
+        os.mkdir(gdir, 0o700)
         mem_bytes = 0
         try:
             root_fd = os.open(jail.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)

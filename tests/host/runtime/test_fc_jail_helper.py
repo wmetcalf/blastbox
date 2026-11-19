@@ -1311,3 +1311,20 @@ def test_serve_never_reowns_an_existing_socket_directory(tmp_path):
     helper._stop.set()
     t.join(5)
     assert shared.stat().st_mode & 0o777 == 0o755 and str(shared) not in chowned
+
+
+def test_an_asset_whose_unlink_fails_stays_tracked_and_is_retried(env, monkeypatch):
+    aid = env.asset("kernel", b"K" * 10)
+    env.owner.assets.clear()
+    real = h.os.unlink
+
+    def eio(p, *a, **k):
+        if str(p) == env.helper._assets[aid].path:
+            raise OSError(5, "Input/output error")
+        return real(p, *a, **k)
+    monkeypatch.setattr(h.os, "unlink", eio)
+    env.helper._maybe_drop_asset(aid)
+    assert aid in env.helper._assets and not env.helper._assets[aid].dropping
+    monkeypatch.setattr(h.os, "unlink", real)
+    env.helper.monitor_once()
+    assert aid not in env.helper._assets
