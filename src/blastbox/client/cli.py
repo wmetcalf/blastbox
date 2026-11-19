@@ -131,6 +131,12 @@ def _print_human(receipt) -> None:  # noqa: ANN001 - VerifiedReceipt, imported l
         print(f"  network            policy {_show(net.policy_effective)}, exit "
               f"{_show(net.exit)}, downgraded {_show(net.downgraded)}, inspect "
               f"{_show(net.inspect)}")
+    conf = getattr(receipt, "confinement", None)
+    if conf is None:
+        print("  confinement        NOT RECORDED (no host-LSM record in this receipt)")
+    else:
+        print(f"  confinement        mode {_show(conf.mode)}, available "
+              f"{_show(conf.available)}, applied {_show(conf.applied)}")
 
 
 def _cmd_verify(args: argparse.Namespace) -> int:

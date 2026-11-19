@@ -738,6 +738,15 @@ class Dispatcher:
         enforce_allowed_runtimes(
             self._engines, reachable_tiers(self._pool, self._tier, self._warm_only)
         )
+        # BLASTBOX_CONFINEMENT here too, for the same reason: an invalid mode is refused, and
+        # require fails closed for embedders that did not pass a detection.
+        if self._confinement is None and _confinement.mode_from_env() == "require":
+            self._confinement = _confinement.detect()
+        if self._confinement is not None:
+            _confinement.check_required(
+                self._confinement.state, self._confinement.mode,
+                _confinement.kinds_for_tiers(
+                    reachable_tiers(self._pool, self._tier, self._warm_only)))
         # OPT-IN engine scoping for SHARED multi-dispatcher stores: when set, claim only jobs for
         # engines this dispatcher handles, so it can't grab (and fail "unknown engine") a job that a
         # co-resident VM/other-engine dispatcher owns. Default OFF preserves the single-dispatcher

@@ -23,8 +23,9 @@ with the DSN) can write:
     confinement      {"mode", "available", "applied"}: the BLASTBOX_CONFINEMENT mode, the host
                      LSM the sandbox's HOST processes would be confined with (selinux /
                      apparmor / landlock / none), and the one actually applied ("none" until
-                     the confinement tier enforces). Local runsc/firecracker runs only; absent
-                     elsewhere and when the dispatcher did not detect it
+                     the confinement tier enforces), as detected when the dispatcher started.
+                     Local runsc/firecracker runs only; absent elsewhere, under
+                     BLASTBOX_CONFINEMENT=off, and when the dispatcher did not detect it
     started_at_ms / finished_at_ms / issued_at_ms   integer epoch ms, its own clock
 
 The receipt is written as ``attestation.json`` beside ``metadata.json`` in the sealed output

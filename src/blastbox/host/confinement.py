@@ -27,6 +27,7 @@ import ctypes
 import os
 import re
 import subprocess
+import sys
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Protocol
@@ -45,6 +46,8 @@ AA_PARSER_MOUNT_BUG = (4, 0, 1)
 _LSM = "/sys/kernel/security/lsm"
 _AA_ENABLED = "/sys/module/apparmor/parameters/enabled"
 _SE_ENFORCE = "/sys/fs/selinux/enforce"
+_AA_SELF = ("/proc/self/attr/apparmor/current", "/proc/self/attr/current")
+_MOUNTS = "/proc/self/mounts"
 _AA_PARSERS = ("apparmor_parser", "/usr/sbin/apparmor_parser", "/sbin/apparmor_parser")
 
 _SYS_LANDLOCK_CREATE_RULESET = 444   # unified syscall number (x86_64, aarch64, ...)
@@ -68,9 +71,13 @@ class ConfinementUnavailable(RuntimeError):
 def landlock_abi() -> int:
     """Landlock ABI via ``landlock_create_ruleset(NULL, 0, VERSION)`` (a query; creates
     nothing). 0 when unavailable: ENOSYS (not built), EOPNOTSUPP (disabled at boot), or a
-    seccomp filter refusing it."""
+    seccomp filter refusing it. Linux only: 444 is another syscall elsewhere (macOS:
+    change_fdguard_np)."""
+    if not sys.platform.startswith("linux"):
+        return 0
     try:
         libc = ctypes.CDLL(None, use_errno=True)
+        libc.syscall.restype = ctypes.c_long
         rc = libc.syscall(_SYS_LANDLOCK_CREATE_RULESET, None, ctypes.c_size_t(0),
                           ctypes.c_uint32(_LANDLOCK_CREATE_RULESET_VERSION))
     except (OSError, AttributeError):
@@ -109,8 +116,13 @@ class HostLsm:
 
     lsms: tuple[str, ...] | None        # /sys/kernel/security/lsm; None = securityfs unreadable
     apparmor: bool
-    selinux: str                        # "enforcing" | "permissive" | "absent"
+    selinux: str                        # "enforcing" | "permissive" | "absent" | "unknown"
     landlock_abi: int                   # 0 = unavailable
+    # Why an ON LSM still cannot be used from here (None = no known blocker): no securityfs to
+    # load policy through, a caller already confined (docker-default has no change_profile), a
+    # read-only selinuxfs (container engines bind it ro).
+    apparmor_blocker: str | None = None
+    selinux_blocker: str | None = None
     apparmor_parser: str | None = None  # "4.0.1"; None = not found / not probed
     runsc: str | None = None            # "release-20261012.0"
     runsc_split_sentry: bool | None = None
@@ -124,9 +136,9 @@ class HostLsm:
             raise ValueError(f"unknown sandbox kind {kind!r}")
         if parse_mode(mode) == "off":
             return "none"
-        if self.selinux == "enforcing":
+        if self.selinux == "enforcing" and self.selinux_blocker is None:
             return "selinux"
-        if self.apparmor:
+        if self.apparmor and self.apparmor_blocker is None:
             return "apparmor"
         if kind == "firecracker" and self.landlock_abi > 0:
             return "landlock"
@@ -147,6 +159,8 @@ class HostLsm:
             "apparmor": self.apparmor,
             "selinux": self.selinux,
             "landlock_abi": self.landlock_abi,
+            "apparmor_blocker": self.apparmor_blocker,
+            "selinux_blocker": self.selinux_blocker,
             "apparmor_parser": self.apparmor_parser,
             "runsc": self.runsc,
             "runsc_split_sentry": self.runsc_split_sentry,
@@ -172,13 +186,45 @@ def _probe_lsm(host: HostReader, landlock: int | None) -> HostLsm:
     apparmor = aa_raw is not None and aa_raw.strip().upper().startswith("Y") and (
         lsms is None or "apparmor" in lsms)
     enforce = host.read(_SE_ENFORCE)
-    if enforce is None or (lsms is not None and "selinux" not in lsms):
+    if lsms is not None and "selinux" not in lsms:
         selinux = "absent"
+    elif enforce is None:
+        # No selinuxfs: absent on a host; inside a container (no securityfs either) it is
+        # simply not visible -- and not usable from here either way.
+        selinux = "absent" if lsms is not None else "unknown"
     else:
         selinux = "enforcing" if enforce.strip() == "1" else "permissive"
     # A listed-but-absent landlock is authoritative; an unreadable list still asks the kernel.
     abi = 0 if (lsms is not None and "landlock" not in lsms) else max(0, int(landlock or 0))
-    return HostLsm(lsms=lsms, apparmor=apparmor, selinux=selinux, landlock_abi=abi)
+    return HostLsm(lsms=lsms, apparmor=apparmor, selinux=selinux, landlock_abi=abi,
+                   apparmor_blocker=_aa_blocker(host, lsms) if apparmor else None,
+                   selinux_blocker=_se_blocker(host) if selinux in ("enforcing", "permissive") else None)
+
+
+def _aa_blocker(host: HostReader, lsms: tuple[str, ...] | None) -> str | None:
+    if lsms is None:
+        # /sys/module shows the HOST's flag; without securityfs no policy can be loaded here.
+        return "securityfs not mounted (container?): no AppArmor policy can be loaded from here"
+    label = host.read(_AA_SELF[0])
+    if label is None:
+        # attr/current is the stacked LSMs' slot; only read it as AppArmor's when it looks so.
+        raw = host.read(_AA_SELF[1])
+        label = raw if raw is not None and (raw.strip() == "unconfined" or raw.rstrip().endswith(
+            ")")) else None
+    label = (label or "").strip().rstrip("\x00").strip()
+    if label and label != "unconfined":
+        return (f"caller already confined by {label!r}: entering a blastbox profile needs a "
+                "change_profile rule there")
+    return None
+
+
+def _se_blocker(host: HostReader) -> str | None:
+    for line in (host.read(_MOUNTS) or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[1] == "/sys/fs/selinux" and parts[2] == "selinuxfs" and \
+                "ro" in parts[3].split(","):
+            return "selinuxfs mounted read-only (container?): no type transition from here"
+    return None
 
 
 def _parser_version(host: HostReader) -> str | None:
@@ -193,14 +239,15 @@ def _parser_version(host: HostReader) -> str | None:
 
 
 def _runsc(host: HostReader, env: Mapping[str, str]) -> tuple[str | None, bool | None]:
-    name = env.get("BLASTBOX_GVISOR_RUNSC", "runsc") or "runsc"
-    path = host.which(name)
+    # Exactly as the runtime reads it: set-but-empty is NOT "runsc".
+    name = env.get("BLASTBOX_GVISOR_RUNSC", "runsc")
+    path = host.which(name) if name and name == name.strip() else None
     if path is None:
         return None, None
     proc = host.run([path, "--version"])
     text = (proc.stdout + proc.stderr) if proc is not None else ""
     m = re.search(r"\brelease-(\d{8})(?:\.\d+)?", text)
-    shown = m.group(0) if m else (_first_line(text) or None)
+    shown = m.group(0) if m else (_first_line(text) or "present (--version failed)")
     sibling = os.path.join(os.path.dirname(host.realpath(path)), "gvisor-bin", "gvisor_sentry")
     if host.exists(sibling):
         return shown, True
@@ -248,7 +295,9 @@ def check_required(state: HostLsm, mode: str, kinds: Iterable[str]) -> None:
             f"{ENV_MODE}=require but no usable LSM for {', '.join(missing)} (selinux="
             f"{state.selinux}, apparmor={'on' if state.apparmor else 'off'}, landlock_abi="
             f"{state.landlock_abi}; Landlock covers firecracker only, permissive SELinux "
-            "does not count)")
+            "does not count"
+            + "".join(f"; {b}" for b in (state.selinux_blocker, state.apparmor_blocker) if b)
+            + ")")
 
 
 @dataclass(frozen=True)
@@ -258,10 +307,13 @@ class Detection:
     mode: str
     state: HostLsm
 
-    def receipt(self, kind: str) -> dict[str, object]:
+    def receipt(self, kind: str) -> dict[str, object] | None:
         """The signed-receipt record for a run of ``kind``. Strings only (the canonicaliser
         rejects floats). ``applied`` is "none" until the tier enforces: this release only
-        detects."""
+        detects. None under ``off``: the receipt keeps its old shape, the opt-out for
+        verifiers that predate the field."""
+        if self.mode == "off":
+            return None
         return {"mode": self.mode, "available": self.state.would_use(kind, self.mode),
                 "applied": "none"}
 

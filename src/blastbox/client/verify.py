@@ -841,7 +841,9 @@ def verify_receipt(
         confinement=_confinement(doc),
         input_bound=want_input is not None,
         metadata_bound=want_metadata is not None,
-        signed=MappingProxyType(doc),
+        # Nested values copied and frozen too: read-only, and not shared with the caller's body.
+        signed=MappingProxyType({k: MappingProxyType(dict(val)) if isinstance(val, Mapping)
+                                 else val for k, val in doc.items()}),
     )
 
 

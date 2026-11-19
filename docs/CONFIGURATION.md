@@ -224,7 +224,8 @@ A local runsc (cold or warm gVisor) or Firecracker run also carries
 `confinement: {mode, available, applied}` -- `BLASTBOX_CONFINEMENT`, the host LSM the sandbox's
 host processes would be confined with, and the one applied (`"none"` until the confinement tier
 enforces; see [HOST-PREP.md](HOST-PREP.md#confinement-tier)). Verifiers older than this field
-refuse it as unknown: upgrade verifiers before dispatchers.
+refuse it as unknown: upgrade verifiers before dispatchers, or set `BLASTBOX_CONFINEMENT=off`
+(which omits the field) until they are.
 
 **What it does not prove:** that detections are true (the envelope is still the worker's account).
 And, plainly: **any pinned key whose holder can write the shared results prefix can attach a

@@ -220,10 +220,14 @@ SELinux enforcing  >  AppArmor enabled  >  Landlock (firecracker only)  >  none
 | Rocky / RHEL 9 (SELinux enforcing) | selinux | selinux |
 | Amazon Linux 2023 (SELinux **permissive** by default) | none | landlock |
 | Alpine (Landlock only) | none | landlock |
-| container without `/sys/kernel/security` | inferred from `/sys/module/apparmor`, `/sys/fs/selinux` | same |
+| container (no `/sys/kernel/security`, or under `docker-default`, or read-only selinuxfs) | none | landlock, if the kernel offers it |
 
 Permissive SELinux only logs, so it never counts (`setenforce 1` and `SELINUX=enforcing` in
-`/etc/selinux/config` to change that). Landlock cannot hold runsc, which mounts.
+`/etc/selinux/config` to change that). Landlock cannot hold runsc, which mounts; for Firecracker
+it is applied inside the jail, after the jailer has set it up. An LSM that is on but cannot be
+used from where the dispatcher runs is reported with the reason and does not count: no
+securityfs to load AppArmor policy through, a caller already confined by another AppArmor
+profile (e.g. `docker-default`, which has no `change_profile` rule), or a read-only selinuxfs.
 
 `BLASTBOX_CONFINEMENT=auto|require|off` (default `auto`). `require` makes `blastbox dispatch`
 refuse to start, and preflight FAIL, when a sandbox kind the dispatcher can run (the cold tier
@@ -234,12 +238,15 @@ Preflight's `confinement` check prints the LSM stack, SELinux mode, AppArmor sta
 `--json` carries the same as `facts`. Two conditions it calls out:
 
 - **apparmor_parser 4.0.1** (WARN): pairing `audit deny umount,` with another `audit deny`
-  mount-class rule compiles to ALLOW mount (measured with kernel 6.8).
+  mount-class rule compiles to ALLOW mount (measured with kernel 6.8). This matters today, not
+  only for the future tier: the shipped `deploy/apparmor/blastbox-sandbox` child profile has
+  that pair (`audit deny mount,` + `audit deny umount,`).
 - **runsc older than `release-20261012`** ships the Sentry inside the runsc binary, so AppArmor
   cannot give it a domain separate from the CLI and gofer ("single binary" in the report).
 
 Each signed receipt for a local runsc or firecracker run records
 `confinement: {mode, available, applied}`; `applied` stays `"none"` until enforcement lands.
+`off` omits the field, which keeps receipts readable by verifiers that predate it.
 
 ## AppArmor and user namespaces
 

@@ -41,6 +41,9 @@ CONTAINER = {  # securityfs not mounted; /sys/module still visible read-only
 }
 
 
+_REAL_DETECT = cf.detect
+
+
 def _host(files: dict[str, str], **kw) -> FakeHost:
     return FakeHost(files=dict(files), **kw)
 
@@ -83,13 +86,14 @@ def test_listed_without_landlock_ignores_the_syscall():
 def test_container_without_securityfs_degrades():
     st = _state(CONTAINER, abi=2)
     assert st.lsms is None
-    assert st.apparmor and st.selinux == "absent" and st.landlock_abi == 2
-    assert st.would_use("gvisor") == "apparmor"
+    assert st.apparmor and st.selinux == "unknown" and st.landlock_abi == 2
+    assert st.would_use("gvisor") == "none"              # host's flag; nothing loadable here
+    assert st.would_use("firecracker") == "landlock"
 
 
 def test_nothing_readable_is_none_not_an_error():
     st = _state({})
-    assert (st.lsms, st.apparmor, st.selinux, st.landlock_abi) == (None, False, "absent", 0)
+    assert (st.lsms, st.apparmor, st.selinux, st.landlock_abi) == (None, False, "unknown", 0)
     assert st.would_use("firecracker") == "none"
 
 
@@ -134,9 +138,18 @@ def test_require_fails_closed_only_for_unmet_kinds():
 
 
 def test_detect_never_spawns(monkeypatch):
+    """The production reader and the real Landlock query: no process is ever started."""
     def boom(*a, **kw):
         raise AssertionError("spawned")
+    monkeypatch.setattr(subprocess, "Popen", boom)
     monkeypatch.setattr(subprocess, "run", boom)
+    monkeypatch.setattr(cf.os, "posix_spawn", boom, raising=False)
+    d = cf.detect({"BLASTBOX_CONFINEMENT": "auto"})
+    assert d.state.runsc is None and d.state.apparmor_parser is None
+    assert set(d.receipt("gvisor") or {}) == {"mode", "available", "applied"}
+
+
+def test_detect_with_fixture_host():
     d = cf.detect({"BLASTBOX_CONFINEMENT": "auto"}, host=_host(ROCKY), landlock=0)
     assert d.receipt("gvisor") == {"mode": "auto", "available": "selinux", "applied": "none"}
 
@@ -253,9 +266,10 @@ def test_preflight_flags_parser_4_0_1():
         "apparmor-parser-4.0.1-audit-deny-umount-allows-mount"]
 
 
-def test_preflight_remote_only_has_no_confinement_check():
+def test_preflight_remote_only_reports_no_local_kind():
     host = _healthy(files=UBUNTU)
-    assert all(c.name != "confinement" for c in pf.run_preflight(host, ["remote"]))
+    c = next(c for c in pf.run_preflight(host, ["remote"]) if c.name == "confinement")
+    assert c.status is Status.PASS and "would use" not in c.detail
 
 
 def test_preflight_json_carries_facts():
@@ -403,8 +417,7 @@ def _start(monkeypatch, *, mode: str, files: dict[str, str]):
         seen.update(kw)
         raise _Built
 
-    real_detect = cf.detect
-    monkeypatch.setattr(cf, "detect", lambda: real_detect(
+    monkeypatch.setattr(cf, "detect", lambda: _REAL_DETECT(
         {"BLASTBOX_CONFINEMENT": mode}, host=_host(files), landlock=3))
     monkeypatch.setattr(factory, "build_job_store_from_env", InMemoryJobStore)
     monkeypatch.setattr(dispatch_mod, "Dispatcher", fake)
@@ -440,3 +453,158 @@ def test_dispatch_cmd_invalid_mode_refuses(monkeypatch):
     monkeypatch.setattr(factory, "build_job_store_from_env", InMemoryJobStore)
     with pytest.raises(ValueError, match="BLASTBOX_CONFINEMENT"):
         _dispatch_cmd(argparse.Namespace(engines="e=img:tag"))
+
+
+# --- round 1 review fixes -----------------------------------------------------------------
+
+CONTAINER_UNDER_DOCKER_DEFAULT = {   # Ubuntu host, dispatcher inside a docker container
+    "/sys/module/apparmor/parameters/enabled": "Y\n",
+    "/proc/self/attr/apparmor/current": "docker-default (enforce)\n",
+}
+SELINUX_RO_CONTAINER = {   # Rocky host, container with selinuxfs bind-mounted read-only
+    "/sys/fs/selinux/enforce": "1",
+    "/proc/self/mounts": "overlay / overlay rw 0 0\nselinuxfs /sys/fs/selinux selinuxfs "
+                         "ro,nosuid,nodev,noexec,relatime 0 0\n",
+}
+
+
+def test_apparmor_without_securityfs_is_not_usable():
+    st = _state(CONTAINER, abi=0)
+    assert st.apparmor and st.apparmor_blocker
+    assert st.would_use("gvisor") == "none"
+    assert cf.unmet(st, "require", ["gvisor"]) == ["gvisor"]
+
+
+def test_apparmor_confined_caller_is_not_usable():
+    files = {**UBUNTU, "/proc/self/attr/apparmor/current": "docker-default (enforce)\n"}
+    st = _state(files)
+    assert "docker-default" in (st.apparmor_blocker or "")
+    assert st.would_use("firecracker") == "none"
+    assert _state(CONTAINER_UNDER_DOCKER_DEFAULT).would_use("gvisor") == "none"
+
+
+def test_apparmor_unconfined_caller_is_usable():
+    st = _state({**UBUNTU, "/proc/self/attr/apparmor/current": "unconfined\n"})
+    assert st.apparmor_blocker is None and st.would_use("gvisor") == "apparmor"
+
+
+def test_read_only_selinuxfs_is_not_usable():
+    st = _state(SELINUX_RO_CONTAINER, abi=4)
+    assert st.selinux == "enforcing" and st.selinux_blocker
+    assert st.would_use("gvisor") == "none" and st.would_use("firecracker") == "landlock"
+
+
+def test_rw_selinuxfs_is_usable():
+    files = {**ROCKY, "/proc/self/mounts": "selinuxfs /sys/fs/selinux selinuxfs rw,relatime 0 0\n"}
+    assert _state(files).would_use("gvisor") == "selinux"
+
+
+def test_preflight_names_the_blocker():
+    c = _pf(CONTAINER)
+    assert "gvisor=none" in c.detail and "securityfs" in c.detail
+
+
+def test_preflight_notes_missing_apparmor_parser():
+    c = _pf(UBUNTU)    # the healthy host has no apparmor_parser
+    assert "apparmor_parser not found" in c.detail
+
+
+def test_off_mode_omits_the_receipt_field():
+    d = cf.detect({"BLASTBOX_CONFINEMENT": "off"}, host=_host(UBUNTU), landlock=0)
+    assert d.receipt("gvisor") is None
+
+
+def test_preflight_validates_mode_on_remote_only():
+    host = _healthy(files=UBUNTU, env={"BLASTBOX_CONFINEMENT": "enforce"})
+    c = next(c for c in pf.run_preflight(host, ["remote"]) if c.name == "confinement")
+    assert c.status is Status.FAIL
+
+
+def _embedded(tmp_path, monkeypatch, mode: str, files: dict[str, str]):
+    from blastbox.host.dispatch import Dispatcher, EngineSpec
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    from tests.host.test_dispatch import _fake_runtime, _limits
+
+    monkeypatch.setattr(cf, "detect", lambda env=None, **kw: _REAL_DETECT(
+        env, host=_host(files), landlock=3))
+    monkeypatch.setenv("BLASTBOX_CONFINEMENT", mode)
+    return Dispatcher(job_store=InMemoryJobStore(),
+                      engines={"e": EngineSpec(name="e", image="i", worker_argv=["w"])},
+                      limits=_limits(), job_root=tmp_path, runtime_selector=_fake_runtime,
+                      attest_key=None)
+
+
+def test_embedded_dispatcher_honours_require(tmp_path, monkeypatch):
+    with pytest.raises(cf.ConfinementUnavailable):
+        _embedded(tmp_path, monkeypatch, "require", ALPINE)
+    _embedded(tmp_path, monkeypatch, "require", ROCKY)
+
+
+def test_embedded_dispatcher_refuses_invalid_mode(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="BLASTBOX_CONFINEMENT"):
+        _embedded(tmp_path, monkeypatch, "requird", ROCKY)
+
+
+def test_verify_cli_prints_confinement(capsys):
+    from blastbox.client import verify as v
+    from blastbox.client.cli import _print_human
+    r = v.VerifiedReceipt(
+        job_id="j", engine="e", status="done", key_id="k", host="h", executor="local",
+        input_sha256="a" * 64, metadata_sha256="b" * 64, worker_runtime="runsc",
+        worker_tier=None, started_at_ms=1, finished_at_ms=2, issued_at_ms=3, network=None,
+        input_bound=False, metadata_bound=True, signed={},
+        confinement=v.AttestedConfinement("auto", "apparmor", "none"))
+    _print_human(r)
+    out = capsys.readouterr().out
+    assert "confinement" in out and "apparmor" in out
+    _print_human(v.VerifiedReceipt(**{**r.__dict__, "confinement": None}))
+    assert "NOT RECORDED" in capsys.readouterr().out
+
+
+def test_landlock_query_is_linux_only(monkeypatch):
+    monkeypatch.setattr(cf.sys, "platform", "darwin")
+    def no_libc(*a, **kw):
+        raise AssertionError("syscall attempted off Linux")
+    monkeypatch.setattr(cf.ctypes, "CDLL", no_libc)
+    assert cf.landlock_abi() == 0
+
+
+def test_selinux_unknown_without_securityfs_or_selinuxfs():
+    st = _state({})
+    assert st.selinux == "unknown" and st.would_use("gvisor") == "none"
+    assert _state(ALPINE).selinux == "absent"     # listed stack without selinux: known absent
+
+
+def test_parser_warn_names_the_shipped_profile():
+    host = _healthy(files=UBUNTU, commands={("/usr/sbin/apparmor_parser", "--version"):
+                                            (0, "AppArmor parser version 4.0.1\n", "")})
+    host.executables["apparmor_parser"] = "/usr/sbin/apparmor_parser"
+    c = next(c for c in pf.run_preflight(host, ["gvisor"]) if c.name == "confinement")
+    assert "deploy/apparmor/blastbox-sandbox" in c.detail
+
+
+def test_runsc_version_failure_is_not_not_found():
+    host = _tools(UBUNTU)
+    del host.commands[("/usr/bin/runsc", "--version")]
+    st = cf.probe(host, env={}, kinds=["gvisor"])
+    assert st.runsc == "present (--version failed)" and st.runsc_split_sentry is None
+
+
+def test_runsc_empty_env_means_no_binary_like_the_runtime():
+    st = cf.probe(_tools(UBUNTU), env={"BLASTBOX_GVISOR_RUNSC": ""}, kinds=["gvisor"])
+    assert st.runsc is None
+
+
+def test_verified_signed_does_not_share_the_callers_confinement():
+    from blastbox.client import verify as v
+    from tests.client.test_verify import _body, _doc, _verify
+    key = attest.load_or_create_key(__import__("pathlib").Path(
+        __import__("tempfile").mkdtemp()) / "k" / "attest.key")
+    pinned = v.load_pinned_keys(key.public_key_pem)
+    body = json.loads(_body(key, _doc(key, net={"confinement": {
+        "mode": "auto", "available": "none", "applied": "none"}})))
+    r = _verify(body, pinned)
+    body["attestation"]["confinement"]["available"] = "selinux"
+    assert r.signed["confinement"]["available"] == "none"   # type: ignore[index]
+    with pytest.raises(TypeError):
+        r.signed["confinement"]["available"] = "selinux"     # type: ignore[index]

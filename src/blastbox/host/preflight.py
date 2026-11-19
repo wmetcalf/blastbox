@@ -1088,6 +1088,9 @@ def _check_confinement(host: HostView, tiers: Collection[str]) -> Check:
     if st.lsms is None:
         parts.append("securityfs not readable (container?): LSM stack inferred from "
                      "/sys/module and /sys/fs/selinux")
+    parts += [b for b in (st.selinux_blocker, st.apparmor_blocker) if b]
+    if st.apparmor and kinds and st.apparmor_parser is None:
+        parts.append("apparmor_parser not found: blastbox profiles cannot be loaded")
     if "gvisor" in kinds:
         split = {True: "split sentry", False: "single binary", None: "sentry layout unknown"}
         parts.append(f"runsc {st.runsc} ({split[st.runsc_split_sentry]})" if st.runsc
@@ -1105,7 +1108,9 @@ def _check_confinement(host: HostView, tiers: Collection[str]) -> Check:
     if st.flags:
         return Check("confinement", Status.WARN,
                      "; ".join(parts) + "; apparmor_parser 4.0.1 compiles `audit deny umount` "
-                     "paired with another `audit deny` mount rule into ALLOW mount", doc, facts)
+                     "paired with another `audit deny` mount rule into ALLOW mount -- the "
+                     "shipped deploy/apparmor/blastbox-sandbox child profile has that pair "
+                     "today", doc, facts)
     return Check("confinement", Status.PASS, "; ".join(parts), facts=facts)
 
 
@@ -1224,9 +1229,9 @@ def run_preflight(host: HostView, tiers: Sequence[str], *, explicit: bool = True
     local = bool(t - {"remote"})
     if local:   # a remote-only dispatcher runs no worker, runsc or JVM engine here
         out.append(_check_apparmor(host))
-        out.append(_check_confinement(host, t))
         out.append(_check_bwrap_stock_profile(host, t))
         out.append(_check_userns(host, t))
+    out.append(_check_confinement(host, t))   # remote-only too: dispatch validates the mode
     out.append(_check_clock(host))
     if local:
         out.append(_check_cpu_flags(host))
