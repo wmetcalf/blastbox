@@ -100,8 +100,9 @@ report time the call asks for ``min(REA_REPORT_MAX_TOKENS, what the
 time left holds at the measured rate)`` and is skipped below ``MIN_REPORT_TOKENS``; the measured
 rate is completion tokens over seconds of this pass's calls that reported usage.
 
-Model failures never fail the job: ``model_status`` records ``unavailable``/``malformed`` (prior
-summary kept, ``more_pending=False``) or ``budget`` (``more_pending=True``). ``skipped`` means the
+Model failures never fail the job: ``model_status`` records ``unavailable``/``malformed``/
+``out_of_credit``/``key_rejected``/``refused`` (prior summary kept, ``more_pending=False``; the last
+three stop the pass at once, with no retry and no final answer; a failed report leaves it unchanged) or ``budget`` (``more_pending=True``). ``skipped`` means the
 model was not consulted because no Ghidra project or MCP session could be had.
 """
 
@@ -127,7 +128,7 @@ from blastbox.engines.rea.iocs import extract_iocs
 from blastbox.engines.rea.continuation import ContinuationError, GhidraStatus, State, pack, unpack
 from blastbox.engines.rea.gostrings import clip_overruns, exact_iocs, go_strings
 from blastbox.engines.rea.mcp_client import McpError, McpStdioClient
-from blastbox.engines.rea.model import ModelClient, ModelError
+from blastbox.engines.rea.model import FATAL_KINDS, ModelClient, ModelError
 from blastbox.engines.rea.reasoning_policy import capture_allowed
 from blastbox.engines.rea.policy import ADDRESS_RE, TOOL_ALLOWLIST, CallRefused, check_call, model_tool_specs, safe_name
 from blastbox.engines.rea.prompts import (
@@ -1375,6 +1376,11 @@ class ReaAgentEngine:
             try:
                 resp = self._chat(model, p, tw, explore_left, messages, tools, p.turn_tokens)
             except ModelError as exc:
+                if exc.kind in FATAL_KINDS:
+                    # Credit, key and refusal failures repeat on every call: seal the class now,
+                    # with no further turn and no final answer to spend.
+                    self._model_failed(p, tw, exc.kind, str(exc))
+                    return
                 if p.good_turns > 0 or (exc.kind == "unavailable" and remaining() >= 2 * MIN_TURN_S):
                     # Earlier turns worked: one failed turn must not waste them (Ruling O). With
                     # no good turn yet, the final-answer reserve is the last retry of an
@@ -1705,7 +1711,7 @@ class ReaAgentEngine:
 
     def _final_failed(self, p: _Pass, tw: TranscriptWriter, kind: str, message: str) -> None:
         """The final answer failed: ``budget`` (chain continues) once any turn succeeded."""
-        if p.good_turns == 0:
+        if p.good_turns == 0 or kind in FATAL_KINDS:
             self._model_failed(p, tw, kind, message)
             return
         p.model_status = "budget"

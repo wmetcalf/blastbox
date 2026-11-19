@@ -3463,3 +3463,24 @@ def test_a_source_ground_stays_dropped_in_a_code_pass_without_an_installer_scrip
     call = model.calls[-1]
     assert call["response_format"] == prompts.report_response_format()
     assert '{"source"' not in call["messages"][-1]["content"].split("\n", 1)[0]
+
+
+@pytest.mark.parametrize("kind", ["out_of_credit", "key_rejected", "refused"])
+def test_fatal_model_error_seals_its_class_without_retry(tmp_path, kind):
+    cont = make_continuation(tmp_path)
+    model = FakeModel([ModelError(kind, "http_402")] + [_final(summary="never")] * 3)
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
+    f = res.payload.fields
+    assert f["model_status"] == kind and f["more_pending"] is False
+    assert not any(w.code == "model_retry" for w in res.warnings)
+    assert len(model.calls) == 1
+
+
+def test_out_of_credit_after_good_turns_spends_no_final_call(tmp_path):
+    cont = make_continuation(tmp_path)
+    model = FakeModel([tc(("binary_overview", {}, "a")), ModelError("out_of_credit", "http_402"),
+                       _final(summary="never")])
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
+    assert res.payload.fields["model_status"] == "out_of_credit"
+    assert res.payload.fields["more_pending"] is False
+    assert len(model.calls) == 2
