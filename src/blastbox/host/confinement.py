@@ -264,8 +264,12 @@ def _cold_blocker(env: Mapping[str, str], host: HostReader) -> str | None:
         return f"docker endpoint not resolvable ({type(exc).__name__}): cold runsc host unknown"
 
 
+#: `docker context create`'s own name rule; anything else is not a context the CLI made.
+_CONTEXT_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.+-]+")
+
+
 def _docker_config_dir(env: Mapping[str, str]) -> str:
-    cfg = env.get("DOCKER_CONFIG", "").strip()
+    cfg = env.get("DOCKER_CONFIG", "")      # verbatim, as the CLI uses it
     if cfg:
         return cfg
     home = env.get("HOME", "").strip()
@@ -280,22 +284,30 @@ def _docker_config_dir(env: Mapping[str, str]) -> str:
 _GO_WS = " \t\n\r"   # the only whitespace Go's JSON decoder skips (no BOM, no NBSP)
 
 
+class _Obj(list):  # type: ignore[type-arg]
+    """A decoded JSON object: its (key, value) pairs in document order, duplicates kept."""
+
+
 def _first_json(text: str) -> object:
     """The first JSON value, as Go's json.Decoder reads it: trailing data ignored, every key
-    pair kept in order (objects become lists of pairs, so duplicate keys are not collapsed)."""
-    return json.JSONDecoder(object_pairs_hook=list).raw_decode(text.lstrip(_GO_WS))[0]
+    pair kept in order (so duplicate keys are not collapsed)."""
+    return json.JSONDecoder(object_pairs_hook=_Obj).raw_decode(text.lstrip(_GO_WS))[0]
 
 
-def _go_field(obj: object, name: str) -> object:
-    """A struct field as Go's decoder fills it: keys matched case-insensitively, in document
-    order, the last one winning; JSON null leaves it unset (None)."""
+def _go_field(obj: object, name: str, *, exact: bool = False) -> object:
+    """A value as Go's decoder fills it, the last matching key winning and JSON null leaving
+    it unset (None): a struct field matches case-insensitively, a map key (``exact``) only
+    exactly."""
     if obj is None:
         return None
-    if not isinstance(obj, list):
+    if not isinstance(obj, _Obj):
         raise ValueError(f"expected an object around {name!r}")
     found: object = None
     for key, value in obj:
-        if key.lower() == name.lower() and value is not None:
+        # Go's EqualFold for these ASCII names: ASCII case plus the two runes that fold onto
+        # ASCII letters (U+017F long s, U+212A Kelvin -- the latter already lower()s to k).
+        if (key == name if exact else key.replace("\u017f", "s").lower() == name.lower()) \
+                and value is not None:
             found = value
     return found
 
@@ -306,29 +318,37 @@ def _local_endpoint(endpoint: str) -> bool:
 
 
 def _resolve_cold_blocker(env: Mapping[str, str], host: HostReader) -> str | None:
-    docker_host = env.get("DOCKER_HOST", "").strip()
+    docker_host = env.get("DOCKER_HOST", "")     # verbatim, as the CLI uses it
     if docker_host:
         if _local_endpoint(docker_host):
             return None
         return f"DOCKER_HOST={docker_host!r}: cold runsc runs on that daemon's host, not this one"
     cfg = _docker_config_dir(env)
-    context = env.get("DOCKER_CONTEXT", "").strip()
+    context = env.get("DOCKER_CONTEXT", "")       # verbatim, as the CLI uses it
     source = "DOCKER_CONTEXT"
     if not context:
         source = "docker config currentContext"
         raw = host.read(os.path.join(cfg, "config.json"))
+        if raw is not None and len(raw) >= _READ_CAP:
+            raise ValueError("config.json at the read cap (truncated)")
         if raw is not None and raw.strip(_GO_WS):   # an empty file is the CLI's default config
             value = _go_field(_first_json(raw), "currentContext")
             if value is not None and not isinstance(value, str):
                 raise ValueError("currentContext is not a string")
-            context = (value or "").strip()
+            context = value or ""
     if not context or context == "default":
+        if env.get("DOCKER_TLS_VERIFY", "") or env.get("DOCKER_TLS", ""):
+            # The CLI's default endpoint under TLS is tcp://localhost:2376, not the socket.
+            return "DOCKER_TLS(_VERIFY) set: the default endpoint is tcp://localhost:2376"
         return None
+    if not _CONTEXT_NAME.fullmatch(context):
+        return f"{source} {context!r} is not a valid docker context name"
     meta = os.path.join(cfg, "contexts", "meta",
                         hashlib.sha256(context.encode()).hexdigest(), "meta.json")
     try:
+        # Endpoints is a map (exact key); the struct fields around it fold case.
         endpoint = _go_field(_go_field(_go_field(_first_json(host.read(meta) or ""),
-                                                 "Endpoints"), "docker"), "Host")
+                                                 "Endpoints"), "docker", exact=True), "Host")
         if not isinstance(endpoint, str) or not endpoint:
             raise ValueError("no docker endpoint")
     except (ValueError, KeyError, TypeError):

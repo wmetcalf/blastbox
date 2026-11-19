@@ -859,3 +859,58 @@ def test_meta_host_key_matched_like_go():
 def test_sys_reader_reads_proc_sys():
     v = cf._SysReader().read("/proc/sys/kernel/ostype")
     assert v is not None and v.strip() == "Linux"
+
+
+def test_endpoints_map_key_is_exact_like_go():
+    """Endpoints is a Go map: 'Docker' is a different key from 'docker'."""
+    d = _hashlib.sha256(b"remote").hexdigest()
+    meta = {f"{_CFG}/contexts/meta/{d}/meta.json":
+            '{"Endpoints": {"docker": {"Host": "tcp://127.0.0.1:1"}, '
+            '"Docker": {"Host": "unix:///var/run/docker.sock"}}}'}
+    host = _host({**UBUNTU, **meta})
+    assert cf.probe(host, env={"DOCKER_CONFIG": _CFG, "DOCKER_CONTEXT": "remote"}).would_use(
+        "cold") == "none"
+
+
+def test_array_config_is_malformed_not_an_object():
+    host = _host({**UBUNTU, **_DOCKER_FILES,
+                  f"{_CFG}/config.json": '[["currentContext", "remote"]]'})
+    st = cf.probe(host, env={"DOCKER_CONFIG": _CFG})
+    assert st.cold_blocker and "not resolvable" in st.cold_blocker
+
+
+def test_long_s_folds_like_go():
+    d = _hashlib.sha256(b"remote").hexdigest()
+    meta = {f"{_CFG}/contexts/meta/{d}/meta.json":
+            '{"Endpoints": {"docker": {"Host": "unix:///var/run/docker.sock", '
+            '"Ho\\u017ft": "tcp://127.0.0.1:1"}}}'}
+    host = _host({**UBUNTU, **meta})
+    assert cf.probe(host, env={"DOCKER_CONFIG": _CFG, "DOCKER_CONTEXT": "remote"}).would_use(
+        "cold") == "none"
+
+
+def test_config_read_at_the_cap_fails_closed():
+    host = _host({**UBUNTU, f"{_CFG}/config.json": " " * cf._READ_CAP})
+    assert cf.probe(host, env={"DOCKER_CONFIG": _CFG}).would_use("cold") == "none"
+
+
+@pytest.mark.parametrize("env", [
+    {"DOCKER_CONTEXT": "remote "}, {"DOCKER_CONTEXT": " remote"}, {"DOCKER_CONTEXT": "lo�c"},
+])
+def test_noncanonical_context_names_fail_closed(env):
+    st = cf.probe(_host({**UBUNTU, **_DOCKER_FILES}), env={"DOCKER_CONFIG": _CFG, **env})
+    assert st.would_use("cold") == "none"
+
+
+def test_docker_config_used_verbatim():
+    files = {**UBUNTU, **{k.replace(_CFG, _CFG + " "): v for k, v in _DOCKER_FILES.items()},
+             f"{_CFG} /config.json": '{"currentContext": "remote"}'}
+    assert cf.probe(_host(files), env={"DOCKER_CONFIG": _CFG + " "}).would_use("cold") == "none"
+
+
+@pytest.mark.parametrize("var", ["DOCKER_TLS_VERIFY", "DOCKER_TLS"])
+def test_tls_default_context_dials_tcp_localhost(var):
+    assert cf.probe(_host(UBUNTU), env={var: "0"}).would_use("cold") == "none"
+    # an explicit unix DOCKER_HOST still wins
+    assert cf.probe(_host(UBUNTU), env={var: "1", "DOCKER_HOST": "unix:///var/run/docker.sock"}
+                    ).would_use("cold") == "apparmor"
