@@ -284,10 +284,16 @@ class SnapshotSlotRuntime:
         except OSError:
             return False
 
-    def is_alive(self, slot: Slot) -> bool:
-        """True iff the restored Firecracker process is still running."""
+    def is_alive(self, slot: Slot) -> "bool | None":
+        """True iff the restored Firecracker process is still running; None for a jailed slot
+        whose helper could not be asked (unknown, not dead)."""
         handle = self._get(slot.slot_id)
-        return handle is not None and self._proc_alive(handle)
+        if handle is None:
+            return False
+        alive = getattr(getattr(handle, "proc", None), "alive", None)
+        if callable(alive):
+            return alive()  # type: ignore[no-any-return]
+        return self._proc_alive(handle)
 
     def invalidate_base(self) -> None:
         """Drop the persisted warm snapshot so the next spawn rebuilds it.
@@ -462,7 +468,12 @@ class SnapshotSlotRuntime:
     def _proc_alive(handle: object) -> bool:
         proc = getattr(handle, "proc", None)
         # A fake/handle without a proc is treated as alive (tests inject this).
-        return proc is None or proc.poll() is None
+        if proc is None:
+            return True
+        try:
+            return proc.poll() is None
+        except Exception:  # noqa: BLE001 - a jailed proc whose helper could not be asked
+            return False     # not READY (is_ready); is_alive() reports it as UNKNOWN instead
 
 
 # ---------------------------------------------------------------------------

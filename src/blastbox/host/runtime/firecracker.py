@@ -1069,8 +1069,7 @@ class VsockHostWarmControl:
                 err = ConnectionError(f"jailed vsock connect failed: {exc}")
                 # The HELPER failing (down, overloaded, refusing us) is this host's problem, not
                 # evidence about the guest -- same attribution rule as EMFILE/ENOMEM below.
-                if getattr(exc, "code", "") in ("unreachable", "timeout", "refused", "internal",
-                                                 "protocol"):
+                if getattr(exc, "host_io", False):
                     err.host_io = True  # type: ignore[attr-defined]
                 raise err from exc
             s.settimeout(budget)
@@ -1207,12 +1206,13 @@ class _FCProcess:
     config_path: Path
     log_path: Path
 
-    def is_alive(self) -> bool:
-        try:
-            return self.proc.poll() is None
-        except Exception:  # noqa: BLE001 - a jailed proc whose helper is unreachable
-            # The helper being gone means systemd stopped it, which killed every jail with it.
-            return False
+    def is_alive(self) -> "bool | None":
+        alive = getattr(self.proc, "alive", None)
+        if callable(alive):
+            # JAILED: tri-state. A helper that cannot be asked is UNKNOWN, never "dead" -- the
+            # pool's unknown-grace handling owns that case (SlotRuntime.is_alive contract).
+            return alive()  # type: ignore[no-any-return]
+        return self.proc.poll() is None
 
     def kill(self) -> None:
         try:
@@ -1718,8 +1718,9 @@ class FirecrackerSlotRuntime:
             return not opened
         return file_identity(rootfs) != key
 
-    def is_alive(self, slot: Slot) -> bool:
-        """Return True iff the Firecracker subprocess is still running."""
+    def is_alive(self, slot: Slot) -> "bool | None":
+        """True iff the Firecracker process is still running (None: a jailed slot whose helper
+        could not be asked -- unknown, not dead)."""
         with self._lock:
             fc_proc = self._procs.get(slot.slot_id)
         if fc_proc is None:
@@ -1740,29 +1741,42 @@ class FirecrackerSlotRuntime:
         if callable(cleanup):
             cleanup(slot)
 
-        if fc_proc is not None:
-            gone = True
+        if fc_proc is not None and callable(getattr(fc_proc.proc, "destroy", None)):
+            self._reap_jailed(slot, fc_proc)
+        elif fc_proc is not None:
             if fc_proc.is_alive():
                 fc_proc.kill()
                 try:
                     fc_proc.proc.wait(timeout=5.0)
                 except subprocess.TimeoutExpired:
-                    gone = False
                     _log.warning(
                         "fc.reap_wait_timeout slot_id=%s", slot.slot_id
                     )
-            destroy = getattr(fc_proc.proc, "destroy", None)
-            if gone and callable(destroy):
-                try:
-                    destroy()
-                except Exception as exc:  # noqa: BLE001 - the helper reclaims it at our exit
-                    _log.warning("fc.jail_destroy_failed slot_id=%s: %s", slot.slot_id, exc)
 
         # Remove the entire scratch dir.
         slot_dir = self._scratch_root / slot.slot_id
         if slot_dir.exists():
             shutil.rmtree(slot_dir, ignore_errors=True)
             _log.debug("fc.reap_cleaned slot_id=%s", slot.slot_id)
+
+    def _reap_jailed(self, slot: Slot, fc_proc: "_FCProcess") -> None:
+        """Kill, confirm and destroy a jailed slot -- or RAISE with the handle put back.
+
+        An unconfirmed teardown (the helper could not be asked, or the VMM did not exit) must not
+        drop the only handle to a possibly-running jail: raising makes the pool quarantine the
+        slot and a later reap retries, the rule the snapshot tier already follows. The helper
+        also reclaims every jail of this process when it exits."""
+        proc: Any = fc_proc.proc
+        try:
+            proc.kill()
+            proc.wait(timeout=5.0)
+            proc.destroy()
+        except Exception as exc:  # noqa: BLE001 - re-raised as an unconfirmed teardown
+            with self._lock:
+                self._procs.setdefault(slot.slot_id, fc_proc)
+            _log.warning("fc.jail_reap_unconfirmed slot_id=%s: %s", slot.slot_id, exc)
+            raise FCError(f"could not confirm the jailed microVM for slot {slot.slot_id} is gone; "
+                          f"quarantining it rather than replacing it: {exc}") from exc
 
     # ------------------------------------------------------------------
     # Output-disk read (called by the dispatcher after the VM exits)

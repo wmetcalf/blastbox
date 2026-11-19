@@ -1001,6 +1001,14 @@ class FcSnapshotLauncher:
                              mem_mib=int(self._cfg.fc_mem_mib),
                              vcpus=int(self._cfg.fc_vcpu_count))
         except JailError as exc:
+            if exc.code == "unknown_gen":
+                # The helper no longer has this generation (it restarted, which kills every jail
+                # and forgets every generation). CERTAIN, not flaky: no later restore of it can
+                # work, so drop the base at once and rebuild instead of burning restore retries.
+                from blastbox.host.runtime.fc_snapshot import SnapshotStale
+
+                raise SnapshotStale(f"jail helper no longer has generation {jail_gen}; "
+                                    "rebuilding the base") from exc
             raise SnapshotError(f"jailed restore spawn failed: {exc}") from exc
         proc = JailedProcess(self._jail, jail_id)
         return _Handle(proc, proc.api_client(), str(Path(slot_workdir) / REL_VSOCK),

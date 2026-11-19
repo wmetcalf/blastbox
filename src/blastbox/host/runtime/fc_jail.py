@@ -53,6 +53,19 @@ JAIL_SNAPSHOT_PATH = "/warm.snapshot"
 JAIL_MEM_PATH = "/warm.mem"
 
 
+#: Error codes that say the HELPER (this host's control plane) failed, not the guest/VMM. A
+#: failure carrying one of these is host I/O for fault attribution: a helper outage hits every
+#: job at once and must never be charged to -- or burn out -- healthy workers.
+INFRA_CODES = frozenset({"unreachable", "timeout", "refused", "internal", "protocol", "busy"})
+
+#: Per-op client deadlines. Staging work in the helper (an asset copy, mkfs or a sparse copy of
+#: an output disk, a publish) is bounded by its own copy timeout (600 s): the client must wait
+#: longer than that, or a slow-but-successful spawn finishes after the client gave up. (The
+#: helper also undoes a spawn whose reply it could not deliver.)
+_SLOW_OPS = {"asset": 900.0, "spawn": 900.0, "publish": 900.0}
+_BUSY_RETRIES = 6
+
+
 class JailError(RuntimeError):
     """The helper refused a request or could not be reached."""
 
@@ -60,6 +73,8 @@ class JailError(RuntimeError):
         super().__init__(f"fc jail helper: {code}{': ' + detail if detail else ''}")
         self.code = code
         self.detail = detail
+        if code in INFRA_CODES:
+            self.host_io = True
 
 
 @dataclass(frozen=True)
@@ -100,10 +115,22 @@ class JailClient:
 
     # ------------------------------------------------------------------ transport
     def call(self, op: str, *, fds: "tuple[int, ...]" = (), **fields: Any) -> "tuple[dict[str, Any], list[int]]":
+        delay = 0.05
+        for attempt in range(_BUSY_RETRIES + 1):
+            try:
+                return self._call_once(op, fds=fds, **fields)
+            except JailError as exc:
+                if exc.code != "busy" or attempt == _BUSY_RETRIES:
+                    raise
+            time.sleep(delay)
+            delay = min(delay * 2, 1.0)
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def _call_once(self, op: str, *, fds: "tuple[int, ...]" = (), **fields: Any) -> "tuple[dict[str, Any], list[int]]":
         msg = encode({"op": op, **fields})
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         try:
-            sock.settimeout(self._timeout)
+            sock.settimeout(max(self._timeout, _SLOW_OPS.get(op, 0.0)))
             try:
                 sock.connect(self.socket_path)
             except OSError as exc:
@@ -126,7 +153,12 @@ class JailClient:
                 os.close(fd)
             raise JailError("refused", f"the helper closed the connection ({op}); is this uid "
                                        f"allowed (--allow-uid)?")
-        reply = decode(data)
+        try:
+            reply = decode(data)
+        except ValueError as exc:
+            for fd in got:
+                os.close(fd)
+            raise JailError("protocol", f"undecodable reply to {op}: {exc}") from exc
         if not isinstance(reply, dict) or not reply.get("ok"):
             for fd in got:
                 os.close(fd)
@@ -329,6 +361,15 @@ class JailedProcess:
 
     def connect_vsock(self) -> socket.socket:
         return self._client.connect(self.jail_id, "vsock")
+
+    def alive(self) -> "bool | None":
+        """Tri-state liveness for the pool: True, False = CONFIRMED gone, None = the helper could
+        not be asked (a control-plane failure is not a dead VM; the pool keeps the slot and asks
+        again within its unknown-grace bound)."""
+        try:
+            return self.poll() is None
+        except JailError:
+            return None
 
     def vsock_present(self) -> bool:
         try:

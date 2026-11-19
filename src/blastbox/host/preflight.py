@@ -794,6 +794,16 @@ def _check_firecracker(host: HostView) -> Check:
     return Check("firecracker", Status.PASS, f"{path}: v{shown}")
 
 
+def _fc_jailed(env: Mapping[str, str]) -> bool:
+    """Jailing on (the default) -- or a bad value, which fc-jailer reports as a FAIL."""
+    from blastbox.host.runtime.fc_jail import JailSettings  # noqa: PLC0415
+
+    try:
+        return JailSettings.from_env(dict(env)).enabled
+    except ValueError:
+        return True
+
+
 def _check_fc_jailer(host: HostView) -> Check:
     """The Firecracker jail helper: ON by default, and the FC tier fails closed without it."""
     from blastbox.host.runtime.fc_jail import ENV_JAILER, JailSettings, opt_out_hint  # noqa: PLC0415
@@ -1580,9 +1590,15 @@ def run_preflight(host: HostView, tiers: Sequence[str], *, explicit: bool = True
         if userns is not None:
             out.append(userns)
     if "firecracker" in t:
-        out.append(_check_kvm(host))
-        out.append(_check_firecracker(host))
-        out.append(_check_fc_jailer(host))
+        if _fc_jailed(host.env):
+            # JAILED (the default): the helper opens /dev/kvm and runs its own firecracker (it
+            # refuses to start without either, and fc-jailer reports its version), so a jailed
+            # dispatcher container legitimately has neither.
+            out.append(_check_fc_jailer(host))
+        else:
+            out.append(_check_kvm(host))
+            out.append(_check_firecracker(host))
+            out.append(_check_fc_jailer(host))
         out.append(_check_fc_guest(host))
     # Snapshot age matters only where warm bases are restored: gVisor always, FC with snapshots.
     if "gvisor" in t or ("firecracker" in t and _warm_snapshot(host.env)):

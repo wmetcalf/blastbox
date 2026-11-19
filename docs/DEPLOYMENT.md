@@ -155,7 +155,10 @@ Inner sandbox auto-selects `container` inside the worker image; runsc is require
 
 A **socket-less cold dispatcher** (break-glass / overflow) plus one **warm sidecar per warm
 backend**, each `BLASTBOX_DISPATCH_WARM_ONLY=1` so it claim-gates on free warm slots and never
-cold-falls-back. The FC sidecar needs only `/dev/kvm`; the gVisor-C/R sidecar needs a scoped
+cold-falls-back. The FC sidecar needs only the Firecracker jail helper's socket directory
+(`/run/blastbox-fc-jail`, bind-mounted; HOST-PREP.md "Firecracker jail helper" -- jailing is on by
+default and the tier refuses to start without the helper), or `/dev/kvm` when it runs unjailed
+(`BLASTBOX_FC_JAILER=off`); the gVisor-C/R sidecar needs a scoped
 cap set + `seccomp=unconfined` for `runsc` (confined to that single-purpose, socket-less box).
 See `deploy/docker/docker-compose.{firecracker,gvisor}.yml` for the exact services. Every
 sidecar **must** repeat `BLASTBOX_ENGINE_<NAME>_PARAM_KEYS` and its pool sizing

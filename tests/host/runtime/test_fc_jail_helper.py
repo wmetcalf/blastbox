@@ -656,3 +656,95 @@ def test_leftover_cleanup_touches_only_this_helpers_own_jails(env):
     deleted = [argv[3] for argv in env.ran if argv[1:3] == ["netns", "del"]]
     assert deleted == [f"bbfcj-{JID}"]
     assert not (env.cfg.chroot_base / h.exec_name(JID)).exists()
+
+
+def _open_fds() -> int:
+    return len(os.listdir("/proc/self/fd"))
+
+
+def test_spawn_and_destroy_leak_no_descriptors(env):
+    jail, _ = env.boot(listener=False)            # warm-up: asset copies, threads
+    env.kill(jail)
+    env.helper.op_destroy(env.owner, {"op": "destroy", "jail": JID}, [])
+    before = _open_fds()
+    for _ in range(3):
+        jail, _ = env.boot(listener=False)
+        env.helper._wait_api(jail)                # the readiness probe must close its O_PATH fd
+        env.kill(jail)
+        env.helper.op_destroy(env.owner, {"op": "destroy", "jail": JID}, [])
+    assert _open_fds() <= before
+
+
+def test_the_monitor_retries_a_dead_owners_failed_teardown(env):
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    owner = env.helper.owner_for(child.pid, os.pidfd_open(child.pid))
+    jail, _ = env.boot(owner=owner, listener=False)
+    real = env.helper._destroy
+    calls = {"n": 0}
+
+    def flaky(j):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise h.HelperError("cleanup_failed", "transient")
+        real(j)
+    env.helper._destroy = flaky
+    child.kill()
+    child.wait(5)
+    env.helper.monitor_once()        # reaps the owner (the first destroy fails), then retries
+    assert calls["n"] == 2
+    assert JID not in env.helper._jails and not jail.top.exists()
+
+
+def test_a_reaped_owner_cannot_register_a_jail_after_the_fact(env):
+    env.owner.dead = True
+    with pytest.raises(h.HelperError, match="unknown_jail"):
+        env.boot(listener=False)
+    assert JID not in env.helper._jails
+
+
+def test_uid_exhaustion_leaks_no_asset_references(env):
+    class _Empty:
+        def take(self):
+            raise h.HelperError("exhausted", "uid range")
+
+        def give(self, uid):
+            pass
+    env.helper._uids = _Empty()
+    with pytest.raises(h.HelperError, match="exhausted"):
+        env.boot(listener=False)
+    assert all(a.refs == 0 for a in env.helper._assets.values())
+
+
+def test_a_spawn_whose_reply_is_lost_is_undone(env):
+    """The client timed out (or died) mid-spawn: nobody would ever destroy that jail."""
+    k = env.asset("kernel", b"K")
+    r = env.asset("rootfs", b"R" * 64)
+    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    a.send(h.encode({"op": "spawn", "jail": JID, "mode": "boot", "kernel": k, "rootfs": r,
+                     "gen": None, "outdisk_mib": 16, "mem_mib": 64, "vcpus": 1,
+                     "ready_listener": False}))
+    real_spawn = env.helper.op_spawn
+
+    def spawn_then_client_leaves(owner, req, fds):
+        out = real_spawn(owner, req, fds)
+        a.close()
+        return out
+    env.helper.op_spawn = spawn_then_client_leaves
+    env.helper.serve_conn(b)
+    assert JID not in env.helper._jails
+
+
+def test_an_overloaded_helper_says_busy_and_the_client_retries(tmp_path, monkeypatch):
+    from blastbox.host.runtime import fc_jail
+
+    client = fc_jail.JailClient(str(tmp_path / "x.sock"))
+    answers = [fc_jail.JailError("busy", "overloaded")] * 2 + [({"ok": True, "v": 1}, [])]
+    monkeypatch.setattr(fc_jail.time, "sleep", lambda s: None)
+
+    def once(op, **kw):
+        a = answers.pop(0)
+        if isinstance(a, Exception):
+            raise a
+        return a
+    monkeypatch.setattr(client, "_call_once", once)
+    assert client.call("hello")[0]["v"] == 1

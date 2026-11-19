@@ -506,6 +506,8 @@ class Jail:
     listener_path: "Path | None" = None
     sealed: bool = False
     destroyed: bool = False
+    #: Its spawn failed and cleanup did not complete: the monitor retries it.
+    orphaned: bool = False
     log: "deque[bytes]" = field(default_factory=lambda: deque(maxlen=64))
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -581,6 +583,8 @@ class Helper:
             _check_root_owned_exec(label, path)
         if self.apparmor:
             _check_root_owned_exec("apparmor_parser", self.cfg.apparmor_parser)
+        if not Path("/dev/kvm").exists():
+            raise RuntimeError("/dev/kvm is missing: no hardware virtualisation on this host")
         self.fc_version = _version(self._run, self.cfg.firecracker)
         base = self.cfg.chroot_base
         base.mkdir(parents=True, exist_ok=True)
@@ -700,6 +704,14 @@ class Helper:
         for jail in jails:
             if jail.proc is not None:
                 jail.proc.poll()          # reap the zombie promptly
+            # RETRY teardown nobody else can ask for: a dead owner's jail (its owner record is
+            # gone, so no client can destroy it) or a failed spawn's (the client got an error and
+            # never learned it exists). Without this a single failed destroy strands its uid, its
+            # disk and its generation reference for the life of the helper.
+            if not jail.destroyed and (jail.owner.dead or jail.orphaned):
+                with contextlib.suppress(Exception):
+                    if self._kill_and_wait(jail, timeout=1.0):
+                        self._destroy(jail)
 
     # ------------------------------------------------------------------ dispatch
     def handle(self, owner: Owner, req: "dict[str, Any]", fds: "list[int]") -> "tuple[dict[str, Any], list[int]]":
@@ -798,6 +810,10 @@ class Helper:
         mode = req["mode"]
         cfg = self.cfg
         with self._lock:
+            if owner.dead:
+                # Reaped while this request was in flight: a jail registered now would belong to
+                # an owner nothing watches any more.
+                raise HelperError("unknown_jail", jail_id)
             if jail_id in self._jails:
                 raise HelperError("exists", jail_id)
             if len(self._jails) >= cfg.max_jails:
@@ -823,9 +839,11 @@ class Helper:
                     raise HelperError("unknown_gen", req["gen"])
                 assets.append(gen.rootfs)
                 mem_mib = max(req["mem_mib"], (gen.mem_bytes + (1 << 20) - 1) >> 20)
+            # The uid FIRST: exhaustion raises, and must not leave the reference counts below
+            # incremented with no jail to ever release them.
+            uid = self._uids.take()
             for aid in assets:
                 self._assets[aid].refs += 1
-            uid = self._uids.take()
             name = exec_name(jail_id)
             top = cfg.chroot_base / name
             jail = Jail(
@@ -842,6 +860,7 @@ class Helper:
             listener_fd = self._start(jail, req, gen)
         except BaseException:
             # _start only returns the listener on success; on failure it closed it itself.
+            jail.orphaned = True
             with contextlib.suppress(Exception):
                 self._kill_and_wait(jail, timeout=5.0)
             with contextlib.suppress(Exception):
@@ -975,7 +994,9 @@ class Helper:
             if jail.exited():
                 raise HelperError("spawn_failed", f"jailer/firecracker exited: {_tail(jail)}")
             with contextlib.suppress(OSError):
-                if self._jail_socket(jail, JAIL_API_SOCK) is not None:
+                pfd = self._jail_socket(jail, JAIL_API_SOCK)
+                if pfd is not None:
+                    os.close(pfd)
                     return
             time.sleep(0.005)
         raise HelperError("spawn_failed", f"API socket did not appear: {_tail(jail)}")
@@ -1309,7 +1330,12 @@ class Helper:
                 except TimeoutError:
                     continue
                 if not slots.acquire(blocking=False):
-                    conn.close()          # overloaded: the client retries
+                    # Overloaded: SAY so (the client retries "busy"); a silent close is
+                    # indistinguishable from a refused uid.
+                    with contextlib.suppress(OSError):
+                        conn.settimeout(1.0)
+                        conn.send(encode({"ok": False, "error": "busy", "detail": "overloaded"}))
+                    conn.close()
                     continue
 
                 def _run(c: socket.socket = conn) -> None:
@@ -1357,7 +1383,14 @@ class Helper:
             except Exception as exc:  # noqa: BLE001 - reported, never crashes the helper
                 _log.exception("fc_jail.op_failed op=%s", req.get("op"))
                 reply = {"ok": False, "error": "internal", "detail": type(exc).__name__}
-            self._reply(conn, reply, out_fds)
+            try:
+                self._reply(conn, reply, out_fds)
+            except OSError:
+                if req.get("op") == "spawn" and reply.get("ok"):
+                    # The client gave up (timed out, died) before learning the jail exists, so
+                    # nothing would ever destroy it: undo the spawn here.
+                    self._abandon(owner, req["jail"])
+                raise
         except (OSError, ValueError) as exc:
             _log.warning("fc_jail.conn_error: %s", exc)
         finally:
@@ -1365,6 +1398,17 @@ class Helper:
                 with contextlib.suppress(OSError):
                     os.close(fd)
             conn.close()
+
+    def _abandon(self, owner: Owner, jail_id: str) -> None:
+        with self._lock:
+            jail = self._jails.get(jail_id)
+        if jail is None or jail.owner is not owner:
+            return
+        _log.warning("fc_jail.spawn_reply_lost jail=%s: undoing the spawn", jail_id)
+        jail.orphaned = True          # the monitor retries if this attempt does not finish
+        with contextlib.suppress(Exception):
+            if self._kill_and_wait(jail, timeout=5.0):
+                self._destroy(jail)
 
     @staticmethod
     def _reply(conn: socket.socket, msg: "dict[str, Any]", fds: "list[int]") -> None:
@@ -1588,8 +1632,9 @@ def main(argv: "list[str] | None" = None) -> int:
     helper.prepare_host()
 
     def _term(signum: int, frame: object) -> None:
-        helper.shutdown()
-        raise SystemExit(0)
+        # Only ask the loop to stop: the teardown runs ONCE, in the finally below, not inside a
+        # signal handler that a second signal could interrupt half way.
+        helper._stop.set()
 
     signal.signal(signal.SIGTERM, _term)
     signal.signal(signal.SIGINT, _term)

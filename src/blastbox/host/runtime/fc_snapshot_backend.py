@@ -197,7 +197,11 @@ class FcSnapshotBackend:
         if handle is None:
             return False
         proc = getattr(handle, "proc", None)
-        if proc is not None and proc.poll() is not None:
+        try:
+            exited = proc is not None and proc.poll() is not None
+        except Exception:  # noqa: BLE001 - a jailed proc whose helper could not be asked
+            exited = False     # unknown: keep holding the pin and ask again next tick
+        if exited:
             self._unreaped.pop(str(workdir), None)
             destroy = getattr(handle, "_destroy_jail", None)
             if callable(destroy):

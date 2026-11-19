@@ -545,3 +545,135 @@ def test_a_jailed_vsock_connect_failure_is_attributed(tmp_path, code, host_io):
     with pytest.raises(ConnectionError) as exc:
         ctl._connect()
     assert bool(getattr(exc.value, "host_io", False)) is host_io
+
+
+# --------------------------------------------------------------------------- helper outages
+class _DownJail(_FakeJail):
+    """The helper stops answering status/signal (overloaded, restarting)."""
+
+    down = False
+
+    def status(self, jail_id):
+        if self.down:
+            raise JailError("timeout", "status")
+        return super().status(jail_id)
+
+    def signal(self, jail_id, sig):
+        if self.down:
+            raise JailError("unreachable", "signal")
+        return super().signal(jail_id, sig)
+
+
+def test_a_helper_outage_is_unknown_liveness_not_death(tmp_path):
+    jail = _DownJail(tmp_path)
+    rt = _cold(tmp_path, jail)
+    slot = rt.spawn()
+    assert rt.is_alive(slot) is True
+    jail.down = True
+    assert rt.is_alive(slot) is None               # UNKNOWN: the pool keeps it and asks again
+
+
+def test_an_unconfirmed_jailed_reap_quarantines_and_keeps_the_handle(tmp_path):
+    from blastbox.host.runtime.firecracker import FCError
+
+    jail = _DownJail(tmp_path)
+    rt = _cold(tmp_path, jail)
+    slot = rt.spawn()
+    jail.down = True
+    with pytest.raises(FCError, match="quarantining"):
+        rt.reap(slot)
+    assert slot.slot_id in rt._procs               # a later reap can retry
+    jail.down = False
+    rt.reap(slot)
+    assert slot.slot_id not in rt._procs and jail.alive == {}
+
+
+def test_a_snapshot_slot_with_an_unreachable_helper_is_unknown(tmp_path):
+    from blastbox.host.runtime.fc_snapshot_backend import FcSnapshotArtifact, FcSnapshotBackend
+    from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
+    from blastbox.host.pool import Slot, SlotState
+
+    jail = _DownJail(tmp_path)
+    launcher, _ = _launcher(tmp_path, jail)
+    handle = FcSnapshotBackend(tmp_path / "base", launcher).restore_in(
+        tmp_path / "slots" / "s9",
+        FcSnapshotArtifact(Path("/h/s"), Path("/h/m"), Path("/h/o"), jail_gen="g" + "f" * 32))
+    rt = SnapshotSlotRuntime.__new__(SnapshotSlotRuntime)
+    rt._lock = threading.Lock()
+    rt._handles = {"s9": handle}
+    rt._restored_at = {}
+    rt._settle_s = 0.0
+    slot = Slot(slot_id="s9", control_dir=tmp_path, input_dir=tmp_path,
+                output_dir=tmp_path / "slots" / "s9" / "out", state=SlotState.IDLE)
+    assert rt.is_alive(slot) is True
+    jail.down = True
+    assert rt.is_alive(slot) is None
+    assert rt.is_ready(slot) is False
+
+
+def test_a_helper_failure_reading_output_is_host_io(tmp_path):
+    jail = _FakeJail(tmp_path)
+    jail.alive[JID] = True
+
+    def down(jail_id):
+        raise JailError("timeout", "outdisk")
+    jail.outdisk = down
+    with pytest.raises(JailError) as exc:
+        JailedProcess(jail, JID).copy_outdisk(tmp_path / "o.ext4")
+    assert getattr(exc.value, "host_io", False) is True
+    assert not getattr(JailError("unknown_jail", "x"), "host_io", False)
+
+
+def test_an_undecodable_reply_closes_its_descriptors_and_is_a_jail_error(tmp_path):
+    path = tmp_path / "h.sock"
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    srv.bind(str(path))
+    srv.listen(1)
+    r, w = os.pipe()
+
+    def serve():
+        c, _ = srv.accept()
+        c.recv(65536)
+        socket.send_fds(c, [b"{not json"], [r])
+        c.close()
+    t = threading.Thread(target=serve)
+    t.start()
+    before = len(os.listdir("/proc/self/fd"))
+    with pytest.raises(JailError) as exc:
+        JailClient(str(path)).call("hello")
+    t.join()
+    os.close(r)
+    os.close(w)
+    srv.close()
+    assert exc.value.code == "protocol" and exc.value.host_io
+    assert len(os.listdir("/proc/self/fd")) <= before - 2      # r, w closed; nothing received kept
+
+
+def test_a_generation_the_helper_forgot_is_stale_not_flaky(tmp_path):
+    from blastbox.host.runtime.fc_snapshot import SnapshotStale
+    from blastbox.host.runtime.fc_snapshot_backend import FcSnapshotArtifact, FcSnapshotBackend
+
+    jail = _FakeJail(tmp_path)
+
+    def gone(jail_id, **kw):
+        raise JailError("unknown_gen", kw.get("gen"))
+    jail.spawn = gone
+    launcher, _ = _launcher(tmp_path, jail)
+    with pytest.raises(SnapshotStale):
+        FcSnapshotBackend(tmp_path / "base", launcher).restore_in(
+            tmp_path / "slots" / "s7",
+            FcSnapshotArtifact(Path("/h/s"), Path("/h/m"), Path("/h/o"), jail_gen="g" + "1" * 32))
+
+
+def test_restore_reclaimed_tolerates_an_unreachable_helper(tmp_path):
+    from blastbox.host.runtime.fc_snapshot_backend import FcSnapshotBackend
+
+    jail = _DownJail(tmp_path)
+    jail.alive[JID] = True
+    jail.down = True
+    backend = FcSnapshotBackend(tmp_path / "base", None)
+
+    class _H:
+        proc = JailedProcess(jail, JID)
+    backend._unreaped[str(tmp_path / "w")] = _H()
+    assert backend.restore_reclaimed(str(tmp_path / "w")) is False
