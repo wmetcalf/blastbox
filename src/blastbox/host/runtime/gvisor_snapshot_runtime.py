@@ -406,6 +406,15 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
     # from runsc after the readiness wait; refuse it here, by name, instead.
     if gcfg.userns_host_base is not None:
         from blastbox.host.runtime.gvisor_snapshot import USERNS_ENV, userns_rootfs_problem
+        # user.max_user_namespaces=0 binds root too: runsc could never create the namespace.
+        if _user_namespaces_disabled():
+            msg = (f"gVisor C/R warm tier refused: {USERNS_ENV} is set but "
+                   "user.max_user_namespaces=0, so runsc cannot create the sandbox's user "
+                   "namespace")
+            if require_available:
+                raise GvisorUnavailable(msg)
+            _log.error("select_gvisor_snapshot_runtime: %s", msg)
+            return None
         # No supplementary groups: the backend starts runsc with none (_sandbox_spawn_kw).
         ok, why = userns_rootfs_problem(str(gcfg.image_rootfs), gcfg.userns_host_base)
         if ok is False:
@@ -492,6 +501,14 @@ def _int_env(env, key: str, default: int) -> int:
     except ValueError:
         _log.warning("invalid %s=%r; using %d", key, raw, default)
         return default
+
+
+def _user_namespaces_disabled() -> bool:
+    try:
+        with open("/proc/sys/user/max_user_namespaces", encoding="ascii") as fh:
+            return fh.read(64).strip() == "0"
+    except OSError:
+        return False
 
 
 def _userns_host_base(env) -> "tuple[int | None, str]":

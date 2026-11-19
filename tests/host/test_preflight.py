@@ -1395,7 +1395,7 @@ def test_gvisor_userns_subuid_reservation_warns(subuid, why):
     host = _healthy(env=_UNS, files={**_SUBIDS, "/etc/subuid": subuid})
     c = _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-userns"]
     assert c.status is Status.WARN and "/etc/subuid" in c.detail and why in c.detail
-    assert "/etc/subgid" not in c.detail
+    assert "/etc/subgid:" not in c.detail and "/etc/subgid reserves no" not in c.detail
 
 
 def test_gvisor_userns_unreadable_subgid_warns():
@@ -1480,3 +1480,20 @@ def test_gvisor_userns_foreign_pool_partly_inside_the_range_is_a_collision():
     host = _healthy(env=_UNS, files={**_SUBIDS, "/etc/subuid": "dockremap:2030000:65536\n"})
     c = _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-userns"]
     assert c.status is Status.WARN and "shared with another" in c.detail and "dockremap" in c.detail
+
+
+def test_gvisor_userns_fails_when_the_host_disables_user_namespaces():
+    host = _healthy(env=_UNS, files={**_SUBIDS, "/proc/sys/user/max_user_namespaces": "0\n"})
+    c = _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-userns"]
+    assert c.status is Status.FAIL and "max_user_namespaces=0" in c.detail
+
+
+def test_gvisor_userns_pass_names_the_reserving_owner():
+    c = _by_name(pf.run_preflight(_healthy(env=_UNS, files=_SUBIDS), ["gvisor"]))["gvisor-userns"]
+    assert c.status is Status.PASS and "reserved for blastbox " in c.detail
+
+
+def test_gvisor_userns_subuid_and_subgid_held_by_different_owners_warns():
+    files = {**_SUBIDS, "/etc/subgid": "alice:2000000:65536\n"}
+    c = _by_name(pf.run_preflight(_healthy(env=_UNS, files=files), ["gvisor"]))["gvisor-userns"]
+    assert c.status is Status.WARN and "alice" in c.detail and "blastbox" in c.detail

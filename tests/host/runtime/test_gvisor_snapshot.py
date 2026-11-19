@@ -2058,10 +2058,24 @@ def test_userns_rootfs_walk_follows_a_chain_and_resolves_relative_links_from_the
     assert ok is False and "/home/coz " in why
 
 
-def test_userns_rootfs_symlink_loop_is_unknown_not_reachable():
+def test_userns_rootfs_symlink_loop_is_refused_not_reachable():
     from blastbox.host.runtime.gvisor_snapshot import userns_rootfs_problem
 
     loop = {"/srv/a": "/srv/b", "/srv/b": "/srv/a"}
     ok, why = userns_rootfs_problem("/srv/a/r", 2_000_000, stat=lambda p: (0o40755, 0, 0, False),
                                     readlink=loop.get, realpath=lambda p: p)
-    assert ok is None and "ELOOP" in why
+    assert ok is False and "ELOOP" in why
+
+
+def test_userns_tier_refused_when_the_host_disables_user_namespaces(tmp_path, monkeypatch):
+    from blastbox.host.runtime import gvisor_snapshot as gs
+    from blastbox.host.runtime import gvisor_snapshot_runtime as gr
+
+    monkeypatch.setattr(gs.GvisorSnapshotBackend, "available", lambda self: True)
+    monkeypatch.setattr(gr, "_user_namespaces_disabled", lambda: True)
+    (tmp_path / "r").mkdir()
+    cfg = gr._gvisor_config_from_env({"BLASTBOX_GVISOR_ROOTFS": str(tmp_path / "r"),
+                                      "BLASTBOX_GVISOR_RUNSC": "/bin/true",
+                                      "BLASTBOX_GVISOR_USERNS_HOST_BASE": "2000000"})
+    with pytest.raises(gr.GvisorUnavailable, match="max_user_namespaces=0"):
+        gr.select_gvisor_snapshot_runtime(cfg=cfg, require_available=True)

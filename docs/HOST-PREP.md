@@ -195,6 +195,8 @@ blastbox preflight --tier gvisor
 - `BASE` must be `>= 65536` (the range never holds host root or ordinary users) and the range must
   end below `4294967295`. A value the runtime cannot use makes the tier **refuse to start** (it never
   falls back to a sandbox running as real host root); preflight's `gvisor-userns` FAILs it too.
+- `user.max_user_namespaces` must not be `0`: that limit binds root too, so runsc could not create
+  the namespace. The tier refuses to start, and preflight's `gvisor-userns` FAILs.
 - runsc must be **release-20241108 or newer** (gofer opens volumes from the initial user namespace):
   older builds fail every boot binding the 0700 per-slot dirs. Preflight WARNs on an older version.
 - The rootfs reachability is checked twice, read-only: by preflight (`gvisor-userns` FAIL; WARN
@@ -202,7 +204,7 @@ blastbox preflight --tier gvisor
   directory named instead of failing the first boot after the readiness wait. runsc binds the
   path **as configured**, so a symlink left at an old path (e.g. under a 0750 home) still needs
   its own directories searchable; the check walks the path as the kernel does, through every symlink hop
-  (a symlink loop is a WARN). The path must be absolute: runsc resolves a relative one against its
+  (a symlink loop is refused: the kernel cannot resolve it either). The path must be absolute: runsc resolves a relative one against its
   per-build bundle directory, so the tier refuses it.
 - **No supplementary groups.** runsc denies `setgroups` in the namespace, so its Sentry and gofer
   would keep runsc's own supplementary groups (the dispatcher's: gid 0 via sudo, `docker`,
@@ -218,7 +220,8 @@ blastbox preflight --tier gvisor
 - Preflight `gvisor-userns` WARNs when `/etc/subuid` or `/etc/subgid` reserves no entry holding the
   whole range (one owner's split lines count together), when a second owner also allocates ids in
   it, or when the only owner holding it is a container runtime's pool (`root`, `containers`,
-  `dockremap`, `lxd`, `incus`; e.g. Incus's `root:1000000:1000000000`).
+  `dockremap`, `lxd`, `incus`; e.g. Incus's `root:1000000:1000000000`), or when `/etc/subuid` and
+  `/etc/subgid` reserve it for different accounts. A PASS names the owner it counted.
 - After the next base boot, `runsc-host-root` should PASS for the warm tier's processes (their
   `uid_map` is `0 BASE 65536`, not the identity map).
 

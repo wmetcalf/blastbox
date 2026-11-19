@@ -587,6 +587,11 @@ def _check_gvisor_userns(host: HostView) -> Check | None:
     ids = f"{base}..{base + USERNS_SIZE - 1}"
     span = f"guest 0..{USERNS_SIZE - 1} -> host {ids}"
     rootfs = host.env.get("BLASTBOX_GVISOR_ROOTFS", "/var/lib/blastbox/gvisor-rootfs")
+    if _sysctl(host, "/proc/sys/user/max_user_namespaces") == "0":
+        # The limit applies to uid 0 too (user_namespaces(7)): rootful runsc cannot create it.
+        return Check("gvisor-userns", Status.FAIL,
+                     "user.max_user_namespaces=0: runsc cannot create the sandbox's user "
+                     "namespace (the limit binds root too); the warm tier refuses to start", doc)
     ok, why = userns_rootfs_problem(rootfs, base, stat=host.stat_path, realpath=host.realpath,
                                     readlink=host.readlink)
     if ok is False:
@@ -606,12 +611,14 @@ def _check_gvisor_userns(host: HostView) -> Check | None:
     if ok is None:
         warnings.append(f"cannot verify rootfs {rootfs} is reachable by host uid {base} ({why}; "
                         "run preflight as root)")
+    holders: dict[str, list[str]] = {}
     for path in ("/etc/subuid", "/etc/subgid"):
         text = host.read(path)
         if text is None:
             warnings.append(f"{path} unreadable")
             continue
         cover, overlap = _subid_cover(text, base, USERNS_SIZE)
+        holders[path] = cover
         if len(cover) > 1 or (cover and overlap):
             # Two owners of the range: another user/daemon allocates these ids too.
             overlap = [*cover, *overlap]
@@ -630,10 +637,13 @@ def _check_gvisor_userns(host: HostView) -> Check | None:
             warnings.append(f"{path} reserves no range holding {ids} (rootful "
                             "runsc maps it anyway, but useradd/podman/a remapped dockerd may hand "
                             "the same ids out)")
+    uid_owner, gid_owner = holders.get("/etc/subuid", []), holders.get("/etc/subgid", [])
+    if len(uid_owner) == 1 and len(gid_owner) == 1 and uid_owner != gid_owner:
+        warnings.append(f"/etc/subuid reserves {ids} for {uid_owner[0]} but /etc/subgid for "
+                        f"{gid_owner[0]}: one of them is another account's ids")
     if warnings:
         return Check("gvisor-userns", Status.WARN, f"{span}; " + "; ".join(warnings), doc)
-    owners = sorted({o for text in (host.read("/etc/subuid"), host.read("/etc/subgid"))
-                     for o in _subid_cover(text, base, USERNS_SIZE)[0]})
+    owners = sorted({*uid_owner, *gid_owner})
     return Check("gvisor-userns", Status.PASS,
                  f"{span}, reserved for {', '.join(owners)} in /etc/subuid + /etc/subgid "
                  f"(make sure that owner is blastbox's), rootfs {rootfs} reachable")
@@ -883,7 +893,9 @@ def _check_userns(host: HostView, tiers: Collection[str] = ("docker",)) -> Check
         return Check("userns", Status.WARN,
                      f"{shown}; {'; '.join(needs)} needs the scoped deploy/apparmor profiles "
                      f"({state})", doc)
-    note = " (fine: rootful runsc and firecracker do not use host user namespaces)" \
+    note = (" (fine: rootful runsc and firecracker do not use host user namespaces"
+            + ("; BLASTBOX_GVISOR_USERNS_HOST_BASE does, as root: see gvisor-userns)"
+               if host.env.get("BLASTBOX_GVISOR_USERNS_HOST_BASE", "").strip() else ")")) \
         if restrict == "1" else ""
     return Check("userns", Status.PASS, shown + note)
 

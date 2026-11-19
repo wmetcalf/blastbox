@@ -500,7 +500,9 @@ def userns_rootfs_problem(rootfs: str, base: int, *,
     resolved = realpath(rootfs)
     chain = _walked_dirs(rootfs, readlink)
     if chain is None:
-        return None, f"rootfs {rootfs} has more than {_MAX_LINK_HOPS} symlink hops (ELOOP)"
+        # The kernel fails this walk with ELOOP: nothing (root or not) can bind it.
+        return False, (f"rootfs {rootfs} has more than {_MAX_LINK_HOPS} symlink hops (ELOOP); "
+                       "runsc cannot bind it")
     unknown = ""
     for path in chain:
         st = stat(path)
