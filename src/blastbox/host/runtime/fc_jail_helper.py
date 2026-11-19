@@ -1946,22 +1946,49 @@ def _version(run: "Callable[..., Any]", fc: str) -> str:
 
 
 def _check_root_owned_exec(label: str, path: str) -> None:
-    """The helper exec()s these as root: they and every directory above them must be root-owned
-    and not group/other-writable, or whoever can write them owns the host."""
+    """The helper exec()s these as root: every directory and symlink its resolution passes
+    through must be root-owned and (directories) not group/other-writable, or whoever can write
+    one of them can swap what root executes."""
     p = Path(path)
     if not p.is_absolute():
         raise RuntimeError(f"{label} path must be absolute: {path!r}")
     st = os.stat(p)
     if not stat.S_ISREG(st.st_mode) or not st.st_mode & 0o100:
         raise RuntimeError(f"{label} {path} is not an executable file")
-    # BOTH the configured path (and its links' own directories) and the file it resolves to:
-    # a symlink to a root-owned binary under a user-writable directory would otherwise pass,
-    # and that user could swap the target the helper then executes as root.
-    real = Path(os.path.realpath(p))
-    for node in {p, *p.parents, real, *real.parents}:
-        nst = os.lstat(node) if node.is_symlink() else os.stat(node)
+    for node in _resolution_nodes(path):
+        nst = os.lstat(node)
         if nst.st_uid != 0 or (not stat.S_ISLNK(nst.st_mode) and nst.st_mode & 0o022):
             raise RuntimeError(f"{label}: {node} must be root-owned and not group/other-writable")
+
+
+def _resolution_nodes(path: str) -> "list[str]":
+    """Every directory, symlink and final file that resolving ``path`` touches -- INCLUDING the
+    directories holding intermediate links of a chain (``p -> D/current -> /opt/fc/bin``), which
+    neither the configured path's ancestors nor the final target's ancestors cover."""
+    seen: list[str] = ["/"]
+    pending = [c for c in path.split("/") if c]
+    cur = "/"
+    hops = 0
+    while pending:
+        comp = pending.pop(0)
+        if comp == ".":
+            continue
+        if comp == "..":
+            cur = os.path.dirname(cur.rstrip("/")) or "/"
+            continue
+        nxt = os.path.join(cur, comp)
+        seen.append(nxt)
+        if os.path.islink(nxt):
+            hops += 1
+            if hops > 40:
+                raise RuntimeError(f"{path}: too many levels of symbolic links")
+            target = os.readlink(nxt)
+            pending = [c for c in target.split("/") if c] + pending
+            if target.startswith("/"):
+                cur = "/"
+            continue
+        cur = nxt
+    return seen
 
 
 def _check_root_dir(path: Path) -> None:

@@ -146,15 +146,28 @@ class JailClient:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         try:
             limit = max(self._timeout, _SLOW_OPS.get(op, 0.0))
-            sock.settimeout(limit if budget is None else max(0.001, min(limit, budget)))
+            end = time.monotonic() + (limit if budget is None else min(limit, budget))
+
+            def _arm() -> None:
+                # A socket timeout applies to EACH operation: re-arm with what is LEFT, so the
+                # budget bounds connect + send + receive together.
+                left = end - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError
+                sock.settimeout(left)
+            _arm()
             try:
                 sock.connect(self.socket_path)
+            except TimeoutError:
+                raise
             except OSError as exc:
                 raise JailError("unreachable", f"{self.socket_path}: {exc.strerror or exc}") from exc
+            _arm()
             if fds:
                 socket.send_fds(sock, [msg], list(fds))
             else:
                 sock.send(msg)
+            _arm()
             data, got, flags, _ = socket.recv_fds(sock, MAX_MSG + 1, 4)
         except TimeoutError as exc:
             raise JailError("timeout", op) from exc

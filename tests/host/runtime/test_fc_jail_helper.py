@@ -1046,29 +1046,38 @@ def test_ordinary_traffic_does_not_replace_a_healthy_sink():
         sink.close()
 
 
-def test_an_executable_symlinked_into_a_writable_directory_is_refused(tmp_path, monkeypatch):
-    """A root-owned target under a user-writable directory: the user swaps it, root runs it."""
-    wdir = tmp_path / "w"
-    wdir.mkdir()
-    (wdir / "fc").write_text("#!/bin/sh\n")
-    (wdir / "fc").chmod(0o755)
+def test_every_link_in_an_executables_resolution_chain_is_checked(tmp_path, monkeypatch):
+    """p -> D/current -> real: the directory D holding the INTERMEDIATE link must be checked
+    too (a user who can write D repoints 'current' at their own binary)."""
+    good = tmp_path / "opt"
+    good.mkdir()
+    (good / "fc").write_text("#!/bin/sh\n")
+    (good / "fc").chmod(0o755)
+    d = tmp_path / "builder"
+    d.mkdir()
+    (d / "current").symlink_to(good / "fc")
     link = tmp_path / "link"
-    link.symlink_to(wdir / "fc")
-    real_stat, real_lstat = os.stat, os.lstat
+    link.symlink_to(d / "current")
+    real_lstat = os.lstat
+    d_ident = (real_lstat(d).st_dev, real_lstat(d).st_ino)
 
-    def as_root(st):
+    def faked(p, *a, **k):              # everything root-owned and 0755, except D (writable)
+        st = real_lstat(p, *a, **k)
         vals = list(st)
-        vals[4] = 0                                     # st_uid
+        vals[4] = 0
+        mode = st.st_mode & ~0o022
+        if (st.st_dev, st.st_ino) == d_ident:
+            mode |= 0o002
+        vals[0] = mode
         return os.stat_result(vals)
-    monkeypatch.setattr(h.os, "stat", lambda p, *a, **k: as_root(real_stat(p, *a, **k)))
-    monkeypatch.setattr(h.os, "lstat", lambda p, *a, **k: as_root(real_lstat(p, *a, **k)))
-    wdir.chmod(0o777)
-    try:
-        with pytest.raises(RuntimeError, match="not group/other-writable"):
-            h._check_root_owned_exec("firecracker", str(link))
-    finally:
-        wdir.chmod(0o755)
-
+    monkeypatch.setattr(h.os, "lstat", faked)
+    with pytest.raises(RuntimeError, match="builder"):
+        h._check_root_owned_exec("firecracker", str(link))
+    # ...and the same chain with D not writable passes.
+    monkeypatch.setattr(h.os, "lstat", lambda p, *a, **k: os.stat_result(
+        [real_lstat(p, *a, **k).st_mode & ~0o022, *list(real_lstat(p, *a, **k))[1:4], 0,
+         *list(real_lstat(p, *a, **k))[5:]]))
+    h._check_root_owned_exec("firecracker", str(link))
 
 def test_a_generation_whose_files_cannot_be_removed_stays_tracked(env, monkeypatch):
     base, _ = env.boot(listener=False)
