@@ -823,3 +823,40 @@ def test_dispatcher_honours_env_require_over_a_passed_auto_detection(tmp_path, m
                    engines={"e": EngineSpec(name="e", image="i", worker_argv=["w"])},
                    limits=_limits(), job_root=tmp_path, runtime_selector=_fake_runtime,
                    attest_key=None, confinement=det)
+
+
+def test_dangling_docker_config_symlink_is_no_config():
+    path = f"{_CFG}/config.json"
+    host = FakeHost(files=UBUNTU, paths={path}, links={path: "/nonexistent/config.json"})
+    assert cf.probe(host, env={"DOCKER_CONFIG": _CFG}).cold_blocker is None
+
+
+def test_blank_home_is_used_verbatim_like_the_cli():
+    host = _host({**UBUNTU, "  /.docker/config.json": '{"currentContext": "remote"}'})
+    assert cf.probe(host, env={"HOME": "  "}).would_use("cold") == "none"
+
+
+def test_cold_only_refusal_omits_the_caller_context_blockers():
+    st = cf.probe(_host(CONTAINER_UNDER_DOCKER_DEFAULT),
+                  env={"DOCKER_HOST": "tcp://builder:2376"}, landlock=0)
+    with pytest.raises(cf.ConfinementUnavailable) as exc:
+        cf.check_required(st, "require", ["cold"])
+    assert "docker-default" not in str(exc.value) and "DOCKER_HOST" in str(exc.value)
+    c = _pf(CONTAINER_UNDER_DOCKER_DEFAULT, env={"BLASTBOX_CONFINEMENT": "require"},
+            tiers=("docker",))
+    assert "docker-default" not in c.detail
+
+
+def test_startup_log_reports_the_enforced_mode(tmp_path, monkeypatch, caplog):
+    from blastbox.host.dispatch import Dispatcher, EngineSpec
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    from tests.host.test_dispatch import _fake_runtime, _limits
+    monkeypatch.setenv("BLASTBOX_CONFINEMENT", "require")
+    det = cf.detect({"BLASTBOX_CONFINEMENT": "off"}, host=_host(ROCKY), landlock=0)
+    with caplog.at_level("INFO", logger="blastbox.host.dispatch"):
+        Dispatcher(job_store=InMemoryJobStore(),
+                   engines={"e": EngineSpec(name="e", image="i", worker_argv=["w"])},
+                   limits=_limits(), job_root=tmp_path, runtime_selector=_fake_runtime,
+                   attest_key=None, confinement=det)
+    line = next(r.getMessage() for r in caplog.records if "confinement (" in r.getMessage())
+    assert "mode=require" in line and "cold=selinux" in line

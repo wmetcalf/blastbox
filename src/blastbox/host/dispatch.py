@@ -20,6 +20,7 @@ Security properties (review will check):
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import contextlib
 import logging
@@ -746,11 +747,13 @@ class Dispatcher:
         if self._confinement is not None:
             kinds = _confinement.kinds_for_tiers(
                 reachable_tiers(self._pool, self._tier, self._warm_only))
+            # The env's require binds too, whatever mode the passed detection was built with --
+            # and the log reports the mode actually applied.
+            if env_mode == "require" and self._confinement.mode != "require":
+                self._confinement = dataclasses.replace(self._confinement, mode="require")
             _log.info("confinement (detection only, nothing enforced): %s",
                       self._confinement.summary(kinds))
-            # The env's require binds too, whatever mode the passed detection was built with.
-            mode = "require" if env_mode == "require" else self._confinement.mode
-            _confinement.check_required(self._confinement.state, mode, kinds)
+            _confinement.check_required(self._confinement.state, self._confinement.mode, kinds)
         # OPT-IN engine scoping for SHARED multi-dispatcher stores: when set, claim only jobs for
         # engines this dispatcher handles, so it can't grab (and fail "unknown engine") a job that a
         # co-resident VM/other-engine dispatcher owns. Default OFF preserves the single-dispatcher

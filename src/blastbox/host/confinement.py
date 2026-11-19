@@ -294,7 +294,8 @@ def _resolve_cold_blocker(env: Mapping[str, str], host: HostReader) -> str | Non
         return f"DOCKER_CONTEXT={context!r}: cold runsc may run on another daemon's host"
     path = os.path.join(_docker_config_dir(env), "config.json")
     raw = host.read(path)
-    if raw is None and host.exists(path):
+    # Follow a symlink first: a dangling one is no config to the CLI (ENOENT, no warning).
+    if raw is None and host.exists(host.realpath(path)):
         return "docker config.json exists but is not readable: current context unknown"
     if raw is not None and len(raw) >= _READ_CAP:
         return "docker config.json too large to read whole: current context unknown"
