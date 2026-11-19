@@ -777,7 +777,8 @@ def test_overflow_gvisor_with_missing_rootfs_is_admitted_so_require_fails():
 @pytest.mark.parametrize("cfg_text", [
     '{"CurrentContext": "remote"}',                       # Go matches keys case-insensitively
     '{"currentContext": "remote"}}',                      # trailing data: Go reads one value
-    '﻿{"currentContext": "remote"}',                 # BOM
+    '{"CurrentContext": "default", "currentContext": "remote"}',         # last match wins
+    '{"currentContext":"remote","CurrentContext":"default","currentContext":"remote"}',
 ])
 def test_docker_config_parsed_like_the_cli(cfg_text):
     host = _host({**UBUNTU, **_DOCKER_FILES, f"{_CFG}/config.json": cfg_text})
@@ -821,3 +822,40 @@ def test_docker_desktop_socket_is_a_vm_not_this_host():
     assert cf.probe(_host(files), env={"DOCKER_CONFIG": _CFG}).would_use("cold") == "none"
     st = cf.probe(_host(UBUNTU), env={"DOCKER_HOST": "unix:///home/u/.docker/desktop/docker.sock"})
     assert st.would_use("cold") == "none"
+
+
+@pytest.mark.parametrize("cfg_text", ["", "  \n", "null", '{"currentContext": null}'])
+def test_empty_docker_config_is_the_default_context(cfg_text):
+    host = _host({**UBUNTU, f"{_CFG}/config.json": cfg_text})
+    assert cf.probe(host, env={"DOCKER_CONFIG": _CFG}).would_use("cold") == "apparmor"
+
+
+def test_last_matching_current_context_key_wins_like_go():
+    cfg = '{"currentContext": "default", "CurrentContext": "remote"}'
+    host = _host({**UBUNTU, **_DOCKER_FILES, f"{_CFG}/config.json": cfg})
+    assert cf.probe(host, env={"DOCKER_CONFIG": _CFG}).would_use("cold") == "none"
+    cfg = '{"CurrentContext": "remote", "currentContext": "default"}'
+    host = _host({**UBUNTU, **_DOCKER_FILES, f"{_CFG}/config.json": cfg})
+    assert cf.probe(host, env={"DOCKER_CONFIG": _CFG}).would_use("cold") == "apparmor"
+
+
+def test_bom_config_is_malformed_not_silently_parsed():
+    # Go does not skip a BOM: the CLI calls it malformed. Malformed fails closed here.
+    host = _host({**UBUNTU, f"{_CFG}/config.json": '\ufeff{"currentContext": "default"}'})
+    st = cf.probe(host, env={"DOCKER_CONFIG": _CFG})
+    assert st.cold_blocker and st.would_use("cold") == "none"
+
+
+def test_meta_host_key_matched_like_go():
+    d = _hashlib.sha256(b"remote").hexdigest()
+    meta = {f"{_CFG}/contexts/meta/{d}/meta.json":
+            '{"Endpoints": {"docker": {"Host": "unix:///var/run/docker.sock", '
+            '"host": "tcp://127.0.0.1:1"}}}'}
+    host = _host({**UBUNTU, **meta})
+    assert cf.probe(host, env={"DOCKER_CONFIG": _CFG, "DOCKER_CONTEXT": "remote"}).would_use(
+        "cold") == "none"
+
+
+def test_sys_reader_reads_proc_sys():
+    v = cf._SysReader().read("/proc/sys/kernel/ostype")
+    assert v is not None and v.strip() == "Linux"

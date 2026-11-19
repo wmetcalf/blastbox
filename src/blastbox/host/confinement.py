@@ -277,10 +277,27 @@ def _docker_config_dir(env: Mapping[str, str]) -> str:
     return os.path.join(home, ".docker")
 
 
+_GO_WS = " \t\n\r"   # the only whitespace Go's JSON decoder skips (no BOM, no NBSP)
+
+
 def _first_json(text: str) -> object:
-    """The first JSON value, as Go's json.Decoder reads it (trailing data ignored, BOM
-    stripped)."""
-    return json.JSONDecoder().raw_decode(text.lstrip("\ufeff").lstrip())[0]
+    """The first JSON value, as Go's json.Decoder reads it: trailing data ignored, every key
+    pair kept in order (objects become lists of pairs, so duplicate keys are not collapsed)."""
+    return json.JSONDecoder(object_pairs_hook=list).raw_decode(text.lstrip(_GO_WS))[0]
+
+
+def _go_field(obj: object, name: str) -> object:
+    """A struct field as Go's decoder fills it: keys matched case-insensitively, in document
+    order, the last one winning; JSON null leaves it unset (None)."""
+    if obj is None:
+        return None
+    if not isinstance(obj, list):
+        raise ValueError(f"expected an object around {name!r}")
+    found: object = None
+    for key, value in obj:
+        if key.lower() == name.lower() and value is not None:
+            found = value
+    return found
 
 
 def _local_endpoint(endpoint: str) -> bool:
@@ -300,21 +317,20 @@ def _resolve_cold_blocker(env: Mapping[str, str], host: HostReader) -> str | Non
     if not context:
         source = "docker config currentContext"
         raw = host.read(os.path.join(cfg, "config.json"))
-        if raw is not None:
-            doc = _first_json(raw)
-            if not isinstance(doc, dict):
-                raise ValueError("config.json is not an object")
-            # Go's decoder matches the struct tag case-insensitively.
-            value = next((v for k, v in doc.items() if k.lower() == "currentcontext"), "")
-            if not isinstance(value, str):
+        if raw is not None and raw.strip(_GO_WS):   # an empty file is the CLI's default config
+            value = _go_field(_first_json(raw), "currentContext")
+            if value is not None and not isinstance(value, str):
                 raise ValueError("currentContext is not a string")
-            context = value.strip()
+            context = (value or "").strip()
     if not context or context == "default":
         return None
     meta = os.path.join(cfg, "contexts", "meta",
                         hashlib.sha256(context.encode()).hexdigest(), "meta.json")
     try:
-        endpoint = str(_first_json(host.read(meta) or "")["Endpoints"]["docker"]["Host"])  # type: ignore[index]
+        endpoint = _go_field(_go_field(_go_field(_first_json(host.read(meta) or ""),
+                                                 "Endpoints"), "docker"), "Host")
+        if not isinstance(endpoint, str) or not endpoint:
+            raise ValueError("no docker endpoint")
     except (ValueError, KeyError, TypeError):
         return f"{source} {context!r}: endpoint unknown, cold runsc may run on another host"
     if _local_endpoint(endpoint):
@@ -416,11 +432,20 @@ class Detection:
 
 class _SysReader:
     def read(self, path: str) -> str | None:
+        # Chunked: /proc/sys handlers refuse ONE large read() with ENOMEM.
+        parts: list[str] = []
+        total = 0
         try:
             with open(path, encoding="utf-8", errors="replace") as fh:
-                return fh.read(_READ_CAP)
+                while total < _READ_CAP:
+                    chunk = fh.read(min(64 * 1024, _READ_CAP - total))
+                    if not chunk:
+                        break
+                    parts.append(chunk)
+                    total += len(chunk)
         except OSError:
             return None
+        return "".join(parts)
 
     def exists(self, path: str) -> bool:
         return os.path.lexists(path)
