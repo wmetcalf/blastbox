@@ -212,7 +212,14 @@ def _aa_blocker(host: HostReader, lsms: tuple[str, ...] | None) -> str | None:
         label = raw if raw is not None and (raw.strip() == "unconfined" or raw.rstrip().endswith(
             ")")) else None
     label = (label or "").strip().rstrip("\x00").strip()
-    if label and label != "unconfined":
+    if not label:
+        # Unknown is not "unconfined": count it as a blocker rather than fail open.
+        return "own AppArmor label not readable (/proc/self/attr): cannot tell if a profile " \
+               "change is possible from here"
+    # The MODE decides, not the name: a flags=(unconfined) or complain-mode profile changes
+    # profile like "unconfined" does (preflight._is_unconfined reads labels the same way).
+    name, _, mode = label.partition(" (")
+    if not (name == "unconfined" or mode.rstrip(")").strip() in ("unconfined", "complain")):
         return (f"caller already confined by {label!r}: entering a blastbox profile needs a "
                 "change_profile rule there")
     return None

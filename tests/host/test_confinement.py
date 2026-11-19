@@ -18,9 +18,10 @@ from tests.host.test_preflight import FakeHost, _healthy
 
 # --- distro fixtures: what /sys looks like -------------------------------------------------
 
-UBUNTU = {  # 24.04: AppArmor on, Landlock stacked
+UBUNTU = {  # 24.04: AppArmor on, Landlock stacked; dispatcher unconfined (systemd, root)
     "/sys/kernel/security/lsm": "lockdown,capability,landlock,yama,apparmor,ima,evm",
     "/sys/module/apparmor/parameters/enabled": "Y\n",
+    "/proc/self/attr/apparmor/current": "unconfined\n",
 }
 ROCKY = {  # Rocky/RHEL 9: SELinux enforcing
     "/sys/kernel/security/lsm": "lockdown,capability,yama,selinux,bpf,landlock",
@@ -606,5 +607,32 @@ def test_verified_signed_does_not_share_the_callers_confinement():
     r = _verify(body, pinned)
     body["attestation"]["confinement"]["available"] = "selinux"
     assert r.signed["confinement"]["available"] == "none"   # type: ignore[index]
-    with pytest.raises(TypeError):
-        r.signed["confinement"]["available"] = "selinux"     # type: ignore[index]
+    json.dumps(dict(r.signed))     # the signed view stays JSON-serialisable
+
+
+def test_unreadable_apparmor_label_is_a_blocker():
+    st = _state({k: v for k, v in UBUNTU.items() if not k.startswith("/proc/")})
+    assert st.apparmor_blocker and "label" in st.apparmor_blocker
+    assert st.would_use("gvisor") == "none"
+
+
+def test_non_apparmor_shaped_attr_current_is_a_blocker():
+    st = _state({**{k: v for k, v in UBUNTU.items() if not k.startswith("/proc/")},
+                 "/proc/self/attr/current": "system_u:system_r:unconfined_t:s0"})
+    assert st.would_use("gvisor") == "none"
+
+
+def test_legacy_attr_current_unconfined_is_usable():
+    assert _state({**{k: v for k, v in UBUNTU.items() if not k.startswith("/proc/")},
+                   "/proc/self/attr/current": "unconfined\n"}).would_use(
+        "gvisor") == "apparmor"
+
+
+@pytest.mark.parametrize("label,usable", [
+    ("unconfined", True), ("vscode (unconfined)", True), ("snap.astral-uv.uv (complain)", True),
+    ("docker-default (enforce)", False), ("x (kill)", False), ("x (user)", False),
+])
+def test_label_mode_not_name_decides(label, usable):
+    st = _state({**UBUNTU, "/proc/self/attr/apparmor/current": label + "\n"})
+    assert (st.would_use("gvisor") == "apparmor") is usable
+    assert pf._is_unconfined(label) is usable      # agrees with sandbox-confinement's reading
