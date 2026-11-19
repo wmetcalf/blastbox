@@ -102,8 +102,12 @@ rate is completion tokens over seconds of this pass's calls that reported usage.
 
 Model failures never fail the job: ``model_status`` records ``unavailable``/``malformed``/
 ``out_of_credit``/``key_rejected``/``refused`` (prior summary kept, ``more_pending=False``; the
-last three stop the pass at once, with no retry and no final answer; a failed report leaves it
-unchanged) or ``budget`` (``more_pending=True``). ``skipped`` means the
+last three are not retried and stop the pass at once with no final answer, except a ``refused``
+turn after a good one, which is a failed turn: the one final-answer request still runs, and a
+fatal failure of that seals its class) or ``budget`` (``more_pending=True``). A failed report
+call leaves ``model_status`` unchanged, except that an evidence-only pass (whose only call it is)
+seals a fatal kind as its status; after an accepted answer a fatal report failure keeps ``ok``
+but schedules no further pass (it would fail the same way). ``skipped`` means the
 model was not consulted because no Ghidra project or MCP session could be had.
 """
 
@@ -876,6 +880,7 @@ class _Pass:
     final_thinking: bool = False  # REA_FINAL_THINKING: keep the model's reasoning on for the final answer
     retain_reasoning: bool = False  # write the model's reasoning to the transcript (never sent back)
     good_turns: int = 0  # model responses that parsed (with or without tool calls)
+    report_error_kind: str | None = None  # the ModelError kind of a failed report call
     report_tokens: int = DEFAULT_REPORT_TOKENS
     report: dict[str, Any] | None = None  # this pass's validated rea.analysis/1 report
     opinion: str | None = None  # the model's own call in that report, before the verdict rule
@@ -1066,7 +1071,9 @@ class ReaAgentEngine:
             opened=p.opened[-MAX_EXPLORED:] if p.accepted else list(state.opened),
         )
         transcript_reserve = tw.cap
-        if p.model_status == "ok" and p.assessed:
+        if p.model_status == "ok" and p.report_error_kind in FATAL_KINDS:
+            more = False  # the accepted answer stands; a next pass's report call would fail the same way
+        elif p.model_status == "ok" and p.assessed:
             more = not p.stop_reason
         elif p.model_status == "ok":
             more = (not p.done) and bool(p.todo)
@@ -1183,6 +1190,8 @@ class ReaAgentEngine:
                 code="evidence_only",
                 message=f"no disassembly (Ghidra {state.ghidra_status}): the report was written from the "
                         f"sweep's evidence ({', '.join(sources)})"))
+        elif outcome == "failed" and p.report_error_kind in FATAL_KINDS:
+            p.model_status = p.report_error_kind
         else:
             p.model_status = {"invalid": "malformed", "failed": "unavailable"}.get(outcome, "skipped")
 
@@ -1377,9 +1386,11 @@ class ReaAgentEngine:
             try:
                 resp = self._chat(model, p, tw, explore_left, messages, tools, p.turn_tokens)
             except ModelError as exc:
-                if exc.kind in FATAL_KINDS:
-                    # Credit, key and refusal failures repeat on every call: seal the class now,
-                    # with no further turn and no final answer to spend.
+                if exc.kind in FATAL_KINDS and not (exc.kind == "refused" and p.good_turns > 0):
+                    # Credit and key failures repeat on every call: seal the class now, with no
+                    # further turn and no final answer to spend. A refusal after good turns may be
+                    # this turn's content (a moderation flag, a proxy filter): it is a failed turn,
+                    # and the one final-answer request below still runs.
                     self._model_failed(p, tw, exc.kind, str(exc))
                     return
                 if p.good_turns > 0 or (exc.kind == "unavailable" and remaining() >= 2 * MIN_TURN_S):
@@ -1578,8 +1589,9 @@ class ReaAgentEngine:
 
         Skipped (``report_skipped_deadline``) when the time left cannot hold ``MIN_REPORT_TOKENS``
         at the measured rate; otherwise asks for ``min(REA_REPORT_MAX_TOKENS, what fits)``. A model
-        error is ``report_failed``, a report that violates the schema ``report_invalid``; either
-        way the rest of the pass seals unchanged. A cut-off report keeps its complete sections
+        error is ``report_failed`` (its kind kept in ``p.report_error_kind``: a fatal kind ends the
+        chain, and seals an evidence-only pass), a report that violates the schema
+        ``report_invalid``; otherwise the rest of the pass seals unchanged. A cut-off report keeps its complete sections
         (``report_salvaged``); one the server cut off (``finish_reason: length``) before the
         model's call gets its verdict from the rule alone (and never meets the bar), or, when the
         last pass left a report with the model's call in it, is dropped for that one, unless that
@@ -1618,6 +1630,7 @@ class ReaAgentEngine:
                 try:
                     resp = self._chat(model, p, tw, remaining, messages, [], tokens, **kw)
                 except ModelError as exc:
+                    p.report_error_kind = exc.kind
                     p.warnings.append(Warning(code="report_failed", message=f"report call failed: {exc}"[:2000]))
                     tw.write({"event": "report_failed", "message": str(exc)[:2000]})
                     return "failed"
@@ -1711,7 +1724,9 @@ class ReaAgentEngine:
         tw.write({"event": "model_turn_failed", "message": message[:2000]})
 
     def _final_failed(self, p: _Pass, tw: TranscriptWriter, kind: str, message: str) -> None:
-        """The final answer failed: ``budget`` (chain continues) once any turn succeeded."""
+        """The final answer failed: ``budget`` (chain continues) once any turn succeeded, unless
+        the failure is a fatal kind (:data:`FATAL_KINDS`), which seals its class whatever the
+        good turns (``more_pending=False``): a next pass would fail the same way."""
         if p.good_turns == 0 or kind in FATAL_KINDS:
             self._model_failed(p, tw, kind, message)
             return

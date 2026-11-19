@@ -10,8 +10,11 @@
   per-socket-operation timeout: the exchange runs in a worker thread that reads in chunks and
   checks the deadline, and the caller stops waiting at the deadline. A proxy trickling bytes
   can therefore not stretch a call past the pass budget (Ruling Q).
-- Transport and HTTP failures raise ``ModelError("unavailable")``; an oversized, non-JSON or
-  non-object body raises ``ModelError("malformed")``. Interpreting ``choices`` is the
+- Transport failures, timeouts and transient HTTP statuses (408, 429, 5xx) raise
+  ``ModelError("unavailable")``; other HTTP errors are classified by
+  :func:`classify_http_error` (``out_of_credit``, ``key_rejected``, ``refused``; see
+  :data:`FATAL_KINDS`) from the status and a capped body prefix, which is never put in a
+  message or log. An oversized, non-JSON or non-object body raises ``ModelError("malformed")``. Interpreting ``choices`` is the
   caller's job (the agent parses it defensively). Reasoning in the reply is never sent back:
   the agent writes it to the pass transcript only (``agent._reasoning``, ``reasoning_policy``).
 - ``REA_MODEL_DIALECT`` (baked into the agent image; default ``vllm``) says how the "thinking
@@ -61,7 +64,9 @@ def classify_http_error(code: int, body: bytes) -> ModelErrorKind:
     """Map an HTTP error status (and a bounded body prefix) to a :data:`ModelErrorKind`.
 
     402 is out of credit; 401 is a rejected key; 403 is a rejected key only when the body is a
-    JSON object with an ``error`` key (a provider's answer), else it is a filter's refusal.
+    JSON object with an ``error`` key (a provider's answer), else it is a filter's refusal. A
+    403 whose ``error.metadata`` holds ``reasons`` or ``flagged_input`` is OpenRouter's
+    moderation refusing the input, not the key: ``refused``.
     408, 429 and 5xx are transient. Every other 4xx, including 400, is a refusal. (Anthropic's
     error docs state no credit-too-low 400 text, so none is matched.)
     """
@@ -74,7 +79,13 @@ def classify_http_error(code: int, body: bytes) -> ModelErrorKind:
             doc = json.loads(body.decode("utf-8", "replace"))
         except Exception:
             return "refused"
-        return "key_rejected" if isinstance(doc, dict) and "error" in doc else "refused"
+        if not isinstance(doc, dict) or "error" not in doc:
+            return "refused"
+        err = doc["error"]
+        meta = err.get("metadata") if isinstance(err, dict) else None
+        if isinstance(meta, dict) and ("reasons" in meta or "flagged_input" in meta):
+            return "refused"
+        return "key_rejected"
     if code in (408, 429) or code >= 500:
         return "unavailable"
     if 400 <= code < 500:
@@ -215,6 +226,14 @@ class ModelClient:
                     box["raw"] = bytes(buf)
             except BaseException as exc:  # handed to the caller below
                 box["exc"] = exc
+                if isinstance(exc, urllib.error.HTTPError):
+                    # The capped error body is read here, inside the deadline, not on the
+                    # caller's thread after it. It only feeds classify_http_error.
+                    try:
+                        err_body = exc.read(_ERROR_BODY_READ)
+                    except Exception:
+                        err_body = b""
+                    box["err_body"] = err_body if isinstance(err_body, bytes) else b""
 
         t = threading.Thread(target=work, name="rea-model-call", daemon=True)
         t.start()
@@ -226,12 +245,7 @@ class ModelClient:
         exc = box.get("exc")
         if isinstance(exc, urllib.error.HTTPError):
             _log.warning("model endpoint returned HTTP %s", exc.code)
-            try:
-                err_body = exc.read(_ERROR_BODY_READ)
-            except Exception:
-                err_body = b""
-            if not isinstance(err_body, bytes):
-                err_body = b""
+            err_body: bytes = box.get("err_body", b"")
             raise ModelError(classify_http_error(exc.code, err_body[:_ERROR_BODY_READ]),
                              f"http_{exc.code}") from None
         if isinstance(exc, (urllib.error.URLError, OSError, ValueError, http.client.HTTPException)):

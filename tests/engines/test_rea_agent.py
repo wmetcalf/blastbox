@@ -430,6 +430,14 @@ def test_model_client_errors(opener, kind):
     (429, b"", "unavailable"), (408, b"", "unavailable"), (500, b"x", "unavailable"), (503, b"", "unavailable"),
     (402, b"\xff" * 100_000, "out_of_credit"),
     (403, b"\xff\xfe not json", "refused"),
+    # OpenRouter moderation: a 403 whose error.metadata carries reasons / flagged_input
+    (403, b'{"error":{"code":403,"message":"Input flagged","metadata":{"reasons":["violence"],'
+          b'"flagged_input":"...","provider_name":"x","model_slug":"m"}}}', "refused"),
+    (403, b'{"error":{"code":403,"message":"flagged","metadata":{"flagged_input":"abc"}}}', "refused"),
+    (403, b'{"error":{"code":403,"message":"flagged","metadata":{"reasons":[]}}}', "refused"),
+    (403, b'{"error":{"code":403,"message":"Key disabled","metadata":{"provider_name":"x"}}}', "key_rejected"),
+    (403, b'{"error":{"code":403,"message":"Key disabled","metadata":"reasons"}}', "key_rejected"),
+    (403, b'{"error":"Key disabled"}', "key_rejected"),
 ])
 def test_classify_http_error(code, body, kind):
     assert classify_http_error(code, body) == kind
@@ -3494,3 +3502,84 @@ def test_fatal_error_on_final_answer_after_good_turns_seals_its_class(tmp_path, 
     f = res.payload.fields
     assert f["model_status"] == kind and f["more_pending"] is False
     assert len(model.calls) == 2
+
+
+# ------------------------------------------------------------------ model error classes: final review
+
+
+@pytest.mark.parametrize("kind", sorted(FATAL_KINDS))
+def test_evidence_only_pass_seals_the_fatal_kind_of_its_report_call(tmp_path, monkeypatch, kind):
+    res, _out, model, _rig = _ev_run(tmp_path, monkeypatch, ModelError(kind, "http_402"))
+    f = res.payload.fields
+    assert f["model_status"] == kind and f["more_pending"] is False
+    assert len(model.calls) == 1
+
+
+def test_evidence_only_pass_still_seals_unavailable_for_a_transient_report_failure(tmp_path, monkeypatch):
+    res, _out, _model, _rig = _ev_run(tmp_path, monkeypatch, ModelError("unavailable", "http_503"))
+    assert res.payload.fields["model_status"] == "unavailable"
+
+
+def test_refused_after_good_turns_asks_for_the_final_answer(tmp_path):
+    cont = make_continuation(tmp_path)
+    model = FakeModel([tc(("binary_overview", {}, "a")), ModelError("refused", "http_400"),
+                       _final(summary="from the final answer")])
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
+    f = res.payload.fields
+    assert f["model_status"] == "ok" and f["summary"] == "from the final answer"
+    assert model.calls[-1]["response_format"]["type"] == "json_schema"
+    assert "model_turn_failed" in _codes(res)
+    assert len(model.calls) == 3
+
+
+def test_refused_after_good_turns_then_a_refused_final_seals_refused(tmp_path):
+    cont = make_continuation(tmp_path, todo=["0x140001420"])
+    model = FakeModel([tc(("binary_overview", {}, "a")), ModelError("refused", "http_400"),
+                       ModelError("refused", "http_400"), _final(summary="never")])
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
+    f = res.payload.fields
+    assert f["model_status"] == "refused" and f["more_pending"] is False
+    assert len(model.calls) == 3
+
+
+@pytest.mark.parametrize("kind", sorted(FATAL_KINDS))
+def test_a_fatal_report_failure_after_an_accepted_answer_schedules_no_pass(tmp_path, monkeypatch, kind):
+    res, _o, model = _report_run(tmp_path, monkeypatch, ModelError(kind, "http_402"))
+    f = res.payload.fields
+    assert f["model_status"] == "ok"  # the answer was accepted
+    assert f["more_pending"] is False
+    assert "report_failed" in _codes(res)
+
+
+def test_a_transient_report_failure_after_an_accepted_answer_still_schedules_a_pass(tmp_path, monkeypatch):
+    res, _o, _m = _report_run(tmp_path, monkeypatch, ModelError("unavailable", "http_503"))
+    f = res.payload.fields
+    assert f["model_status"] == "ok" and "no_report" in f["gaps"] and f["more_pending"] is True
+
+
+def test_http_error_body_is_read_on_the_worker_thread_and_kept_out_of_the_message():
+    import threading
+
+    seen: list[str] = []
+
+    class _Err(urllib.error.HTTPError):
+        def read(self, n=-1):
+            seen.append(threading.current_thread().name)
+            return b'{"error":{"message":"SECRET-BODY"}}'
+
+    m = ModelClient("http://m:1/v1", "x", 5, opener=FakeOpener(exc=_Err("http://x", 402, "pay", {}, None)))
+    with pytest.raises(ModelError) as ei:
+        m.chat([{"role": "user", "content": "q"}], [], 16)
+    assert ei.value.kind == "out_of_credit" and "SECRET-BODY" not in str(ei.value)
+    assert seen == ["rea-model-call"]
+
+
+def test_http_error_body_read_failure_is_an_empty_body():
+    class _Err(urllib.error.HTTPError):
+        def read(self, n=-1):
+            raise OSError("reset")
+
+    m = ModelClient("http://m:1/v1", "x", 5, opener=FakeOpener(exc=_Err("http://x", 403, "no", {}, None)))
+    with pytest.raises(ModelError) as ei:
+        m.chat([{"role": "user", "content": "q"}], [], 16)
+    assert ei.value.kind == "refused"
