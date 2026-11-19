@@ -311,7 +311,7 @@ def test_boot_spawn_stages_the_jail_and_hands_back_the_listener(env):
     assert len(fds) == 1
     listener = socket.socket(fileno=fds[0])
     try:
-        root = jail.root
+        root = Path(jail.root)
         assert (root / "vmlinux").read_bytes() == b"KERNEL"
         assert (root / "rootfs.ext4").stat().st_nlink >= 2       # a hard link of the asset
         assert (root / "outdisk.ext4").stat().st_size == 16 << 20
@@ -319,7 +319,7 @@ def test_boot_spawn_stages_the_jail_and_hands_back_the_listener(env):
         assert any(c[0] == "f" and c[2] == jail.uid for c in env.chowns)
         import stat as _stat
         assert _stat.S_ISSOCK(os.lstat(root / "vsock.sock_10000").st_mode)
-        assert jail.listener_path == root / "vsock.sock_10000"
+        assert jail.listener_path == str(root / "vsock.sock_10000")
         assert any(argv[1:4] == ["netns", "add", f"bbfcj-{JID}"] for argv in env.ran)
         assert any(argv[0] == env.cfg.mkfs for argv in env.ran)
         argv = env.argvs[-1]
@@ -349,8 +349,8 @@ def test_connect_never_follows_a_symlink_the_jail_planted(env, tmp_path):
     host.bind(str(target))
     host.listen(1)
     try:
-        (jail.root / "vsock.sock").unlink()
-        (jail.root / "vsock.sock").symlink_to(target)
+        (Path(jail.root) / "vsock.sock").unlink()
+        (Path(jail.root) / "vsock.sock").symlink_to(target)
         with pytest.raises(h.HelperError, match="no_socket"):
             env.helper.op_connect(env.owner, {"op": "connect", "jail": JID, "target": "vsock"}, [])
     finally:
@@ -384,15 +384,15 @@ def test_destroy_refuses_a_live_jail_and_cleans_up_an_exited_one(env):
     env.kill(jail)
     uid = jail.uid
     env.helper.op_destroy(env.owner, {"op": "destroy", "jail": JID}, [])
-    assert not jail.top.exists()
+    assert not Path(jail.top).exists()
     assert JID not in env.helper._jails and JID not in env.owner.jails
     assert any(argv[1:4] == ["netns", "del", f"bbfcj-{JID}"] for argv in env.ran)
     assert env.helper._uids.given == uid
 
 
 def _snapshot(jail: h.Jail, mem_size: int = 64 << 20) -> None:
-    (jail.root / "warm.snapshot").write_bytes(b"state")
-    with open(jail.root / "warm.mem", "wb") as f:
+    (Path(jail.root) / "warm.snapshot").write_bytes(b"state")
+    with open(Path(jail.root) / "warm.mem", "wb") as f:
         f.truncate(mem_size)
 
 
@@ -411,7 +411,7 @@ def test_publish_makes_a_root_owned_read_only_generation(env):
     gdir = Path(reply["dir"])
     for name in ("warm.snapshot", "warm.mem", "outdisk.ext4"):
         assert (gdir / name).stat().st_mode & 0o777 == 0o444
-    assert not (jail.root / "warm.mem").exists()      # moved out of the jail's reach
+    assert not (Path(jail.root) / "warm.mem").exists()      # moved out of the jail's reach
     assert any(c[0] == "f" and c[2:] == (0, 0) for c in env.chowns)
     assert reply["gen"] in env.owner.gens
 
@@ -421,7 +421,7 @@ def test_publish_refuses_files_the_jail_could_have_planted(env, tmp_path, plant)
     jail, _ = env.boot(listener=False)
     _snapshot(jail)
     env.kill(jail)
-    mem = jail.root / "warm.mem"
+    mem = Path(jail.root) / "warm.mem"
     if plant == "symlink":
         mem.unlink()
         secret = tmp_path / "secret"
@@ -447,9 +447,9 @@ def test_restore_uses_the_generation_and_a_discarded_one_waits_for_its_jails(env
         "op": "spawn", "jail": JID2, "mode": "restore", "kernel": None, "rootfs": None,
         "gen": gen, "outdisk_mib": 16, "mem_mib": 64, "vcpus": 1, "ready_listener": False}, [])
     slot = env.helper._jails[JID2]
-    assert (slot.root / "warm.mem").stat().st_ino == (env.helper._gens[gen].dir / "warm.mem").stat().st_ino
-    assert (slot.root / "outdisk.ext4").stat().st_mode & 0o777 == 0o600
-    gdir = env.helper._gens[gen].dir
+    assert (Path(slot.root) / "warm.mem").stat().st_ino == (Path(env.helper._gens[gen].dir) / "warm.mem").stat().st_ino
+    assert (Path(slot.root) / "outdisk.ext4").stat().st_mode & 0o777 == 0o600
+    gdir = Path(env.helper._gens[gen].dir)
     env.helper.op_discard(env.owner, {"op": "discard", "gen": gen}, [])
     assert gdir.exists(), "a generation a live jail maps was deleted"
     with pytest.raises(h.HelperError, match="unknown_gen"):
@@ -486,7 +486,7 @@ def test_a_dead_owners_jails_are_killed_and_reclaimed(env):
         child.wait(5)
         env.helper.monitor_once()
         assert jail.proc.poll() is not None
-        assert JID not in env.helper._jails and not jail.top.exists()
+        assert JID not in env.helper._jails and not Path(jail.top).exists()
         assert child.pid not in env.helper._owners
     finally:
         if child.poll() is None:
@@ -683,17 +683,17 @@ def test_the_monitor_retries_a_dead_owners_failed_teardown(env):
     real = env.helper._destroy
     calls = {"n": 0}
 
-    def flaky(j):
+    def flaky(j, **kw):
         calls["n"] += 1
         if calls["n"] == 1:
             raise h.HelperError("cleanup_failed", "transient")
-        real(j)
+        real(j, **kw)
     env.helper._destroy = flaky
     child.kill()
     child.wait(5)
     env.helper.monitor_once()        # reaps the owner (the first destroy fails), then retries
     assert calls["n"] == 2
-    assert JID not in env.helper._jails and not jail.top.exists()
+    assert JID not in env.helper._jails and not Path(jail.top).exists()
 
 
 def test_a_reaped_owner_cannot_register_a_jail_after_the_fact(env):
@@ -753,7 +753,7 @@ def test_an_overloaded_helper_says_busy_and_the_client_retries(tmp_path, monkeyp
 
 def test_a_vmm_grown_output_disk_is_refused(env):
     jail, _ = env.boot(listener=False)
-    with open(jail.root / "outdisk.ext4", "r+b") as f:
+    with open(Path(jail.root) / "outdisk.ext4", "r+b") as f:
         f.truncate(4 << 30)
     with pytest.raises(h.HelperError, match="bad_outdisk"):
         env.helper.op_outdisk(env.owner, {"op": "outdisk", "jail": JID}, [])
@@ -843,28 +843,40 @@ def test_a_sparse_asset_stays_sparse_and_the_client_offset_is_restored(env, tmp_
     assert copy.stat().st_size == 256 << 20 and copy.stat().st_blocks * 512 < 16 << 20
 
 
-def test_closing_a_lingering_client_socket_does_not_block():
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.bind(("127.0.0.1", 0))
-    srv.listen(1)
-    c = socket.create_connection(srv.getsockname())
-    peer, _ = srv.accept()                       # never reads
-    c.setblocking(False)
+def test_releasing_a_lingering_client_socket_does_not_block():
+    c, peer, srv = _lingering_socket()
+    sink = h.FdSink()
     try:
-        while True:
-            c.send(b"x" * 65536)
-    except BlockingIOError:
-        pass
-    c.setblocking(True)
-    import struct
-    c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 30))
-    fd = c.detach()
-    t0 = time.monotonic()
-    h.Helper._close_client_fd(fd)
-    assert time.monotonic() - t0 < 2.0
-    peer.close()
-    srv.close()
+        t0 = time.monotonic()
+        sink.release([c.detach()])
+        sink.release([os.open("/dev/null", os.O_RDONLY)])    # the wedged sink is replaced
+        assert time.monotonic() - t0 < 5.0
+    finally:
+        sink.close()
+        peer.close()
+        srv.close()
 
+
+def test_a_nested_lingering_socket_cannot_pin_the_helper(env):
+    """An AF_UNIX socket whose queue holds a lingering socket: its final release would run the
+    inner socket's linger in whichever thread drops the last reference."""
+    c, peer, srv = _lingering_socket()
+    x, y = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+    socket.send_fds(x, [b"n"], [c.fileno()])
+    c.close()
+    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        socket.send_fds(a, [h.encode({"op": "hello"})], [y.fileno()])
+        x.close()
+        y.close()
+        t0 = time.monotonic()
+        env.helper.serve_conn(b)
+        assert time.monotonic() - t0 < 5.0
+    finally:
+        a.close()
+        env.helper._sink.close()
+        peer.close()
+        srv.close()
 
 def test_concurrent_publishes_cannot_exceed_the_generation_cap(env):
     env.helper.cfg = h.HelperConfig(**{**env.cfg.__dict__, "max_gens_per_owner": 1})
@@ -928,7 +940,7 @@ def _lingering_socket():
     return c, peer, srv
 
 
-@pytest.mark.parametrize("shape", ["excess-fds", "second-message"])
+@pytest.mark.parametrize("shape", ["excess-fds", "second-message", "empty-record-first"])
 def test_a_lingering_socket_the_kernel_would_release_cannot_pin_the_helper(env, shape):
     c, peer, srv = _lingering_socket()
     a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -936,16 +948,37 @@ def test_a_lingering_socket_the_kernel_would_release_cannot_pin_the_helper(env, 
     try:
         if shape == "excess-fds":
             socket.send_fds(a, [h.encode({"op": "hello"})], [r, w, c.fileno()])
+        elif shape == "second-message":
+            a.send(h.encode({"op": "hello"}))
+            socket.send_fds(a, [b"x"], [c.fileno()])
         else:
             a.send(h.encode({"op": "hello"}))
+            a.send(b"")
             socket.send_fds(a, [b"x"], [c.fileno()])
         c.close()
         os.close(r)
         os.close(w)
         t0 = time.monotonic()
         env.helper.serve_conn(b)
-        assert time.monotonic() - t0 < 2.0
+        assert time.monotonic() - t0 < 5.0
     finally:
         a.close()
+        env.helper._sink.close()
         peer.close()
         srv.close()
+
+
+def test_reaping_skips_a_jail_whose_publish_holds_its_lock(env):
+    """A slow publish must not stall the monitor (and every other owner's reaping)."""
+    jail, _ = env.boot(listener=False)
+    env.kill(jail)
+    jail.lock.acquire()
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(h.HelperError, match="busy"):
+            env.helper._destroy(jail, wait=False)
+        assert time.monotonic() - t0 < 1.0
+    finally:
+        jail.lock.release()
+    env.helper._destroy(jail, wait=False)
+    assert jail.destroyed

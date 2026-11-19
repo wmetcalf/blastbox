@@ -784,7 +784,8 @@ def test_a_failed_cold_spawn_whose_kill_is_unconfirmed_is_parked_not_forgotten(t
     parked = [p for p in fl._PENDING_DESTROY if getattr(p, "_client", None) is jail]
     assert len(parked) == 1
     jail.down = False
-    fl._retry_pending_destroys()
+    fl._retry_pending_destroys()          # re-sends the kill (never waits on the spawn path)
+    fl._retry_pending_destroys()          # ...and destroys it once it has exited
     assert jail.alive == {}
     assert not [p for p in fl._PENDING_DESTROY if getattr(p, "_client", None) is jail]
 

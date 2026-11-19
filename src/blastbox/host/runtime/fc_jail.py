@@ -444,12 +444,6 @@ def _copy_bounded(src: int, dst: int, size: int) -> None:
     from blastbox.host.runtime.firecracker import disk_timeout_s
 
     timeout = disk_timeout_s()
-    with _ABANDONED_LOCK:
-        _ABANDONED[:] = [t for t in _ABANDONED if t.is_alive()]
-        if len(_ABANDONED) >= _MAX_ABANDONED:
-            # Bounded: a wedged filesystem must not cost a thread and two fds per job forever.
-            raise HostDiskTimeout(cmd=f"copy jailed output disk (refused: {len(_ABANDONED)} "
-                                      "earlier copies still stuck)", timeout=timeout)
     s2, d2 = os.dup(src), os.dup(dst)
     done: "list[BaseException | None]" = []
 
@@ -463,11 +457,22 @@ def _copy_bounded(src: int, dst: int, size: int) -> None:
             os.close(s2)
             os.close(d2)
     worker = threading.Thread(target=_run, daemon=True, name="fc-jail-outdisk-copy")
+    # Only copies that OUTLIVED their deadline count -- healthy in-flight copies are not
+    # "stuck", and a job batch finishing together must not be refused on a working disk. The
+    # bound is therefore the cap plus at most the dispatch concurrency racing past the check.
     with _ABANDONED_LOCK:
-        _ABANDONED.append(worker)
+        _ABANDONED[:] = [t for t in _ABANDONED if t.is_alive()]
+        if len(_ABANDONED) >= _MAX_ABANDONED:
+            os.close(s2)
+            os.close(d2)
+            # Bounded: a wedged filesystem must not cost a thread and two fds per job forever.
+            raise HostDiskTimeout(cmd=f"copy jailed output disk (refused: {len(_ABANDONED)} "
+                                      "earlier copies still stuck)", timeout=timeout)
     worker.start()
     worker.join(timeout)
     if not done:
+        with _ABANDONED_LOCK:
+            _ABANDONED.append(worker)
         raise HostDiskTimeout(cmd="copy jailed output disk", timeout=timeout)
     if done[0] is not None:
         raise done[0]

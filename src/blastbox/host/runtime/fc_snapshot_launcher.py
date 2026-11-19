@@ -460,10 +460,11 @@ def _retry_pending_destroys() -> None:
     for proc in batch:
         try:
             # Entries may still be RUNNING (a failed spawn whose kill could not be confirmed):
-            # kill again first; destroy() itself refuses a live jail.
+            # re-send the kill and move on -- NEVER wait here, this runs on the spawn path
+            # (the pool's tick); a later retry destroys it once it has exited.
             if proc.poll() is None:
                 proc.kill()
-                proc.wait(timeout=5.0)
+                raise RuntimeError("still running")
             proc.destroy()
         except Exception:  # noqa: BLE001 - retried again later
             still.append(proc)

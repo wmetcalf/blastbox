@@ -63,7 +63,6 @@ import shutil
 import signal
 import socket
 import stat
-import struct
 import subprocess
 import sys
 import threading
@@ -82,6 +81,7 @@ MAX_MSG = 16 * 1024
 MAX_REQUEST_FDS = 1
 #: The kernel's per-message SCM_RIGHTS maximum: the helper always makes room for all of them.
 SCM_MAX_FD = 253
+_LISTEN_BACKLOG = 64
 
 #: Names INSIDE a jail. The jailer pivot_root()s into the jail and firecracker's cwd is ``/``.
 JAIL_KERNEL = "vmlinux"
@@ -492,7 +492,7 @@ class Asset:
 class Gen:
     id: str
     owner: Owner
-    dir: Path
+    dir: str          # plain strings for per-object paths: see _jp
     rootfs: str           # asset id
     mem_bytes: int
     refs: "set[str]" = field(default_factory=set)
@@ -505,10 +505,10 @@ class Jail:
     owner: Owner
     uid: int
     mode: str
-    top: Path                     # <chroot_base>/<exec name>  (removed on destroy)
-    root: Path                    # <top>/<id>/root
+    top: str                      # <chroot_base>/<exec name>  (removed on destroy)
+    root: str                     # <top>/<id>/root
     netns: str
-    cgroup: Path
+    cgroup: str
     mem_mib: int
     #: The staged output disk's size: the jail's VMM holds that file read-write, so its size
     #: as seen later is attacker-controlled -- op_outdisk refuses anything else.
@@ -519,7 +519,7 @@ class Jail:
     proc: "subprocess.Popen[bytes] | None" = None
     pidfd: "int | None" = None
     outdisk_fd: "int | None" = None
-    listener_path: "Path | None" = None
+    listener_path: "str | None" = None
     sealed: bool = False
     destroyed: bool = False
     #: Its spawn failed and cleanup did not complete: the monitor retries it.
@@ -558,6 +558,132 @@ class UidPool:
             self._free.append(uid)
 
 
+
+# --------------------------------------------------------------------------- client-file sink
+_SINK_CODE = r"""
+import os, socket, sys
+s = socket.socket(fileno=int(sys.argv[1]))
+while True:
+    try:
+        data, fds, _, _ = socket.recv_fds(s, 16, 253)
+    except OSError:
+        break
+    if not data:
+        break
+    s.send(b"A")                       # holding them: the helper may drop its copies now
+    try:
+        s.recv(16)                     # "G": the helper's copies are gone
+    except OSError:
+        break
+    for fd in fds:
+        try:
+            os.close(fd)               # the FINAL release -- here, never in the helper
+        except OSError:
+            pass
+    s.send(b"D")
+"""
+
+
+class FdSink:
+    """Where every client-supplied file is finally released: a disposable child process.
+
+    Closing the last reference to a client's file runs its release in the closing thread, and
+    a client controls what that costs -- a socket set to linger with unsent data, an AF_UNIX
+    socket whose queue holds such a socket, a connection with such records queued -- so the
+    helper never drops a last reference itself. It hands the descriptors (and the client's
+    connection) to the sink, which acknowledges holding them before the helper closes its own
+    copies; the sink then closes them. A sink still busy with an earlier batch is presumed
+    wedged and replaced: SIGKILL ends a lingering close, and the dying sink's remaining files
+    are released by its own exit.
+    """
+
+    def __init__(self, popen: "Callable[..., subprocess.Popen[bytes]]" = subprocess.Popen) -> None:
+        self._popen = popen
+        self._lock = threading.Lock()
+        self._proc: "subprocess.Popen[bytes] | None" = None
+        self._sock: "socket.socket | None" = None
+        self._pending = 0           # batches handed over whose "D" has not arrived
+
+    def _start(self) -> None:
+        a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        try:
+            self._proc = self._popen(
+                [sys.executable, "-I", "-c", _SINK_CODE, str(b.fileno())],
+                pass_fds=(b.fileno(),), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, close_fds=True, env={})
+        finally:
+            b.close()
+        a.settimeout(2.0)
+        self._sock = a
+        self._pending = 0
+
+    def _kill(self) -> None:
+        if self._sock is not None:
+            # Its peer end holds nothing of the client's: closing ours cannot block.
+            self._sock.close()
+            self._sock = None
+        if self._proc is not None:
+            with contextlib.suppress(OSError):
+                self._proc.kill()
+            with contextlib.suppress(Exception):
+                self._proc.wait(timeout=5)
+            self._proc = None
+
+    def _settle(self) -> None:
+        """Collect "D"s without blocking; a sink with work outstanding is replaced."""
+        assert self._sock is not None
+        while self._pending:
+            try:
+                got = self._sock.recv(16, socket.MSG_DONTWAIT)
+            except BlockingIOError:
+                break
+            except OSError:
+                got = b""
+            if not got:
+                self._kill()
+                return
+            self._pending -= got.count(b"D")
+        if self._pending:
+            self._kill()            # still closing an earlier batch: presumed wedged
+
+    def release(self, fds: "list[int]") -> None:
+        """Take ownership of ``fds``. Never blocks on anything a client controls."""
+        fds = [fd for fd in fds if fd >= 0]
+        if not fds:
+            return
+        with self._lock:
+            for start in range(0, len(fds), SCM_MAX_FD):
+                batch = fds[start:start + SCM_MAX_FD]
+                for _attempt in range(2):
+                    if self._sock is not None:
+                        self._settle()
+                    if self._sock is None:
+                        self._start()
+                    assert self._sock is not None
+                    try:
+                        socket.send_fds(self._sock, [b"F"], batch)
+                        if self._sock.recv(16) != b"A":
+                            raise OSError("sink did not acknowledge")
+                    except OSError:
+                        self._kill()
+                        continue
+                    for fd in batch:        # not the last reference: the sink holds them
+                        with contextlib.suppress(OSError):
+                            os.close(fd)
+                    with contextlib.suppress(OSError):
+                        self._sock.send(b"G")
+                    self._pending += 1
+                    break
+                else:
+                    # Two fresh sinks could not take them (no processes left?). Keep them open
+                    # rather than risk the release here; logged, and the host is in trouble.
+                    _log.error("fc_jail.fd_sink_failed: leaking %d client descriptors",
+                               len(batch))
+
+    def close(self) -> None:
+        with self._lock:
+            self._kill()
+
 # --------------------------------------------------------------------------- the helper
 SO_PEERPIDFD = getattr(socket, "SO_PEERPIDFD", 77)
 
@@ -571,7 +697,7 @@ class Helper:
                  apparmor_enabled: "bool | None" = None,
                  proc_root: Path = Path("/proc"),
                  fchown: "Callable[[int, int, int], None]" = os.fchown,
-                 lchown: "Callable[[Path, int, int], None]" = (
+                 lchown: "Callable[[str | Path, int, int], None]" = (
                      lambda p, u, g: os.chown(p, u, g, follow_symlinks=False)),
                  netns_dir: Path = Path("/run/netns")) -> None:
         self.cfg = cfg
@@ -592,6 +718,7 @@ class Helper:
         self._peer_conns: dict[int, int] = {}
         self._uids = UidPool(cfg.uid_min, cfg.uid_max)
         self._stop = threading.Event()
+        self._sink = FdSink()
         if apparmor_enabled is None:
             apparmor_enabled = _apparmor_enabled()
         if cfg.apparmor == "require" and not apparmor_enabled:
@@ -654,7 +781,7 @@ class Helper:
         if parent is not None and parent.is_dir():
             for leaf in parent.iterdir():
                 if leaf.is_dir() and JAIL_ID_RE.match(leaf.name):
-                    _kill_cgroup(leaf)
+                    _kill_cgroup(str(leaf))
         entries = list(base.iterdir()) if base.is_dir() else []
         loaded = set(_loaded_profiles()) if self.apparmor else set()
         for entry in entries:
@@ -709,7 +836,7 @@ class Helper:
             with contextlib.suppress(Exception):
                 self._kill_and_wait(jail, timeout=5.0)
             try:
-                self._destroy(jail)
+                self._destroy(jail, wait=False)
             except Exception as exc:  # noqa: BLE001 - retried by the monitor
                 _log.error("fc_jail.reap_destroy_failed jail=%s: %s", jail.id, exc)
         for gid in gens:
@@ -740,7 +867,7 @@ class Helper:
             if not jail.destroyed and (jail.owner.dead or jail.orphaned):
                 with contextlib.suppress(Exception):
                     if self._kill_and_wait(jail, timeout=1.0):
-                        self._destroy(jail)
+                        self._destroy(jail, wait=False)
 
     # ------------------------------------------------------------------ dispatch
     def handle(self, owner: Owner, req: "dict[str, Any]", fds: "list[int]") -> "tuple[dict[str, Any], list[int]]":
@@ -886,11 +1013,11 @@ class Helper:
             for aid in assets:
                 self._assets[aid].refs += 1
             name = exec_name(jail_id)
-            top = cfg.chroot_base / name
+            top = _jp(str(cfg.chroot_base), name)
             jail = Jail(
                 id=jail_id, owner=owner, uid=uid, mode=mode, top=top,
-                root=top / jail_id / "root", netns=f"bbfcj-{jail_id}",
-                cgroup=cfg.cgroup_root / cfg.cgroup_parent_rel / jail_id,
+                root=_jp(top, jail_id, "root"), netns=f"bbfcj-{jail_id}",
+                cgroup=_jp(str(cfg.cgroup_root), cfg.cgroup_parent_rel, jail_id),
                 mem_mib=mem_mib, gen=gen.id if gen else None, assets=assets,
             )
             if gen is not None:
@@ -914,12 +1041,13 @@ class Helper:
         cfg = self.cfg
         # STAGE as root before anything runs as the jail uid: the jail dirs, the per-jail
         # binary name, the drives and (optionally) the READY listener.
-        jail.top.mkdir(mode=0o700)
-        (jail.top / jail.id).mkdir(mode=0o700)
-        jail.root.mkdir(mode=0o700)
-        exec_src = cfg.bin_dir / exec_name(jail.id)
-        exec_src.unlink(missing_ok=True)
-        os.link(cfg.bin_dir / "firecracker", exec_src)
+        os.mkdir(jail.top, 0o700)
+        os.mkdir(_jp(jail.top, jail.id), 0o700)
+        os.mkdir(jail.root, 0o700)
+        exec_src = _jp(str(cfg.bin_dir), exec_name(jail.id))
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(exec_src)
+        os.link(_jp(str(cfg.bin_dir), "firecracker"), exec_src)
         root_fd = os.open(jail.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
             if jail.mode == "boot":
@@ -972,14 +1100,14 @@ class Helper:
             # Bound by the helper in the jail root, owned by the jail uid (firecracker must be
             # able to connect), and handed to the client: the client never needs a path into
             # the jail. AppArmor mediates this connect by the HOST path (see render_profile).
-            path = jail.root / f"{JAIL_VSOCK}_{READY_PORT}"
+            path = _jp(jail.root, f"{JAIL_VSOCK}_{READY_PORT}")
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             # Through a directory fd: the full host path is ~108 bytes plus the chroot base,
             # past the AF_UNIX limit. The socket's path (what AppArmor mediates) is still the
             # real host path.
             dir_fd = os.open(jail.root, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
             try:
-                sock.bind(f"/proc/self/fd/{dir_fd}/{path.name}")
+                sock.bind(f"/proc/self/fd/{dir_fd}/{JAIL_VSOCK}_{READY_PORT}")
             except BaseException:
                 sock.close()
                 raise
@@ -1012,7 +1140,7 @@ class Helper:
                 # API): vcpus alone throttles the I/O path of a guest using every vCPU.
                 "cpu.max": f"{(req['vcpus'] + 1) * 100000} 100000",
             }
-            argv = jailer_argv(cfg, jail.id, jail.uid, exec_file=str(exec_src), cgroups=cgroups,
+            argv = jailer_argv(cfg, jail.id, jail.uid, exec_file=exec_src, cgroups=cgroups,
                                netns_path=str(self._netns_dir / jail.netns),
                            fsize=max(jail.outdisk_bytes, (jail.mem_mib << 20) + (1 << 20)))
             proc = self._popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -1024,7 +1152,8 @@ class Helper:
             threading.Thread(target=_drain, args=(proc, jail.log), daemon=True,
                              name=f"fcj-log-{jail.id[:8]}").start()
             self._wait_api(jail)
-            exec_src.unlink(missing_ok=True)
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(exec_src)
             _log.info("fc_jail.spawned jail=%s mode=%s uid=%d pid=%d", jail.id, jail.mode, jail.uid,
                       proc.pid)
         except BaseException:
@@ -1216,8 +1345,8 @@ class Helper:
 
     def _publish(self, owner: Owner, jail: Jail) -> "tuple[dict[str, Any], list[int]]":
         gid = "g" + secrets.token_hex(16)
-        gdir = self.cfg.gens_dir / gid
-        gdir.mkdir(mode=0o711)
+        gdir = _jp(str(self.cfg.gens_dir), gid)
+        os.mkdir(gdir, 0o711)
         mem_bytes = 0
         try:
             root_fd = os.open(jail.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -1268,7 +1397,7 @@ class Helper:
                                   mem_bytes=mem_bytes)
             owner.gens.add(gid)
         _log.info("fc_jail.published gen=%s from=%s mem=%d", gid, jail.id, mem_bytes)
-        return {"gen": gid, "dir": str(gdir)}, []
+        return {"gen": gid, "dir": gdir}, []
 
     def op_destroy(self, owner: Owner, req: "dict[str, Any]", fds: "list[int]") -> "tuple[dict[str, Any], list[int]]":
         jail = self._jail_of(owner, req["jail"])
@@ -1299,38 +1428,50 @@ class Helper:
             return False
         return True
 
-    def _destroy(self, jail: Jail) -> None:
+    def _destroy(self, jail: Jail, *, wait: bool = True) -> None:
         """Remove every trace of an EXITED jail. Idempotent; raises if something is left that
-        could still hold the jail's resources (then nothing is released, and it is retried)."""
-        with jail.lock:
-            if jail.destroyed:
-                return
-            if not jail.exited():
-                raise HelperError("alive", jail.id)
+        could still hold the jail's resources (then nothing is released, and it is retried).
+
+        ``wait=False`` (the monitor and owner reaping): a jail whose lock is held -- a publish
+        copying its disk, for up to the copy timeout -- is skipped and retried next tick, so
+        one owner's slow publish cannot stall every other owner's reaping."""
+        if not jail.lock.acquire(blocking=wait):
+            raise HelperError("busy", f"{jail.id} is in use; retried")
+        try:
+            self._destroy_locked(jail)
+        finally:
+            jail.lock.release()
+
+    def _destroy_locked(self, jail: Jail) -> None:
+        if jail.destroyed:
+            return
+        if not jail.exited():
+            raise HelperError("alive", jail.id)
+        if _cgroup_populated(jail.cgroup):
+            _kill_cgroup(jail.cgroup)
             if _cgroup_populated(jail.cgroup):
-                _kill_cgroup(jail.cgroup)
-                if _cgroup_populated(jail.cgroup):
-                    raise HelperError("alive", f"{jail.id}: cgroup still populated")
-            with contextlib.suppress(FileNotFoundError):
-                jail.cgroup.rmdir()
-            if jail.outdisk_fd is not None:
-                os.close(jail.outdisk_fd)
-                jail.outdisk_fd = None
-            if jail.pidfd is not None:
-                os.close(jail.pidfd)
-                jail.pidfd = None
-            if jail.profile is not None:
-                _remove_profile(jail.profile)
-                jail.profile = None
-            self._run([self.cfg.ip, "netns", "del", jail.netns], capture_output=True,
-                      check=False, timeout=10)
-            (self.cfg.bin_dir / exec_name(jail.id)).unlink(missing_ok=True)
-            errs: list[str] = []
-            if jail.top.exists():
-                shutil.rmtree(jail.top, onerror=lambda fn, p, exc: errs.append(str(p)))
-            if errs:
-                raise HelperError("cleanup_failed", ", ".join(errs[:3]))
-            jail.destroyed = True
+                raise HelperError("alive", f"{jail.id}: cgroup still populated")
+        with contextlib.suppress(FileNotFoundError):
+            os.rmdir(jail.cgroup)
+        if jail.outdisk_fd is not None:
+            os.close(jail.outdisk_fd)
+            jail.outdisk_fd = None
+        if jail.pidfd is not None:
+            os.close(jail.pidfd)
+            jail.pidfd = None
+        if jail.profile is not None:
+            _remove_profile(jail.profile)
+            jail.profile = None
+        self._run([self.cfg.ip, "netns", "del", jail.netns], capture_output=True,
+                  check=False, timeout=10)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(_jp(str(self.cfg.bin_dir), exec_name(jail.id)))
+        errs: list[str] = []
+        if os.path.lexists(jail.top):
+            shutil.rmtree(jail.top, onerror=lambda fn, p, exc: errs.append(str(p)))
+        if errs:
+            raise HelperError("cleanup_failed", ", ".join(errs[:3]))
+        jail.destroyed = True
         with self._lock:
             self._jails.pop(jail.id, None)
             jail.owner.jails.discard(jail.id)
@@ -1388,7 +1529,7 @@ class Helper:
         srv.bind(str(cfg.socket_path))
         self._lchown(cfg.socket_path, 0, cfg.socket_gid)
         os.chmod(cfg.socket_path, 0o660)
-        srv.listen(64)
+        srv.listen(_LISTEN_BACKLOG)
         srv.settimeout(1.0)
         threading.Thread(target=self._monitor_loop, daemon=True, name="fcj-monitor").start()
         slots = threading.BoundedSemaphore(self.cfg.max_conns)
@@ -1420,11 +1561,16 @@ class Helper:
                     # indistinguishable from a refused uid. Drain first (closing with unread data
                     # resets the client before it reads "busy") -- and drain WITHOUT blocking:
                     # this is the accept thread.
-                    self._drain(conn)
+                    # Read the queued request (non-blocking) so "busy" is what the client reads;
+                    # its descriptors and the connection itself go to the sink.
+                    taken: list[int] = []
+                    with contextlib.suppress(OSError):
+                        _, taken, _, _ = socket.recv_fds(conn, MAX_MSG + 1, SCM_MAX_FD,
+                                                         socket.MSG_DONTWAIT)
                     with contextlib.suppress(OSError):
                         conn.send(encode({"ok": False, "error": "busy", "detail": "overloaded"}),
                                   socket.MSG_DONTWAIT)
-                    conn.close()
+                    self._sink.release([*taken, conn.detach()])
                     continue
 
                 def _run(c: socket.socket = conn, p: int = peer) -> None:
@@ -1436,6 +1582,7 @@ class Helper:
                 threading.Thread(target=_run, daemon=True, name="fcj-conn").start()
         finally:
             srv.close()
+            self._sink.close()
 
     def _release_peer(self, peer: int) -> None:
         with self._lock:
@@ -1444,19 +1591,6 @@ class Helper:
                 self._peer_conns[peer] = n
             else:
                 self._peer_conns.pop(peer, None)
-
-    @staticmethod
-    def _close_client_fd(fd: int) -> None:
-        """Close a client-supplied descriptor WITHOUT blocking. close() of a socket the client
-        set to linger (with unsent data) blocks for the linger time; making it abortive first
-        (SO_LINGER 0) turns that into an immediate reset, so a hostile client can neither pin
-        a connection slot nor stall a closer behind which descriptors pile up."""
-        with contextlib.suppress(OSError):
-            if stat.S_ISSOCK(os.fstat(fd).st_mode):
-                with socket.socket(fileno=os.dup(fd)) as s:
-                    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-        with contextlib.suppress(OSError):
-            os.close(fd)
 
     def _monitor_loop(self) -> None:
         while not self._stop.wait(1.0):
@@ -1477,7 +1611,7 @@ class Helper:
                 return
             # Room for the kernel's per-message maximum: descriptors that do not fit are
             # released BY THE KERNEL inside recvmsg, where a lingering socket's close blocks this
-            # thread -- every one must be installed so _close_client_fd can make it abortive.
+            # thread -- every one must be installed so the FdSink can take it.
             data, fds, flags, _ = socket.recv_fds(conn, MAX_MSG + 1, SCM_MAX_FD)
             if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC) or len(data) > MAX_MSG:
                 self._reply(conn, {"ok": False, "error": "protocol", "detail": "truncated"}, [])
@@ -1515,31 +1649,12 @@ class Helper:
         except (OSError, ValueError) as exc:
             _log.warning("fc_jail.conn_error: %s", exc)
         finally:
-            for fd in fds:
-                self._close_client_fd(fd)
             for fd in out_fds:
                 with contextlib.suppress(OSError):
                     os.close(fd)
-            self._drain(conn)
-            conn.close()
-
-    def _drain(self, conn: socket.socket) -> None:
-        """Make close() of ``conn`` unable to block: stop the client queueing more (SHUT_RD --
-        its sends now fail EPIPE), then receive every queued message without blocking and close
-        each descriptor abortively. Otherwise close() releases queued descriptors in THIS thread,
-        and a lingering socket among them blocks it for as long as the client likes."""
-        with contextlib.suppress(OSError):
-            conn.shutdown(socket.SHUT_RD)
-        for _ in range(1024):           # bounded by what was queued before the shutdown
-            try:
-                data, fds, _, _ = socket.recv_fds(conn, MAX_MSG + 1, SCM_MAX_FD,
-                                                  socket.MSG_DONTWAIT)
-            except OSError:
-                return
-            for fd in fds:
-                self._close_client_fd(fd)
-            if not data and not fds:
-                return
+            # The client's descriptors AND its connection (whose queue may hold more of them):
+            # their final release must not happen in this thread.
+            self._sink.release([*fds, conn.detach()])
 
     def _abandon(self, owner: Owner, jail_id: str) -> None:
         with self._lock:
@@ -1600,9 +1715,17 @@ def _status_fields(text: str) -> "dict[str, str]":
     return out
 
 
-def _cgroup_populated(cg: Path) -> bool:
+def _jp(*parts: str) -> str:
+    """os.path.join for per-jail / per-generation paths. Deliberately NOT pathlib: pathlib
+    interns every component (immortal in Python 3.12), and these names are unique per spawn and
+    client-chosen -- a long-lived root helper would keep every one forever."""
+    return os.path.join(*parts)
+
+
+def _cgroup_populated(cg: str) -> bool:
     try:
-        text = (cg / "cgroup.events").read_text()
+        with open(_jp(cg, "cgroup.events")) as fh:
+            text = fh.read()
     except FileNotFoundError:
         return False
     except OSError:
@@ -1610,14 +1733,15 @@ def _cgroup_populated(cg: Path) -> bool:
     return "populated 1" in text
 
 
-def _kill_cgroup(cg: Path) -> None:
+def _kill_cgroup(cg: str) -> None:
     with contextlib.suppress(OSError):
-        (cg / "cgroup.kill").write_text("1")
+        with open(_jp(cg, "cgroup.kill"), "w") as fh:
+            fh.write("1")
     deadline = time.monotonic() + 5.0
     while _cgroup_populated(cg) and time.monotonic() < deadline:
         time.sleep(0.02)
     with contextlib.suppress(OSError):
-        cg.rmdir()
+        os.rmdir(cg)
 
 
 def _enable_controllers(cg: Path) -> None:
