@@ -930,3 +930,19 @@ def test_a_budget_bounds_connect_send_and_receive_together(tmp_path, monkeypatch
         JailClient(str(path)).call("status", jail=JID, timeout_s=0.2)
     assert time.monotonic() - t0 < 0.3             # not 0.15 + a fresh 0.2 for the receive
     srv.close()
+
+
+def test_wait_and_tick_probes_never_use_the_default_helper_timeout(tmp_path):
+    jail = _FakeJail(tmp_path)
+    jail.alive[JID] = True
+    seen = []
+    real = jail.status
+    jail.status = lambda jid, timeout_s=None: (seen.append(timeout_s), real(jid))[1]
+    p = JailedProcess(jail, JID)
+    with pytest.raises(subprocess.TimeoutExpired):
+        p.wait(timeout=0.3)
+    assert seen and all(t is not None and t <= 0.3 for t in seen)
+    seen.clear()
+    p.vsock_present()
+    p.poll()
+    assert seen and all(t is not None and t <= fc_jail._TICK_BUDGET_S for t in seen)

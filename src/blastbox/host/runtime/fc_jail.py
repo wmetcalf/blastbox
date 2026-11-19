@@ -65,6 +65,9 @@ INFRA_CODES = frozenset({"unreachable", "timeout", "refused", "internal", "proto
 #: longer than that, or a slow-but-successful spawn finishes after the client gave up. (The
 #: helper also undoes a spawn whose reply it could not deliver.)
 _SLOW_OPS = {"asset": 900.0, "spawn": 900.0, "publish": 900.0}
+#: Budget for the cheap status probes the pool runs on its tick (poll/is_ready/vsock): a stalled
+#: helper must cost the tick seconds, not the 60 s default -- it then reads as UNKNOWN.
+_TICK_BUDGET_S = 5.0
 _BUSY_RETRIES = 6
 
 
@@ -329,7 +332,7 @@ class JailedProcess:
         self._destroyed = False
         self._lock = threading.Lock()
 
-    def poll(self, timeout_s: "float | None" = None) -> "int | None":
+    def poll(self, timeout_s: "float | None" = _TICK_BUDGET_S) -> "int | None":
         if self.returncode is not None:
             return self.returncode
         try:
@@ -366,7 +369,8 @@ class JailedProcess:
         deadline = None if timeout is None else time.monotonic() + timeout
         delay = 0.01
         while True:
-            rc = self.poll()
+            left = None if deadline is None else max(0.001, deadline - time.monotonic())
+            rc = self.poll(left)           # each helper round trip within what is left
             if rc is not None:
                 return rc
             if deadline is not None and time.monotonic() >= deadline:
@@ -407,7 +411,7 @@ class JailedProcess:
 
     def vsock_present(self) -> bool:
         try:
-            st = self._client.status(self.jail_id)
+            st = self._client.status(self.jail_id, _TICK_BUDGET_S)
         except JailError:
             return False
         return st.get("returncode") is None and bool(st.get("vsock"))

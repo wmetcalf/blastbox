@@ -1254,3 +1254,34 @@ def test_a_sink_is_replaced_before_it_holds_too_many_descriptors(monkeypatch):
         sink.close()
         peer.close()
         srv.close()
+
+
+def test_a_jail_without_a_pidfd_is_still_signalled_through_its_unreaped_child(env):
+    jail, _ = env.boot(listener=False)
+    with jail.pidfd_lock:
+        os.close(jail.pidfd)
+        jail.pidfd = None                      # as if pidfd_open had failed
+    env.helper._signal(jail, signal.SIGKILL)
+    assert jail.proc.wait(5) is not None
+
+
+def test_the_chroot_base_check_follows_symlink_chains(tmp_path, monkeypatch):
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    w = tmp_path / "w"
+    w.mkdir()
+    (w / "hop").symlink_to(real_dir)
+    base = tmp_path / "base"
+    base.symlink_to(w / "hop")
+    real_lstat = os.lstat
+    w_ident = (real_lstat(w).st_dev, real_lstat(w).st_ino)
+
+    def faked(p, *a, **k):
+        st = real_lstat(p, *a, **k)
+        vals = list(st)
+        vals[4] = 0
+        vals[0] = (st.st_mode & ~0o022) | (0o002 if (st.st_dev, st.st_ino) == w_ident else 0)
+        return os.stat_result(vals)
+    monkeypatch.setattr(h.os, "lstat", faked)
+    with pytest.raises(RuntimeError, match=str(w)):
+        h._check_root_dir(base)

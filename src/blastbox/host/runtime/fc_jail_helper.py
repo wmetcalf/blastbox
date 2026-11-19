@@ -1300,6 +1300,8 @@ class Helper:
                                start_new_session=True)
             jail.proc = proc
             jail.spawning = False
+            # Unreaped (we hold the Popen), so the pid cannot be reused yet: _signal falls back
+            # to it if this pidfd_open fails, and the failed spawn's cleanup can still kill it.
             jail.pidfd = os.pidfd_open(proc.pid)
             threading.Thread(target=_drain, args=(proc, jail.log), daemon=True,
                              name=f"fcj-log-{jail.id[:8]}").start()
@@ -1580,9 +1582,16 @@ class Helper:
     @staticmethod
     def _signal(jail: Jail, sig: int) -> None:
         with jail.pidfd_lock:
-            if jail.pidfd is not None and not jail.exited():
+            if jail.exited():
+                return
+            if jail.pidfd is not None:
                 with contextlib.suppress(ProcessLookupError):
                     signal.pidfd_send_signal(jail.pidfd, sig)
+            elif jail.proc is not None and jail.proc.returncode is None:
+                # No pidfd (its open failed): the child is still ours and unreaped, so its pid
+                # is not reusable and Popen's signal is safe.
+                with contextlib.suppress(ProcessLookupError):
+                    jail.proc.send_signal(sig)
 
     def _destroy(self, jail: Jail, *, wait: bool = True) -> None:
         """Remove every trace of an EXITED jail. Idempotent; raises if something is left that
@@ -2034,9 +2043,11 @@ def _resolution_nodes(path: str) -> "list[str]":
 
 
 def _check_root_dir(path: Path) -> None:
-    for node in [path, *path.parents]:
-        st = os.stat(node)
-        if st.st_uid != 0 or (st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX):
+    # Every node the resolution passes through, symlink chains included (as for executables).
+    for node in _resolution_nodes(str(path)):
+        st = os.lstat(node)
+        if st.st_uid != 0 or (not stat.S_ISLNK(st.st_mode) and st.st_mode & 0o022
+                              and not st.st_mode & stat.S_ISVTX):
             raise RuntimeError(f"{node} must be root-owned and not group/other-writable")
 
 
