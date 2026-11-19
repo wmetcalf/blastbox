@@ -65,23 +65,29 @@ def api_boot_sequence(
     *,
     vsock_uds: str = REL_VSOCK,
     outdisk_path: str = REL_OUTDISK,
+    kernel_path: "str | None" = None,
+    rootfs_path: "str | None" = None,
 ) -> list[tuple[str, dict[str, Any]]]:
     """The ordered ``(api_path, body)`` PUTs that configure + start a base microVM
     over the API — the API-socket equivalent of the cold ``fc-config.json``.
 
     rootfs/kernel are absolute (shared, read-only); ``vsock_uds`` + ``outdisk_path``
     default to **relative** names so each restore's cwd yields a distinct socket +
-    disk. ``InstanceStart`` is last."""
+    disk. ``InstanceStart`` is last.
+
+    ``kernel_path`` / ``rootfs_path`` override the host paths for a JAILED microVM, whose
+    drives are names inside its chroot (the rootfs then bakes into the snapshot as a relative
+    name, like the outdisk)."""
     return [
         (
             "/boot-source",
-            {"kernel_image_path": cfg.fc_kernel, "boot_args": _BOOT_ARGS},
+            {"kernel_image_path": kernel_path or cfg.fc_kernel, "boot_args": _BOOT_ARGS},
         ),
         (
             "/drives/rootfs",
             {
                 "drive_id": "rootfs",
-                "path_on_host": cfg.fc_rootfs,
+                "path_on_host": rootfs_path or cfg.fc_rootfs,
                 "is_root_device": True,
                 "is_read_only": True,
             },
@@ -177,9 +183,15 @@ class _Handle:
     def __init__(
         self, proc, api, vsock_uds: str, ready_check=None, mem_dir: Path | None = None,
         base_outdisk: Path | None = None, stranded: list[str] | None = None,
-        ack_generation: "int | None" = None,
+        ack_generation: "int | None" = None, jail: Any = None,
     ) -> None:
         self.proc = proc
+        # The JailClient when this microVM runs under the jail helper (proc is then a
+        # JailedProcess and nothing about it is reachable by path from this process).
+        self._jail = jail
+        # Jailed base only: the (dev, ino, size, mtime_ns) of the rootfs the helper copied for
+        # this boot -- what the rootfs pin compares, since /proc cannot show a jailed process.
+        self.opened_rootfs_identity: "tuple[int, ...] | None" = None
         self.api = api
         self.vsock_uds = vsock_uds
         self._ready_check = ready_check
@@ -202,6 +214,46 @@ class _Handle:
         if self._ready_check is not None:
             self._ready_check(timeout_s)
 
+    def vsock_present(self) -> bool:
+        """Whether firecracker has (re)created this microVM's host-side vsock socket."""
+        present = getattr(self.proc, "vsock_present", None)
+        if getattr(self, "_jail", None) is not None and callable(present):
+            return bool(present())
+        try:
+            return Path(self.vsock_uds).exists()
+        except OSError:
+            return False
+
+    def connect_vsock(self) -> "Any":
+        """A jailed microVM's vsock UDS, connected by the helper (None when unjailed)."""
+        if getattr(self, "_jail", None) is None:
+            return None
+        return self.proc.connect_vsock()
+
+    def _checkpoint_jailed(self) -> object:
+        """Snapshot a JAILED base and have the helper publish it as a read-only generation.
+
+        Order is load-bearing: the files are written by the jail uid inside its chroot, so the
+        VMM must be confirmed GONE before the helper takes them -- a live process could keep a
+        writable descriptor on the memory file and rewrite it under every later restore.
+        """
+        from blastbox.host.runtime.fc_jail import JAIL_MEM_PATH, JAIL_SNAPSHOT_PATH, JailError
+        from blastbox.host.runtime.fc_snapshot_backend import (
+            FcSnapshotArtifact,
+            _create_snapshot,
+        )
+
+        _create_snapshot(self.api, JAIL_SNAPSHOT_PATH, JAIL_MEM_PATH)
+        if not _terminate_proc(self.proc):
+            raise SnapshotBuildError("jailed base did not exit after its snapshot; not publishing")
+        try:
+            reply = self._jail.publish(self.proc.jail_id)
+        except JailError as exc:
+            raise SnapshotBuildError(f"jail helper could not publish the snapshot: {exc}") from exc
+        gdir = Path(str(reply["dir"]))
+        return FcSnapshotArtifact(gdir / "warm.snapshot", gdir / "warm.mem",
+                                  gdir / "outdisk.ext4", jail_gen=str(reply["gen"]))
+
     def checkpoint(self, dest_dir: Path) -> object:
         """Pause + Full-snapshot this base microVM. The state file lands under
         ``dest_dir`` (the manager's base dir); the big mem file lands under the
@@ -212,6 +264,8 @@ class _Handle:
             _create_snapshot,
         )
 
+        if getattr(self, "_jail", None) is not None:
+            return self._checkpoint_jailed()
         if self._mem_dir is None:
             raise RuntimeError("checkpoint() called on a handle without a mem_dir")
         dest = Path(dest_dir)
@@ -305,6 +359,8 @@ class _Handle:
                 except subprocess.TimeoutExpired:
                     gone = False
         self._remove_base_workdir(confirmed=gone)
+        if gone:
+            self._destroy_jail()
         if not gone:
             # RAISE. Recording `gone=False` and returning normally told both callers the teardown
             # was CONFIRMED: FcSnapshotRuntime.reap() then releases the generation pin and lets
@@ -316,6 +372,25 @@ class _Handle:
             raise SnapshotError(
                 "firecracker did not exit after SIGKILL; its microVM may still be running"
             )
+
+    def _destroy_jail(self) -> None:
+        """Remove a jailed microVM's chroot/cgroup/netns once its exit is confirmed.
+
+        NOT fatal when it fails: the process is confirmed gone, and the helper itself refuses to
+        delete a generation while any jail -- destroyed or not -- still references it, so no
+        snapshot file can be unlinked under a live VM because of this. The jail is retried by
+        the launcher (and reclaimed by the helper when this dispatcher exits)."""
+        destroy = getattr(self.proc, "destroy", None)
+        if getattr(self, "_jail", None) is None or not callable(destroy):
+            return
+        try:
+            destroy()
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("fc_snapshot: could not destroy jail %s: %s",
+                         getattr(self.proc, "jail_id", "?"), exc)
+            pending = _PENDING_DESTROY
+            with _STRANDED_LOCK:
+                pending.append(self.proc)
 
     def _remove_base_workdir(self, *, confirmed: bool) -> None:
         """Drop this build's own base workdir once its VM is provably gone.
@@ -354,7 +429,26 @@ class _Handle:
         self._base_workdir = None
 
 
-def _terminate_proc(proc: "subprocess.Popen | None") -> bool:
+# Jailed microVMs whose exit was confirmed but whose jail could not be removed yet.
+_PENDING_DESTROY: "list[Any]" = []
+
+
+def _retry_pending_destroys() -> None:
+    with _STRANDED_LOCK:
+        batch = list(_PENDING_DESTROY)
+        del _PENDING_DESTROY[:]
+    still = []
+    for proc in batch:
+        try:
+            proc.destroy()
+        except Exception:  # noqa: BLE001 - retried again later
+            still.append(proc)
+    if still:
+        with _STRANDED_LOCK:
+            _PENDING_DESTROY[:0] = still
+
+
+def _terminate_proc(proc: "subprocess.Popen | Any") -> bool:
     """Kill a spawned firecracker so partial-failure paths don't leak an orphaned microVM.
 
     Returns True when exit is CONFIRMED. It used to swallow the second TimeoutExpired and return
@@ -500,6 +594,17 @@ def _default_copy_outdisk(src: Path, dst: Path) -> None:
         _copy_with_deadline(src, dst, disk_timeout_s())
 
 
+def _accepts(fn: Any, name: str) -> bool:
+    """Whether callable ``fn`` takes keyword ``name`` (or **kwargs)."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD or (
+        p.name == name and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                                      inspect.Parameter.KEYWORD_ONLY)) for p in params)
+
+
 def _ready_factory_kwargs(fn: Any, *, ack_generation: "int | None") -> "dict[str, Any]":
     """``{"ack_generation": ...}`` if this factory accepts it, else ``{}``.
 
@@ -547,9 +652,13 @@ class FcSnapshotLauncher:
         copy_outdisk: Callable[[Path, Path], None] = _default_copy_outdisk,
         ready_check_factory: Callable[..., Callable[[float], None]] | None = None,
         ack_sampler: "Callable[[], int | None] | None" = None,
+        jail: Any = None,
     ) -> None:
         self._cfg = cfg
         self._base_dir = Path(base_dir)
+        # A JailClient: every firecracker this launcher starts runs under the root jail helper.
+        # None = unjailed (BLASTBOX_FC_JAILER=off, or a test double).
+        self._jail = jail
         # Durable across boot handles: a handle is abandoned after a failed checkpoint.
         self._stranded_partials: list[str] = []
         # Where the snapshot mem file (~guest RAM) is written at checkpoint time. The
@@ -603,6 +712,8 @@ class FcSnapshotLauncher:
         # the retired-generation sweep: a retry is worthless if the condition it fixes is what
         # stops you reaching it (upstream, PR #82).
         _retry_stranded_partials(self._stranded_partials)
+        if getattr(self, "_jail", None) is not None:
+            return self._boot_base_jailed()
         # BEFORE _spawn. The READY listener is bound after the spawn and the whole API boot
         # sequence, so sampling the generation at bind time meant a base invalidation landing
         # during those seconds stamped this RETIRING build with the REPLACEMENT's generation --
@@ -668,6 +779,80 @@ class FcSnapshotLauncher:
             ack_generation=ack_gen,
         )
 
+    def _jail_assets(self) -> "tuple[str, str, tuple[int, ...]]":
+        """(kernel asset, rootfs asset, rootfs identity) registered with the helper."""
+        kernel, _ = self._jail.asset("kernel", self._cfg.fc_kernel)
+        rootfs, key = self._jail.asset("rootfs", self._cfg.fc_rootfs)
+        return kernel, rootfs, key
+
+    def _boot_base_jailed(self) -> "_Handle":
+        """Boot the base microVM under the jail helper (see fc_jail).
+
+        The kernel and rootfs cross to the helper as descriptors this process opened; the
+        helper copies them once per file identity and hard-links them into the jail. Drives are
+        jail-relative names, so the snapshot bakes no host path at all."""
+        from blastbox.host.runtime.fc_jail import (
+            JAIL_KERNEL_PATH,
+            JAIL_ROOTFS_PATH,
+            JailError,
+            JailedProcess,
+            new_jail_id,
+        )
+
+        _retry_pending_destroys()
+        ack_gen = self._ack_sampler() if self._ack_sampler is not None else None
+        jail_id = new_jail_id()
+        kwargs = dict(mode="boot", outdisk_mib=_DEFAULT_OUTDISK_MIB,
+                      mem_mib=int(self._cfg.fc_mem_mib), vcpus=int(self._cfg.fc_vcpu_count),
+                      ready_listener=True)
+        try:
+            kernel, rootfs, key = self._jail_assets()
+            listener = self._jail.spawn(jail_id, kernel=kernel, rootfs=rootfs, **kwargs)
+        except JailError as exc:
+            if exc.code != "unknown_asset":
+                raise SnapshotBuildError(f"jailed base spawn failed: {exc}") from exc
+            # The helper restarted (it forgets assets): register again, once.
+            self._jail.forget_assets()
+            kernel, rootfs, key = self._jail_assets()
+            try:
+                listener = self._jail.spawn(jail_id, kernel=kernel, rootfs=rootfs, **kwargs)
+            except JailError as exc2:
+                raise SnapshotBuildError(f"jailed base spawn failed: {exc2}") from exc2
+        proc = JailedProcess(self._jail, jail_id)
+        api = proc.api_client()
+        # A NOMINAL path: nothing is created there. The faux slot the READY waiter builds is
+        # rooted at it, but its listener is the one the helper bound inside the jail.
+        nominal = self._base_dir / f"base-jail-{jail_id}" / REL_VSOCK
+        try:
+            for path, body in api_boot_sequence(self._cfg, kernel_path=JAIL_KERNEL_PATH,
+                                                rootfs_path=JAIL_ROOTFS_PATH):
+                api.put(path, body)
+            proc.seal()
+            if self._ready_check_factory is None:
+                ready = None
+                if listener is not None:
+                    listener.close()
+            else:
+                if not _accepts(self._ready_check_factory, "listener"):
+                    raise SnapshotBuildError(
+                        "a jailed base needs a ready_check_factory that accepts listener=")
+                ready = self._ready_check_factory(
+                    nominal, listener=listener,
+                    **_ready_factory_kwargs(self._ready_check_factory, ack_generation=ack_gen),
+                )
+        except BaseException:
+            if listener is not None:
+                listener.close()
+            if _terminate_proc(proc):
+                with contextlib.suppress(Exception):
+                    proc.destroy()
+            raise
+        handle = _Handle(proc, api, str(nominal), ready_check=ready, mem_dir=self._mem_dir,
+                         stranded=self._stranded_partials, ack_generation=ack_gen,
+                         jail=self._jail)
+        handle.opened_rootfs_identity = key
+        return handle
+
     def sweep_orphan_generations(self) -> int:
         """Remove generation files left behind by a dispatcher that is no longer running.
 
@@ -681,6 +866,11 @@ class FcSnapshotLauncher:
         backing store out from under its live microVMs, which is far worse than the leak. Files
         whose name does not parse are left alone.
         """
+        if getattr(self, "_jail", None) is not None:
+            # Jailed generations live in the helper, scoped to THIS process: the helper reclaims
+            # a dead dispatcher's generations itself (it watches the owner's pidfd), so there is
+            # nothing on this side to sweep.
+            return 0
         removed = 0
         failed: list[str] = []
         reclaimed_owners: set[str] = set()
@@ -797,7 +987,27 @@ class FcSnapshotLauncher:
             except OSError as exc:
                 _log.warning("fc_snapshot: could not reclaim legacy artifact %s: %s", path, exc)
 
-    def restore_in(self, slot_workdir: Path, *, outdisk_src: Path | None = None):
+    def _restore_in_jailed(self, slot_workdir: Path, jail_gen: str) -> "_Handle":
+        """Restore generation ``jail_gen`` into a fresh jail. The helper stages the snapshot,
+        memory file and rootfs (hard links of root-owned read-only files) and a private copy of
+        the generation's outdisk; ``slot_workdir`` is only this dispatcher's own scratch."""
+        from blastbox.host.runtime.fc_jail import JailError, JailedProcess, new_jail_id
+
+        _retry_pending_destroys()
+        Path(slot_workdir).mkdir(parents=True, exist_ok=True)
+        jail_id = new_jail_id()
+        try:
+            self._jail.spawn(jail_id, mode="restore", gen=jail_gen,
+                             mem_mib=int(self._cfg.fc_mem_mib),
+                             vcpus=int(self._cfg.fc_vcpu_count))
+        except JailError as exc:
+            raise SnapshotError(f"jailed restore spawn failed: {exc}") from exc
+        proc = JailedProcess(self._jail, jail_id)
+        return _Handle(proc, proc.api_client(), str(Path(slot_workdir) / REL_VSOCK),
+                       jail=self._jail)
+
+    def restore_in(self, slot_workdir: Path, *, outdisk_src: Path | None = None,
+                   jail_gen: "str | None" = None):
         """Spawn a fresh firecracker in ``slot_workdir`` for a snapshot restore. The
         caller (SnapshotManager) issues load+resume; the relative vsock/outdisk
         resolve under this cwd → per-slot uniqueness.
@@ -809,6 +1019,13 @@ class FcSnapshotLauncher:
         → ``EXT4-fs error: Directory block failed checksum`` corruption. Copying the
         snapshot-time base image (empty at READY) keeps the (disk, guest-RAM) pair
         consistent; writes still land on the isolated per-slot copy (one job per slot)."""
+        jail = getattr(self, "_jail", None)
+        if jail_gen is not None or jail is not None:
+            if jail_gen is None or jail is None:
+                # Never mix: an unjailed artifact restored by a jailed launcher (or vice versa)
+                # would bake host paths into a jail, or run a jailed generation unjailed.
+                raise SnapshotError("snapshot artifact and launcher disagree about jailing")
+            return self._restore_in_jailed(Path(slot_workdir), jail_gen)
         # Prefer THIS generation's frozen disk; fall back to the shared base only for artifacts
         # built before the disk was versioned.
         # No fixed-path fallback. Every generation carries its OWN frozen disk (checkpoint fails

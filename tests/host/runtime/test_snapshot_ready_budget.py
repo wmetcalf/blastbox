@@ -123,6 +123,7 @@ class TestBothFactoriesPassItOn:
 
         seen = self._recorder(monkeypatch, fr)   # FC bound it at import time
         monkeypatch.setenv(READY_ENV, "615")
+        monkeypatch.setenv("BLASTBOX_FC_JAILER", "off")   # the unjailed construction path
         # Stand-in HOST assets so FCConfig.from_env resolves; the factory bails before the
         # construction otherwise. Their contents are never read -- only the construction call
         # is under test.

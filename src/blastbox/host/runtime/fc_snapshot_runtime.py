@@ -23,11 +23,12 @@ import contextlib
 import logging
 import os
 import shutil
+import socket
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from blastbox.worker.warm import AckCapability
 from blastbox.host.pool import Slot, SlotState
@@ -40,6 +41,7 @@ _log = logging.getLogger(__name__)
 def _vsock_ready_check_factory(vsock_path: Path,
                                ack_capable: "AckCapability | None" = None,
                                ack_generation: "int | None" = None,
+                               listener: "socket.socket | None" = None,
                                ) -> Callable[[float], None]:
     """Build a blocking ``ready_check(timeout_s)`` for the base-VM build.
 
@@ -66,7 +68,12 @@ def _vsock_ready_check_factory(vsock_path: Path,
     )
     # ack_generation was sampled by the launcher BEFORE it spawned this base; binding happens
     # after the spawn, so sampling at bind time could stamp a generation this base never was.
-    signal.prepare(faux, ack_generation=ack_generation)  # bind before the guest's READY retries
+    # bind before the guest's READY retries -- or, for a JAILED base, adopt the listener the
+    # jail helper bound inside the jail (this process has no path into it).
+    if listener is not None:
+        signal.prepare(faux, ack_generation=ack_generation, listener=listener)
+    else:
+        signal.prepare(faux, ack_generation=ack_generation)
 
     def _wait(timeout_s: float) -> None:
         deadline = time.monotonic() + timeout_s
@@ -267,6 +274,11 @@ class SnapshotSlotRuntime:
         # Hold WARMING until the post-restore vsock settle window elapses.
         if restored_at is not None and self._clock() - restored_at < self._settle_s:
             return False
+        present = getattr(handle, "vsock_present", None)
+        if callable(present):
+            # The FC handle answers for itself: a jailed microVM's socket is only visible to
+            # the jail helper.
+            return bool(present())
         try:
             return Path(handle.vsock_uds).exists()  # type: ignore[attr-defined]
         except OSError:
@@ -399,8 +411,12 @@ class SnapshotSlotRuntime:
         from blastbox.host.runtime.firecracker import VsockHostWarmControl
 
         vsock_uds = Path(slot.output_dir).parent / REL_VSOCK
+        handle = self._get(slot.slot_id) if hasattr(self, "_lock") else None
+        connect = getattr(handle, "connect_vsock", None)
+        jailed = getattr(handle, "_jail", None) is not None and callable(connect)
         return VsockHostWarmControl(vsock_uds, ack_capable=self._ack_capable,
-                                    ack_generation=getattr(slot, "ack_generation", None))
+                                    ack_generation=getattr(slot, "ack_generation", None),
+                                    uds_connect=connect if jailed else None)
 
     def stage_warm_input(self, slot: Slot, staged_input_path: Path) -> Path:
         """FC input travels over vsock (signal_go reads this path), not via a shared
@@ -418,6 +434,12 @@ class SnapshotSlotRuntime:
 
         slot_workdir = Path(slot.output_dir).parent
         image = slot_workdir / REL_OUTDISK
+        handle = self._get(slot.slot_id) if hasattr(self, "_lock") else None
+        proc: Any = getattr(handle, "proc", None)
+        if getattr(handle, "_jail", None) is not None and hasattr(proc, "copy_outdisk"):
+            # JAILED: the disk lives in the jail. The helper hands over a descriptor on the inode
+            # it created at staging, and the host-side parser works on this process's own copy.
+            proc.copy_outdisk(image)
         if not image.exists():
             raise FCError(
                 f"output disk not found for slot {slot.slot_id}: {image}"
@@ -475,6 +497,7 @@ def select_snapshot_runtime(
         _MIN_SNAPSHOT_KERNEL,
         FCConfig,
         FCUnavailable,
+        _jail_client,
         firecracker_available,
         guest_kernel_version,
     )
@@ -513,7 +536,19 @@ def select_snapshot_runtime(
             _log.debug("select_snapshot_runtime: config unavailable: %s", exc)
             return None
 
-    if not firecracker_available(cfg):  # type: ignore[arg-type]
+    # JAILED BY DEFAULT. Resolved before the availability probe because it changes what is
+    # probed: a jailed dispatcher runs no firecracker and needs no /dev/kvm -- the helper does.
+    # Unreachable helper + jailing on = the tier FAILS CLOSED, never an unjailed fallback.
+    try:
+        jail = _jail_client()
+    except (FCUnavailable, ValueError) as exc:
+        if require_available:
+            raise FCUnavailable(str(exc)) from exc
+        _log.error("select_snapshot_runtime: %s", exc)
+        return None
+
+    if not (firecracker_available(cfg, jail=jail)  # type: ignore[arg-type]
+            if jail is not None else firecracker_available(cfg)):  # type: ignore[arg-type]
         if require_available:
             from blastbox.host.runtime.firecracker import _guest_refusal
 
@@ -521,7 +556,9 @@ def select_snapshot_runtime(
             raise FCUnavailable(
                 f"snapshot warm tier refused: {guest}" if guest else
                 "snapshot warm tier required but prerequisites missing: check "
-                "firecracker binary, /dev/kvm, BLASTBOX_FC_KERNEL, BLASTBOX_FC_ROOTFS."
+                + ("BLASTBOX_FC_KERNEL, BLASTBOX_FC_ROOTFS (readable by the dispatcher) and the "
+                   "jail helper's firecracker version." if jail is not None else
+                   "firecracker binary, /dev/kvm, BLASTBOX_FC_KERNEL, BLASTBOX_FC_ROOTFS.")
             )
         _log.debug("select_snapshot_runtime: prerequisites not met")
         return None
@@ -546,6 +583,14 @@ def select_snapshot_runtime(
         return None
 
     base_dir = Path(cfg.scratch_root)  # type: ignore[attr-defined]
+    if jail is not None and resolve_mem_dir() is not None:
+        msg = ("BLASTBOX_SNAPSHOT_MEM_DIR / BLASTBOX_SNAPSHOT_MEM_TMPFS cannot apply under the "
+               "jailer: jailed snapshots live in the jail helper's --chroot-base (put THAT on "
+               "tmpfs to preload them), or set BLASTBOX_FC_JAILER=off")
+        if require_available:
+            raise FCUnavailable(msg)
+        _log.error("%s. Snapshot tier unavailable.", msg)
+        return None
     # Resolve the RAM-preload mem dir once, hand it to BOTH the launcher (whose base
     # handle writes warm.mem there at checkpoint) and the backend (whose restore loads
     # mem from there) so build/restore agree on the mem-file location.
@@ -563,9 +608,10 @@ def select_snapshot_runtime(
         base_dir,
         mem_dir=mem_dir,
         ready_check_factory=(
-            lambda p, ack_generation=None: _vsock_ready_check_factory(
-                p, ack_capable=ack_capable, ack_generation=ack_generation)
+            lambda p, ack_generation=None, listener=None: _vsock_ready_check_factory(
+                p, ack_capable=ack_capable, ack_generation=ack_generation, listener=listener)
         ),
+        jail=jail,
         # Lets boot_base stamp the build with the generation current when it STARTED. The
         # launcher owns no capability of its own, so it cannot sample this itself.
         # ack_sampler deliberately LEFT UNSET. SnapshotManager.__init__ binds its own epoch

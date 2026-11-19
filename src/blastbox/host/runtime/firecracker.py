@@ -37,6 +37,7 @@ Hard-won lessons from RedTusk FirecrackerWorkerRuntime (ported + adapted):
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -182,6 +183,21 @@ class FCUnavailable(FCError):
     Raised by ``firecracker_available()`` callers that need a hard failure, and
     by ``FCConfig.from_env()`` when prerequisites are missing.
     """
+
+
+def _jail_client() -> Any:
+    """The jail helper client when jailing is on (the default), None when it is off.
+
+    Raises :class:`FCUnavailable` naming the opt-out when jailing is on and the helper is not
+    usable, and ``ValueError`` for an unrecognised ``BLASTBOX_FC_JAILER``. The FC tier never
+    falls back to running firecracker unjailed on its own.
+    """
+    from blastbox.host.runtime.fc_jail import JailError, require_jail
+
+    try:
+        return require_jail()
+    except JailError as exc:
+        raise FCUnavailable(str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +414,7 @@ def rootfs_guest_problem(rootfs: str) -> str:
     return _rfs.guest_problem(rootfs, "firecracker")
 
 
-def firecracker_available(cfg: FCConfig | None = None) -> bool:
+def firecracker_available(cfg: FCConfig | None = None, *, jail: Any = None) -> bool:
     """Return True iff all FC prerequisites are present on this host.
 
     Checks:
@@ -418,19 +434,21 @@ def firecracker_available(cfg: FCConfig | None = None) -> bool:
             except (FCUnavailable, ValueError):
                 return False
 
-        # Binary
+        # Binary + KVM -- the dispatcher's own, unless JAILED: then the helper runs firecracker
+        # (it verified its binaries at startup) and this process needs neither.
         fc_bin = cfg.fc_bin
-        if not fc_bin:
-            return False
-        bin_path = shutil.which(fc_bin) or fc_bin
-        if not os.access(bin_path, os.X_OK):
-            _log.debug("firecracker binary not found/executable: %s", bin_path)
-            return False
+        bin_path = fc_bin
+        if jail is None:
+            if not fc_bin:
+                return False
+            bin_path = shutil.which(fc_bin) or fc_bin
+            if not os.access(bin_path, os.X_OK):
+                _log.debug("firecracker binary not found/executable: %s", bin_path)
+                return False
 
-        # KVM
-        if not Path("/dev/kvm").exists():
-            _log.debug("firecracker_available=False: /dev/kvm missing")
-            return False
+            if not Path("/dev/kvm").exists():
+                _log.debug("firecracker_available=False: /dev/kvm missing")
+                return False
 
         # Kernel
         if not cfg.fc_kernel or not Path(cfg.fc_kernel).is_file():
@@ -460,7 +478,14 @@ def firecracker_available(cfg: FCConfig | None = None) -> bool:
         # Version (probe LAST — only spawn the subprocess once the cheap checks pass).
         # The FC config adds an unconditional virtio-rng entropy device, which is a
         # guest-reachable host-memory DoS on FC < 1.15.1; refuse an older/unknown binary.
-        ver = firecracker_version(bin_path)
+        if jail is not None:
+            # The version of the firecracker the HELPER runs (from its hello).
+            raw = str(getattr(jail, "info", {}).get("firecracker", ""))
+            m = re.match(r"^(\d+)\.(\d+)\.(\d+)$", raw)
+            ver = (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+            bin_path = "the jail helper's firecracker"
+        else:
+            ver = firecracker_version(bin_path)
         if ver is None or ver < _MIN_FC_VERSION:
             _log.warning(
                 "firecracker_available=False: %s is version %s, need >= %s "
@@ -727,7 +752,7 @@ class _VsockReadyState:
     """Per-slot listener state for :class:`VsockReadySignal`."""
 
     srv: socket.socket
-    uds: Path
+    uds: "Path | None"           # None: an adopted listener (bound by the jail helper)
     ready: threading.Event
     stop: threading.Event
     thread: threading.Thread | None = None
@@ -782,7 +807,8 @@ class VsockReadySignal:
         # ``<uds_path>_<port>`` for guest→host streams.
         return slot.output_dir.parent / f"vsock.sock_{_READY_PORT}"
 
-    def prepare(self, slot: Slot, ack_generation: "int | None" = None) -> None:
+    def prepare(self, slot: Slot, ack_generation: "int | None" = None,
+                listener: "socket.socket | None" = None) -> None:
         """Bind the READY listener for ``slot``.  Call before launching FC.
 
         ``ack_generation`` is the generation the caller sampled BEFORE starting the launch this
@@ -793,6 +819,26 @@ class VsockReadySignal:
         """
         with self._lock:
             if slot.slot_id in self._slots:
+                if listener is not None:
+                    listener.close()
+                return
+            uds: "Path | None"
+            if listener is not None:
+                # JAILED: the helper bound <jail>/vsock.sock_<port> and handed us the listening
+                # socket. Nothing to bind, and nothing of ours to unlink at cleanup.
+                uds = None
+                srv = listener
+                try:
+                    srv.setblocking(False)
+                except OSError as exc:
+                    srv.close()
+                    _log.error("fc.vsock_ready_listener_unusable slot_id=%s: %s",
+                               slot.slot_id, exc)
+                    return
+                state = _VsockReadyState(
+                    srv=srv, uds=None, ready=threading.Event(), stop=threading.Event()
+                )
+                self._start_accept(slot, state, ack_generation)
                 return
             uds = self._uds_for(slot)
             try:
@@ -821,20 +867,25 @@ class VsockReadySignal:
             state = _VsockReadyState(
                 srv=srv, uds=uds, ready=threading.Event(), stop=threading.Event()
             )
-            # The generation this listener STARTED under. Without it a listener still running
-            # when the base is replaced could teach the new generation with the old base's
-            # advertisement -- the same slot-vs-job confusion, one layer out. The caller may have
-            # sampled it EARLIER still (before a slow launch); prefer that.
-            _gen = ack_generation
-            thread = threading.Thread(
-                target=self._accept_loop,
-                args=(slot.slot_id, state, _gen),
-                name=f"fc-vsock-ready-{slot.slot_id[:8]}",
-                daemon=True,
-            )
-            state.thread = thread
-            self._slots[slot.slot_id] = state
-            thread.start()
+            self._start_accept(slot, state, ack_generation)
+
+    def _start_accept(self, slot: Slot, state: _VsockReadyState,
+                      ack_generation: "int | None") -> None:
+        """Register ``state`` and start its accept loop. Caller holds ``self._lock``."""
+        # The generation this listener STARTED under. Without it a listener still running
+        # when the base is replaced could teach the new generation with the old base's
+        # advertisement -- the same slot-vs-job confusion, one layer out. The caller may have
+        # sampled it EARLIER still (before a slow launch); prefer that.
+        _gen = ack_generation
+        thread = threading.Thread(
+            target=self._accept_loop,
+            args=(slot.slot_id, state, _gen),
+            name=f"fc-vsock-ready-{slot.slot_id[:8]}",
+            daemon=True,
+        )
+        state.thread = thread
+        self._slots[slot.slot_id] = state
+        thread.start()
 
     def _accept_loop(self, slot_id: str, state: _VsockReadyState,
                      ack_generation: "int | None" = None) -> None:
@@ -946,7 +997,7 @@ class VsockReadySignal:
         if state.thread is not None:
             state.thread.join(timeout=2.0)
         try:
-            if state.uds.exists():
+            if state.uds is not None and state.uds.exists():
                 state.uds.unlink()
         except OSError:
             pass
@@ -985,7 +1036,11 @@ class VsockHostWarmControl:
         connect_fn: "Callable[[], socket.socket] | None" = None,
         ack_capable: "AckCapability | None" = None,
         ack_generation: "int | None" = None,
+        uds_connect: "Callable[[], socket.socket] | None" = None,
     ) -> None:
+        # A JAILED slot: the jail helper connects the vsock UDS (this process has no path into
+        # the jail) and the CONNECT handshake below runs over that socket unchanged.
+        self._uds_connect = uds_connect
         # Shared with the runtime (see host_warm_control); true once the CURRENT base advertised.
         self._ack_capable = ack_capable if ack_capable is not None else AckCapability()
         # The SLOT's generation, taken at SPAWN. Reading it here instead meant an old-generation
@@ -1005,16 +1060,27 @@ class VsockHostWarmControl:
     def _connect(self, *, deadline: float | None = None) -> "socket.socket":
         if self._connect_fn is not None:
             return self._connect_fn()
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        # Cap the handshake at the warm deadline (never looser than connect_timeout) so the
-        # CONNECT-reply read is inside the same budget as the rest of signal_go — a slowloris
-        # guest dribbling the OK\n reply can't pin dispatch.
-        s.settimeout(
-            self._connect_timeout
-            if deadline is None
-            else min(self._connect_timeout, max(0.0, deadline - time.monotonic()))
-        )
-        s.connect(str(self._uds))
+        budget = (self._connect_timeout if deadline is None
+                  else min(self._connect_timeout, max(0.0, deadline - time.monotonic())))
+        if getattr(self, "_uds_connect", None) is not None:
+            try:
+                s = self._uds_connect()  # type: ignore[misc]
+            except Exception as exc:  # noqa: BLE001 - JailError: report it as a connect failure
+                err = ConnectionError(f"jailed vsock connect failed: {exc}")
+                # The HELPER failing (down, overloaded, refusing us) is this host's problem, not
+                # evidence about the guest -- same attribution rule as EMFILE/ENOMEM below.
+                if getattr(exc, "code", "") in ("unreachable", "timeout", "refused", "internal",
+                                                 "protocol"):
+                    err.host_io = True  # type: ignore[attr-defined]
+                raise err from exc
+            s.settimeout(budget)
+        else:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            # Cap the handshake at the warm deadline (never looser than connect_timeout) so the
+            # CONNECT-reply read is inside the same budget as the rest of signal_go — a slowloris
+            # guest dribbling the OK\n reply can't pin dispatch.
+            s.settimeout(budget)
+            s.connect(str(self._uds))
         s.sendall(f"CONNECT {self._job_port}\n".encode())
         line = recv_line(s, deadline=deadline)
         if not line.startswith(b"OK"):
@@ -1142,12 +1208,16 @@ class _FCProcess:
     log_path: Path
 
     def is_alive(self) -> bool:
-        return self.proc.poll() is None
+        try:
+            return self.proc.poll() is None
+        except Exception:  # noqa: BLE001 - a jailed proc whose helper is unreachable
+            # The helper being gone means systemd stopped it, which killed every jail with it.
+            return False
 
     def kill(self) -> None:
         try:
             self.proc.kill()
-        except (ProcessLookupError, OSError):
+        except Exception:  # noqa: BLE001 - ProcessLookupError/OSError, or a JailError
             pass
 
     def wait(self, timeout: float | None = None) -> int:
@@ -1204,7 +1274,11 @@ class FirecrackerSlotRuntime:
         *,
         subprocess_runner: SubprocessRunner = _default_subprocess_runner,
         ready_signal: ReadySignal | None = None,
+        jail: Any = None,
     ) -> None:
+        # A JailClient: each slot's microVM is spawned by the root jail helper (see fc_jail).
+        # None = unjailed (BLASTBOX_FC_JAILER=off, or a test double).
+        self._jail = jail
         # Shared with every VsockHostWarmControl this runtime hands out: one warm base
         # image, so ack-capability is a property of the image rather than of a job.
         self._ack_capable = AckCapability()
@@ -1340,6 +1414,10 @@ class FirecrackerSlotRuntime:
 
         for d in (slot_dir, output_dir, input_dir, control_dir):
             d.mkdir(parents=True, exist_ok=True)
+
+        if getattr(self, "_jail", None) is not None:
+            return self._spawn_jailed(slot_id, slot_dir, output_dir, input_dir, control_dir,
+                                      checked_key)
 
         # Create the per-slot output disk.  The guest mounts this as vdb and
         # writes results here; the host reads it via rdump_ext4 after exit.
@@ -1494,6 +1572,90 @@ class FirecrackerSlotRuntime:
 
         return slot
 
+    def _spawn_jailed(self, slot_id: str, slot_dir: Path, output_dir: Path, input_dir: Path,
+                      control_dir: Path, checked_key: "tuple[int, ...] | None") -> Slot:
+        """spawn() under the jail helper: the slot's microVM is booted over its API socket
+        (the helper hands this process a connected socket) with jail-relative drives, and is
+        only returned once the helper has verified its confinement (seal)."""
+        from blastbox.host.rootfs_stamp import RootfsStampError
+        from blastbox.host.runtime.fc_jail import (
+            JAIL_KERNEL_PATH,
+            JAIL_ROOTFS_PATH,
+            JailError,
+            JailedProcess,
+        )
+        from blastbox.host.runtime.fc_snapshot_launcher import api_boot_sequence
+
+        jail = self._jail
+        cfg = self._cfg
+        slot = Slot(slot_id=slot_id, control_dir=control_dir, input_dir=input_dir,
+                    output_dir=output_dir, state=SlotState.WARMING, spawned_at=0.0)
+        proc: "JailedProcess | None" = None
+        listener = None
+        prepared = False
+        try:
+            def _spawn() -> "tuple[Any, tuple[int, ...]]":
+                kernel, _ = jail.asset("kernel", cfg.fc_kernel)
+                rootfs, key = jail.asset("rootfs", cfg.fc_rootfs)
+                # The file the helper copied must be the one the guest gate CHECKED: a
+                # republish between the check and this registration boots a different guest.
+                if checked_key is not None and tuple(key) != tuple(checked_key):
+                    raise RootfsStampError(
+                        f"{cfg.fc_rootfs} changed while it was being checked; the next spawn "
+                        "checks the new one")
+                return jail.spawn(slot_id, mode="boot", kernel=kernel, rootfs=rootfs,
+                                  outdisk_mib=cfg.fc_outdisk_mib, mem_mib=cfg.fc_mem_mib,
+                                  vcpus=cfg.fc_vcpu_count, ready_listener=True), key
+            try:
+                listener, _key = _spawn()
+            except JailError as exc:
+                if exc.code != "unknown_asset":
+                    raise FCError(f"jailed spawn failed: {exc}") from exc
+                jail.forget_assets()           # the helper restarted: register again, once
+                listener, _key = _spawn()
+            proc = JailedProcess(jail, slot_id)
+            prepare = getattr(self._ready_signal, "prepare", None)
+            if callable(prepare):
+                prepare(slot, listener=listener)
+                prepared = True
+            elif listener is not None:
+                listener.close()
+            listener = None
+            api = proc.api_client()
+            for path, body in api_boot_sequence(cfg, kernel_path=JAIL_KERNEL_PATH,
+                                                rootfs_path=JAIL_ROOTFS_PATH):
+                api.put(path, body)
+            proc.seal()
+        except BaseException:
+            if listener is not None:
+                listener.close()
+            if prepared:
+                cleanup = getattr(self._ready_signal, "cleanup", None)
+                if callable(cleanup):
+                    with contextlib.suppress(Exception):
+                        cleanup(slot)
+            if proc is not None:
+                gone = False
+                with contextlib.suppress(Exception):
+                    proc.kill()
+                    proc.wait(timeout=5.0)
+                    gone = True
+                if gone:
+                    with contextlib.suppress(Exception):
+                        proc.destroy()
+            shutil.rmtree(slot_dir, ignore_errors=True)
+            raise
+        _log.info("fc.spawn_jailed slot_id=%s", slot_id)
+        fc_proc = _FCProcess(proc=proc, slot_id=slot_id,  # type: ignore[arg-type]
+                             config_path=slot_dir / "fc-config.json", log_path=slot_dir / "fc.log")
+        with self._lock:
+            self._procs[slot_id] = fc_proc
+            if not hasattr(self, "_rootfs_keys"):
+                self._rootfs_keys = {}
+            self._rootfs_keys[slot_id] = checked_key
+        slot.ack_generation = None
+        return slot
+
     def is_ready(self, slot: Slot) -> bool:
         """Delegate to the injected ReadySignal -- and refuse a slot whose rootfs changed
         between its spawn-time check and the boot that opened it."""
@@ -1579,14 +1741,22 @@ class FirecrackerSlotRuntime:
             cleanup(slot)
 
         if fc_proc is not None:
+            gone = True
             if fc_proc.is_alive():
                 fc_proc.kill()
                 try:
                     fc_proc.proc.wait(timeout=5.0)
                 except subprocess.TimeoutExpired:
+                    gone = False
                     _log.warning(
                         "fc.reap_wait_timeout slot_id=%s", slot.slot_id
                     )
+            destroy = getattr(fc_proc.proc, "destroy", None)
+            if gone and callable(destroy):
+                try:
+                    destroy()
+                except Exception as exc:  # noqa: BLE001 - the helper reclaims it at our exit
+                    _log.warning("fc.jail_destroy_failed slot_id=%s: %s", slot.slot_id, exc)
 
         # Remove the entire scratch dir.
         slot_dir = self._scratch_root / slot.slot_id
@@ -1610,6 +1780,12 @@ class FirecrackerSlotRuntime:
         """
         slot_dir = self._scratch_root / slot.slot_id
         image = slot_dir / "outdisk.ext4"
+        with self._lock:
+            fc_proc = self._procs.get(slot.slot_id)
+        copy = getattr(getattr(fc_proc, "proc", None), "copy_outdisk", None)
+        if getattr(self, "_jail", None) is not None and callable(copy):
+            # JAILED: the disk lives in the jail; parse this process's own copy of it.
+            copy(image)
         if not image.exists():
             raise FCError(
                 f"output disk not found for slot {slot.slot_id}: {image}"
@@ -1632,8 +1808,13 @@ class FirecrackerSlotRuntime:
         ack meaningful. Until then it just means "older worker", which must not convict anything.
         """
         vsock_uds = self._scratch_root / slot.slot_id / "vsock.sock"
+        connect = None
+        if getattr(self, "_jail", None) is not None:
+            with self._lock:
+                fc_proc = self._procs.get(slot.slot_id)
+            connect = getattr(getattr(fc_proc, "proc", None), "connect_vsock", None)
         return VsockHostWarmControl(vsock_uds, ack_capable=self._ack_capable,
-                                    ack_generation=slot.ack_generation)
+                                    ack_generation=slot.ack_generation, uds_connect=connect)
 
     def stage_warm_input(self, slot: Slot, staged_input_path: Path) -> Path:
         """FC input travels over vsock (signal_go reads this path), NOT through a
@@ -1686,14 +1867,26 @@ def select_fc_runtime(
             _log.debug("select_fc_runtime: config unavailable: %s", exc)
             return None
 
-    if not firecracker_available(cfg):
+    # JAILED BY DEFAULT; an unreachable helper fails the tier closed (see _jail_client).
+    try:
+        jail = _jail_client()
+    except (FCUnavailable, ValueError) as exc:
+        if require_available:
+            raise FCUnavailable(str(exc)) from exc
+        _log.error("select_fc_runtime: %s", exc)
+        return None
+
+    if not (firecracker_available(cfg, jail=jail) if jail is not None
+            else firecracker_available(cfg)):
         if require_available:
             guest = _guest_refusal(cfg)
             raise FCUnavailable(
                 f"Firecracker runtime refused: {guest}" if guest else
                 "Firecracker runtime required (BLASTBOX_WORKER_RUNTIME=firecracker) "
-                "but prerequisites missing: check firecracker binary, /dev/kvm, "
-                "BLASTBOX_FC_KERNEL, and BLASTBOX_FC_ROOTFS."
+                "but prerequisites missing: check "
+                + ("BLASTBOX_FC_KERNEL and BLASTBOX_FC_ROOTFS (readable by the dispatcher) and "
+                   "the jail helper's firecracker version." if jail is not None else
+                   "firecracker binary, /dev/kvm, BLASTBOX_FC_KERNEL, and BLASTBOX_FC_ROOTFS.")
             )
         _log.debug("select_fc_runtime: prerequisites not met")
         return None
@@ -1702,4 +1895,5 @@ def select_fc_runtime(
         cfg,
         subprocess_runner=subprocess_runner,
         ready_signal=ready_signal,
+        jail=jail,
     )

@@ -78,6 +78,14 @@ class FakeHost(pf.HostView):
     def guest_problem(self, rootfs: str, runtime: str) -> str:
         return getattr(self, "guest_problems", {}).get(rootfs, "")
 
+    #: A healthy Firecracker jail helper unless a test says otherwise.
+    jail = ({"protocol": 1, "firecracker": "1.16.0", "apparmor": True, "ready_port": 10000},
+            "", "")
+
+    def jail_hello(self, socket_path: str):
+        self.jail_asked = socket_path
+        return self.jail
+
     def listdir(self, path: str) -> list[str] | None:
         prefix = path.rstrip("/") + "/"
         names = {p[len(prefix):].split("/", 1)[0] for p in self.paths if p.startswith(prefix)}
@@ -1655,3 +1663,64 @@ def test_an_admitted_runsc_overflow_fail_is_not_reported_as_never_ready():
     c = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False))["runsc"]
     assert c.status is Status.WARN and "still admits" in c.detail, c.detail
     assert "never becomes ready" not in c.detail
+
+# --- firecracker jail helper ---------------------------------------------------------------
+
+def _jail_check(env: "dict[str, str] | None" = None, jail=None, euid: int = 1000):
+    host = _healthy(env={**_healthy().env, **(env or {})})
+    host.euid = euid
+    if jail is not None:
+        host.jail = jail
+    return host, _by_name(pf.run_preflight(host, ["firecracker"]))["fc-jailer"]
+
+
+def test_jail_helper_is_checked_by_default_and_passes_when_healthy():
+    host, c = _jail_check()
+    assert c.status is Status.PASS and "1.16.0" in c.detail
+    assert host.jail_asked == "/run/blastbox-fc-jail/helper.sock"
+
+
+def test_jail_socket_knob_is_honoured():
+    host, _ = _jail_check({"BLASTBOX_FC_JAIL_SOCKET": "/run/x/h.sock"})
+    assert host.jail_asked == "/run/x/h.sock"
+
+
+def test_unreachable_jail_helper_fails_and_names_the_opt_out():
+    _, c = _jail_check(jail=(None, "unreachable", "no such file"))
+    assert c.status is Status.FAIL
+    assert "BLASTBOX_FC_JAILER=off" in c.detail and "fails closed" in c.detail
+    assert c.doc.endswith("#firecracker-jail-helper")
+
+
+def test_jailer_off_warns_that_firecracker_runs_unjailed():
+    host, c = _jail_check({"BLASTBOX_FC_JAILER": "off"})
+    assert c.status is Status.WARN and "UNJAILED" in c.detail
+    assert not hasattr(host, "jail_asked")
+
+
+def test_a_jailer_typo_fails_rather_than_disabling_the_jail():
+    _, c = _jail_check({"BLASTBOX_FC_JAILER": "of"})
+    assert c.status is Status.FAIL
+
+
+def test_jail_helper_with_an_old_firecracker_fails():
+    _, c = _jail_check(jail=({"protocol": 1, "firecracker": "1.12.1", "apparmor": True}, "", ""))
+    assert c.status is Status.FAIL and "1.12.1" in c.detail
+
+
+def test_jail_helper_without_apparmor_warns():
+    _, c = _jail_check(jail=({"protocol": 1, "firecracker": "1.16.0", "apparmor": False}, "", ""))
+    assert c.status is Status.WARN and "AppArmor" in c.detail
+
+
+def test_jail_helper_refusing_root_is_a_warning_not_a_failure():
+    _, c = _jail_check(jail=(None, "refused", "closed"), euid=0)
+    assert c.status is Status.WARN and "dispatcher" in c.detail
+
+
+def test_a_jailed_firecracker_process_is_recognised_by_its_per_jail_name():
+    jailed = _proc(300, ["/firecracker-0b4f6d1e-1111-4222-8333-944455556666", "--id", "x",
+                         "--start-time-us", "1", "--api-sock", "/fc-api.sock"], uid=200001,
+                   aa="blastbox-fc-jail-0b4f6d1e-1111-4222-8333-944455556666 (enforce)\n")
+    c = _by_name(pf.run_preflight(_with_procs(jailed), ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.PASS and "jailed" in c.detail
