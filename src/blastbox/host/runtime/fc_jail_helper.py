@@ -55,7 +55,9 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import re
+import resource
 import secrets
 import select
 import shutil
@@ -364,7 +366,6 @@ def render_profile(cfg: "HelperConfig", jail_id: str, *, boot: bool, listener_ho
         f"  /{JAIL_VSOCK} rw,",
         f"  /{JAIL_VSOCK}_* rw,",
         "  /run/ r,",
-        "  /run/** rwk,",
         "  /dev/null rw,",
         "  unix (create, bind, listen, accept, connect, send, receive, getattr, getopt, setopt,"
         " shutdown) type=stream,",
@@ -426,6 +427,10 @@ class HelperConfig:
     nofile: int = 1024
     max_jails: int = 512
     max_jails_per_owner: int = 256
+    max_owners: int = 64
+    max_gens_per_owner: int = 4
+    max_conns: int = 64
+    max_conns_per_peer: int = 8
     max_asset_bytes: int = 16 << 30
     max_snapshot_bytes: int = 64 << 20
     spawn_timeout_s: float = 10.0
@@ -515,11 +520,18 @@ class Jail:
     destroyed: bool = False
     #: Its spawn failed and cleanup did not complete: the monitor retries it.
     orphaned: bool = False
+    #: True from registration until _start has a process (or has given up).
+    spawning: bool = True
     log: "deque[bytes]" = field(default_factory=lambda: deque(maxlen=64))
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def exited(self) -> bool:
-        return self.proc is None or self.proc.poll() is not None
+        if self.proc is None:
+            # Registered but still being staged/started: NOT exited. Treating it as exited let a
+            # destroy (or an owner reap) tear it down and free its uid while _start went on to
+            # add a netns, load a profile and launch the jailer for a jail nobody tracks.
+            return not self.spawning
+        return self.proc.poll() is not None
 
 
 class UidPool:
@@ -570,7 +582,9 @@ class Helper:
         self._jails: dict[str, Jail] = {}
         self._gens: dict[str, Gen] = {}
         self._assets: dict[str, Asset] = {}
-        self._asset_lock = threading.Lock()   # one asset copy at a time
+        self._asset_locks: dict[str, threading.Lock] = {}
+        self._peer_conns: dict[int, int] = {}
+        self._to_close: "queue.SimpleQueue[int]" = queue.SimpleQueue()
         self._uids = UidPool(cfg.uid_min, cfg.uid_max)
         self._stop = threading.Event()
         if apparmor_enabled is None:
@@ -660,6 +674,9 @@ class Helper:
                 return known
             # Get-or-create under ONE lock: two first connections from the same process must
             # not each build an Owner (the loser's jails would never be reaped).
+            if len(self._owners) >= self.cfg.max_owners and known is None:
+                os.close(pidfd)
+                raise HelperError("exhausted", "too many client processes")
             owner = Owner(pid=pid, pidfd=pidfd)
             self._owners[pid] = owner
             if known is not None:
@@ -754,17 +771,19 @@ class Helper:
         key = identity(st)
         kind = req["kind"]
         aid = "a" + hashlib.sha256(repr((kind, key)).encode()).hexdigest()[:32]
-        with self._asset_lock:
+        # PER ASSET, not helper-wide: one client's slow (or deliberately stalled) copy must not
+        # hold every other dispatcher's registration hostage.
+        with self._lock:
+            lock = self._asset_locks.setdefault(aid, threading.Lock())
+        with lock:
             with self._lock:
                 existing = self._assets.get(aid)
             if existing is None:
-                # A PRIVATE description of the same file: the copy seeks, and the client's own
-                # descriptor (shared with this one) must not have its offset moved under it.
-                src = os.open(f"/proc/self/fd/{fds[0]}", os.O_RDONLY | os.O_CLOEXEC)
-                try:
-                    existing = self._copy_asset(aid, kind, src, st, key)
-                finally:
-                    os.close(src)
+                # Read through the CLIENT's own descriptor (positioned reads only, so its offset
+                # is untouched). Reopening it via /proc/self/fd would make a new description
+                # with ROOT credentials -- files whose content depends on the opener (sysfs PCI
+                # config) would then hand root-only bytes to the client.
+                existing = self._copy_asset(aid, kind, fds[0], st, key)
         with self._lock:
             if aid not in owner.assets:
                 if len(owner.assets) == owner.assets.maxlen:
@@ -782,7 +801,8 @@ class Helper:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
         try:
             try:
-                sparse_copy(src, fd, st.st_size,
+                os.ftruncate(fd, st.st_size)
+                _copy_range(src, fd, 0, st.st_size,
                             deadline=time.monotonic() + self.cfg.copy_timeout_s)
                 if identity(os.fstat(src)) != key:
                     raise HelperError("bad_asset", "the file changed while it was copied")
@@ -867,6 +887,7 @@ class Helper:
             listener_fd = self._start(jail, req, gen)
         except BaseException:
             # _start only returns the listener on success; on failure it closed it itself.
+            jail.spawning = False
             jail.orphaned = True
             with contextlib.suppress(Exception):
                 self._kill_and_wait(jail, timeout=5.0)
@@ -984,6 +1005,7 @@ class Helper:
                                stderr=subprocess.STDOUT, env={}, cwd="/", close_fds=True,
                                start_new_session=True)
             jail.proc = proc
+            jail.spawning = False
             jail.pidfd = os.pidfd_open(proc.pid)
             threading.Thread(target=_drain, args=(proc, jail.log), daemon=True,
                              name=f"fcj-log-{jail.id[:8]}").start()
@@ -1155,6 +1177,10 @@ class Helper:
             raise HelperError("alive", "kill the base before publishing it")
         if _cgroup_populated(jail.cgroup):
             raise HelperError("alive", "the jail cgroup still has processes")
+        with self._lock:
+            live = sum(1 for g in owner.gens if g in self._gens and not self._gens[g].retired)
+        if live >= self.cfg.max_gens_per_owner:
+            raise HelperError("exhausted", "too many live generations; discard one first")
         gid = "g" + secrets.token_hex(16)
         gdir = self.cfg.gens_dir / gid
         gdir.mkdir(mode=0o711)
@@ -1331,7 +1357,8 @@ class Helper:
         srv.listen(64)
         srv.settimeout(1.0)
         threading.Thread(target=self._monitor_loop, daemon=True, name="fcj-monitor").start()
-        slots = threading.BoundedSemaphore(32)
+        slots = threading.BoundedSemaphore(self.cfg.max_conns)
+        threading.Thread(target=self._closer_loop, daemon=True, name="fcj-closer").start()
         _log.info("fc_jail.listening socket=%s apparmor=%s firecracker=%s", cfg.socket_path,
                   self.apparmor, self.fc_version)
         if ready is not None:
@@ -1342,7 +1369,20 @@ class Helper:
                     conn, _ = srv.accept()
                 except TimeoutError:
                     continue
-                if not slots.acquire(blocking=False):
+                except OSError as exc:
+                    # EMFILE/ENFILE/ENOMEM: shed load, never fall out of the loop (that would
+                    # run shutdown() and kill every tenant's microVMs).
+                    _log.error("fc_jail.accept_failed: %s", exc)
+                    time.sleep(0.2)
+                    continue
+                peer = _peer_pid(conn)
+                with self._lock:
+                    busy_peer = self._peer_conns.get(peer, 0) >= self.cfg.max_conns_per_peer
+                    if not busy_peer:
+                        self._peer_conns[peer] = self._peer_conns.get(peer, 0) + 1
+                if busy_peer or not slots.acquire(blocking=False):
+                    if not busy_peer:
+                        self._release_peer(peer)
                     # Overloaded: SAY so (the client retries "busy"); a silent close is
                     # indistinguishable from a refused uid.
                     with contextlib.suppress(OSError):
@@ -1351,14 +1391,31 @@ class Helper:
                     conn.close()
                     continue
 
-                def _run(c: socket.socket = conn) -> None:
+                def _run(c: socket.socket = conn, p: int = peer) -> None:
                     try:
                         self.serve_conn(c)
                     finally:
                         slots.release()
+                        self._release_peer(p)
                 threading.Thread(target=_run, daemon=True, name="fcj-conn").start()
         finally:
             srv.close()
+
+    def _release_peer(self, peer: int) -> None:
+        with self._lock:
+            n = self._peer_conns.get(peer, 0) - 1
+            if n > 0:
+                self._peer_conns[peer] = n
+            else:
+                self._peer_conns.pop(peer, None)
+
+    def _closer_loop(self) -> None:
+        """Close client-supplied descriptors off the request path: close() of a socket the
+        client set to linger blocks, and must not pin a connection slot while it does."""
+        while True:
+            fd = self._to_close.get()
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
     def _monitor_loop(self) -> None:
         while not self._stop.wait(1.0):
@@ -1387,7 +1444,11 @@ class Helper:
                 self._reply(conn, {"ok": False, "error": "protocol", "detail": str(exc)}, [])
                 return
             pidfd = _peer_pidfd(conn, pid)
-            owner = self.owner_for(pid, pidfd)
+            try:
+                owner = self.owner_for(pid, pidfd)
+            except HelperError as exc:
+                self._reply(conn, {"ok": False, "error": exc.code, "detail": exc.detail}, [])
+                return
             try:
                 result, out_fds = self.handle(owner, req, fds)
                 reply = {"ok": True, **result}
@@ -1410,7 +1471,9 @@ class Helper:
         except (OSError, ValueError) as exc:
             _log.warning("fc_jail.conn_error: %s", exc)
         finally:
-            for fd in fds + out_fds:
+            for fd in fds:
+                self._to_close.put(fd)       # the client's: may block on close (see closer)
+            for fd in out_fds:
                 with contextlib.suppress(OSError):
                     os.close(fd)
             conn.close()
@@ -1437,6 +1500,14 @@ class Helper:
 
 # --------------------------------------------------------------------------- host utilities
 _log = logging.getLogger("blastbox.fc_jail_helper")
+
+
+def _peer_pid(conn: socket.socket) -> int:
+    try:
+        cred = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        return int(array.array("i", cred)[0])
+    except OSError:
+        return -1
 
 
 def _peer_pidfd(conn: socket.socket, pid: int) -> int:
@@ -1643,6 +1714,11 @@ def main(argv: "list[str] | None" = None) -> int:
         print("blastbox-fc-jail-helper must run as root", file=sys.stderr)
         return 2
     os.umask(0o077)
+    # Each live jail holds ~3 helper descriptors and each client process one pidfd: the 1024
+    # soft default is below max_jails. Raise the soft limit to the hard one.
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft < hard:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
     cfg = parse_args(argv)
     helper = Helper(cfg)
     helper.prepare_host()

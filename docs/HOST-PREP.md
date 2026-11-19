@@ -333,6 +333,11 @@ descriptors, never as paths.
 - **Lifetime:** jails and generations belong to the dispatcher process that created them; when it
   exits the helper kills and removes them. Stopping or restarting the helper kills every microVM
   (they are in its cgroup); dispatchers rebuild their warm base on the next spawn.
+- **Shared capacity (residual):** dispatchers cannot touch each other's microVMs, but they share
+  the helper's capacity -- `--max-jails`, the uid range, the memory cap and the chroot base. Limits
+  per client process (`max_jails_per_owner` 256, 4 live generations, 8 concurrent requests, 64
+  client processes) bound a misbehaving or compromised dispatcher, but it can still exhaust what
+  is shared and deny service to the others. Size the caps for the stacks you run.
 - **Opting out:** `BLASTBOX_FC_JAILER=off` on the dispatcher restores the previous behaviour
   (firecracker as the dispatcher uid in its container, sharing one scratch tree). Not recommended.
 - **Not jailed:** `blastbox`'s build-time CPU-feature probe (`cpu_probe`) still runs firecracker

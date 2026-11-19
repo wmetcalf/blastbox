@@ -763,3 +763,63 @@ def test_the_jail_gets_a_file_size_limit(env):
     argv = env.argvs[-1]
     limits = [argv[i + 1] for i, a in enumerate(argv) if a == "--resource-limit"]
     assert any(x.startswith("fsize=") and int(x.split("=")[1]) >= 64 << 20 for x in limits)
+
+
+def test_a_jail_still_being_staged_is_not_exited_and_cannot_be_destroyed(env):
+    seen = {}
+    real_start = env.helper._start
+
+    def start_with_a_destroy_racing_it(jail, req, gen):
+        with pytest.raises(h.HelperError, match="alive"):
+            env.helper.op_destroy(env.owner, {"op": "destroy", "jail": jail.id}, [])
+        seen["uid_still_held"] = jail.uid
+        return real_start(jail, req, gen)
+    env.helper._start = start_with_a_destroy_racing_it
+    jail, _ = env.boot(listener=False)
+    assert not jail.destroyed and jail.proc.poll() is None
+    assert seen["uid_still_held"] == jail.uid
+
+
+def test_an_asset_is_read_through_the_clients_own_descriptor(env, tmp_path, monkeypatch):
+    """No root reopen of the client's fd (a new description would carry ROOT credentials)."""
+    p = tmp_path / "k"
+    p.write_bytes(b"K" * 9000)
+    fd = os.open(p, os.O_RDONLY)
+    os.lseek(fd, 123, os.SEEK_SET)
+    real_open = os.open
+
+    def no_proc_reopen(path, *a, **k):
+        assert not str(path).startswith("/proc/self/fd/"), "reopened the client's descriptor"
+        return real_open(path, *a, **k)
+    monkeypatch.setattr(h.os, "open", no_proc_reopen)
+    try:
+        aid = env.helper.op_asset(env.owner, {"op": "asset", "kind": "kernel"}, [fd])[0]["asset"]
+        assert os.lseek(fd, 0, os.SEEK_CUR) == 123          # the client's offset is untouched
+    finally:
+        os.close(fd)
+    assert env.helper._assets[aid].path.read_bytes() == b"K" * 9000
+
+
+def test_client_processes_and_generations_are_capped(env):
+    env.helper.cfg = h.HelperConfig(**{**env.cfg.__dict__, "max_owners": 1})
+    with pytest.raises(h.HelperError, match="exhausted"):
+        env.helper.owner_for(777001, os.pidfd_open(os.getpid()))
+    env.helper.cfg = h.HelperConfig(**{**env.cfg.__dict__, "max_gens_per_owner": 1})
+    base, _ = env.boot(listener=False)
+    _snapshot(base)
+    env.kill(base)
+    env.helper.op_publish(env.owner, {"op": "publish", "jail": JID}, [])
+    env.helper.op_destroy(env.owner, {"op": "destroy", "jail": JID}, [])
+    second, _ = env.boot(jail_id=JID2, listener=False)
+    _snapshot(second)
+    env.kill(second)
+    with pytest.raises(h.HelperError, match="exhausted"):
+        env.helper.op_publish(env.owner, {"op": "publish", "jail": JID2}, [])
+
+
+def test_the_profile_grants_no_writable_tree():
+    cfg = h.HelperConfig(socket_path=Path("/run/x/h.sock"), socket_gid=1,
+                         allowed_uids=frozenset({10001}), firecracker="/f", jailer="/j",
+                         chroot_base=Path("/srv/j"))
+    text = h.render_profile(cfg, JID, boot=False, listener_host_path=None)
+    assert "/run/** " not in text and "** rw" not in text

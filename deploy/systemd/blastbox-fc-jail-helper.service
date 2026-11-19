@@ -37,6 +37,7 @@ KillMode=control-group
 # Host-level cap over every jailed microVM (guest RAM + VMM overhead). Size it for
 # (sum of warm/ceiling slots across every FC dispatcher) x (BLASTBOX_FC_MEM_MIB + 256 MiB).
 MemoryMax=64G
+LimitNOFILE=65536
 Restart=on-failure
 RestartSec=2s
 
