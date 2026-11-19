@@ -216,41 +216,77 @@ def test_every_network_allow_in_the_profile_actually_survives_compilation(
     )
 
 
-def _rule_exprs(profile: Path) -> list[str]:
-    """The compiled rule expressions (`--dump=rule-exprs`), one per `rule:` line."""
+_MOUNT_CLASS = 0x7    # AA_CLASS_MOUNT: the policy DFA's first byte for mount/umount/pivot_root
+
+
+def _policy_start_classes(text: str) -> set[int]:
+    """The class bytes the compiled POLICY DFA's start state has a transition for
+    (`--dump=dfa-states`; the second DFA dumped is the policy one, after the file DFA). The
+    kernel mediates a class only if that transition exists (RULE_MEDIATES): without it, every
+    operation of the class is allowed, whatever the rules say."""
     res = subprocess.run(
-        ["apparmor_parser", "-Q", "-K", "--skip-cache", "--dump=rule-exprs", "-S", str(profile)],
-        capture_output=True, timeout=120,
+        ["apparmor_parser", "-Q", "-K", "--skip-cache", "--dump=dfa-states", "-S"],
+        input=text.encode(), capture_output=True, timeout=120,
     )
     assert res.returncode == 0, res.stderr.decode()
-    return [ln.split("rule: ", 1)[1].split("  ->", 1)[0]
-            for ln in res.stderr.decode().splitlines() if ln.startswith("rule: ")]
+    lines = res.stderr.decode().splitlines()
+    starts = [i for i, ln in enumerate(lines) if "<== " in ln]
+    assert len(starts) >= 2, "expected a file DFA and a policy DFA in the dump"
+    policy = lines[starts[1]:]
+    first = next(i for i, ln in enumerate(policy) if ln.startswith("{1} perms"))
+    classes: set[int] = set()
+    for ln in policy[first + 1:]:
+        if ln.startswith("{"):
+            break
+        m = re.search(r"\b0x([0-9a-f]+) ->", ln)
+        if m:
+            classes.add(int(m.group(1), 16))
+    return classes
 
 
-@pytest.mark.skipif(shutil.which("apparmor_parser") is None,
-                    reason="apparmor_parser not installed on this host")
-def test_no_umount_deny_covers_the_whole_mount_class() -> None:
-    """A bare `audit deny umount,` compiles to a deny over the whole mount class prefix
-    (`\\x07[^\\000]*`), which covers the class's own mediation marker. Paired with
-    `audit deny mount,` on apparmor_parser 4.0.1, that made BOTH deny rules dead: measured live
-    (kernel 7.0), a process under this profile with `capability sys_admin, mount, umount,`
-    allows added could mount and umount freely, and with the path-qualified umount denies below
-    it could do neither. The shipped profile has no mount allow, so default-deny still held --
-    but its explicit denies were decoration, and any future allow (here or in an included
-    abstraction) would have gone straight through."""
-    exprs = _rule_exprs(_PROFILE_DIR / "blastbox-sandbox")
-    assert r"\x07[^\000]*" not in exprs, (
-        "a mount-class deny over the bare class prefix: spell umount denies with a path "
-        "(`audit deny umount /,` and `audit deny umount /**,`), never bare"
+_PARSER = pytest.mark.skipif(shutil.which("apparmor_parser") is None,
+                             reason="apparmor_parser not installed on this host")
+
+
+@_PARSER
+def test_the_child_profile_mediates_the_mount_class() -> None:
+    """A non-quiet umount deny that can match the EMPTY mountpoint -- bare `audit deny umount,`,
+    or `umount *,` / `umount **,` -- clears the mount class's mediation marker, and the compiled
+    policy then has no mount class at all: the kernel allows every mount, umount and
+    pivot_root. The shipped profile was in that state on apparmor_parser 4.0.1; only its
+    `audit deny capability sys_admin,` stood between a workload and mount. Measured live
+    (kernel 7.0): with that capability deny replaced by an allow plus `mount, umount,` allows,
+    the old profile let a confined process mount and umount; this one denies both (EACCES).
+    The check is on the compiled DFA, so it catches every spelling."""
+    text = (_PROFILE_DIR / "blastbox-sandbox").read_text()
+    assert _MOUNT_CLASS in _policy_start_classes(text), (
+        "the compiled child profile does not mediate the mount class: a umount deny is matching "
+        "the empty mountpoint -- spell it with a path (`audit deny umount /,` and "
+        "`audit deny umount /**,`)"
     )
-    assert any(e.startswith(r"\x07/") for e in exprs), "the umount denies did not compile"
+
+
+@_PARSER
+@pytest.mark.parametrize("extra,mediated", [
+    ("", True),
+    ("  audit deny umount,", False),          # the old spelling
+    ("  audit deny umount **,", False),       # matches the empty mountpoint too
+    ("  umount,", True),                      # an ALLOW keeps the class mediated
+])
+def test_the_mediation_check_tells_the_spellings_apart(extra: str, mediated: bool) -> None:
+    """The oracle above, pinned against the spellings it must distinguish."""
+    text = (_PROFILE_DIR / "blastbox-sandbox").read_text().replace(
+        "  network netlink raw,", "  network netlink raw,\n" + extra if extra else
+        "  network netlink raw,")
+    assert (_MOUNT_CLASS in _policy_start_classes(text)) is mediated
 
 
 def test_umount_denies_are_spelled_with_a_path() -> None:
-    """The text-level guard for hosts without apparmor_parser (see the compiled check above)."""
+    """The text-level guard for hosts without apparmor_parser (the compiled check above is the
+    real one): no umount deny that matches the empty mountpoint."""
     rules = [ln.split("#", 1)[0].strip() for ln in
              (_PROFILE_DIR / "blastbox-sandbox").read_text().splitlines()]
-    assert not any(re.fullmatch(r"(audit\s+)?deny\s+umount\s*,", r) for r in rules)
+    assert not any(re.fullmatch(r"(audit\s+)?deny\s+umount\s*(\*\*?)?\s*,", r) for r in rules)
     assert "audit deny umount /," in rules and "audit deny umount /**," in rules
 
 

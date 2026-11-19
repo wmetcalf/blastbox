@@ -78,12 +78,12 @@ profile blastbox-sandbox flags=(attach_disconnected,mediate_deleted) {
   # ---- capabilities and operations a detonation never needs ------------------------------
   audit deny ptrace,
   audit deny mount,
-  # umount WITH A PATH, never bare. A bare `umount` deny compiles to a deny over the whole
-  # mount class prefix, which covers the class's mediation marker; paired with `audit deny
-  # mount,` on apparmor_parser 4.0.1 that made BOTH denies dead (measured live: with mount
-  # allows added, a confined process could mount and umount). Default-deny still held here
-  # because nothing allows mount, but the denies must work on their own.
-  # tests/deploy/test_apparmor_profiles.py checks the COMPILED expressions.
+  # umount WITH A PATH, never bare (nor `*`/`**`). A umount deny that can match the empty
+  # mountpoint clears the mount class's mediation marker, and the compiled policy then does
+  # not mediate mount at all: every mount, umount and pivot_root is allowed, whatever these
+  # rules say. With the bare form this profile was in that state on apparmor_parser 4.0.1 --
+  # only the `capability sys_admin` deny below stopped a mount. tests/deploy/
+  # test_apparmor_profiles.py checks that the COMPILED policy mediates the mount class.
   audit deny umount /,
   audit deny umount /**,
   audit deny pivot_root,
