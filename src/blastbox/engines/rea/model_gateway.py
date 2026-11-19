@@ -4,7 +4,15 @@ The REA sandbox reaches this over plain HTTP through a tinyproxy URL filter. A
 request may carry a per-job grant in ``X-Rea-Grant`` (sealed by Loadout to this
 gateway's X25519 key); the gateway opens it, checks the route and model, forces
 OpenRouter zero-data-retention routing, injects the provider key and forwards over
-verified TLS. With no grant header the operator key for the route is used.
+verified TLS. With no grant header the operator key for the route is used, unless
+``REA_GW_REQUIRE_GRANT=1``: then a request without a grant answers 401 even when an
+operator key is configured (per-job keys only; no operator spend from the sandbox).
+
+On the grant path the body is pinned to the granted model: ``model`` must equal the
+grant's model, an OpenRouter ``models`` fallback list is allowed only as exactly
+``[grant.model]``, and ``route`` / ``plugins`` are refused outright, so a grant can
+never spend its key on another model or on paid plugins. Bodies holding NaN or
+Infinity are refused (400) rather than re-serialised as invalid JSON.
 
 Nothing secret is ever logged: one line per request carries method, route, status
 and elapsed milliseconds, and nothing else.
@@ -47,6 +55,9 @@ OPERATOR_KEY_ENV = {
     "openrouter": "REA_GW_OPERATOR_KEY_FILE_OPENROUTER",
     "anthropic": "REA_GW_OPERATOR_KEY_FILE_ANTHROPIC",
 }
+REQUIRE_GRANT_ENV = "REA_GW_REQUIRE_GRANT"
+# Body fields that would let a grant reach models or paid features it does not name.
+_UNPINNED_FIELDS = ("route", "plugins")
 _LOGGED_METHODS = frozenset({"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"})
 
 _GRANT_REJECTED = b'{"error":{"message":"grant rejected"}}'
@@ -69,6 +80,7 @@ class GatewayConfig:
     upstream: dict[str, str] = field(default_factory=lambda: dict(PRODUCTION_UPSTREAM))
     opener: Opener | None = None
     now: Callable[[], int] = lambda: int(time.time())
+    require_grant: bool = False
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -122,6 +134,28 @@ def operator_keys_from_env(env: dict[str, str] | None = None) -> dict[str, str]:
         if path:
             keys[provider] = read_operator_key(path)
     return keys
+
+
+def require_grant_from_env(env: dict[str, str] | None = None) -> bool:
+    env = dict(os.environ) if env is None else env
+    value = env.get(REQUIRE_GRANT_ENV, "")
+    if value in ("", "0"):
+        return False
+    if value == "1":
+        return True
+    raise ValueError("invalid REA_GW_REQUIRE_GRANT (use 0 or 1)")
+
+
+def _reject_constant(_name: str) -> Any:
+    raise ValueError("non-finite number")
+
+
+def _model_pinned(body: Any, model: str) -> bool:
+    if not isinstance(body, dict) or body.get("model") != model:
+        return False
+    if "models" in body and body["models"] != [model]:
+        return False
+    return not any(k in body for k in _UNPINNED_FIELDS)
 
 
 def _upstream_headers(provider: str, key: str) -> dict[str, str]:
@@ -205,7 +239,7 @@ class _Handler(BaseHTTPRequestHandler):
         cfg = self.server.cfg
         grant_token = self.headers.get("X-Rea-Grant")
         try:
-            body = json.loads(raw)
+            body = json.loads(raw, parse_constant=_reject_constant)
         except (ValueError, RecursionError):
             body = None
         if grant_token is not None:
@@ -220,12 +254,12 @@ class _Handler(BaseHTTPRequestHandler):
             if grant.provider != provider:
                 self._reply(401, _GRANT_REJECTED)
                 return
-            if not isinstance(body, dict) or body.get("model") != grant.model:
+            if not _model_pinned(body, grant.model):
                 self._reply(400, _MODEL_NOT_GRANTED)
                 return
             key = grant.key
         else:
-            op_key = cfg.operator_keys.get(provider)
+            op_key = None if cfg.require_grant else cfg.operator_keys.get(provider)
             if not op_key:
                 self._reply(401, _GRANT_REJECTED)
                 return
@@ -326,16 +360,28 @@ def main() -> None:
         key_path = os.environ.get("REA_GW_PRIVATE_KEY_FILE", "")
         private_key = load_private_key(key_path) if key_path else None
         operator_keys = operator_keys_from_env()
+        require_grant = require_grant_from_env()
         address = _parse_listen(os.environ.get("REA_GW_LISTEN", "0.0.0.0:8080"))
     except ValueError as e:
         # Messages are fixed strings that never carry key material.
         log.error("rea-model-gw: fatal: %s", e)
         raise SystemExit(2) from None
-    cfg = GatewayConfig(private_key=private_key, operator_keys=operator_keys)
-    server = make_server(cfg, address)
+    cfg = GatewayConfig(
+        private_key=private_key, operator_keys=operator_keys, require_grant=require_grant
+    )
+    server: ThreadingHTTPServer | None = None
+    try:
+        server = make_server(cfg, address)
+    except OSError:
+        pass
+    if server is None:
+        # Outside the except block so no traceback or chained context survives.
+        log.error("rea-model-gw: fatal: cannot listen on %s:%d", address[0], address[1])
+        raise SystemExit(2)
     log.info(
-        "rea-model-gw listening on %s:%d grants=%s operator=%s",
-        address[0], address[1], private_key is not None, sorted(operator_keys),
+        "rea-model-gw listening on %s:%d grants=%s require_grant=%s operator=%s",
+        address[0], address[1], private_key is not None, require_grant,
+        sorted(operator_keys),
     )
     try:
         server.serve_forever()

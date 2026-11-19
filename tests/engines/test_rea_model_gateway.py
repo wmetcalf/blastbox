@@ -111,7 +111,7 @@ def gw() -> Iterator:
     servers = []
 
     def start(opener: FakeOpener, operator_keys: dict[str, str] | None = None,
-              private_key: bytes | None = GW_PRIV):
+              private_key: bytes | None = GW_PRIV, require_grant: bool = False):
         cfg = mg.GatewayConfig(
             private_key=private_key,
             operator_keys=operator_keys or {},
@@ -119,6 +119,7 @@ def gw() -> Iterator:
                       "anthropic": "https://up.invalid/an"},
             opener=opener,
             now=lambda: NOW,
+            require_grant=require_grant,
         )
         srv = mg.make_server(cfg, ("127.0.0.1", 0))
         t = threading.Thread(target=srv.serve_forever, daemon=True)
@@ -353,3 +354,147 @@ def test_production_opener_refuses_redirects_and_ignores_proxy_env(monkeypatch):
     # env-reading one, so no handler routes through a proxy.
     assert not [h for h in op.handlers if isinstance(h, urllib.request.ProxyHandler)]
     assert "https_open" in {m for h in op.handlers for m in dir(h)}
+
+
+# --- review fixes: model pinning, require-grant, request hygiene ---
+
+
+@pytest.mark.parametrize("extra", [
+    {"models": ["vendor/model-a", "vendor/pricey-b"]},
+    {"models": ["vendor/pricey-b"]},
+    {"models": "vendor/model-a"},
+    {"route": "fallback"},
+    {"route": None},
+    {"plugins": [{"id": "web"}]},
+    {"plugins": []},
+])
+def test_grant_refuses_fallback_routing_and_plugins(gw, extra):
+    op = FakeOpener()
+    port = gw(op, {"openrouter": SYN_OP_KEY})
+    st, out = _call(port, body=_body(**extra), grant=_grant())
+    assert st == 400
+    assert json.loads(out) == {"error": {"message": "model not granted"}}
+    assert op.requests == []
+
+
+def test_grant_models_exactly_the_granted_model_is_forwarded(gw):
+    op = FakeOpener()
+    port = gw(op)
+    st, _ = _call(port, body=_body(models=["vendor/model-a"]), grant=_grant())
+    assert st == 200
+    assert json.loads(op.requests[0].data)["models"] == ["vendor/model-a"]
+
+
+def test_require_grant_refuses_operator_fallback(gw):
+    op = FakeOpener()
+    port = gw(op, {"openrouter": SYN_OP_KEY}, require_grant=True)
+    st, out = _call(port, body=_body())
+    assert st == 401 and json.loads(out) == {"error": {"message": "grant rejected"}}
+    assert op.requests == []
+    st2, _ = _call(port, body=_body(), grant=_grant())
+    assert st2 == 200
+    assert op.hdr("Authorization") == f"Bearer {SYN_GRANT_KEY}"
+
+
+def test_require_grant_env(monkeypatch):
+    monkeypatch.setenv("REA_GW_REQUIRE_GRANT", "1")
+    assert mg.require_grant_from_env() is True
+    monkeypatch.setenv("REA_GW_REQUIRE_GRANT", "0")
+    assert mg.require_grant_from_env() is False
+    monkeypatch.delenv("REA_GW_REQUIRE_GRANT")
+    assert mg.require_grant_from_env() is False
+    monkeypatch.setenv("REA_GW_REQUIRE_GRANT", "yes")
+    with pytest.raises(ValueError):
+        mg.require_grant_from_env()
+
+
+def _raw(port: int, head: bytes, body: bytes = b"") -> int:
+    import socket
+
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as s:
+        s.sendall(head + b"\r\n" + body)
+        data = b""
+        while b"\r\n" not in data:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+    return int(data.split(b" ", 2)[1])
+
+
+@pytest.mark.parametrize("headers, want", [
+    (b"Transfer-Encoding: chunked\r\n", 411),
+    (b"Transfer-Encoding: chunked\r\nContent-Length: 2\r\n", 411),
+    (b"Content-Length: 2\r\nContent-Length: 2\r\n", 400),
+    (b"Content-Length: 1e3\r\n", 400),
+    (b"Content-Length: -2\r\n", 400),
+])
+def test_request_framing(gw, headers, want):
+    op = FakeOpener()
+    port = gw(op, {"openrouter": SYN_OP_KEY})
+    head = b"POST " + OR_PATH.encode() + b" HTTP/1.1\r\nHost: x\r\n" + headers
+    assert _raw(port, head, b"{}") == want
+    assert op.requests == []
+
+
+def test_query_string_and_head_are_403(gw):
+    op = FakeOpener()
+    port = gw(op, {"openrouter": SYN_OP_KEY})
+    assert _call(port, path=OR_PATH + "?a=b", body=_body())[0] == 403
+    assert _call(port, path=OR_PATH, method="HEAD")[0] == 403
+    assert op.requests == []
+
+
+@pytest.mark.parametrize("body", [
+    {"messages": []},
+    "a string",
+    [{"model": "vendor/model-a"}],
+    None,
+])
+def test_grant_body_without_model_or_not_object_is_400(gw, body):
+    op = FakeOpener()
+    port = gw(op, {"openrouter": SYN_OP_KEY})
+    st, out = _call(port, body=body, grant=_grant())
+    assert st == 400
+    assert json.loads(out) == {"error": {"message": "model not granted"}}
+    assert op.requests == []
+
+
+@pytest.mark.parametrize("const", ["NaN", "Infinity", "-Infinity"])
+@pytest.mark.parametrize("granted", [True, False])
+def test_non_finite_numbers_are_400(gw, const, granted):
+    op = FakeOpener()
+    port = gw(op, {"openrouter": SYN_OP_KEY})
+    raw = ('{"model":"vendor/model-a","temperature":%s}' % const).encode()
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    hdrs = {"Content-Type": "application/json"}
+    if granted:
+        hdrs["X-Rea-Grant"] = _grant()
+    c.request("POST", OR_PATH, body=raw, headers=hdrs)
+    assert c.getresponse().status == 400
+    c.close()
+    assert op.requests == []
+
+
+def test_main_bind_failure_exits_2_without_traceback(monkeypatch, capsys, caplog):
+    import socket
+
+    held = socket.socket()
+    held.bind(("127.0.0.1", 0))
+    held.listen(1)
+    try:
+        port = held.getsockname()[1]
+        monkeypatch.setenv("REA_GW_LISTEN", f"127.0.0.1:{port}")
+        for v in ("REA_GW_PRIVATE_KEY_FILE", "REA_GW_OPERATOR_KEY_FILE_OPENROUTER",
+                  "REA_GW_OPERATOR_KEY_FILE_ANTHROPIC", "REA_GW_REQUIRE_GRANT"):
+            monkeypatch.delenv(v, raising=False)
+        with pytest.raises(SystemExit) as ei:
+            mg.main()
+        assert ei.value.code == 2
+        assert ei.value.__cause__ is None and ei.value.__context__ is None
+    finally:
+        held.close()
+    cap = capsys.readouterr()
+    text = caplog.text + cap.out + cap.err
+    assert "Traceback" not in text
+    assert "cannot listen" in text
