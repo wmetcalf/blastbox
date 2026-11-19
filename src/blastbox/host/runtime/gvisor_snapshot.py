@@ -649,7 +649,8 @@ def _warn_if_lax_parent(workdir: Path) -> None:
     """One-time warning if the slot dir's parent is group/other-writable. The 0o700 slot leaf
     already blocks other local users from reaching the 0o777 out/ctrl scratch (you can't traverse
     INTO a 0o700 dir you don't own), so this is defense-in-depth/observability — it surfaces a lax
-    deploy (the parent should be root-owned 0700) instead of letting the old comment-only
+    deploy (the parent should be root-owned and not group/other-writable: 0755, or 0700 only when
+    the gVisor rootfs is not under it) instead of letting the old comment-only
     assumption pass silently."""
     parent = workdir.parent
     key = str(parent)
@@ -1226,6 +1227,19 @@ class GvisorSnapshotBackend:
         # checkpoint, so a retry list held on the handle is discarded with it (PR #82).
         self._stranded_partials: list[str] = []
 
+    def _userns_reachability_gate(self, exc_type: type[Exception]) -> None:
+        """Re-check, where the rootfs is BOUND (every boot and restore), that the user-namespaced
+        gofer can still reach it: selection checked it once, but a re-pointed symlink or a
+        tightened parent after startup would otherwise surface as a bare runsc
+        ``binding rootfs ... permission denied``. A dozen stats; undecidable passes."""
+        base = getattr(self._cfg, "userns_host_base", None)
+        if base is None:
+            return
+        rootfs = str(getattr(self._cfg, "image_rootfs", "") or "")
+        ok, why = userns_rootfs_problem(rootfs, base)
+        if ok is False:
+            raise exc_type(f"{USERNS_ENV}={base}, but {why}")
+
     def _sandbox_spawn_kw(self) -> dict[str, Any]:
         """Extra spawn args for the runsc calls that START sandbox processes (run, restore).
         Under a user namespace runsc denies setgroups, so its sentry and gofer keep runsc's own
@@ -1263,6 +1277,7 @@ class GvisorSnapshotBackend:
             rootfs_key = self._rootfs_pin().before_boot()
         except RootfsStampError as exc:
             raise SnapshotBuildError(str(exc)) from exc
+        self._userns_reachability_gate(SnapshotBuildError)
         # BEFORE `runsc run` -- see GvisorBootHandle.__init__. The generation that is current when
         # the build STARTS is the one this base can honestly speak for; anything sampled after the
         # launch may already belong to the base that replaced it.
@@ -1420,6 +1435,7 @@ class GvisorSnapshotBackend:
             self._rootfs_pin().check_restore(artifact)
         except RootfsStampError as exc:
             raise SnapshotStale(str(exc)) from exc
+        self._userns_reachability_gate(GvisorCommandError)
         wd = Path(slot_workdir)
         _prepare_slot_dirs(self._cfg, wd)
         cid = f"slot-{uuid.uuid4().hex[:12]}"

@@ -644,9 +644,18 @@ def _check_gvisor_userns(host: HostView) -> Check | None:
     if warnings:
         return Check("gvisor-userns", Status.WARN, f"{span}; " + "; ".join(warnings), doc)
     owners = sorted({*uid_owner, *gid_owner})
+    accounts = {line.split(":", 1)[0] for line in (host.read("/etc/passwd") or "").splitlines()}
+    real = [o for o in owners if o in accounts]
+    if real:
+        # newuidmap/newgidmap authorise the NAMED account to map these ids into its own userns:
+        # that account could become host uid BASE and signal the warm sandbox processes.
+        return Check("gvisor-userns", Status.WARN,
+                     f"{span}; reserved for {', '.join(real)}, a real account in /etc/passwd: "
+                     "newuidmap lets it map these ids, i.e. become the sandbox's host uid; "
+                     "reserve them under a name no account has", doc)
     return Check("gvisor-userns", Status.PASS,
                  f"{span}, reserved for {', '.join(owners)} in /etc/subuid + /etc/subgid "
-                 f"(make sure that owner is blastbox's), rootfs {rootfs} reachable")
+                 f"(no such account), rootfs {rootfs} reachable")
 
 
 _KVM_MISSING = "/dev/kvm missing"
@@ -868,6 +877,11 @@ def _check_userns(host: HostView, tiers: Collection[str] = ("docker",)) -> Check
         ("max_user_namespaces", max_ns),
         ("unprivileged_userns_clone", clone)) if v is not None) or "no userns sysctls readable"
     needs = _needs_userns(host.env, tiers, cold_runc="docker" in tiers and _cold_runs_runc(host))
+    if max_ns == "0" and "gvisor" in tiers and \
+            host.env.get("BLASTBOX_GVISOR_USERNS_HOST_BASE", "").strip():
+        # The limit binds root too, so rootful runsc cannot create the warm sandbox's namespace.
+        needs = [*needs, "BLASTBOX_GVISOR_USERNS_HOST_BASE (runsc creates the warm sandbox's "
+                 "user namespace; this limit binds root too)"]
     if max_ns == "0" or clone == "0":
         status = Status.FAIL if needs else Status.PASS
         return Check("userns", status,

@@ -1497,3 +1497,17 @@ def test_gvisor_userns_subuid_and_subgid_held_by_different_owners_warns():
     files = {**_SUBIDS, "/etc/subgid": "alice:2000000:65536\n"}
     c = _by_name(pf.run_preflight(_healthy(env=_UNS, files=files), ["gvisor"]))["gvisor-userns"]
     assert c.status is Status.WARN and "alice" in c.detail and "blastbox" in c.detail
+
+
+def test_gvisor_userns_reservation_owned_by_a_real_account_warns():
+    files = {**_SUBIDS, "/etc/passwd": "root:x:0:0::/root:/bin/sh\nblastbox:x:998:998::/:/x\n"}
+    c = _by_name(pf.run_preflight(_healthy(env=_UNS, files=files), ["gvisor"]))["gvisor-userns"]
+    assert c.status is Status.WARN and "real account" in c.detail and "newuidmap" in c.detail
+
+
+def test_userns_check_fails_max_user_namespaces_zero_when_warm_userns_is_opted_in():
+    files = {**_SUBIDS, "/proc/sys/user/max_user_namespaces": "0\n"}
+    by = _by_name(pf.run_preflight(_healthy(env=_UNS, files=files), ["gvisor"]))
+    assert by["userns"].status is Status.FAIL and "USERNS_HOST_BASE" in by["userns"].detail
+    plain = _by_name(pf.run_preflight(_healthy(files=files), ["gvisor"]))["userns"]
+    assert plain.status is Status.PASS

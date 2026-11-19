@@ -179,8 +179,10 @@ Prepare the host:
 
 ```sh
 # 1. Reserve the id range so nothing else hands it out (useradd, podman, a remapped dockerd).
-#    Rootful runsc writes the map itself, so this is a reservation, not a permission.
-echo 'blastbox:2000000:65536' | sudo tee -a /etc/subuid /etc/subgid
+#    Rootful runsc writes the map itself and needs no entry. But an entry IS a permission for
+#    the named account (newuidmap/newgidmap let it map those ids into its own namespace, i.e.
+#    become the sandbox's host uid), so use a name NO account has -- not the dispatcher's user.
+echo 'blastbox-userns:2000000:65536' | sudo tee -a /etc/subuid /etc/subgid
 
 # 2. The rootfs and EVERY directory on the way to it must be searchable by host uid 2000000. A
 #    rootfs under a 0750 home fails at the first boot with `binding rootfs ... permission denied`.
@@ -221,7 +223,7 @@ blastbox preflight --tier gvisor
   whole range (one owner's split lines count together), when a second owner also allocates ids in
   it, or when the only owner holding it is a container runtime's pool (`root`, `containers`,
   `dockremap`, `lxd`, `incus`; e.g. Incus's `root:1000000:1000000000`), or when `/etc/subuid` and
-  `/etc/subgid` reserve it for different accounts. A PASS names the owner it counted.
+  `/etc/subgid` reserve it for different accounts. A PASS names the owner it counted; an owner that is a real account in `/etc/passwd` is a WARN (newuidmap would let it map the ids).
 - After the next base boot, `runsc-host-root` should PASS for the warm tier's processes (their
   `uid_map` is `0 BASE 65536`, not the identity map).
 
@@ -314,7 +316,8 @@ environment actually configures something that needs a user namespace on a tier 
 `BLASTBOX_GVISOR_ROOTLESS` is the `gvisor-rootless` check's concern), and passes when the scoped profiles
 are visibly loaded (securityfs is root-only; run preflight as root to confirm). `max_user_namespaces=0`
 or `unprivileged_userns_clone=0` switches user namespaces off outright: a FAIL only when something
-configured needs one, otherwise a fine hardening choice (PASS).
+configured needs one, otherwise a fine hardening choice (PASS). `BLASTBOX_GVISOR_USERNS_HOST_BASE`
+needs one even though runsc runs as root: `max_user_namespaces` binds root too.
 
 AppArmor itself should be **enabled** (`/sys/module/apparmor/parameters/enabled` = `Y`): without it
 docker-default is not applied to runsc/worker processes and the `blastbox-sandbox` child profile
@@ -400,7 +403,7 @@ Preflight reads `/proc/cpuinfo` and warns on flags with operational consequences
   padded value.
 - Without `--tier`, a local tier that a cascade lists only as an **overflow** member is skipped by the dispatcher
   when its startup gate fails, so those FAILs (`kvm` when `/dev/kvm` is missing, `firecracker`,
-  `fc-guest`, `runsc`, `gvisor-rootless`) are reported as WARNs saying so. A non-rw `/dev/kvm` or a
+  `fc-guest`, `runsc`, `gvisor-rootless`, `gvisor-userns`) are reported as WARNs saying so. A non-rw `/dev/kvm` or a
   missing gVisor rootfs is not a startup gate: a warm overflow tier is admitted but its base never
   builds, so the cascade runs without it (WARN); a cold Firecracker overflow tier really spawns
   there and every spawn fails (FAIL). With `--tier <that tier>` its prerequisites gate as usual.

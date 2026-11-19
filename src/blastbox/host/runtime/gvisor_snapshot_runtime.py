@@ -503,9 +503,12 @@ def _int_env(env, key: str, default: int) -> int:
         return default
 
 
-def _user_namespaces_disabled() -> bool:
+_MAX_USER_NAMESPACES = "/proc/sys/user/max_user_namespaces"
+
+
+def _user_namespaces_disabled(path: str = _MAX_USER_NAMESPACES) -> bool:
     try:
-        with open("/proc/sys/user/max_user_namespaces", encoding="ascii") as fh:
+        with open(path, encoding="ascii") as fh:
             return fh.read(64).strip() == "0"
     except OSError:
         return False

@@ -1957,6 +1957,7 @@ def test_unreachable_userns_rootfs_is_refused_at_selection(tmp_path, monkeypatch
 
     monkeypatch.setattr(gs, "userns_rootfs_problem",
                         lambda r, b, **kw: real(r, b, **{**kw, "stat": fake_stat}))
+    monkeypatch.setattr(gr, "_user_namespaces_disabled", lambda: False)   # hermetic
     cfg = gr._gvisor_config_from_env({"BLASTBOX_GVISOR_ROOTFS": str(home / "r"),
                                       "BLASTBOX_GVISOR_RUNSC": "/bin/true",
                                       "BLASTBOX_GVISOR_USERNS_HOST_BASE": "2000000"})
@@ -1978,8 +1979,13 @@ def test_userns_rootfs_acl_is_unknown_even_when_mode_bits_allow():
 
 
 @pytest.mark.parametrize("userns", [None, 2_000_000])
-def test_runsc_run_and_restore_actually_spawn_without_supplementary_groups(tmp_path, userns):
+def test_runsc_run_and_restore_actually_spawn_without_supplementary_groups(tmp_path, userns,
+                                                                           monkeypatch):
     """Drives boot_base/restore_in: the kwargs reaching the spawn, not the helper's return."""
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    # tmp_path sits under a 0700 pytest dir the mapped uid could not search: not under test here
+    monkeypatch.setattr(gs, "userns_rootfs_problem", lambda r, b, **kw: (True, ""))
     seen: dict[str, dict] = {}
 
     def run(argv, **kw):
@@ -2079,3 +2085,46 @@ def test_userns_tier_refused_when_the_host_disables_user_namespaces(tmp_path, mo
                                       "BLASTBOX_GVISOR_USERNS_HOST_BASE": "2000000"})
     with pytest.raises(gr.GvisorUnavailable, match="max_user_namespaces=0"):
         gr.select_gvisor_snapshot_runtime(cfg=cfg, require_available=True)
+
+
+def test_userns_refuses_worker_gid_outside_the_map(tmp_path):
+    from blastbox.host.runtime.gvisor_snapshot import (
+        GvisorCommandError, GvisorConfig, GvisorSnapshotBackend)
+
+    with pytest.raises(GvisorCommandError, match="outside that map"):
+        GvisorSnapshotBackend(GvisorConfig(
+            runsc_bin="runsc", root=tmp_path / "s", image_rootfs=tmp_path / "r",
+            network="none", warm_argv=["/w"], userns_host_base=2_000_000, gid=70000))
+
+
+def test_user_namespaces_disabled_reads_the_sysctl(tmp_path):
+    from blastbox.host.runtime.gvisor_snapshot_runtime import _user_namespaces_disabled
+
+    f = tmp_path / "max"
+    f.write_text("0\n")
+    assert _user_namespaces_disabled(str(f)) is True
+    f.write_text("63367\n")
+    assert _user_namespaces_disabled(str(f)) is False
+    assert _user_namespaces_disabled(str(tmp_path / "absent")) is False
+
+
+@pytest.mark.parametrize("verb", ["boot", "restore"])
+def test_userns_rootfs_is_rechecked_where_it_is_bound(tmp_path, monkeypatch, verb):
+    """Selection checked it once; a re-pointed link or tightened parent later must be named at
+    the boot/restore that binds it, not surface as a bare runsc permission error."""
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    ran: list = []
+    be = GvisorSnapshotBackend(_cfg(tmp_path, userns_host_base=2_000_000),
+                               run=lambda argv, **kw: ran.append(argv) or 0,
+                               ready_wait=lambda d, t: None)
+    monkeypatch.setattr(gs, "userns_rootfs_problem",
+                        lambda r, b, **kw: (False, f"{r} unreachable"))
+    with pytest.raises(Exception, match="unreachable"):
+        if verb == "boot":
+            be.boot_base()
+        else:
+            wd = tmp_path / "slots" / "s1"
+            wd.mkdir(parents=True)
+            be.restore_in(wd, str(tmp_path / "ckpt"))
+    assert not any("run" in a or "restore" in a for a in ran)   # refused before any spawn
