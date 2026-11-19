@@ -203,6 +203,44 @@ those it reports `unknown (run as root)` and does not fail. A firecracker inside
 container shows the container's profile (e.g. `docker-default (enforce)`), which counts as
 confined, but it is not jailed.
 
+### Confinement tier
+
+*Detection only in this release: nothing is enforced yet.* The confinement tier will put the
+HOST-side sandbox processes (runsc's CLI, gofer and sentry; firecracker) into blastbox's own LSM
+policy -- runsc ignores the OCI `apparmorProfile`/`selinuxLabel` and firecracker has no LSM hook.
+Today blastbox reports what the host offers and which LSM each sandbox kind WOULD use:
+
+```text
+SELinux enforcing  >  AppArmor enabled  >  Landlock (firecracker only)  >  none
+```
+
+| Host | gVisor (runsc) | Firecracker |
+|---|---|---|
+| Ubuntu / Debian (AppArmor) | apparmor | apparmor |
+| Rocky / RHEL 9 (SELinux enforcing) | selinux | selinux |
+| Amazon Linux 2023 (SELinux **permissive** by default) | none | landlock |
+| Alpine (Landlock only) | none | landlock |
+| container without `/sys/kernel/security` | inferred from `/sys/module/apparmor`, `/sys/fs/selinux` | same |
+
+Permissive SELinux only logs, so it never counts (`setenforce 1` and `SELINUX=enforcing` in
+`/etc/selinux/config` to change that). Landlock cannot hold runsc, which mounts.
+
+`BLASTBOX_CONFINEMENT=auto|require|off` (default `auto`). `require` makes `blastbox dispatch`
+refuse to start, and preflight FAIL, when a sandbox kind the dispatcher can run (the cold tier
+counts as gVisor) has no usable LSM. Any other value is refused rather than read as `off`.
+
+Preflight's `confinement` check prints the LSM stack, SELinux mode, AppArmor state and
+`apparmor_parser` version, the Landlock ABI, the runsc release, and firecracker/jailer presence;
+`--json` carries the same as `facts`. Two conditions it calls out:
+
+- **apparmor_parser 4.0.1** (WARN): pairing `audit deny umount,` with another `audit deny`
+  mount-class rule compiles to ALLOW mount (measured with kernel 6.8).
+- **runsc older than `release-20261012`** ships the Sentry inside the runsc binary, so AppArmor
+  cannot give it a domain separate from the CLI and gofer ("single binary" in the report).
+
+Each signed receipt for a local runsc or firecracker run records
+`confinement: {mode, available, applied}`; `applied` stays `"none"` until enforcement lands.
+
 ## AppArmor and user namespaces
 
 Ubuntu 24.04+ sets `kernel.apparmor_restrict_unprivileged_userns=1`. What that means per tier:

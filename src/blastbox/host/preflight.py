@@ -67,6 +67,7 @@ class Check:
     status: Status
     detail: str
     doc: str = ""          # "docs/HOST-PREP.md#anchor", printed as the fix pointer
+    facts: Mapping[str, object] | None = None   # structured detail, emitted by --json
 
 
 class NotReadOnly(RuntimeError):
@@ -130,11 +131,20 @@ class HostView:
         """Run a read-only query; None if it could not be spawned or timed out."""
         raise NotImplementedError
 
+    def landlock_abi(self) -> int:
+        """Landlock ABI (a VERSION query; creates no ruleset). 0 = unavailable."""
+        return 0
+
 
 class RealHost(HostView):
     def __init__(self) -> None:
         self.env = os.environ
         self.euid = os.geteuid()
+
+    def landlock_abi(self) -> int:
+        from blastbox.host.confinement import landlock_abi  # noqa: PLC0415
+
+        return landlock_abi()
 
     def read(self, path: str) -> str | None:
         # Chunked: a /proc/sys handler fails ONE large read() with ENOMEM (a 4 MiB read of
@@ -1056,6 +1066,49 @@ def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc]) -> Check:
                      else ""))
 
 
+def _check_confinement(host: HostView, tiers: Collection[str]) -> Check:
+    """Which host LSM each local sandbox kind WOULD be confined with (detection only: nothing
+    is enforced yet), and whether BLASTBOX_CONFINEMENT=require can be met."""
+    from blastbox.host import confinement as cf  # noqa: PLC0415
+
+    doc = f"{DOC}#confinement-tier"
+    try:
+        mode = cf.mode_from_env(host.env)
+    except ValueError as exc:
+        return Check("confinement", Status.FAIL, f"{exc}; the dispatcher refuses to start", doc)
+    kinds = cf.kinds_for_tiers(tiers)
+    st = cf.probe(host, env=host.env, kinds=kinds, landlock=host.landlock_abi())
+    would = {k: st.would_use(k, mode) for k in kinds}
+    facts = {"mode": mode, "enforced": False, "host": st.as_dict(), "would_use": would}
+    head = (f"mode={mode}; lsm={','.join(st.lsms) if st.lsms is not None else 'unknown'} "
+            f"selinux={st.selinux} apparmor={'on' if st.apparmor else 'off'}"
+            + (f" (parser {st.apparmor_parser})" if st.apparmor_parser else "")
+            + f" landlock_abi={st.landlock_abi}")
+    parts = [head]
+    if st.lsms is None:
+        parts.append("securityfs not readable (container?): LSM stack inferred from "
+                     "/sys/module and /sys/fs/selinux")
+    if "gvisor" in kinds:
+        split = {True: "split sentry", False: "single binary", None: "sentry layout unknown"}
+        parts.append(f"runsc {st.runsc} ({split[st.runsc_split_sentry]})" if st.runsc
+                     else "runsc not found")
+    if "firecracker" in kinds:
+        parts.append(f"firecracker {st.firecracker or 'not found'}, jailer "
+                     f"{st.jailer or 'not found'}")
+    if would:
+        parts.append("would use: " + ", ".join(f"{k}={v}" for k, v in would.items()))
+    parts.append("detection only, nothing enforced yet")
+    missing = cf.unmet(st, mode, kinds)
+    if missing:
+        return Check("confinement", Status.FAIL,
+                     "; ".join(parts) + f"; require unmet for {', '.join(missing)}", doc, facts)
+    if st.flags:
+        return Check("confinement", Status.WARN,
+                     "; ".join(parts) + "; apparmor_parser 4.0.1 compiles `audit deny umount` "
+                     "paired with another `audit deny` mount rule into ALLOW mount", doc, facts)
+    return Check("confinement", Status.PASS, "; ".join(parts), facts=facts)
+
+
 _TIER_CHECKS = {
     "firecracker": ("kvm", "firecracker", "fc-guest"),
     "gvisor": ("runsc", "gvisor-rootless"),
@@ -1171,6 +1224,7 @@ def run_preflight(host: HostView, tiers: Sequence[str], *, explicit: bool = True
     local = bool(t - {"remote"})
     if local:   # a remote-only dispatcher runs no worker, runsc or JVM engine here
         out.append(_check_apparmor(host))
+        out.append(_check_confinement(host, t))
         out.append(_check_bwrap_stock_profile(host, t))
         out.append(_check_userns(host, t))
     out.append(_check_clock(host))
@@ -1224,5 +1278,6 @@ def render_json(checks: Sequence[Check], tiers: Sequence[str], *, strict: bool =
         "ok": exit_code(checks, strict=strict, ack=ack) == 0,
         "counts": _counts(checks),
         "checks": [{"name": c.name, "status": c.status.value, "detail": c.detail,
-                    "doc": c.doc} for c in checks],
+                    "doc": c.doc, **({"facts": dict(c.facts)} if c.facts is not None else {})}
+                   for c in checks],
     }, indent=2, sort_keys=True)

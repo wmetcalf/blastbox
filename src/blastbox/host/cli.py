@@ -931,6 +931,15 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     from blastbox.host.dispatch import enforce_allowed_runtimes, reachable_tiers
 
     enforce_allowed_runtimes(engines, reachable_tiers(pool, tier, warm_only))
+    # Host-LSM confinement (detection only for now): an invalid BLASTBOX_CONFINEMENT, or require
+    # with no usable LSM for a local sandbox kind this dispatcher can run, refuses to start --
+    # BEFORE pool.start(), so no slot is spawned.
+    from blastbox.host import confinement as _confinement
+
+    confinement = _confinement.detect()
+    _confinement.check_required(
+        confinement.state, confinement.mode,
+        _confinement.kinds_for_tiers(reachable_tiers(pool, tier, warm_only)))
 
     # Capability-based routing: the runtime declares its dispatch_style. A network-endpoint pool
     # (aws / static / cascade) drives workers over http_agent + remote_http via VmJobDispatcher; every
@@ -1089,6 +1098,7 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
                 )
         pool.start()  # file-handshake warm path: start after tier-identity validation
     dispatcher = Dispatcher(
+        confinement=confinement,
         require_shared_blob_store=_require_shared_blob_store(),
         job_store=store,
         engines=engines,

@@ -58,6 +58,7 @@ from blastbox.contract.envelope import (
 )
 from blastbox.errors import HOST_RESOURCE_ERRNOS, OutputTrustError, OutputTrustUnknown, WarmTimeout, sanitize_public_error
 from blastbox.host import attest as _attest
+from blastbox.host import confinement as _confinement
 from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
 from blastbox.host.canary import (
     CanaryFailure,
@@ -511,7 +512,11 @@ class Dispatcher:
         blob_retry_backoff_s: float = _BLOB_RETRY_BACKOFF_S,
         attest_key: object = _attest.FROM_ENV,
         claim_untargeted_after_s: float = 0.0,
+        confinement: "_confinement.Detection | None" = None,
     ) -> None:
+        # Host-LSM confinement detection (host/confinement.py), fixed at startup and signed into
+        # each local receipt. None = not detected (embedders/tests): the receipt omits it.
+        self._confinement = confinement
         # Execution-receipt signing key (host/attest.py): an AttestKey, None (no receipts), or
         # FROM_ENV (BLASTBOX_ATTEST_KEY only -- strictly opt-in; unset = no receipts). A
         # key that cannot be loaded is logged loudly and disables receipts -- never jobs.
@@ -2164,6 +2169,7 @@ class Dispatcher:
             observation = None if receipt_input_sha256 is None else _attest.RunObservation(
                 job_id=job.job_id, engine=job.engine, input_sha256=receipt_input_sha256,
                 worker_runtime="warm", worker_tier=signed_tier,
+                confinement=self._confinement_receipt(signed_tier),
                 net_policy_effective=warm_personality.name,
                 net_exit=warm_personality.exit_driver,
                 started_at_ms=started_at_ms, finished_at_ms=finished_at_ms)
@@ -2857,6 +2863,8 @@ class Dispatcher:
         observation = None if receipt_input_sha256 is None else _attest.RunObservation(
             job_id=job.job_id, engine=job.engine, input_sha256=receipt_input_sha256,
             worker_runtime=runtime.runtime, worker_tier=None,
+            confinement=self._confinement_receipt(
+                "gvisor" if runtime.runtime == "runsc" else None),
             started_at_ms=started_at_ms, finished_at_ms=finished_at_ms,
             **self._verified_net_claim(personality, network_args, gateway_health))
 
@@ -3158,6 +3166,13 @@ class Dispatcher:
             verdict = False
         cache[network] = (verdict, now)
         return verdict
+
+    def _confinement_receipt(self, kind: str | None) -> dict[str, object] | None:
+        """The receipt's ``confinement`` record for a local run of sandbox ``kind`` (None for a
+        kind the confinement tier does not cover, e.g. cold runc, or when not detected)."""
+        if self._confinement is None or kind not in _confinement.KINDS:
+            return None
+        return self._confinement.receipt(kind)
 
     def _verified_net_claim(self, personality, network_args: list[str],
                             gateway_health) -> dict:

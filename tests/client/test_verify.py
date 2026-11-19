@@ -635,3 +635,30 @@ def test_the_host_and_client_share_one_wire_contract(key):
     assert attest.VerifyKey is attest_wire.VerifyKey is v.VerifyKey
     assert attest.ALG == v.ALG and attest.VERSION == v.VERSION
     assert Path(attest.__file__).parent.name == "host"
+
+
+# ---------------------------------------------------------------------------
+# Confinement (host-LSM detection record)
+# ---------------------------------------------------------------------------
+
+_CONF = {"mode": "auto", "available": "apparmor", "applied": "none"}
+
+
+def test_a_confinement_record_verifies_and_is_reported(key, pinned):
+    r = _verify(_body(key, _doc(key, net={"confinement": _CONF})), pinned)
+    assert r.confinement == v.AttestedConfinement("auto", "apparmor", "none")
+    assert r.as_dict()["confinement"] == _CONF
+
+
+def test_a_receipt_without_confinement_reports_none(key, pinned):
+    r = _verify(_body(key, _doc(key)), pinned)
+    assert r.confinement is None and "confinement" not in r.as_dict()
+
+
+@pytest.mark.parametrize("bad", [
+    "apparmor", None, [], {"mode": "auto", "available": "apparmor"},
+    {**_CONF, "extra": "x"}, {**_CONF, "applied": True}, {**_CONF, "mode": 1},
+])
+def test_a_malformed_confinement_record_is_refused(key, pinned, bad):
+    with pytest.raises(v.ReceiptMalformed, match="confinement"):
+        _verify(_body(key, _doc(key, confinement=bad)), pinned)

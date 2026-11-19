@@ -1,0 +1,298 @@
+"""Host LSM detection for the confinement tier -- DETECTION AND REPORTING ONLY.
+
+The confinement tier (later PRs) will put the HOST-side sandbox processes -- runsc's CLI, gofer
+and sentry; firecracker -- into blastbox's own LSM policy, because runsc ignores the OCI
+``apparmorProfile``/``selinuxLabel`` and firecracker has no LSM hook. Nothing here enters a
+domain, loads a policy or changes the host: it answers "what does this host offer, and which LSM
+WOULD each sandbox kind be confined with", for ``blastbox preflight`` and for the signed receipt.
+
+Selection, per sandbox kind ("gvisor" | "firecracker"):
+
+    SELinux (enforcing)  >  AppArmor (enabled)  >  Landlock (firecracker only)  >  none
+
+SELinux in permissive mode only logs, so it is never selected (AL2023 ships permissive).
+Landlock is not offered for gVisor: runsc mounts, which a Landlock domain forbids.
+
+``BLASTBOX_CONFINEMENT``: ``auto`` (default; best available, else none), ``require`` (fail
+closed when a kind this host runs has no usable LSM), ``off``. Anything else is an error, never
+"off": a typo must not be what disables confinement.
+
+Degrades cleanly: a container without securityfs (``/sys/kernel/security`` unmounted) falls
+back to ``/sys/module/apparmor`` and ``/sys/fs/selinux``; a kernel without Landlock answers
+ENOSYS/EOPNOTSUPP (ABI 0); a missing tool is reported absent, never raised.
+"""
+from __future__ import annotations
+
+import ctypes
+import os
+import re
+import subprocess
+from collections.abc import Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
+from typing import Protocol
+
+ENV_MODE = "BLASTBOX_CONFINEMENT"
+MODES = ("auto", "require", "off")
+KINDS = ("gvisor", "firecracker")
+
+#: First runsc release that ships the Sentry as its own binary (``gvisor-bin/gvisor_sentry``):
+#: only then can AppArmor give the sentry a domain separate from the CLI and gofer.
+SPLIT_SENTRY_RELEASE = 20261012
+#: apparmor_parser 4.0.1 (measured with kernel 6.8) compiles ``audit deny umount,`` paired with
+#: another ``audit deny`` mount-class rule into ALLOW mount.
+AA_PARSER_MOUNT_BUG = (4, 0, 1)
+
+_LSM = "/sys/kernel/security/lsm"
+_AA_ENABLED = "/sys/module/apparmor/parameters/enabled"
+_SE_ENFORCE = "/sys/fs/selinux/enforce"
+_AA_PARSERS = ("apparmor_parser", "/usr/sbin/apparmor_parser", "/sbin/apparmor_parser")
+
+_SYS_LANDLOCK_CREATE_RULESET = 444   # unified syscall number (x86_64, aarch64, ...)
+_LANDLOCK_CREATE_RULESET_VERSION = 1
+
+
+class HostReader(Protocol):
+    """The read-only slice of :class:`blastbox.host.preflight.HostView` this module needs."""
+
+    def read(self, path: str) -> str | None: ...
+    def exists(self, path: str) -> bool: ...
+    def which(self, name: str) -> str | None: ...
+    def realpath(self, path: str) -> str: ...
+    def run(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str] | None: ...
+
+
+class ConfinementUnavailable(RuntimeError):
+    """``require`` mode and a sandbox kind this host runs has no usable LSM."""
+
+
+def landlock_abi() -> int:
+    """Landlock ABI via ``landlock_create_ruleset(NULL, 0, VERSION)`` (a query; creates
+    nothing). 0 when unavailable: ENOSYS (not built), EOPNOTSUPP (disabled at boot), or a
+    seccomp filter refusing it."""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        rc = libc.syscall(_SYS_LANDLOCK_CREATE_RULESET, None, ctypes.c_size_t(0),
+                          ctypes.c_uint32(_LANDLOCK_CREATE_RULESET_VERSION))
+    except (OSError, AttributeError):
+        return 0
+    return int(rc) if rc > 0 else 0
+
+
+def parse_mode(raw: str | None) -> str:
+    mode = (raw or "").strip().lower() or "auto"
+    if mode not in MODES:
+        raise ValueError(f"{ENV_MODE}={raw!r}: expected one of {', '.join(MODES)}")
+    return mode
+
+
+def mode_from_env(env: Mapping[str, str] | None = None) -> str:
+    env = os.environ if env is None else env
+    return parse_mode(env.get(ENV_MODE))
+
+
+def kinds_for_tiers(tiers: Iterable[str]) -> list[str]:
+    """Sandbox kinds behind dispatcher/preflight tier names. The cold docker tier runs runsc
+    (gVisor); remote tiers run nothing on this host."""
+    t = set(tiers)
+    kinds = set()
+    if t & {"cold", "docker", "gvisor"}:
+        kinds.add("gvisor")
+    if "firecracker" in t:
+        kinds.add("firecracker")
+    return [k for k in KINDS if k in kinds]
+
+
+@dataclass(frozen=True)
+class HostLsm:
+    """What the host offers. Tool fields are None when not probed (the dispatcher's receipt
+    probe reads /sys only and never spawns)."""
+
+    lsms: tuple[str, ...] | None        # /sys/kernel/security/lsm; None = securityfs unreadable
+    apparmor: bool
+    selinux: str                        # "enforcing" | "permissive" | "absent"
+    landlock_abi: int                   # 0 = unavailable
+    apparmor_parser: str | None = None  # "4.0.1"; None = not found / not probed
+    runsc: str | None = None            # "release-20261012.0"
+    runsc_split_sentry: bool | None = None
+    firecracker: str | None = None      # resolved path
+    jailer: str | None = None           # resolved path
+
+    def would_use(self, kind: str, mode: str = "auto") -> str:
+        """The LSM ``kind``'s host processes would be confined with: selinux | apparmor |
+        landlock | none. Pure."""
+        if kind not in KINDS:
+            raise ValueError(f"unknown sandbox kind {kind!r}")
+        if parse_mode(mode) == "off":
+            return "none"
+        if self.selinux == "enforcing":
+            return "selinux"
+        if self.apparmor:
+            return "apparmor"
+        if kind == "firecracker" and self.landlock_abi > 0:
+            return "landlock"
+        return "none"
+
+    @property
+    def flags(self) -> list[str]:
+        """Known-bad conditions on this host, as stable identifiers."""
+        out = []
+        if self.apparmor and self.apparmor_parser and _version(self.apparmor_parser) == \
+                AA_PARSER_MOUNT_BUG:
+            out.append("apparmor-parser-4.0.1-audit-deny-umount-allows-mount")
+        return out
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "lsms": None if self.lsms is None else list(self.lsms),
+            "apparmor": self.apparmor,
+            "selinux": self.selinux,
+            "landlock_abi": self.landlock_abi,
+            "apparmor_parser": self.apparmor_parser,
+            "runsc": self.runsc,
+            "runsc_split_sentry": self.runsc_split_sentry,
+            "firecracker": self.firecracker,
+            "jailer": self.jailer,
+            "flags": self.flags,
+        }
+
+
+def _version(text: str | None) -> tuple[int, int, int] | None:
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", text or "")
+    return None if m is None else (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+def _first_line(text: str | None) -> str:
+    return next((ln.strip() for ln in (text or "").splitlines() if ln.strip()), "")
+
+
+def _probe_lsm(host: HostReader, landlock: int | None) -> HostLsm:
+    raw = host.read(_LSM)
+    lsms = None if raw is None else tuple(x for x in raw.strip().split(",") if x)
+    aa_raw = host.read(_AA_ENABLED)
+    apparmor = aa_raw is not None and aa_raw.strip().upper().startswith("Y") and (
+        lsms is None or "apparmor" in lsms)
+    enforce = host.read(_SE_ENFORCE)
+    if enforce is None or (lsms is not None and "selinux" not in lsms):
+        selinux = "absent"
+    else:
+        selinux = "enforcing" if enforce.strip() == "1" else "permissive"
+    # A listed-but-absent landlock is authoritative; an unreadable list still asks the kernel.
+    abi = 0 if (lsms is not None and "landlock" not in lsms) else max(0, int(landlock or 0))
+    return HostLsm(lsms=lsms, apparmor=apparmor, selinux=selinux, landlock_abi=abi)
+
+
+def _parser_version(host: HostReader) -> str | None:
+    for name in _AA_PARSERS:
+        path = host.which(name)
+        if path is None:
+            continue
+        proc = host.run([path, "--version"])
+        ver = _version(proc.stdout + proc.stderr) if proc is not None else None
+        return None if ver is None else ".".join(map(str, ver))
+    return None
+
+
+def _runsc(host: HostReader, env: Mapping[str, str]) -> tuple[str | None, bool | None]:
+    name = env.get("BLASTBOX_GVISOR_RUNSC", "runsc") or "runsc"
+    path = host.which(name)
+    if path is None:
+        return None, None
+    proc = host.run([path, "--version"])
+    text = (proc.stdout + proc.stderr) if proc is not None else ""
+    m = re.search(r"\brelease-(\d{8})(?:\.\d+)?", text)
+    shown = m.group(0) if m else (_first_line(text) or None)
+    sibling = os.path.join(os.path.dirname(host.realpath(path)), "gvisor-bin", "gvisor_sentry")
+    if host.exists(sibling):
+        return shown, True
+    if m is None:
+        return shown, None
+    return shown, int(m.group(1)) >= SPLIT_SENTRY_RELEASE
+
+
+def _firecracker(host: HostReader, env: Mapping[str, str]) -> tuple[str | None, str | None]:
+    fc = host.which(env.get("BLASTBOX_FC_BIN", "").strip() or "firecracker")
+    jailer = host.which("jailer")
+    if jailer is None and fc is not None:
+        jailer = host.which(os.path.join(os.path.dirname(fc), "jailer"))
+    return fc, jailer
+
+
+def probe(host: HostReader, *, env: Mapping[str, str] | None = None,
+          kinds: Collection[str] = (), landlock: int | None = None) -> HostLsm:
+    """Read the host. Tool versions are probed only for ``kinds`` (runsc for gvisor;
+    firecracker/jailer presence for firecracker) and the parser only when AppArmor is on, so an
+    empty ``kinds`` never spawns anything. ``landlock`` is the ABI (None = 0)."""
+    env = os.environ if env is None else env
+    state = _probe_lsm(host, landlock)
+    extra: dict[str, object] = {}
+    if kinds and state.apparmor:
+        extra["apparmor_parser"] = _parser_version(host)
+    if "gvisor" in kinds:
+        extra["runsc"], extra["runsc_split_sentry"] = _runsc(host, env)
+    if "firecracker" in kinds:
+        extra["firecracker"], extra["jailer"] = _firecracker(host, env)
+    return replace(state, **extra)  # type: ignore[arg-type]
+
+
+def unmet(state: HostLsm, mode: str, kinds: Iterable[str]) -> list[str]:
+    """Kinds ``require`` cannot satisfy on this host (empty outside require)."""
+    if parse_mode(mode) != "require":
+        return []
+    return [k for k in kinds if state.would_use(k, mode) == "none"]
+
+
+def check_required(state: HostLsm, mode: str, kinds: Iterable[str]) -> None:
+    missing = unmet(state, mode, kinds)
+    if missing:
+        raise ConfinementUnavailable(
+            f"{ENV_MODE}=require but no usable LSM for {', '.join(missing)} (selinux="
+            f"{state.selinux}, apparmor={'on' if state.apparmor else 'off'}, landlock_abi="
+            f"{state.landlock_abi}; Landlock covers firecracker only, permissive SELinux "
+            "does not count)")
+
+
+@dataclass(frozen=True)
+class Detection:
+    """The mode plus the host state, fixed when the dispatcher starts."""
+
+    mode: str
+    state: HostLsm
+
+    def receipt(self, kind: str) -> dict[str, object]:
+        """The signed-receipt record for a run of ``kind``. Strings only (the canonicaliser
+        rejects floats). ``applied`` is "none" until the tier enforces: this release only
+        detects."""
+        return {"mode": self.mode, "available": self.state.would_use(kind, self.mode),
+                "applied": "none"}
+
+
+class _SysReader:
+    def read(self, path: str) -> str | None:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                return fh.read(64 * 1024)
+        except OSError:
+            return None
+
+    def exists(self, path: str) -> bool:
+        return os.path.lexists(path)
+
+    def which(self, name: str) -> str | None:
+        return None
+
+    def realpath(self, path: str) -> str:
+        return os.path.realpath(path)
+
+    def run(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str] | None:
+        return None
+
+
+def detect(env: Mapping[str, str] | None = None, *, host: HostReader | None = None,
+           landlock: int | None = None) -> Detection:
+    """The dispatcher's startup detection: /sys reads and the Landlock query, no spawns.
+    Raises ValueError on an invalid mode."""
+    env = os.environ if env is None else env
+    mode = mode_from_env(env)
+    state = _probe_lsm(_SysReader() if host is None else host,
+                       landlock_abi() if landlock is None else landlock)
+    return Detection(mode=mode, state=state)
