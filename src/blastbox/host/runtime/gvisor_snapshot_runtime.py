@@ -401,6 +401,23 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
             raise GvisorUnavailable(f"gVisor C/R warm tier refused: {problem}")
         _log.error("select_gvisor_snapshot_runtime: %s", problem)
         return None
+    # The user-namespaced gofer binds the rootfs as an unprivileged host uid. An unreachable
+    # rootfs only fails at the first boot, as a bare `binding rootfs ... permission denied`
+    # from runsc after the readiness wait; refuse it here, by name, instead.
+    if gcfg.userns_host_base is not None:
+        from blastbox.host.runtime.gvisor_snapshot import USERNS_ENV, userns_rootfs_problem
+        ok, why = userns_rootfs_problem(str(gcfg.image_rootfs), gcfg.userns_host_base)
+        if ok is False:
+            msg = (f"gVisor C/R warm tier refused: {USERNS_ENV}={gcfg.userns_host_base}, but {why}. "
+                   "Move the rootfs (e.g. under /var/lib/blastbox) or grant search on its parents "
+                   "(see docs/HOST-PREP.md#warm-gvisor-in-a-user-namespace)")
+            if require_available:
+                raise GvisorUnavailable(msg)
+            _log.error("select_gvisor_snapshot_runtime: %s", msg)
+            return None
+        if ok is None:
+            _log.warning("select_gvisor_snapshot_runtime: could not verify the user-namespaced "
+                         "gofer can reach rootfs %s: %s", gcfg.image_rootfs, why)
     # RAM-preload (COW-image-to-RAM): the runsc checkpoint image holds the guest's memory pages
     # (~guest RAM with soffice live) and dominates restore cost. Holding the checkpoint dir on
     # tmpfs (/dev/shm) pins it in RAM, so every per-slot restore pages the COW-shared base in from
@@ -478,18 +495,12 @@ def _int_env(env, key: str, default: int) -> int:
 def _userns_host_base(env) -> int | None:
     """BLASTBOX_GVISOR_USERNS_HOST_BASE: host uid/gid that guest 0 maps to (65536 ids). Unset =
     no user namespace. An invalid value, or one whose range would include host root, is refused
-    LOUDLY (warning, no userns) rather than guessed at."""
-    raw = env.get("BLASTBOX_GVISOR_USERNS_HOST_BASE", "").strip()
-    if not raw:
-        return None
-    try:
-        base = int(raw)
-    except ValueError:
-        _log.warning("invalid BLASTBOX_GVISOR_USERNS_HOST_BASE %r; no user namespace", raw)
-        return None
-    if base < 65536 or base + 65536 > 2**32 - 1:
-        _log.warning("BLASTBOX_GVISOR_USERNS_HOST_BASE %r out of range; no user namespace", raw)
-        return None
+    LOUDLY (warning, no userns) rather than guessed at; `blastbox preflight` FAILs it."""
+    from blastbox.host.runtime.gvisor_snapshot import USERNS_ENV, parse_userns_host_base
+
+    base, problem = parse_userns_host_base(env.get(USERNS_ENV, ""))
+    if problem:
+        _log.warning("%s; running WITHOUT a user namespace", problem)
     return base
 
 

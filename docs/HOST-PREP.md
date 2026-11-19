@@ -47,7 +47,7 @@ which the dispatcher skips at startup.
 | Tier | Needs on the host | Preflight checks |
 |---|---|---|
 | **docker** (cold) | docker daemon, `runsc` registered as a docker runtime (fail-closed without it) | `docker`, `docker-runsc-runtime`, `runsc-host-root`, `sandbox-confinement` |
-| **gvisor** (warm C/R) | the `runsc` binary with checkpoint/restore (driven directly, no docker; root) | `runsc`, `gvisor-rootfs`, `gvisor-rootless`, `snapshot-age`, `runsc-host-root`, `sandbox-confinement` |
+| **gvisor** (warm C/R) | the `runsc` binary with checkpoint/restore (driven directly, no docker; root) | `runsc`, `gvisor-rootfs`, `gvisor-rootless`, `gvisor-userns` (when opted in), `snapshot-age`, `runsc-host-root`, `sandbox-confinement` |
 | **firecracker** (warm/cold) | `/dev/kvm` read/write, `firecracker` ≥ 1.15.1, guest kernel + rootfs | `kvm`, `firecracker`, `fc-guest`, `snapshot-age` (with `BLASTBOX_POOL_WARM_SNAPSHOT`), `sandbox-confinement`, `fc-scratch` |
 | **remote** (static / AWS) | nothing runtime-specific locally; the remote box runs the worker image under its own runsc | common checks only (no docker: no cold path) |
 | every tier | a pool the dispatcher accepts, synced clock, scratch off `/tmp` | `pool-runtime`, `clock`, `scratch` |
@@ -152,15 +152,84 @@ With docker's stock (non-remapped) setup, the host-side `runsc-sandbox` (Sentry)
 `runsc-gofer` processes are **real host root**: their `/proc/<pid>/uid_map` is the identity map
 `0 0 4294967295` and `Uid` is 0, with capabilities such as `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH`
 (sandbox) and `CAP_SYS_CHROOT` (gofer). gVisor is the boundary, but a Sentry or gofer escape then
-lands as host root. Preflight's `runsc-host-root` check warns when it sees this. The recommended
-direction is a **user-namespace-remapped** setup: a separate docker daemon with `userns-remap`
-for the blastbox runtime, or containerd per-container uid/gid mappings. This is pending a spike
-(warm checkpoint/restore under a remapped daemon is unverified), so treat the warning as known
-residual risk until then; do not flip `userns-remap` on a shared daemon, which remaps every
-existing container and its volumes.
+lands as host root. Preflight's `runsc-host-root` check warns when it sees this. The fix is to
+run them in a **user namespace**:
+
+- **Warm gVisor tier:** set `BLASTBOX_GVISOR_USERNS_HOST_BASE` (opt-in; see
+  [Warm gVisor in a user namespace](#warm-gvisor-in-a-user-namespace)).
+- **Cold docker tier:** not automated. It needs a *separate* docker daemon with `userns-remap`
+  (see [Cold docker tier: a remapped dockerd](#cold-docker-tier-a-remapped-dockerd)); do not flip
+  `userns-remap` on a shared daemon, which remaps every existing container and its volumes.
 
 Reading another user's `/proc/<pid>/uid_map`/`status` can need privileges; preflight then says
 `unknown (run as root)` and does not fail.
+
+### Warm gVisor in a user namespace
+
+`BLASTBOX_GVISOR_USERNS_HOST_BASE=<BASE>` makes the warm tier put a user namespace in the OCI spec
+it hands runsc: guest ids `0..65535` map to host `BASE..BASE+65535` for both uids and gids.
+runsc itself stays **rootful** (so `checkpoint`/`restore` keep working, unlike
+`BLASTBOX_GVISOR_ROOTLESS`), but the `runsc-sandbox` (Sentry) and `runsc-gofer` it starts run as
+host uid `BASE` with capabilities scoped to their namespace instead of real host root. The
+in-sandbox uid drop is kept: the worker is guest `65532`, i.e. host `BASE+65532`. Off (unset) by
+default. Measured on toolz2 (runsc release-20261012.0, the ClippyShot warm worker): boot,
+checkpoint and four restores green, byte-identical output, restore ~117 ms either way.
+
+Prepare the host:
+
+```sh
+# 1. Reserve the id range so nothing else hands it out (useradd, podman, a remapped dockerd).
+#    Rootful runsc writes the map itself, so this is a reservation, not a permission.
+echo 'blastbox:2000000:65536' | sudo tee -a /etc/subuid /etc/subgid
+
+# 2. The rootfs and EVERY parent directory must be searchable by host uid 2000000. A rootfs under
+#    a 0750 home fails at the first boot with `binding rootfs ... permission denied`.
+sudo mkdir -p /var/lib/blastbox && sudo chmod 0755 /var/lib/blastbox
+namei -l /var/lib/blastbox/gvisor-rootfs     # every component needs o+x (the rootfs o+rx)
+
+# 3. Opt in (in the gVisor dispatcher's environment), then check.
+export BLASTBOX_GVISOR_USERNS_HOST_BASE=2000000
+blastbox preflight --tier gvisor
+```
+
+- `BASE` must be `>= 65536` (the range never holds host root or ordinary users) and the range must
+  end below `4294967295`. A value the runtime cannot use is **ignored with a warning** and the tier
+  runs as before (real host root); preflight's `gvisor-userns` check FAILs it so it is not missed.
+- The rootfs reachability is checked twice, read-only: by preflight (`gvisor-userns` FAIL; WARN
+  when a component cannot be stat'd as this user or carries a POSIX ACL) and by the runtime at
+  startup, which refuses the tier with the offending directory named instead of failing the first
+  boot after the readiness wait. A symlinked rootfs is checked at its resolved path.
+- Output files land owned by `BASE+65532`. The dispatcher runs as root, so host-side cleanup is
+  unaffected; anything else reading job output directly needs read access by other/group.
+- Preflight `gvisor-userns` WARNs when `/etc/subuid` or `/etc/subgid` reserves no entry holding the
+  whole range, or when an entry for another user overlaps it.
+- After the next base boot, `runsc-host-root` should PASS for the warm tier's processes (their
+  `uid_map` is `0 BASE 65536`, not the identity map).
+
+What it does **not** change:
+
+- **AppArmor:** runsc's host processes are still not confined by a blastbox profile
+  (`sandbox-confinement` keeps warning: `unconfined`). The user namespace limits what an escape
+  lands as; it is not a MAC policy.
+- **The cold docker tier:** docker's `--runtime=runsc` workers are started by dockerd, not by this
+  knob, and stay real host root. See below.
+
+### Cold docker tier: a remapped dockerd
+
+Documented, not implemented or automated. The cold tier can get the same property from a
+**second** docker daemon that runs with `userns-remap` and serves only blastbox workers:
+
+- its own `--data-root`, `--exec-root`, `--pidfile` and socket (e.g. `/run/docker-blastbox.sock`),
+  with `"userns-remap": "blastbox-cold"` and `runsc` registered, pointed at by the cold
+  dispatcher's `DOCKER_HOST`;
+- a **separate** subordinate range for it in `/etc/subuid` and `/etc/subgid` (e.g.
+  `blastbox-cold:2100000:65536`), split from the warm tier's `BASE` range so a cold escape and a
+  warm escape do not land as the same host ids;
+- images re-pulled/loaded into that daemon (a remapped daemon has its own image store).
+
+Never enable `userns-remap` on the host's shared daemon: it remaps every existing container and
+its volumes. Until this is set up, `runsc-host-root` keeps warning for cold workers; treat that as
+known residual risk.
 
 ## Firecracker
 

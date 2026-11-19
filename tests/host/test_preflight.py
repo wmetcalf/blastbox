@@ -86,6 +86,11 @@ class FakeHost(pf.HostView):
     def readlink(self, path: str) -> str | None:
         return self.links.get(path)
 
+    def stat_path(self, path: str) -> tuple[int, int, int, bool] | None:
+        # Undeclared paths are an ordinary root-owned 0755 dir; None marks "cannot stat".
+        stats = getattr(self, "stats", {})
+        return stats[path] if path in stats else (0o40755, 0, 0, False)
+
     def run(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str] | None:
         key = tuple(argv)
         self.ran.append(key)
@@ -1328,3 +1333,84 @@ def test_fc_rootfs_with_an_incompatible_stamp_fails():
     host.guest_problems = {"/var/lib/blastbox/fc/rootfs.ext4": "stamped for aarch64"}
     c = _by_name(pf.run_preflight(host, ["firecracker"]))["fc-guest"]
     assert c.status is Status.FAIL and "aarch64" in c.detail
+
+
+# --- warm gVisor in a user namespace (BLASTBOX_GVISOR_USERNS_HOST_BASE) ---------------------
+
+_UNS = {"BLASTBOX_GVISOR_USERNS_HOST_BASE": "2000000"}
+_SUBIDS = {"/etc/subuid": "coz:100000:65536\nblastbox:2000000:65536\n",
+           "/etc/subgid": "coz:100000:65536\nblastbox:2000000:65536\n"}
+
+
+def test_gvisor_userns_check_only_when_opted_in():
+    assert "gvisor-userns" not in _by_name(pf.run_preflight(_healthy(), ["gvisor"]))
+    host = _healthy(env=_UNS, files=_SUBIDS)
+    c = _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-userns"]
+    assert c.status is Status.PASS and "2000000..2065535" in c.detail
+    assert "gvisor-userns" not in _by_name(pf.run_preflight(host, ["docker"]))
+
+
+@pytest.mark.parametrize("raw", ["root", "0", "1000", "4294967290"])
+def test_gvisor_userns_value_the_runtime_ignores_fails(raw):
+    host = _healthy(env={"BLASTBOX_GVISOR_USERNS_HOST_BASE": raw}, files=_SUBIDS)
+    c = _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-userns"]
+    assert c.status is Status.FAIL and "host root" in c.detail
+
+
+def test_gvisor_userns_rootfs_under_a_0750_home_fails():
+    host = _healthy(env={**_UNS, "BLASTBOX_GVISOR_ROOTFS": "/home/coz/rootfs"}, files=_SUBIDS)
+    host.stats = {"/home/coz": (0o40750, 1000, 1000, False)}
+    c = _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-userns"]
+    assert c.status is Status.FAIL and "/home/coz " in c.detail and "refuses to start" in c.detail
+
+
+def test_gvisor_userns_rootfs_check_follows_symlinks():
+    host = _healthy(env={**_UNS, "BLASTBOX_GVISOR_ROOTFS": "/var/lib/blastbox/gvisor-rootfs"},
+                    files=_SUBIDS, links={"/var/lib/blastbox/gvisor-rootfs": "/home/coz/rootfs"})
+    host.stats = {"/home/coz": (0o40700, 1000, 1000, False)}
+    assert _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-userns"].status is Status.FAIL
+
+
+def test_gvisor_userns_unverifiable_rootfs_warns_never_fails():
+    host = _healthy(env=_UNS, files=_SUBIDS)
+    host.stats = {"/var/lib/blastbox": None}
+    c = _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-userns"]
+    assert c.status is Status.WARN and "cannot verify" in c.detail
+
+
+@pytest.mark.parametrize("subuid,why", [
+    ("coz:100000:65536\n", "reserves no range"),
+    ("blastbox:2000000:65535\n", "overlaps"),                  # one id short
+    ("dockremap:1999000:2000\nblastbox:2000000:65536\n", "overlaps"),
+])
+def test_gvisor_userns_subuid_reservation_warns(subuid, why):
+    host = _healthy(env=_UNS, files={**_SUBIDS, "/etc/subuid": subuid})
+    c = _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-userns"]
+    assert c.status is Status.WARN and "/etc/subuid" in c.detail and why in c.detail
+    assert "/etc/subgid" not in c.detail
+
+
+def test_gvisor_userns_unreadable_subgid_warns():
+    host = _healthy(env=_UNS, files={"/etc/subuid": _SUBIDS["/etc/subuid"]})
+    c = _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-userns"]
+    assert c.status is Status.WARN and "/etc/subgid unreadable" in c.detail
+
+
+def test_gvisor_userns_on_an_overflow_tier_only_the_startup_gate_skips_it():
+    env = {**_UNS, "BLASTBOX_POOL_RUNTIME": "cascade",
+           "BLASTBOX_POOL_TIERS": "firecracker:2,gvisor:2"}
+    bad = _healthy(env={**env, "BLASTBOX_GVISOR_ROOTFS": "/home/coz/rootfs"}, files=_SUBIDS)
+    bad.stats = {"/home/coz": (0o40750, 1000, 1000, False)}
+    tiers = pf.resolve_tiers([], bad.env)
+    c = _by_name(pf.run_preflight(bad, tiers, explicit=False))["gvisor-userns"]
+    assert c.status is Status.WARN and "skips it at startup" in c.detail
+
+
+def test_runsc_host_root_points_at_the_userns_knob():
+    host = _healthy(files={"/proc/42/cmdline": "runsc-gofer\0--root\0",
+                           "/proc/42/uid_map": "0 0 4294967295\n",
+                           "/proc/42/status": "Uid:\t0\t0\t0\t0\nCapEff:\t0\n"},
+                    paths={"/proc/42"})
+    host.paths |= {"/var/lib/blastbox/gvisor-rootfs/bin/sh", "/var/lib/blastbox/jobs"}
+    c = _by_name(pf.run_preflight(host, ["gvisor"]))["runsc-host-root"]
+    assert c.status is Status.WARN and "BLASTBOX_GVISOR_USERNS_HOST_BASE" in c.detail

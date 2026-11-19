@@ -130,6 +130,10 @@ class HostView:
         """Run a read-only query; None if it could not be spawned or timed out."""
         raise NotImplementedError
 
+    def stat_path(self, path: str) -> tuple[int, int, int, bool] | None:
+        """``(st_mode, st_uid, st_gid, has_posix_acl)`` following symlinks; None if unstat-able."""
+        raise NotImplementedError
+
 
 class RealHost(HostView):
     def __init__(self) -> None:
@@ -188,6 +192,11 @@ class RealHost(HostView):
         from blastbox.host.runtime.firecracker import guest_kernel_version  # noqa: PLC0415
 
         return guest_kernel_version(path)
+
+    def stat_path(self, path: str) -> tuple[int, int, int, bool] | None:
+        from blastbox.host.runtime.gvisor_snapshot import _real_path_stat  # noqa: PLC0415
+
+        return _real_path_stat(path)
 
     def run(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str] | None:
         if not is_read_only(argv):
@@ -480,6 +489,80 @@ def _check_gvisor_rootless(host: HostView) -> Check | None:
                  "BLASTBOX_GVISOR_ROOTLESS is set, but the warm gVisor tier needs `runsc "
                  "restore`, which gVisor does not support rootless; the tier refuses to start. "
                  "Run it rootful (unset BLASTBOX_GVISOR_ROOTLESS)", f"{DOC}#gvisor-runsc")
+
+
+def _subid_cover(text: str | None, base: int, size: int) -> tuple[list[str], list[str]]:
+    """``(covering, overlapping)`` owner names in an /etc/subuid-style file: entries whose
+    ``name:start:count`` range holds all of ``base..base+size-1``, and entries that share only
+    part of it (another tool's ids in the same range)."""
+    cover: list[str] = []
+    overlap: list[str] = []
+    for line in (text or "").splitlines():
+        fields = line.strip().split(":")
+        if len(fields) != 3 or line.lstrip().startswith("#"):
+            continue
+        try:
+            start, count = int(fields[1]), int(fields[2])
+        except ValueError:
+            continue
+        if count <= 0:
+            continue
+        if start <= base and base + size <= start + count:
+            cover.append(fields[0])
+        elif start < base + size and base < start + count:
+            overlap.append(f"{fields[0]}:{start}:{count}")
+    return cover, overlap
+
+
+_USERNS_UNREACHABLE = "rootfs unreachable by the user-namespaced gofer"
+
+
+def _check_gvisor_userns(host: HostView) -> Check | None:
+    """BLASTBOX_GVISOR_USERNS_HOST_BASE (warm tier): the value the runtime accepts, the id range
+    reserved in /etc/subuid + /etc/subgid, and the rootfs reachable by the mapped uid."""
+    from blastbox.host.runtime.gvisor_snapshot import (  # noqa: PLC0415
+        USERNS_ENV,
+        USERNS_SIZE,
+        parse_userns_host_base,
+        userns_rootfs_problem,
+    )
+
+    doc = f"{DOC}#warm-gvisor-in-a-user-namespace"
+    if not host.env.get(USERNS_ENV, "").strip():
+        return None
+    base, problem = parse_userns_host_base(host.env[USERNS_ENV])
+    if base is None:
+        return Check("gvisor-userns", Status.FAIL,
+                     f"{problem}: the warm tier ignores it and runs the runsc sandbox/gofer as "
+                     "real host root", doc)
+    ids = f"{base}..{base + USERNS_SIZE - 1}"
+    span = f"guest 0..{USERNS_SIZE - 1} -> host {ids}"
+    rootfs = host.env.get("BLASTBOX_GVISOR_ROOTFS", "/var/lib/blastbox/gvisor-rootfs")
+    ok, why = userns_rootfs_problem(rootfs, base, stat=host.stat_path, realpath=host.realpath)
+    if ok is False:
+        return Check("gvisor-userns", Status.FAIL,
+                     f"{_USERNS_UNREACHABLE}: {why}; the warm tier refuses to start", doc)
+    warnings: list[str] = []
+    if ok is None:
+        warnings.append(f"cannot verify rootfs {rootfs} is reachable by host uid {base} ({why}; "
+                        "run preflight as root)")
+    for path in ("/etc/subuid", "/etc/subgid"):
+        text = host.read(path)
+        if text is None:
+            warnings.append(f"{path} unreadable")
+            continue
+        cover, overlap = _subid_cover(text, base, USERNS_SIZE)
+        if overlap:
+            warnings.append(f"{path}: {', '.join(overlap)} overlaps {ids} "
+                            "(ids shared with another user/daemon)")
+        elif not cover:
+            warnings.append(f"{path} reserves no range holding {ids} (rootful "
+                            "runsc maps it anyway, but useradd/podman/a remapped dockerd may hand "
+                            "the same ids out)")
+    if warnings:
+        return Check("gvisor-userns", Status.WARN, f"{span}; " + "; ".join(warnings), doc)
+    return Check("gvisor-userns", Status.PASS,
+                 f"{span}, reserved in /etc/subuid + /etc/subgid, rootfs {rootfs} reachable")
 
 
 _KVM_MISSING = "/dev/kvm missing"
@@ -960,9 +1043,10 @@ def _check_runsc_host_root(host: HostView, procs: Sequence[_Proc]) -> Check:
         return Check("runsc-host-root", Status.WARN,
                      f"{len(root)} runsc process(es) run as real host root (identity uid_map, "
                      f"uid 0): {shown}. A sandbox escape lands as host root with those "
-                     "capabilities; a user-namespace-remapped setup (a separate remapped docker "
-                     "daemon, or containerd per-container mappings) is recommended, pending a "
-                     "spike", doc)
+                     "capabilities. Run them user-namespace-mapped: warm gVisor tier, set "
+                     "BLASTBOX_GVISOR_USERNS_HOST_BASE; cold docker tier, a separate userns-remap "
+                     "dockerd (documented, not automated)",
+                     doc)
     if unknown:
         return Check("runsc-host-root", Status.WARN,
                      f"{_UNKNOWN}: cannot read uid_map/status of {_pids(unknown)}", doc)
@@ -1058,7 +1142,7 @@ def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc]) -> Check:
 
 _TIER_CHECKS = {
     "firecracker": ("kvm", "firecracker", "fc-guest"),
-    "gvisor": ("runsc", "gvisor-rootless"),
+    "gvisor": ("runsc", "gvisor-rootless", "gvisor-userns"),
 }
 #: Per-tier checks that are not startup gates (see _is_startup_gate) but are moot once the tier
 #: is skipped for another reason.
@@ -1082,6 +1166,10 @@ def _is_startup_gate(c: Check) -> bool:
     admitted and every spawn fails; a missing gVisor rootfs is booted anyway."""
     if c.name == "kvm":
         return c.detail.startswith(_KVM_MISSING)
+    if c.name == "gvisor-userns":
+        # Only the unreachable rootfs is refused at startup; a bad value is ignored (with a
+        # warning) and the tier runs without a user namespace.
+        return c.detail.startswith(_USERNS_UNREACHABLE)
     return c.name != "gvisor-rootfs"
 
 
@@ -1151,6 +1239,9 @@ def run_preflight(host: HostView, tiers: Sequence[str], *, explicit: bool = True
         rootless = _check_gvisor_rootless(host)
         if rootless is not None:
             out.append(rootless)
+        userns = _check_gvisor_userns(host)
+        if userns is not None:
+            out.append(userns)
     if "firecracker" in t:
         out.append(_check_kvm(host))
         out.append(_check_firecracker(host))

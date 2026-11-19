@@ -384,6 +384,87 @@ def _runsc(cfg: GvisorConfig) -> list[str]:
 
 _WARN_ON_INSECURE = "BLASTBOX_WARN_ON_INSECURE"
 
+#: Ids mapped into the warm tier's user namespace (guest 0..65535).
+USERNS_SIZE = 65536
+_MAX_HOST_ID = 2**32 - 2          # (uid_t)-1 is "no id", never a mappable one
+USERNS_ENV = "BLASTBOX_GVISOR_USERNS_HOST_BASE"
+
+
+def parse_userns_host_base(raw: str | None) -> tuple[int | None, str]:
+    """``(base, problem)`` for BLASTBOX_GVISOR_USERNS_HOST_BASE. Unset/blank = ``(None, "")``
+    (no user namespace). A value that is not an integer, or whose 65536-id range would include
+    host root or the ordinary-user range below 65536, or run past the largest uid, is
+    ``(None, why)``. Pure: the runtime logs ``why``, preflight reports it."""
+    text = (raw or "").strip()
+    if not text:
+        return None, ""
+    try:
+        base = int(text)
+    except ValueError:
+        return None, f"{USERNS_ENV}={text!r} is not an integer"
+    if base < USERNS_SIZE or base + USERNS_SIZE - 1 > _MAX_HOST_ID:
+        return None, (f"{USERNS_ENV}={text!r} is out of range (need {USERNS_SIZE} <= base <= "
+                      f"{_MAX_HOST_ID - USERNS_SIZE + 1}, so the range never maps host root)")
+    return base, ""
+
+
+#: (st_mode, st_uid, st_gid, has_posix_acl) for one path, or None if it cannot be stat'd.
+PathStat = tuple[int, int, int, bool]
+
+
+def _real_path_stat(path: str) -> PathStat | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    try:
+        acl = "system.posix_acl_access" in os.listxattr(path)
+    except OSError:
+        acl = False
+    return st.st_mode, st.st_uid, st.st_gid, acl
+
+
+def userns_rootfs_problem(rootfs: str, base: int, *,
+                          stat: Callable[[str], PathStat | None] = _real_path_stat,
+                          realpath: Callable[[str], str] = os.path.realpath,
+                          ) -> tuple[bool | None, str]:
+    """Whether the user-namespaced sentry/gofer (host uid/gid ``base``, guest root) can reach
+    ``rootfs``: search (x) on every ancestor and read+search on the rootfs dir itself. Its
+    capabilities are scoped to its namespace, so they override DAC only on inodes whose owner
+    and group both map into it (``base..base+65535``); everywhere else plain mode bits decide (no
+    supplementary groups). Measured: a rootfs under a 0750 home fails ``binding rootfs ...
+    permission denied``, and only at the first boot.
+
+    Returns ``(True, "")`` when reachable, ``(False, why)`` when the mode bits deny it, and
+    ``(None, why)`` when it cannot be decided (a component cannot be stat'd, or carries a POSIX
+    ACL that might grant what the mode bits deny) -- unknown is never treated as a denial."""
+    resolved = realpath(rootfs)
+    parts = [p for p in resolved.split("/") if p]
+    chain = ["/"] + ["/" + "/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+    for i, path in enumerate(chain):
+        need = 0o5 if i == len(chain) - 1 else 0o1      # r-x on the rootfs, --x on ancestors
+        st = stat(path)
+        if st is None:
+            return None, f"cannot stat {path}"
+        mode, uid, gid, acl = st
+        if base <= uid < base + USERNS_SIZE and base <= gid < base + USERNS_SIZE:
+            continue      # owner AND group map in: namespace caps override DAC (kernel rule)
+        if uid == base:
+            bits = (mode >> 6) & 0o7
+        elif gid == base:
+            bits = (mode >> 3) & 0o7
+        else:
+            bits = mode & 0o7
+        if bits & need != need:
+            what = "read+search" if need == 0o5 else "search"
+            if acl:
+                return None, (f"{path} (mode {mode & 0o7777:04o}, owner {uid}:{gid}) has a POSIX "
+                              f"ACL; cannot tell whether host id {base} has {what} on it")
+            return False, (f"{path} (mode {mode & 0o7777:04o}, owner {uid}:{gid}) does not grant "
+                           f"{what} to host uid/gid {base}: the user-namespaced sentry/gofer "
+                           f"cannot reach rootfs {resolved}")
+    return True, ""
+
 
 def _oci_config(cfg: GvisorConfig, workdir: Path, *, in_ro: bool) -> dict:
     """A self-contained OCI spec (config.json) for the warm/restore container with
@@ -479,7 +560,7 @@ def _oci_config(cfg: GvisorConfig, workdir: Path, *, in_ro: bool) -> dict:
     if rlimits:
         spec["process"]["rlimits"] = rlimits
     if cfg.userns_host_base is not None:
-        idmap = [{"containerID": 0, "hostID": cfg.userns_host_base, "size": 65536}]
+        idmap = [{"containerID": 0, "hostID": cfg.userns_host_base, "size": USERNS_SIZE}]
         spec["linux"]["namespaces"].append({"type": "user"})
         spec["linux"]["uidMappings"] = idmap
         spec["linux"]["gidMappings"] = list(idmap)
@@ -1052,6 +1133,12 @@ class GvisorSnapshotBackend:
                 "`restore`, which gVisor does not support rootless (it fails with 'Rootless "
                 "mode not supported with \"restore\"'). Run this tier as root, or use a "
                 "non-snapshot gVisor tier.")
+        if cfg.userns_host_base is not None and not (
+                0 <= cfg.uid < USERNS_SIZE and 0 <= cfg.gid < USERNS_SIZE):
+            # The worker's guest uid/gid must be inside the 0..65535 map, or runsc cannot set it.
+            raise GvisorCommandError(
+                f"{USERNS_ENV} maps guest ids 0..{USERNS_SIZE - 1}, but the worker runs as "
+                f"{cfg.uid}:{cfg.gid}, which is outside that map")
         self._cfg = cfg
         self._run = run
         self._run_text = run_text

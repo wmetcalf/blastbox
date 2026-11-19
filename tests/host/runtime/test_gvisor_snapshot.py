@@ -1823,3 +1823,92 @@ def test_userns_host_base_env_parsing():
     assert _userns_host_base({"BLASTBOX_GVISOR_USERNS_HOST_BASE": "2000000"}) == 2_000_000
     for bad in ("x", "0", "1000", str(2**32 - 10)):
         assert _userns_host_base({"BLASTBOX_GVISOR_USERNS_HOST_BASE": bad}) is None
+
+
+def test_userns_env_parse_bounds():
+    from blastbox.host.runtime.gvisor_snapshot import parse_userns_host_base
+
+    assert parse_userns_host_base(None) == (None, "")
+    assert parse_userns_host_base(" 65536 ") == (65536, "")
+    top = 2**32 - 2 - 65536 + 1          # last id of the range is 2**32-2, never (uid_t)-1
+    assert parse_userns_host_base(str(top)) == (top, "")
+    for bad in ("65535", str(top + 1), "-1", "2e6"):
+        base, why = parse_userns_host_base(bad)
+        assert base is None and "BLASTBOX_GVISOR_USERNS_HOST_BASE" in why
+
+
+def _stats(table):
+    return lambda p: table.get(p)
+
+
+def test_userns_rootfs_reachability_follows_mode_bits():
+    from blastbox.host.runtime.gvisor_snapshot import userns_rootfs_problem
+
+    B = 2_000_000
+    ident = lambda p: p  # noqa: E731
+    ok_tree = {"/": (0o40755, 0, 0, False), "/var": (0o40755, 0, 0, False),
+               "/var/lib": (0o40755, 0, 0, False), "/var/lib/r": (0o40755, 0, 0, False)}
+    assert userns_rootfs_problem("/var/lib/r", B, stat=_stats(ok_tree), realpath=ident) == (True, "")
+    # the measured failure: a rootfs under a 0750 home
+    home = {"/": (0o40755, 0, 0, False), "/home": (0o40755, 0, 0, False),
+            "/home/coz": (0o40750, 1000, 1000, False), "/home/coz/r": (0o40755, 0, 0, False)}
+    ok, why = userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)
+    assert ok is False and "/home/coz " in why and "0750" in why
+    # search-only (0711) parents are enough; the rootfs itself needs read too
+    home["/home/coz"] = (0o40711, 1000, 1000, False)
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is True
+    home["/home/coz/r"] = (0o40711, 0, 0, False)
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is False
+    # group bits apply when the dir's group is the mapped gid; owner bits when it is the uid
+    home["/home/coz/r"] = (0o40750, 0, B, False)
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is True
+    home["/home/coz/r"] = (0o40507, B, 0, False)
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is True
+    # in-namespace owner AND group: namespace caps override DAC; owner alone does not
+    home["/home/coz/r"] = (0o40700, B + 5, B + 5, False)
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is True
+    home["/home/coz/r"] = (0o40700, B + 5, 0, False)
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is False
+    # undecidable is never a denial: an ACL, or an unstat-able component
+    home["/home/coz"] = (0o40750, 1000, 1000, True)
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is None
+    del home["/home/coz"]
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is None
+    # the RESOLVED path is what the gofer binds
+    ok, why = userns_rootfs_problem("/srv/r", B, stat=_stats(ok_tree),
+                                    realpath=lambda p: "/var/lib/r")
+    assert ok is True
+
+
+def test_userns_refuses_worker_ids_outside_the_map(tmp_path):
+    from blastbox.host.runtime.gvisor_snapshot import (
+        GvisorCommandError, GvisorConfig, GvisorSnapshotBackend)
+
+    base = dict(runsc_bin="runsc", root=tmp_path / "s", image_rootfs=tmp_path / "r",
+                network="none", warm_argv=["/w"], userns_host_base=2_000_000)
+    assert GvisorSnapshotBackend(GvisorConfig(**base)) is not None
+    with pytest.raises(GvisorCommandError, match="outside that map"):
+        GvisorSnapshotBackend(GvisorConfig(**base, uid=70000))
+
+
+def test_unreachable_userns_rootfs_is_refused_at_selection(tmp_path, monkeypatch):
+    from blastbox.host.runtime import gvisor_snapshot as gs
+    from blastbox.host.runtime import gvisor_snapshot_runtime as gr
+
+    monkeypatch.setattr(gs.GvisorSnapshotBackend, "available", lambda self: True)
+    home = tmp_path / "home"
+    (home / "r").mkdir(parents=True)
+    real = gs.userns_rootfs_problem
+
+    def fake_stat(p):   # the parent is a 0750 home owned by someone else
+        return (0o40750, 1000, 1000, False) if p == str(home) else (0o40755, 0, 0, False)
+
+    monkeypatch.setattr(gs, "userns_rootfs_problem",
+                        lambda r, b, **kw: real(r, b, stat=fake_stat))
+    cfg = gr._gvisor_config_from_env({"BLASTBOX_GVISOR_ROOTFS": str(home / "r"),
+                                      "BLASTBOX_GVISOR_RUNSC": "/bin/true",
+                                      "BLASTBOX_GVISOR_USERNS_HOST_BASE": "2000000"})
+    assert cfg.userns_host_base == 2_000_000
+    assert gr.select_gvisor_snapshot_runtime(cfg=cfg) is None
+    with pytest.raises(gr.GvisorUnavailable, match="cannot reach rootfs"):
+        gr.select_gvisor_snapshot_runtime(cfg=cfg, require_available=True)
