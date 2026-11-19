@@ -134,11 +134,6 @@ class HostView:
         """``(st_mode, st_uid, st_gid, has_posix_acl)`` following symlinks; None if unstat-able."""
         raise NotImplementedError
 
-    def dispatcher_groups(self) -> list[int] | None:
-        """Supplementary gids the root dispatcher would hand the user-namespaced gofer, taken as
-        this process's when preflight runs as root (as the dispatcher does); None otherwise."""
-        raise NotImplementedError
-
 
 class RealHost(HostView):
     def __init__(self) -> None:
@@ -202,9 +197,6 @@ class RealHost(HostView):
         from blastbox.host.runtime.gvisor_snapshot import _real_path_stat  # noqa: PLC0415
 
         return _real_path_stat(path)
-
-    def dispatcher_groups(self) -> list[int] | None:
-        return os.getgroups() if self.euid == 0 else None
 
     def run(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str] | None:
         if not is_read_only(argv):
@@ -536,6 +528,32 @@ def _subid_cover(text: str | None, base: int, size: int) -> tuple[list[str], lis
 
 
 _USERNS_UNREACHABLE = "rootfs unreachable by the user-namespaced gofer"
+#: gVisor 3c4b2ad ("gofer: open volumes from the initial userns", 2024-11-08): before it the
+#: namespaced gofer opened bind sources itself and could not reach the 0700 per-slot dirs.
+_USERNS_MIN_RUNSC = 20241108
+
+
+def _runsc_older_than_userns_volumes(host: HostView) -> str:
+    name = host.env.get("BLASTBOX_GVISOR_RUNSC", "runsc")
+    path = host.which(name) if name and name == name.strip() else None
+    proc = host.run([path, "--version"]) if path else None
+    m = re.search(r"release-(\d{8})", (proc.stdout + proc.stderr) if proc else "")
+    if m and int(m.group(1)) < _USERNS_MIN_RUNSC:
+        return (f"runsc release-{m.group(1)} predates release-{_USERNS_MIN_RUNSC} (gofer opens "
+                "volumes from the initial userns): every base boot fails binding the 0700 "
+                "per-slot dirs; upgrade runsc")
+    return ""
+
+
+def _ids_in_range(text: str | None, base: int, size: int) -> list[str]:
+    """``name:id`` of /etc/passwd- or /etc/group-style entries whose id falls in the range."""
+    out = []
+    for line in (text or "").splitlines():
+        fields = line.split(":")
+        if len(fields) >= 3 and fields[2].strip().isdigit() and \
+                base <= int(fields[2]) < base + size:
+            out.append(f"{fields[0]}:{fields[2]}")
+    return out
 
 
 def _check_gvisor_userns(host: HostView) -> Check | None:
@@ -554,17 +572,26 @@ def _check_gvisor_userns(host: HostView) -> Check | None:
     base, problem = parse_userns_host_base(host.env[USERNS_ENV])
     if base is None:
         return Check("gvisor-userns", Status.FAIL,
-                     f"{problem}: the warm tier ignores it and runs the runsc sandbox/gofer as "
-                     "real host root", doc)
+                     f"{problem}: the warm tier refuses to start (it will not fall back to a "
+                     "sandbox running as real host root)", doc)
     ids = f"{base}..{base + USERNS_SIZE - 1}"
     span = f"guest 0..{USERNS_SIZE - 1} -> host {ids}"
     rootfs = host.env.get("BLASTBOX_GVISOR_ROOTFS", "/var/lib/blastbox/gvisor-rootfs")
-    ok, why = userns_rootfs_problem(rootfs, base, stat=host.stat_path, realpath=host.realpath,
-                                    groups=host.dispatcher_groups())
+    ok, why = userns_rootfs_problem(rootfs, base, stat=host.stat_path, realpath=host.realpath)
     if ok is False:
         return Check("gvisor-userns", Status.FAIL,
                      f"{_USERNS_UNREACHABLE}: {why}; the warm tier refuses to start", doc)
     warnings: list[str] = []
+    old_runsc = _runsc_older_than_userns_volumes(host)
+    if old_runsc:
+        warnings.append(old_runsc)
+    for path, kind in (("/etc/passwd", "user"), ("/etc/group", "group")):
+        inside = _ids_in_range(host.read(path), base, USERNS_SIZE)
+        if inside:
+            # Owner AND group in the range = the sandbox's namespace caps override DAC on them.
+            warnings.append(f"{path} has {kind}(s) inside {ids}: {', '.join(inside[:5])} "
+                            "(an escape's namespace capabilities reach files they own; directory-"
+                            "service ids are not checked)")
     if ok is None:
         warnings.append(f"cannot verify rootfs {rootfs} is reachable by host uid {base} ({why}; "
                         "run preflight as root)")
@@ -1196,10 +1223,6 @@ def _is_startup_gate(c: Check) -> bool:
     admitted and every spawn fails; a missing gVisor rootfs is booted anyway."""
     if c.name == "kvm":
         return c.detail.startswith(_KVM_MISSING)
-    if c.name == "gvisor-userns":
-        # Only the unreachable rootfs is refused at startup; a bad value is ignored (with a
-        # warning) and the tier runs without a user namespace.
-        return c.detail.startswith(_USERNS_UNREACHABLE)
     return c.name != "gvisor-rootfs"
 
 
@@ -1222,12 +1245,7 @@ def _downgrade_overflow(checks: list[Check], env: Mapping[str, str]) -> list[Che
             c = Check(c.name, Status.WARN,
                       f"{c.detail} -- {tier} is an overflow tier of this cascade, so the "
                       "dispatcher skips it at startup and runs without it", c.doc)
-        elif tier in warm and c.status is Status.FAIL and not (
-                c.name == "gvisor-userns" and not _is_startup_gate(c)
-                and not any(o is not c and names.get(o.name) == tier and o.status is Status.FAIL
-                            for o in checks)):
-            # (An ignored userns value is not a never-ready cause: the tier builds and serves as
-            # host root, so that FAIL stands unless something else keeps the tier from serving.)
+        elif tier in warm and c.status is Status.FAIL:
             # Admitted, but its warm base never builds: the cascade never spawns there and
             # serves on the other tiers.
             c = Check(c.name, Status.WARN,

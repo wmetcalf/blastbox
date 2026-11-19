@@ -193,18 +193,24 @@ blastbox preflight --tier gvisor
 ```
 
 - `BASE` must be `>= 65536` (the range never holds host root or ordinary users) and the range must
-  end below `4294967295`. A value the runtime cannot use is **ignored with a warning** and the tier
-  runs as before (real host root); preflight's `gvisor-userns` check FAILs it so it is not missed.
+  end below `4294967295`. A value the runtime cannot use makes the tier **refuse to start** (it never
+  falls back to a sandbox running as real host root); preflight's `gvisor-userns` FAILs it too.
+- runsc must be **release-20241108 or newer** (gofer opens volumes from the initial user namespace):
+  older builds fail every boot binding the 0700 per-slot dirs. Preflight WARNs on an older version.
 - The rootfs reachability is checked twice, read-only: by preflight (`gvisor-userns` FAIL; WARN
   when it cannot decide) and by the runtime at startup, which refuses the tier with the offending
   directory named instead of failing the first boot after the readiness wait. runsc binds the
   path **as configured**, so a symlink left at an old path (e.g. under a 0750 home) still needs
   its own directories searchable; both the configured path and the link target are checked.
-- The gofer keeps the dispatcher's **supplementary groups** (runsc denies `setgroups` in the
-  namespace), so a directory searchable only through one of them (e.g. `root:root 0750` with a
-  root dispatcher) is reachable. The runtime uses its own groups; preflight uses its own only
-  when run as root (as the dispatcher is), and otherwise WARNs where membership decides it.
-  A POSIX ACL on any component also makes it a WARN (an ACL can grant or deny past the mode bits).
+- **No supplementary groups.** runsc denies `setgroups` in the namespace, so its Sentry and gofer
+  would keep runsc's own supplementary groups (the dispatcher's: gid 0 via sudo, `docker`,
+  `disk`, ...) and an escape would land with them. blastbox starts the sandbox-starting runsc calls
+  (`run`, `restore`) with none, so group bits only count for gid `BASE`: a `root:root 0750`
+  directory on the way to the rootfs blocks it. A POSIX ACL on any component makes the check a
+  WARN (an ACL can grant or deny past the mode bits).
+- Preflight also WARNs on local accounts (`/etc/passwd`, `/etc/group`) whose ids fall inside the
+  range: the Sentry/gofer's namespace capabilities reach files owned by such an id. Directory-
+  service ids (sssd/FreeIPA) are not checked; pick a `BASE` outside their ranges.
 - Output files land owned by `BASE+65532`. The dispatcher runs as root, so host-side cleanup is
   unaffected; anything else reading job output directly needs read access by other/group.
 - Preflight `gvisor-userns` WARNs when `/etc/subuid` or `/etc/subgid` reserves no entry holding the

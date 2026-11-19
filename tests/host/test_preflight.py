@@ -91,8 +91,6 @@ class FakeHost(pf.HostView):
         stats = getattr(self, "stats", {})
         return stats[path] if path in stats else (0o40755, 0, 0, False)
 
-    def dispatcher_groups(self) -> list[int] | None:
-        return getattr(self, "groups", [0] if self.euid == 0 else None)
 
     def run(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str] | None:
         key = tuple(argv)
@@ -1366,13 +1364,9 @@ def test_gvisor_userns_rootfs_under_a_0750_home_fails():
     host.stats = {"/home/coz": (0o40750, 1000, 1000, False)}
     c = _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-userns"]
     assert c.status is Status.FAIL and "/home/coz " in c.detail and "refuses to start" in c.detail
-    # not root: the dispatcher's groups (which could include 1000) are unknown -> WARN, never FAIL
+    # the gofer starts with no supplementary groups, so a non-root preflight decides it the same
     host.euid = 1000
-    c = _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-userns"]
-    assert c.status is Status.WARN and "supplementary groups" in c.detail
-    # root whose groups DO include the dir's group: the gofer inherits them -> reachable
-    host.euid, host.groups = 0, [0, 1000]
-    assert _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-userns"].status is Status.PASS
+    assert _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-userns"].status is Status.FAIL
 
 
 def test_gvisor_userns_rootfs_check_follows_symlinks():
@@ -1439,19 +1433,32 @@ def test_gvisor_userns_two_entries_covering_the_whole_range_collide():
     assert c.status is Status.WARN and "dockremap" in c.detail and "blastbox" in c.detail
 
 
-def test_gvisor_userns_invalid_value_stays_fail_on_an_available_overflow_tier():
-    """PR #211 review: an ignored value lets the overflow tier build and serve as host root."""
+def test_gvisor_userns_invalid_value_is_a_startup_gate():
+    """The tier refuses an unusable value, so on a cascade overflow it is skipped like any gate."""
     env = {"BLASTBOX_GVISOR_USERNS_HOST_BASE": "1000", "BLASTBOX_POOL_RUNTIME": "cascade",
            "BLASTBOX_POOL_TIERS": "firecracker:2,gvisor:2"}
     host = _healthy(env=env, files=_SUBIDS)
     c = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False))[
         "gvisor-userns"]
-    assert c.status is Status.FAIL
-    # ...but when another gate already excludes the tier, it is moot like the rest
-    host.commands[("/usr/bin/runsc", "help")] = (0, "Subcommands:\n  run\n", "")
-    c = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False))[
-        "gvisor-userns"]
-    assert c.status is Status.WARN
+    assert c.status is Status.WARN and "skips it at startup" in c.detail
+    c = _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-userns"]
+    assert c.status is Status.FAIL and "refuses to start" in c.detail
+
+
+def test_gvisor_userns_warns_on_runsc_older_than_initial_userns_volume_open():
+    old = {("/usr/bin/runsc", "--version"): (0, "runsc version release-20241001.0\n", "")}
+    host = _healthy(env=_UNS, files=_SUBIDS, commands=old)
+    c = _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-userns"]
+    assert c.status is Status.WARN and "release-20241001" in c.detail
+    assert _by_name(pf.run_preflight(_healthy(env=_UNS, files=_SUBIDS), ["gvisor"]))[
+        "gvisor-userns"].status is Status.PASS
+
+
+def test_gvisor_userns_warns_on_local_accounts_inside_the_range():
+    files = {**_SUBIDS, "/etc/passwd": "root:x:0:0::/root:/bin/sh\nad:x:2000123:2000123::/:/x\n",
+             "/etc/group": "root:x:0:\n"}
+    c = _by_name(pf.run_preflight(_healthy(env=_UNS, files=files), ["gvisor"]))["gvisor-userns"]
+    assert c.status is Status.WARN and "ad:2000123" in c.detail and "/etc/group" not in c.detail
 
 
 def test_gvisor_userns_symlink_in_a_private_dir_fails():

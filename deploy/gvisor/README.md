@@ -176,8 +176,9 @@ process under a host memory cgroup (the spec's cgroup is intentionally ignored).
 Per-slot `out/` + `ctrl/` are mode `0o777` (shared cross-uid scratch between the non-root worker
 and the host services) but live inside a **`0o700`** slot dir created atomically — another local
 user can't traverse into it to reach them, independent of the deploy parent. blastbox additionally
-**warns** if the deploy state parent (`/var/lib/blastbox/...`) is group/other-writable; lock it to
-root-owned `0o700`.
+**warns** if the deploy state parent (`/var/lib/blastbox/...`) is group/other-writable; make it
+root-owned and not group/other-writable (`0o755`; `0o700` only when the gVisor rootfs is not under
+it, because `BLASTBOX_GVISOR_USERNS_HOST_BASE` needs search on every directory to the rootfs).
 
 ## Snapshot sensitivity
 

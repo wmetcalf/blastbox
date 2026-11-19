@@ -1819,10 +1819,37 @@ def test_oci_config_userns_host_base_adds_user_namespace(tmp_path):
 def test_userns_host_base_env_parsing():
     from blastbox.host.runtime.gvisor_snapshot_runtime import _userns_host_base
 
-    assert _userns_host_base({}) is None
-    assert _userns_host_base({"BLASTBOX_GVISOR_USERNS_HOST_BASE": "2000000"}) == 2_000_000
+    assert _userns_host_base({}) == (None, "")
+    assert _userns_host_base({"BLASTBOX_GVISOR_USERNS_HOST_BASE": "2000000"}) == (2_000_000, "")
     for bad in ("x", "0", "1000", str(2**32 - 10)):
-        assert _userns_host_base({"BLASTBOX_GVISOR_USERNS_HOST_BASE": bad}) is None
+        base, why = _userns_host_base({"BLASTBOX_GVISOR_USERNS_HOST_BASE": bad})
+        assert base is None and why
+
+
+def test_unusable_userns_value_refuses_the_tier_instead_of_running_as_host_root(tmp_path):
+    """Fail CLOSED: the operator asked for a namespace; a typo must not yield host-root sandboxes."""
+    from blastbox.host.runtime.gvisor_snapshot import GvisorCommandError, GvisorSnapshotBackend
+    from blastbox.host.runtime.gvisor_snapshot_runtime import _gvisor_config_from_env
+
+    cfg = _gvisor_config_from_env({"BLASTBOX_GVISOR_USERNS_HOST_BASE": "2,000,000",
+                                   "BLASTBOX_GVISOR_ROOTFS": str(tmp_path)})
+    assert cfg.userns_host_base is None and cfg.userns_problem
+    with pytest.raises(GvisorCommandError, match="refusing to start"):
+        GvisorSnapshotBackend(cfg)
+    assert GvisorSnapshotBackend(_gvisor_config_from_env(
+        {"BLASTBOX_GVISOR_ROOTFS": str(tmp_path)})) is not None
+
+
+@pytest.mark.parametrize("userns", [None, 2_000_000])
+def test_sandbox_starting_runsc_calls_drop_supplementary_groups_under_userns(tmp_path, userns):
+    """runsc denies setgroups in the namespace, so sentry/gofer keep runsc's groups: start it
+    with none, or an escape lands with the dispatcher's gid 0 / docker / disk."""
+    from blastbox.host.runtime.gvisor_snapshot import GvisorConfig, GvisorSnapshotBackend
+
+    cfg = GvisorConfig(runsc_bin="runsc", root=tmp_path / "s", image_rootfs=tmp_path / "r",
+                       network="none", warm_argv=["/w"], userns_host_base=userns)
+    kw = GvisorSnapshotBackend(cfg)._sandbox_spawn_kw()
+    assert kw == ({"extra_groups": []} if userns else {})
 
 
 def test_userns_env_parse_bounds():
@@ -1852,22 +1879,18 @@ def test_userns_rootfs_reachability_follows_mode_bits():
     # the measured failure: a rootfs under a 0750 home
     home = {"/": (0o40755, 0, 0, False), "/home": (0o40755, 0, 0, False),
             "/home/coz": (0o40750, 1000, 1000, False), "/home/coz/r": (0o40755, 0, 0, False)}
-    ok, why = userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident,
-                                    groups=[0])
+    ok, why = userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)
     assert ok is False and "/home/coz " in why and "0750" in why
     # search-only (0711) is enough everywhere, the rootfs included (lisafs falls back to O_PATH)
     home["/home/coz"] = (0o40711, 1000, 1000, False)
     assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is True
     home["/home/coz/r"] = (0o40711, 0, 0, False)
     assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is True
+    # the gofer is started with no supplementary groups: a g+x-only root:root dir is closed
     home["/home/coz/r"] = (0o40750, 0, 0, False)
-    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident,
-                                 groups=[])[0] is False
-    # the gofer keeps the dispatcher's supplementary groups: a g+x-only dir is reachable by them
+    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is False
     assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident,
                                  groups=[0])[0] is True
-    # ...and with unknown groups, a verdict that hinges on membership is undecidable
-    assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is None
     # group bits apply when the dir's group is the mapped gid; owner bits when it is the uid
     home["/home/coz/r"] = (0o40710, 0, B, False)
     assert userns_rootfs_problem("/home/coz/r", B, stat=_stats(home), realpath=ident)[0] is True

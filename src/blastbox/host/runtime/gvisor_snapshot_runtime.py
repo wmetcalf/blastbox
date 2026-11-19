@@ -406,9 +406,8 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
     # from runsc after the readiness wait; refuse it here, by name, instead.
     if gcfg.userns_host_base is not None:
         from blastbox.host.runtime.gvisor_snapshot import USERNS_ENV, userns_rootfs_problem
-        # The gofer keeps THIS process's supplementary groups (runsc denies setgroups).
-        ok, why = userns_rootfs_problem(str(gcfg.image_rootfs), gcfg.userns_host_base,
-                                        groups=os.getgroups())
+        # No supplementary groups: the backend starts runsc with none (_sandbox_spawn_kw).
+        ok, why = userns_rootfs_problem(str(gcfg.image_rootfs), gcfg.userns_host_base)
         if ok is False:
             msg = (f"gVisor C/R warm tier refused: {USERNS_ENV}={gcfg.userns_host_base}, but {why}. "
                    "Move the rootfs (e.g. under /var/lib/blastbox, not via a symlink from the old path) "
@@ -495,20 +494,22 @@ def _int_env(env, key: str, default: int) -> int:
         return default
 
 
-def _userns_host_base(env) -> int | None:
-    """BLASTBOX_GVISOR_USERNS_HOST_BASE: host uid/gid that guest 0 maps to (65536 ids). Unset =
-    no user namespace. An invalid value, or one whose range would include host root, is refused
-    LOUDLY (warning, no userns) rather than guessed at; `blastbox preflight` FAILs it."""
+def _userns_host_base(env) -> "tuple[int | None, str]":
+    """BLASTBOX_GVISOR_USERNS_HOST_BASE: ``(base, problem)``. Unset = ``(None, "")``, no user
+    namespace. An unusable value (not an integer, or a range that could hold host root) comes
+    back as ``(None, why)``, and the backend REFUSES the tier on it: silently running as host
+    root after the operator asked for a namespace is the failure this knob exists to prevent."""
     from blastbox.host.runtime.gvisor_snapshot import USERNS_ENV, parse_userns_host_base
 
     base, problem = parse_userns_host_base(env.get(USERNS_ENV, ""))
     if problem:
-        _log.warning("%s; running WITHOUT a user namespace", problem)
-    return base
+        _log.error("%s; the gVisor warm tier refuses to start", problem)
+    return base, problem
 
 
 def _gvisor_config_from_env(env):
     import json
+    userns_base, userns_problem = _userns_host_base(env)
     from blastbox.host.runtime.gvisor_snapshot import GvisorConfig
     root = env.get("BLASTBOX_GVISOR_ROOT", "/var/lib/blastbox/gvisor-root")
     rootfs = env.get("BLASTBOX_GVISOR_ROOTFS", "/var/lib/blastbox/gvisor-rootfs")
@@ -563,7 +564,8 @@ def _gvisor_config_from_env(env):
                   in ("1", "true", "yes", "on")),
         warm_argv=warm_argv,
         extra_env=extra_env,
-        userns_host_base=_userns_host_base(env),
+        userns_host_base=userns_base,
+        userns_problem=userns_problem,
         ld_preload=env.get("BLASTBOX_GVISOR_LD_PRELOAD") or None,
         platform=env.get("BLASTBOX_GVISOR_PLATFORM") or None,
         cpu_features_annotation=env.get("BLASTBOX_GVISOR_CPUFEATURES") or None,

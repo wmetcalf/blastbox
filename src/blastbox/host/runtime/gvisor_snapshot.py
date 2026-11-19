@@ -82,6 +82,9 @@ class GvisorConfig:
     # owned by userns_host_base + guest uid (e.g. 2065532 for uid 65532); the warm tier runs as
     # root, so host-side cleanup is unaffected. None = no user namespace (today's behaviour).
     userns_host_base: int | None = None
+    # Set when BLASTBOX_GVISOR_USERNS_HOST_BASE was given but is unusable: the backend REFUSES
+    # the tier rather than silently run the sandbox as real host root the operator opted out of.
+    userns_problem: str = ""
     platform: str | None = None
     ld_preload: str | None = None                 # soffice tier: /opt/clippyshot/accept-retry.so
     cpu_features_annotation: str | None = None     # dev.gvisor.internal.cpufeatures (pinning)
@@ -434,7 +437,7 @@ def _path_chain(path: str) -> list[str]:
 def userns_rootfs_problem(rootfs: str, base: int, *,
                           stat: Callable[[str], PathStat | None] = _real_path_stat,
                           realpath: Callable[[str], str] = os.path.realpath,
-                          groups: "Collection[int] | None" = None,
+                          groups: Collection[int] = (),
                           ) -> tuple[bool | None, str]:
     """Whether the user-namespaced gofer (host uid/gid ``base``, guest root) can reach
     ``rootfs``: search (x) on every directory the bind walks. runsc mounts ``rootfs`` as
@@ -444,16 +447,15 @@ def userns_rootfs_problem(rootfs: str, base: int, *,
 
     The gofer's capabilities are scoped to its namespace, so they override DAC only on inodes
     whose owner AND group both map into it (``base..base+65535``); everywhere else plain mode
-    bits decide. runsc starts the gofer with setgroups denied, so it KEEPS the launching
-    process's supplementary groups: pass them as ``groups`` (``os.getgroups()`` in the
-    dispatcher). ``None`` (preflight, which is not the dispatcher process) makes a component
-    whose verdict hinges on group membership undecidable. Measured: a rootfs under a 0750 home
-    fails ``binding rootfs ... permission denied``, and only at the first boot.
+    bits decide. ``groups`` are the gofer's supplementary host gids: runsc denies setgroups in
+    the namespace, so the gofer keeps whatever runsc was started with, and the backend starts it
+    with none (``extra_groups=[]``). Measured: a rootfs under a 0750 home fails ``binding rootfs
+    ... permission denied``, and only at the first boot.
 
     Returns ``(True, "")`` when reachable, ``(False, why)`` when the mode bits deny it, and
-    ``(None, why)`` when it cannot be decided (a component cannot be stat'd, carries a POSIX
-    ACL, or turns on unknown group membership) -- unknown is never treated as a denial, but a
-    later component whose mode bits plainly deny it still is."""
+    ``(None, why)`` when it cannot be decided (a component cannot be stat'd, or carries a POSIX
+    ACL, which can grant or deny past the mode bits) -- unknown is never treated as a denial,
+    but a later component whose mode bits plainly deny it still is."""
     resolved = realpath(rootfs)
     chain = list(dict.fromkeys([*_path_chain(os.path.abspath(rootfs)), *_path_chain(resolved)]))
     unknown = ""
@@ -465,24 +467,17 @@ def userns_rootfs_problem(rootfs: str, base: int, *,
         if base <= uid < base + USERNS_SIZE and base <= gid < base + USERNS_SIZE:
             continue      # owner AND group map in: namespace caps override DAC (kernel rule)
         shown = f"{path} (mode {mode & 0o7777:04o}, owner {uid}:{gid})"
-        group_ok, other_ok = bool(mode & 0o010), bool(mode & 0o001)
-        if uid == base:
-            ok: bool | None = bool(mode & 0o100)
-        elif gid == base or (groups is not None and gid in groups):
-            ok = group_ok
-        elif groups is None and group_ok != other_ok:
-            ok = None
-        else:
-            ok = other_ok
         if acl:
             # A named-user/group entry can grant what the bits deny, or deny what they grant.
             unknown = unknown or (f"{shown} has a POSIX ACL; cannot tell whether host id {base} "
                                   "can search it")
             continue
-        if ok is None:
-            unknown = unknown or (f"{shown}: search for host id {base} depends on whether the "
-                                  f"dispatcher's supplementary groups include {gid}")
-            continue
+        if uid == base:
+            ok = bool(mode & 0o100)
+        elif gid == base or gid in groups:
+            ok = bool(mode & 0o010)
+        else:
+            ok = bool(mode & 0o001)
         if not ok:
             return False, (f"{shown} does not grant search to host uid/gid {base}: the "
                            f"user-namespaced gofer cannot reach rootfs {rootfs}"
@@ -623,7 +618,9 @@ def _warn_if_lax_parent(workdir: Path) -> None:
         _warned_lax_parents.add(key)
         _log.warning(
             "gVisor warm state parent %s is group/other-writable (mode %o); slot dirs are 0o700 "
-            "so this is not an exposure, but lock the deploy parent to root-owned 0700.",
+            "so this is not an exposure, but make the deploy parent root-owned and not "
+            "group/other-writable (0755; 0700 only if the gVisor rootfs is not under it, since "
+            "BLASTBOX_GVISOR_USERNS_HOST_BASE needs search on the rootfs path).",
             parent, mode,
         )
 
@@ -1159,6 +1156,10 @@ class GvisorSnapshotBackend:
                 "`restore`, which gVisor does not support rootless (it fails with 'Rootless "
                 "mode not supported with \"restore\"'). Run this tier as root, or use a "
                 "non-snapshot gVisor tier.")
+        if cfg.userns_problem:
+            raise GvisorCommandError(
+                f"{cfg.userns_problem}; refusing to start the warm-snapshot tier without the user "
+                "namespace it asks for (its sandbox would run as real host root). Fix or unset it.")
         if cfg.userns_host_base is not None and not (
                 0 <= cfg.uid < USERNS_SIZE and 0 <= cfg.gid < USERNS_SIZE):
             # The worker's guest uid/gid must be inside the 0..65535 map, or runsc cannot set it.
@@ -1179,6 +1180,13 @@ class GvisorSnapshotBackend:
         # Durable across boot handles: SnapshotManager kills and abandons a handle after a failed
         # checkpoint, so a retry list held on the handle is discarded with it (PR #82).
         self._stranded_partials: list[str] = []
+
+    def _sandbox_spawn_kw(self) -> dict[str, Any]:
+        """Extra spawn args for the runsc calls that START sandbox processes (run, restore).
+        Under a user namespace runsc denies setgroups, so its sentry and gofer keep runsc's own
+        supplementary groups -- the dispatcher's (gid 0 via sudo/initgroups, docker, disk, ...)
+        -- and an escape would land with them. Start runsc with none."""
+        return {"extra_groups": []} if self._cfg.userns_host_base is not None else {}
 
     def available(self) -> bool:
         # `probe` is a full override (tests/embedders); honor it verbatim.
@@ -1241,6 +1249,7 @@ class GvisorSnapshotBackend:
             try:
                 self._run(
                     [*_runsc(self._cfg), "run", "-detach", "-bundle", str(base), cid],
+                    **self._sandbox_spawn_kw(),
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=_sink.write_fd,
@@ -1378,6 +1387,7 @@ class GvisorSnapshotBackend:
                 self._run(
                     [*_runsc(self._cfg), "restore", "-image-path", str(artifact),
                      "-detach", "-bundle", str(wd), cid],
+                    **self._sandbox_spawn_kw(),
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=_sink.write_fd,
