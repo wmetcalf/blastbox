@@ -2021,3 +2021,11 @@ def test_userns_rootfs_walk_searches_directories_before_dotdot():
                                     stat=lambda p: modes.get(p, (0o40755, 0, 0, False)),
                                     readlink=lambda p: None, realpath=lambda p: "/var/r")
     assert ok is False and "/root " in why
+
+
+def test_userns_rootfs_walk_takes_dotdot_after_a_symlink_physically():
+    """`/a/link/../r` with link -> /x/y is /x/r to the kernel, not /a/r (PR #211 review)."""
+    from blastbox.host.runtime.gvisor_snapshot import _walked_dirs
+
+    assert _walked_dirs("/a/link/../r", {"/a/link": "/x/y"}.get) == [
+        "/", "/a", "/x", "/x/y", "/x/r"]
