@@ -1099,11 +1099,11 @@ def _check_confinement(host: HostView, tiers: Collection[str],
     if st.lsms is None:
         parts.append("securityfs not readable (container?): LSM stack inferred from "
                      "/sys/module and /sys/fs/selinux")
-    parts += [b for b in (st.selinux_blocker, st.apparmor_blocker) if b]
-    if "cold" in kinds and st.cold_blocker:
-        parts.append(st.cold_blocker)
+    parts += cf._blockers(st, kinds)
     if st.apparmor and kinds and st.apparmor_parser is None:
         parts.append("apparmor_parser not found: blastbox profiles cannot be loaded")
+    elif st.apparmor_parser == "present (--version failed)":
+        parts.append("apparmor_parser present but `--version` failed")
     if "gvisor" in kinds:     # the warm tier's own binary; cold runsc is dockerd's runtime
         split = {True: "split sentry", False: "single binary", None: "sentry layout unknown"}
         parts.append(f"runsc {st.runsc} ({split[st.runsc_split_sentry]})" if st.runsc

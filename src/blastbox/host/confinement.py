@@ -6,7 +6,8 @@ and sentry; firecracker -- into blastbox's own LSM policy, because runsc ignores
 domain, loads a policy or changes the host: it answers "what does this host offer, and which LSM
 WOULD each sandbox kind be confined with", for ``blastbox preflight`` and the dispatcher's log.
 
-Selection, per sandbox kind ("gvisor" | "firecracker"):
+Selection, per sandbox kind ("cold" | "gvisor" | "firecracker"; cold is runsc started by dockerd,
+judged on host state only and only with the default docker endpoint):
 
     SELinux (enforcing)  >  AppArmor (enabled)  >  Landlock (firecracker only)  >  none
 
@@ -118,7 +119,8 @@ def kinds_for_tiers(tiers: Iterable[str]) -> list[str]:
 @dataclass(frozen=True)
 class HostLsm:
     """What the host offers. Tool fields are None when not probed (the dispatcher's startup
-    probe reads /sys only and never spawns)."""
+    probe only reads files -- /sys, /proc/self/attr, /proc/self/mounts and the docker
+    config.json, for currentContext only -- and never spawns)."""
 
     lsms: tuple[str, ...] | None        # /sys/kernel/security/lsm; None = securityfs unreadable
     apparmor: bool
@@ -129,8 +131,8 @@ class HostLsm:
     # read-only selinuxfs (container engines bind it ro).
     apparmor_blocker: str | None = None
     selinux_blocker: str | None = None
-    # Cold runsc is started by the daemon the docker CLI talks to; when that is not this host's
-    # (DOCKER_HOST / DOCKER_CONTEXT elsewhere), this host's LSM view says nothing about it.
+    # Cold runsc is started by the daemon the docker CLI talks to; with any non-default
+    # endpoint configuration this host's LSM view is not taken to describe it.
     cold_blocker: str | None = None
     apparmor_parser: str | None = None  # "4.0.1"; None = not found / not probed
     runsc: str | None = None            # "release-20261012.0"
@@ -263,10 +265,10 @@ def _cold_blocker(env: Mapping[str, str], host: HostReader) -> str | None:
 
 
 def _docker_config_dir(env: Mapping[str, str]) -> str:
-    cfg = env.get("DOCKER_CONFIG", "")
-    if cfg.strip():
+    cfg = env.get("DOCKER_CONFIG", "")      # verbatim when set, as the CLI uses it
+    if cfg:
         return cfg
-    home = env.get("HOME", "").strip()
+    home = env.get("HOME", "")
     if not home:
         # As the docker CLI: an empty or unset HOME falls back to the passwd entry.
         import pwd  # noqa: PLC0415
@@ -290,7 +292,10 @@ def _resolve_cold_blocker(env: Mapping[str, str], host: HostReader) -> str | Non
         if context == "default":
             return None
         return f"DOCKER_CONTEXT={context!r}: cold runsc may run on another daemon's host"
-    raw = host.read(os.path.join(_docker_config_dir(env), "config.json"))
+    path = os.path.join(_docker_config_dir(env), "config.json")
+    raw = host.read(path)
+    if raw is None and host.exists(path):
+        return "docker config.json exists but is not readable: current context unknown"
     if raw is not None and len(raw) >= _READ_CAP:
         return "docker config.json too large to read whole: current context unknown"
     if raw is None or not raw.strip():
@@ -318,7 +323,7 @@ def _parser_version(host: HostReader) -> str | None:
             continue
         proc = host.run([path, "--version"])
         ver = _version(proc.stdout + proc.stderr) if proc is not None else None
-        return None if ver is None else ".".join(map(str, ver))
+        return "present (--version failed)" if ver is None else ".".join(map(str, ver))
     return None
 
 
@@ -380,9 +385,20 @@ def check_required(state: HostLsm, mode: str, kinds: Iterable[str]) -> None:
             f"{state.selinux}, apparmor={'on' if state.apparmor else 'off'}, landlock_abi="
             f"{state.landlock_abi}; Landlock covers firecracker only, permissive SELinux "
             "does not count"
-            + "".join(f"; {b}" for b in (state.selinux_blocker, state.apparmor_blocker,
-                                         state.cold_blocker) if b)
+            + "".join(f"; {b}" for b in _blockers(state, missing))
             + ")")
+
+
+def _blockers(state: HostLsm, kinds: Iterable[str]) -> list[str]:
+    """The blockers that apply to ``kinds``: cold ignores the caller-context ones and has its
+    own; the kinds the dispatcher starts itself are blocked by those."""
+    kinds = set(kinds)
+    out: list[str] = []
+    if kinds - {"cold"}:
+        out += [b for b in (state.selinux_blocker, state.apparmor_blocker) if b]
+    if "cold" in kinds and state.cold_blocker:
+        out.append(state.cold_blocker)
+    return out
 
 
 @dataclass(frozen=True)
@@ -438,7 +454,7 @@ class _SysReader:
 
 def detect(env: Mapping[str, str] | None = None, *, host: HostReader | None = None,
            landlock: int | None = None) -> Detection:
-    """The dispatcher's startup detection: /sys reads and the Landlock query, no spawns.
+    """The dispatcher's startup detection: file reads and the Landlock query, no spawns.
     Raises ValueError on an invalid mode."""
     env = os.environ if env is None else env
     mode = mode_from_env(env)

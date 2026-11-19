@@ -387,15 +387,16 @@ def _as_pinned(keys: object) -> PinnedKeys:
 
 @dataclass(frozen=True)
 class AttestedConfinement:
-    """The host-LSM confinement the signing dispatcher recorded for a local runsc/firecracker
-    run (``confinement``). Only present when the receipt carries it."""
+    """The host-LSM confinement a signing dispatcher recorded for a run (``confinement``).
+    Accepted ahead of time: current dispatchers do not sign it yet (detection only), the
+    confinement tier's enforcement change will. Only present when the receipt carries it."""
 
     #: ``BLASTBOX_CONFINEMENT`` on the signer: "auto", "require" or "off".
     mode: str
     #: The host LSM the sandbox's host processes would be confined with ("selinux",
     #: "apparmor", "landlock" or "none").
     available: str
-    #: The LSM actually applied; "none" while the confinement tier only detects.
+    #: The LSM actually applied ("none" when nothing was).
     applied: str
 
 
@@ -560,7 +561,7 @@ _REQUIRED_FIELDS: dict[str, type | tuple[type, ...]] = {
 }
 #: Present only where the signer enforced the posture, and then together.
 _NET_FIELDS = ("net_policy_effective", "net_exit", "net_downgraded", "net_inspect")
-#: Optional: present only on a local runsc/firecracker run whose dispatcher detected it.
+#: Optional, accepted ahead of the dispatchers that will sign it (none does yet).
 _CONFINEMENT_KEYS = frozenset({"mode", "available", "applied"})
 
 

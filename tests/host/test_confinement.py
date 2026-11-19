@@ -753,11 +753,73 @@ def test_empty_home_uses_the_passwd_home(monkeypatch):
     assert cf.probe(host, env={"HOME": ""}).would_use("cold") == "none"
 
 
-def test_undecodable_docker_context_env_does_not_raise():
-    assert cf.probe(_host(UBUNTU), env={"DOCKER_CONTEXT": "\udcff"}).would_use("cold") == "none"
+def test_cold_resolution_never_raises():
+    """The catch-all: a resolver failure is a blocker, never an exception out of probe()."""
+    class Boom(FakeHost):
+        def read(self, path):
+            if path.endswith("config.json"):
+                raise RuntimeError("boom")
+            return super().read(path)
+    st = cf.probe(Boom(files=UBUNTU), env={"DOCKER_CONFIG": _CFG})
+    assert st.would_use("cold") == "none" and "RuntimeError" in (st.cold_blocker or "")
+
+
+def test_blank_docker_config_is_used_verbatim_like_the_cli():
+    host = _host({**UBUNTU, "  /config.json": '{"currentContext": "remote"}'})
+    assert cf.probe(host, env={"DOCKER_CONFIG": "  "}).would_use("cold") == "none"
+
+
+def test_require_message_names_only_the_unmet_kinds_blockers():
+    st = cf.probe(_host(AL2023), env={"DOCKER_HOST": "tcp://builder:2376"}, landlock=4)
+    with pytest.raises(cf.ConfinementUnavailable) as exc:
+        cf.check_required(st, "require", ["gvisor"])
+    assert "DOCKER_HOST" not in str(exc.value)
+    with pytest.raises(cf.ConfinementUnavailable, match="DOCKER_HOST"):
+        cf.check_required(st, "require", ["cold"])
+
+
+def test_parser_present_but_version_failing_is_not_not_found():
+    host = _healthy(files=UBUNTU)
+    host.executables["apparmor_parser"] = "/usr/sbin/apparmor_parser"
+    c = next(c for c in pf.run_preflight(host, ["gvisor"]) if c.name == "confinement")
+    assert "apparmor_parser not found" not in c.detail and "--version` failed" in c.detail
+
+
+def test_dispatcher_refuses_an_invalid_env_mode_even_with_a_passed_detection(
+        tmp_path, monkeypatch):
+    from blastbox.host.dispatch import Dispatcher, EngineSpec
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    from tests.host.test_dispatch import _fake_runtime, _limits
+    monkeypatch.setenv("BLASTBOX_CONFINEMENT", "requird")
+    det = cf.detect({"BLASTBOX_CONFINEMENT": "auto"}, host=_host(ROCKY), landlock=0)
+    with pytest.raises(ValueError, match="BLASTBOX_CONFINEMENT"):
+        Dispatcher(job_store=InMemoryJobStore(),
+                   engines={"e": EngineSpec(name="e", image="i", worker_argv=["w"])},
+                   limits=_limits(), job_root=tmp_path, runtime_selector=_fake_runtime,
+                   attest_key=None, confinement=det)
 
 
 def test_require_refuses_cold_on_a_remote_daemon():
     st = cf.probe(_host(UBUNTU), env={"DOCKER_HOST": "tcp://builder:2376"})
     with pytest.raises(cf.ConfinementUnavailable, match="DOCKER_HOST"):
         cf.check_required(st, "require", ["cold"])
+
+
+def test_existing_but_unreadable_docker_config_is_unknown():
+    path = f"{_CFG}/config.json"
+    host = FakeHost(files=UBUNTU, paths={path})          # exists, read() -> None
+    st = cf.probe(host, env={"DOCKER_CONFIG": _CFG})
+    assert st.would_use("cold") == "none" and "not readable" in (st.cold_blocker or "")
+
+
+def test_dispatcher_honours_env_require_over_a_passed_auto_detection(tmp_path, monkeypatch):
+    from blastbox.host.dispatch import Dispatcher, EngineSpec
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    from tests.host.test_dispatch import _fake_runtime, _limits
+    monkeypatch.setenv("BLASTBOX_CONFINEMENT", "require")
+    det = cf.detect({"BLASTBOX_CONFINEMENT": "auto"}, host=_host(ALPINE), landlock=3)
+    with pytest.raises(cf.ConfinementUnavailable):
+        Dispatcher(job_store=InMemoryJobStore(),
+                   engines={"e": EngineSpec(name="e", image="i", worker_argv=["w"])},
+                   limits=_limits(), job_root=tmp_path, runtime_selector=_fake_runtime,
+                   attest_key=None, confinement=det)
