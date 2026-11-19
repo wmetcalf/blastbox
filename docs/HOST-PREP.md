@@ -236,7 +236,7 @@ rule), or a read-only selinuxfs. `cold` is judged on the host's state alone, bec
 (through a docker runtime wrapper) starts that runsc, not the dispatcher -- unless
 the docker CLI talks to another daemon (resolved as the CLI does: `DOCKER_HOST`, else
 `DOCKER_CONTEXT`, else the `docker context use` choice in `config.json`; only a `unix://`
-endpoint is local), in which case this host says nothing about it and `cold` counts as none.
+endpoint is local, and not Docker Desktop's, whose daemon runs in a VM), in which case this host says nothing about it and `cold` counts as none.
 
 `BLASTBOX_CONFINEMENT=auto|require|off` (default `auto`). `require` makes `blastbox dispatch`
 refuse to start, and preflight FAIL, when a sandbox kind the dispatcher can run (including

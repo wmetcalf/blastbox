@@ -772,3 +772,52 @@ def test_overflow_gvisor_with_missing_rootfs_is_admitted_so_require_fails():
     host.paths.discard("/var/lib/blastbox/gvisor-rootfs/bin/sh")   # missing: booted anyway
     cs = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False)
     assert next(c for c in cs if c.name == "confinement").status is Status.FAIL
+
+
+@pytest.mark.parametrize("cfg_text", [
+    '{"CurrentContext": "remote"}',                       # Go matches keys case-insensitively
+    '{"currentContext": "remote"}}',                      # trailing data: Go reads one value
+    '﻿{"currentContext": "remote"}',                 # BOM
+])
+def test_docker_config_parsed_like_the_cli(cfg_text):
+    host = _host({**UBUNTU, **_DOCKER_FILES, f"{_CFG}/config.json": cfg_text})
+    assert cf.probe(host, env={"DOCKER_CONFIG": _CFG}).would_use("cold") == "none"
+
+
+@pytest.mark.parametrize("cfg_text", [
+    '{"currentContext":' + "[" * 10000 + "]" * 10000 + "}",
+    '{"currentContext": "\\ud800"}',
+    "not json at all",
+])
+def test_unresolvable_docker_config_fails_closed_without_raising(cfg_text):
+    host = _host({**UBUNTU, f"{_CFG}/config.json": cfg_text})
+    st = cf.probe(host, env={"DOCKER_CONFIG": _CFG})
+    assert st.would_use("cold") == "none" and st.cold_blocker
+
+
+def test_undecodable_docker_context_env_does_not_raise():
+    st = cf.probe(_host(UBUNTU), env={"DOCKER_CONTEXT": "\udcff"})
+    assert st.would_use("cold") == "none"
+
+
+def test_empty_home_uses_the_passwd_home(monkeypatch):
+    import pwd
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: type("P", (), {"pw_dir": "/srv/svc"})())
+    meta = {k.replace(_CFG, "/srv/svc/.docker"): v
+            for k, v in _ctx_meta("remote", "tcp://b:1").items()}
+    host = _host({**UBUNTU, **meta, "/srv/svc/.docker/config.json": '{"currentContext":"remote"}'})
+    assert cf.probe(host, env={"HOME": ""}).would_use("cold") == "none"
+
+
+def test_sys_reader_reads_a_large_docker_config(tmp_path):
+    big = tmp_path / "config.json"
+    big.write_text('{"auths": {"x": {"auth": "' + "a" * 200_000 + '"}}, "currentContext": "r"}')
+    assert cf._SysReader().read(str(big)).endswith('"r"}')   # type: ignore[union-attr]
+
+
+def test_docker_desktop_socket_is_a_vm_not_this_host():
+    files = {**UBUNTU, **_ctx_meta("desktop-linux", "unix:///home/u/.docker/desktop/docker.sock"),
+             f"{_CFG}/config.json": '{"currentContext": "desktop-linux"}'}
+    assert cf.probe(_host(files), env={"DOCKER_CONFIG": _CFG}).would_use("cold") == "none"
+    st = cf.probe(_host(UBUNTU), env={"DOCKER_HOST": "unix:///home/u/.docker/desktop/docker.sock"})
+    assert st.would_use("cold") == "none"

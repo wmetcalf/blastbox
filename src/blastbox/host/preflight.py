@@ -1256,9 +1256,9 @@ def run_preflight(host: HostView, tiers: Sequence[str], *, explicit: bool = True
         out.append(_check_userns(host, t))
     # A tier check FAIL refuses the tier; of the soft checks only an explicit refusal does (a
     # missing gVisor rootfs is admitted and booted anyway, see _is_startup_gate).
+    soft_names = {n for soft in _SOFT_CHECKS.values() for n in soft}
     failed = {c.name for c in out if c.status is Status.FAIL and (
-        c.name not in {n for soft in _SOFT_CHECKS.values() for n in soft}
-        or (c.facts or {}).get("refused"))}
+        c.name not in soft_names or (c.facts or {}).get("refused"))}
     skipped = {tier for tier in _overflow_only_tiers(host.env)
                if failed & {*_TIER_CHECKS[tier], *_SOFT_CHECKS[tier]}}
     if not explicit and host.env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower() in ("", "none"):

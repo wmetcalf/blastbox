@@ -54,6 +54,7 @@ _AA_SELF = ("/proc/self/attr/apparmor/current", "/proc/self/attr/current")
 _MOUNTS = "/proc/self/mounts"
 _AA_PARSERS = ("apparmor_parser", "/usr/sbin/apparmor_parser", "/sbin/apparmor_parser")
 
+_READ_CAP = 4 * 1024 * 1024           # docker config.json can be large (inline registry auths)
 _SYS_LANDLOCK_CREATE_RULESET = 444   # unified syscall number (x86_64, aarch64, ...)
 _LANDLOCK_CREATE_RULESET_VERSION = 1
 
@@ -254,32 +255,69 @@ def _se_blocker(host: HostReader) -> str | None:
 def _cold_blocker(env: Mapping[str, str], host: HostReader) -> str | None:
     """Why the daemon the docker CLI will talk to is not known to be THIS host's, resolved the
     way the CLI resolves it: DOCKER_HOST, else DOCKER_CONTEXT, else config.json currentContext;
-    a named context's endpoint from its meta.json. Only a unix:// endpoint is local."""
+    a named context's endpoint from its meta.json. Only a unix:// endpoint is local (not
+    Docker Desktop's, which fronts a VM). Anything
+    that cannot be resolved is a blocker (fail closed), never an exception."""
+    try:
+        return _resolve_cold_blocker(env, host)
+    except Exception as exc:  # noqa: BLE001 -- never raise on host state
+        return f"docker endpoint not resolvable ({type(exc).__name__}): cold runsc host unknown"
+
+
+def _docker_config_dir(env: Mapping[str, str]) -> str:
+    cfg = env.get("DOCKER_CONFIG", "").strip()
+    if cfg:
+        return cfg
+    home = env.get("HOME", "").strip()
+    if not home:
+        # As the docker CLI: an empty or unset HOME falls back to the passwd entry.
+        import pwd  # noqa: PLC0415
+
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    return os.path.join(home, ".docker")
+
+
+def _first_json(text: str) -> object:
+    """The first JSON value, as Go's json.Decoder reads it (trailing data ignored, BOM
+    stripped)."""
+    return json.JSONDecoder().raw_decode(text.lstrip("\ufeff").lstrip())[0]
+
+
+def _local_endpoint(endpoint: str) -> bool:
+    """A unix socket on this host -- except Docker Desktop's, whose daemon runs in a VM."""
+    return endpoint.startswith("unix://") and "/.docker/desktop/" not in endpoint
+
+
+def _resolve_cold_blocker(env: Mapping[str, str], host: HostReader) -> str | None:
     docker_host = env.get("DOCKER_HOST", "").strip()
     if docker_host:
-        if docker_host.startswith("unix://"):
+        if _local_endpoint(docker_host):
             return None
         return f"DOCKER_HOST={docker_host!r}: cold runsc runs on that daemon's host, not this one"
-    cfg = env.get("DOCKER_CONFIG", "").strip() or os.path.join(
-        env.get("HOME", "").strip() or os.path.expanduser("~"), ".docker")
+    cfg = _docker_config_dir(env)
     context = env.get("DOCKER_CONTEXT", "").strip()
     source = "DOCKER_CONTEXT"
     if not context:
         source = "docker config currentContext"
-        try:
-            context = str(json.loads(host.read(os.path.join(cfg, "config.json")) or "{}")
-                          .get("currentContext") or "").strip()
-        except (ValueError, AttributeError):
-            context = ""
+        raw = host.read(os.path.join(cfg, "config.json"))
+        if raw is not None:
+            doc = _first_json(raw)
+            if not isinstance(doc, dict):
+                raise ValueError("config.json is not an object")
+            # Go's decoder matches the struct tag case-insensitively.
+            value = next((v for k, v in doc.items() if k.lower() == "currentcontext"), "")
+            if not isinstance(value, str):
+                raise ValueError("currentContext is not a string")
+            context = value.strip()
     if not context or context == "default":
         return None
     meta = os.path.join(cfg, "contexts", "meta",
                         hashlib.sha256(context.encode()).hexdigest(), "meta.json")
     try:
-        endpoint = str(json.loads(host.read(meta) or "{}")["Endpoints"]["docker"]["Host"])
+        endpoint = str(_first_json(host.read(meta) or "")["Endpoints"]["docker"]["Host"])  # type: ignore[index]
     except (ValueError, KeyError, TypeError):
         return f"{source} {context!r}: endpoint unknown, cold runsc may run on another host"
-    if endpoint.startswith("unix://"):
+    if _local_endpoint(endpoint):
         return None
     return f"{source} {context!r} -> {endpoint!r}: cold runsc runs on that daemon's host"
 
@@ -380,7 +418,7 @@ class _SysReader:
     def read(self, path: str) -> str | None:
         try:
             with open(path, encoding="utf-8", errors="replace") as fh:
-                return fh.read(64 * 1024)
+                return fh.read(_READ_CAP)
         except OSError:
             return None
 
