@@ -1036,6 +1036,7 @@ class Helper:
         aid = "a" + hashlib.sha256(repr((kind, key)).encode()).hexdigest()[:32]
         # PER ASSET, not helper-wide: one client's slow (or deliberately stalled) copy must not
         # hold every other dispatcher's registration hostage.
+        evicted: "str | None" = None
         with self._asset_locks[int(aid[1:9], 16) % len(self._asset_locks)]:
             with self._lock:
                 existing = self._assets.get(aid)
@@ -1045,14 +1046,16 @@ class Helper:
                 # with ROOT credentials -- files whose content depends on the opener (sysfs PCI
                 # config) would then hand root-only bytes to the client.
                 existing = self._copy_asset(aid, kind, fds[0], st, key)
-        evicted: "str | None" = None
-        with self._lock:
-            # Reaped while the copy ran: pinning to a dead owner would keep the copy forever.
-            dead = owner.dead
-            if not dead and aid not in owner.assets:
-                if len(owner.assets) == owner.assets.maxlen:
-                    evicted = owner.assets[0]
-                owner.assets.append(aid)
+            # PIN while still holding the stripe: the monitor's sweep drops any unreferenced,
+            # unpinned asset whose stripe it can take, and would otherwise catch this one
+            # between its registration and its pin.
+            with self._lock:
+                # Reaped while the copy ran: pinning to a dead owner would keep the copy forever.
+                dead = owner.dead
+                if not dead and aid not in owner.assets:
+                    if len(owner.assets) == owner.assets.maxlen:
+                        evicted = owner.assets[0]
+                    owner.assets.append(aid)
         # Outside the state lock (dropping takes the asset's stripe lock first).
         if evicted is not None:
             self._maybe_drop_asset(evicted)

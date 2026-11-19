@@ -1216,3 +1216,26 @@ def test_a_lingering_socket_beyond_a_full_sinks_table_never_closes_in_the_helper
         sink.close()
         peer.close()
         srv.close()
+
+
+def test_a_registered_asset_is_pinned_before_the_sweep_can_see_it(env, tmp_path):
+    stop = threading.Event()
+
+    def sweeper():
+        while not stop.is_set():
+            env.helper.monitor_once()
+    t = threading.Thread(target=sweeper, daemon=True)
+    t.start()
+    try:
+        for i in range(40):
+            p = tmp_path / f"k{i}"
+            p.write_bytes(b"K" * (i + 1))
+            fd = os.open(p, os.O_RDONLY)
+            try:
+                aid = env.helper.op_asset(env.owner, {"op": "asset", "kind": "kernel"}, [fd])[0]["asset"]
+            finally:
+                os.close(fd)
+            assert aid in env.helper._assets, f"swept between registration and pin ({i})"
+    finally:
+        stop.set()
+        t.join(5)
