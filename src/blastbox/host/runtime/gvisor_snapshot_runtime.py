@@ -475,6 +475,24 @@ def _int_env(env, key: str, default: int) -> int:
         return default
 
 
+def _userns_host_base(env) -> int | None:
+    """BLASTBOX_GVISOR_USERNS_HOST_BASE: host uid/gid that guest 0 maps to (65536 ids). Unset =
+    no user namespace. An invalid value, or one whose range would include host root, is refused
+    LOUDLY (warning, no userns) rather than guessed at."""
+    raw = env.get("BLASTBOX_GVISOR_USERNS_HOST_BASE", "").strip()
+    if not raw:
+        return None
+    try:
+        base = int(raw)
+    except ValueError:
+        _log.warning("invalid BLASTBOX_GVISOR_USERNS_HOST_BASE %r; no user namespace", raw)
+        return None
+    if base < 65536 or base + 65536 > 2**32 - 1:
+        _log.warning("BLASTBOX_GVISOR_USERNS_HOST_BASE %r out of range; no user namespace", raw)
+        return None
+    return base
+
+
 def _gvisor_config_from_env(env):
     import json
     from blastbox.host.runtime.gvisor_snapshot import GvisorConfig
@@ -531,6 +549,7 @@ def _gvisor_config_from_env(env):
                   in ("1", "true", "yes", "on")),
         warm_argv=warm_argv,
         extra_env=extra_env,
+        userns_host_base=_userns_host_base(env),
         ld_preload=env.get("BLASTBOX_GVISOR_LD_PRELOAD") or None,
         platform=env.get("BLASTBOX_GVISOR_PLATFORM") or None,
         cpu_features_annotation=env.get("BLASTBOX_GVISOR_CPUFEATURES") or None,

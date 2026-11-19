@@ -70,6 +70,17 @@ class GvisorConfig:
     # uid 0 is NOT host root, it is the unprivileged user that launched runsc -- and an escape
     # lands as that user instead. The isolation boundary is gVisor either way; this only moves
     # what is on the far side of it.
+    # Run the sandbox + gofer inside a USER NAMESPACE while runsc itself stays rootful (so
+    # `checkpoint`/`restore` keep working -- unlike `rootless`). Guest uid 0..65535 map to host
+    # userns_host_base..+65535, so the sentry and gofer run as an unprivileged, unmapped-to-root
+    # host uid (their capabilities are scoped to that namespace) instead of real host root.
+    # Measured on toolz2 2026-11-19 (runsc release-20261012.0, clippyshot warm tier): boot,
+    # checkpoint and restore all work, output bytes identical, restore latency unchanged.
+    # REQUIREMENT: the rootfs (and its parents) must be traversable by the mapped uid -- a rootfs
+    # under a 0750 home dir fails with `binding rootfs ... permission denied`. Output files land
+    # owned by userns_host_base + guest uid (e.g. 2065532 for uid 65532); the warm tier runs as
+    # root, so host-side cleanup is unaffected. None = no user namespace (today's behaviour).
+    userns_host_base: int | None = None
     platform: str | None = None
     ld_preload: str | None = None                 # soffice tier: /opt/clippyshot/accept-retry.so
     cpu_features_annotation: str | None = None     # dev.gvisor.internal.cpufeatures (pinning)
@@ -467,6 +478,11 @@ def _oci_config(cfg: GvisorConfig, workdir: Path, *, in_ro: bool) -> dict:
         rlimits.append({"type": "RLIMIT_NOFILE", "hard": cfg.rlimit_nofile, "soft": cfg.rlimit_nofile})
     if rlimits:
         spec["process"]["rlimits"] = rlimits
+    if cfg.userns_host_base is not None:
+        idmap = [{"containerID": 0, "hostID": cfg.userns_host_base, "size": 65536}]
+        spec["linux"]["namespaces"].append({"type": "user"})
+        spec["linux"]["uidMappings"] = idmap
+        spec["linux"]["gidMappings"] = list(idmap)
     if cfg.cpu_features_annotation:
         spec["annotations"] = {"dev.gvisor.internal.cpufeatures": cfg.cpu_features_annotation}
     return spec

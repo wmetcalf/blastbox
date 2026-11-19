@@ -1798,3 +1798,28 @@ class TestRootlessIsOptInAndPlacedCorrectly:
         from blastbox.host.runtime.gvisor_snapshot import GvisorSnapshotBackend
 
         assert GvisorSnapshotBackend(_cfg(tmp_path)) is not None
+
+
+def test_oci_config_userns_host_base_adds_user_namespace(tmp_path):
+    from blastbox.host.runtime.gvisor_snapshot import GvisorConfig, _oci_config
+
+    base = dict(runsc_bin="runsc", root=tmp_path / "s", image_rootfs=tmp_path / "r",
+                network="none", warm_argv=["/w"])
+    plain = _oci_config(GvisorConfig(**base), tmp_path, in_ro=True)
+    assert {"type": "user"} not in plain["linux"]["namespaces"]
+    assert "uidMappings" not in plain["linux"]
+    spec = _oci_config(GvisorConfig(**base, userns_host_base=2_000_000), tmp_path, in_ro=True)
+    assert {"type": "user"} in spec["linux"]["namespaces"]
+    want = [{"containerID": 0, "hostID": 2_000_000, "size": 65536}]
+    assert spec["linux"]["uidMappings"] == want and spec["linux"]["gidMappings"] == want
+    # the in-sandbox uid drop is kept (unlike rootless, which pins guest uid 0)
+    assert spec["process"]["user"] == {"uid": 65532, "gid": 65532}
+
+
+def test_userns_host_base_env_parsing():
+    from blastbox.host.runtime.gvisor_snapshot_runtime import _userns_host_base
+
+    assert _userns_host_base({}) is None
+    assert _userns_host_base({"BLASTBOX_GVISOR_USERNS_HOST_BASE": "2000000"}) == 2_000_000
+    for bad in ("x", "0", "1000", str(2**32 - 10)):
+        assert _userns_host_base({"BLASTBOX_GVISOR_USERNS_HOST_BASE": bad}) is None
