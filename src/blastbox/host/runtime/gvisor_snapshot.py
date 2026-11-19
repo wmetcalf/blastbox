@@ -442,7 +442,9 @@ def _walked_dirs(path: str, readlink: Callable[[str], str | None]) -> list[str]:
     """Every directory a kernel path walk of ``path`` searches, in order: each component of the
     path AND of every symlink target met on the way (``..`` taken physically, as the kernel
     does). Every entry is symlink-free, so ``stat`` on it is the directory actually walked."""
-    todo = [p for p in os.path.abspath(path).split("/") if p]
+    # NOT abspath/normpath: those drop `x/..` lexically, but the kernel still searches x.
+    full = path if path.startswith("/") else os.path.join(os.getcwd(), path)
+    todo = [p for p in full.split("/") if p]
     cur, out, hops = "/", ["/"], 0
     while todo:
         name = todo.pop(0)

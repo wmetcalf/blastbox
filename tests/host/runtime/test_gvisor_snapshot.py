@@ -2010,3 +2010,14 @@ def test_userns_rootfs_walk_follows_every_symlink_hop():
         "/var/lib/blastbox/gvisor-rootfs", 2_000_000,
         stat=lambda p: modes.get(p, (0o40755, 0, 0, False)),
         readlink=links.get, realpath=lambda p: "/srv/r")[0] is True
+
+
+def test_userns_rootfs_walk_searches_directories_before_dotdot():
+    """`/root/../var/r` still searches /root: no lexical normalisation of the configured path."""
+    from blastbox.host.runtime.gvisor_snapshot import userns_rootfs_problem
+
+    modes = {"/root": (0o40700, 0, 0, False)}
+    ok, why = userns_rootfs_problem("/root/../var/r", 2_000_000,
+                                    stat=lambda p: modes.get(p, (0o40755, 0, 0, False)),
+                                    readlink=lambda p: None, realpath=lambda p: "/var/r")
+    assert ok is False and "/root " in why
