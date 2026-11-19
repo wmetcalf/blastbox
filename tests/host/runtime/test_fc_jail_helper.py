@@ -1239,3 +1239,18 @@ def test_a_registered_asset_is_pinned_before_the_sweep_can_see_it(env, tmp_path)
     finally:
         stop.set()
         t.join(5)
+
+
+def test_a_sink_is_replaced_before_it_holds_too_many_descriptors(monkeypatch):
+    monkeypatch.setattr(h, "_SINK_MAX_HELD", 2)
+    c, peer, srv = _lingering_socket()
+    sink = h.FdSink()
+    try:
+        sink.release([c.detach()])                 # stuck closing: stays held
+        first = sink._proc
+        sink.release([os.open("/dev/null", os.O_RDONLY), os.open("/dev/null", os.O_RDONLY)])
+        assert sink._proc is not first             # 1 held + 2 > cap: replaced at once
+    finally:
+        sink.close()
+        peer.close()
+        srv.close()

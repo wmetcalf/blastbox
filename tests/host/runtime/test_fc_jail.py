@@ -912,3 +912,21 @@ def test_a_call_with_a_budget_never_waits_the_default_timeout(tmp_path):
         JailClient(str(path)).status(JID, timeout_s=0.2)
     assert time.monotonic() - t0 < 1.5
     srv.close()
+
+
+def test_a_budget_bounds_connect_send_and_receive_together(tmp_path, monkeypatch):
+    path = tmp_path / "silent2.sock"
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    srv.bind(str(path))
+    srv.listen(1)
+    real_connect = socket.socket.connect
+
+    def slow_connect(self, addr):
+        time.sleep(0.15)                           # the connect itself eats most of the budget
+        return real_connect(self, addr)
+    monkeypatch.setattr(socket.socket, "connect", slow_connect)
+    t0 = time.monotonic()
+    with pytest.raises(JailError):
+        JailClient(str(path)).call("status", jail=JID, timeout_s=0.2)
+    assert time.monotonic() - t0 < 0.3             # not 0.15 + a fresh 0.2 for the receive
+    srv.close()
