@@ -418,7 +418,8 @@ class JailedProcess:
         not be asked (a control-plane failure is not a dead VM; the pool keeps the slot and asks
         again within its unknown-grace bound). ``budget_s`` bounds the helper round trip."""
         try:
-            return self.poll(budget_s) is None
+            # No budget given (the pool's health check): the tick budget, never the 60 s default.
+            return self.poll(_TICK_BUDGET_S if budget_s is None else budget_s) is None
         except JailError:
             return None
 

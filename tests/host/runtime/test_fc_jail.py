@@ -974,3 +974,16 @@ def test_an_unreachable_helper_is_undecided_so_a_cascade_retries_the_tier(monkey
     wrapped.__cause__ = exc.value
     assert cascade._is_undecided_availability(wrapped)
     assert not cascade._is_undecided_availability(fc.FCUnavailable("a decided refusal"))
+
+
+def test_a_health_check_without_a_budget_still_uses_the_tick_budget(tmp_path):
+    jail = _FakeJail(tmp_path)
+    seen = []
+    real = jail.status
+    jail.status = lambda jid, timeout_s=None: (seen.append(timeout_s), real(jid, timeout_s))[1]
+    rt = _cold(tmp_path, jail)
+    slot = rt.spawn()
+    seen.clear()
+    assert rt.is_alive(slot) is True
+    assert seen and all(t is not None and t <= fc_jail._TICK_BUDGET_S for t in seen)
+    rt.reap(slot)
