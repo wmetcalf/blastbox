@@ -1066,7 +1066,8 @@ def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc]) -> Check:
                      else ""))
 
 
-def _check_confinement(host: HostView, tiers: Collection[str]) -> Check:
+def _check_confinement(host: HostView, tiers: Collection[str],
+                       skipped: Collection[str] = ()) -> Check:
     """Which host LSM each local sandbox kind WOULD be confined with (detection only: nothing
     is enforced yet), and whether BLASTBOX_CONFINEMENT=require can be met."""
     from blastbox.host import confinement as cf  # noqa: PLC0415
@@ -1099,7 +1100,7 @@ def _check_confinement(host: HostView, tiers: Collection[str]) -> Check:
     parts += [b for b in (st.selinux_blocker, st.apparmor_blocker) if b]
     if st.apparmor and kinds and st.apparmor_parser is None:
         parts.append("apparmor_parser not found: blastbox profiles cannot be loaded")
-    if "gvisor" in kinds:
+    if {"cold", "gvisor"} & set(kinds):
         split = {True: "split sentry", False: "single binary", None: "sentry layout unknown"}
         parts.append(f"runsc {st.runsc} ({split[st.runsc_split_sentry]})" if st.runsc
                      else "runsc not found")
@@ -1111,11 +1112,11 @@ def _check_confinement(host: HostView, tiers: Collection[str]) -> Check:
     parts.append("detection only, nothing enforced yet")
     missing = cf.unmet(st, mode, kinds)
     if missing:
-        # A kind reachable only through cascade OVERFLOW tiers: the dispatcher skips an
-        # overflow tier that is unavailable at startup (as _downgrade_overflow models).
-        overflow = _overflow_only_tiers(host.env)
+        # A kind reachable only through cascade OVERFLOW tiers that are themselves unavailable
+        # (``skipped``: their tier checks FAILed): the dispatcher skips those at startup. An
+        # AVAILABLE overflow tier is admitted, and then require refuses to start.
         hard = [k for k in missing
-                if not {t for t in reach if cf.kinds_for_tiers({t}) == [k]} <= overflow]
+                if not {t for t in reach if cf.kinds_for_tiers({t}) == [k]} <= set(skipped)]
         msg = "; ".join(parts) + f"; require unmet for {', '.join(missing)}"
         if hard:
             return Check("confinement", Status.FAIL, msg, doc, facts)
@@ -1248,7 +1249,11 @@ def run_preflight(host: HostView, tiers: Sequence[str], *, explicit: bool = True
         out.append(_check_apparmor(host))
         out.append(_check_bwrap_stock_profile(host, t))
         out.append(_check_userns(host, t))
-    out.append(_check_confinement(host, t))   # remote-only too: dispatch validates the mode
+    failed = {c.name for c in out if c.status is Status.FAIL}
+    skipped = {tier for tier in _overflow_only_tiers(host.env)
+               if failed & set(_TIER_CHECKS[tier])}
+    # remote-only too: dispatch validates the mode
+    out.append(_check_confinement(host, t, skipped))
     out.append(_check_clock(host))
     if local:
         out.append(_check_cpu_flags(host))

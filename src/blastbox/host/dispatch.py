@@ -2873,7 +2873,7 @@ class Dispatcher:
             job_id=job.job_id, engine=job.engine, input_sha256=receipt_input_sha256,
             worker_runtime=runtime.runtime, worker_tier=None,
             confinement=self._confinement_receipt(
-                "gvisor" if runtime.runtime == "runsc" else None),
+                "cold" if runtime.runtime == "runsc" else None),
             started_at_ms=started_at_ms, finished_at_ms=finished_at_ms,
             **self._verified_net_claim(personality, network_args, gateway_health))
 

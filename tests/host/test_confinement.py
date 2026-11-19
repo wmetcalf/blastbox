@@ -125,8 +125,9 @@ def test_mode_typo_is_an_error_not_off():
 
 
 def test_kinds_for_tiers():
-    assert cf.kinds_for_tiers({"cold"}) == ["gvisor"]
-    assert cf.kinds_for_tiers({"docker", "firecracker"}) == ["gvisor", "firecracker"]
+    assert cf.kinds_for_tiers({"cold"}) == ["cold"]
+    assert cf.kinds_for_tiers({"docker", "gvisor", "firecracker"}) == [
+        "cold", "gvisor", "firecracker"]
     assert cf.kinds_for_tiers({"aws-ec2", "remote"}) == []
 
 
@@ -223,7 +224,7 @@ def _pf(files, *, env=None, abi=0, tiers=("docker", "gvisor", "firecracker"), co
 def test_preflight_ubuntu_reports_would_use():
     c = _pf(UBUNTU, abi=6)
     assert c.status is Status.PASS
-    assert "would use: gvisor=apparmor, firecracker=apparmor" in c.detail
+    assert "would use: cold=apparmor, gvisor=apparmor, firecracker=apparmor" in c.detail
     assert "nothing enforced" in c.detail
     assert c.facts is not None and c.facts["enforced"] is False
 
@@ -236,10 +237,10 @@ def test_preflight_al2023_permissive():
 
 def test_preflight_require_fails_where_unmet():
     c = _pf(AL2023, abi=4, env={"BLASTBOX_CONFINEMENT": "require"})
-    assert c.status is Status.FAIL and "require unmet for gvisor" in c.detail
+    assert c.status is Status.FAIL and "require unmet for cold, gvisor" in c.detail
     # --tier firecracker still reaches the cold fallback (gVisor) unless warm-only
     cold = _pf(AL2023, abi=4, env={"BLASTBOX_CONFINEMENT": "require"}, tiers=("firecracker",))
-    assert cold.status is Status.FAIL and "gvisor" in cold.detail
+    assert cold.status is Status.FAIL and "require unmet for cold" in cold.detail
     ok = _pf(AL2023, abi=4, env={"BLASTBOX_CONFINEMENT": "require",
                                  "BLASTBOX_DISPATCH_WARM_ONLY": "1"}, tiers=("firecracker",))
     assert ok.status is Status.PASS
@@ -282,7 +283,7 @@ def test_preflight_json_carries_facts():
     checks = pf.run_preflight(host, ["gvisor"])
     out = json.loads(pf.render_json(checks, ["gvisor"]))
     row = next(r for r in out["checks"] if r["name"] == "confinement")
-    assert row["facts"]["would_use"] == {"gvisor": "selinux"}
+    assert row["facts"]["would_use"] == {"cold": "selinux", "gvisor": "selinux"}
     assert all("facts" not in r for r in out["checks"] if r["name"] != "confinement")
 
 
@@ -439,7 +440,7 @@ def test_dispatch_cmd_passes_detection(monkeypatch):
 
 
 def test_dispatch_cmd_require_refuses_cold_on_landlock_only_host(monkeypatch):
-    with pytest.raises(cf.ConfinementUnavailable, match="gvisor"):
+    with pytest.raises(cf.ConfinementUnavailable, match="cold"):
         _start(monkeypatch, mode="require", files=ALPINE)
 
 
@@ -646,12 +647,42 @@ def test_listed_selinux_without_selinuxfs_is_unknown_not_absent():
     assert st.selinux == "unknown" and st.would_use("gvisor") == "none"
 
 
-def test_require_unmet_only_by_an_overflow_tier_is_a_warn():
-    env = {"BLASTBOX_CONFINEMENT": "require", "BLASTBOX_POOL_RUNTIME": "cascade",
-           "BLASTBOX_POOL_TIERS": "firecracker:4,gvisor:2", "BLASTBOX_DISPATCH_WARM_ONLY": "1"}
-    c = _pf(AL2023, abi=4, env=env, tiers=("gvisor", "firecracker"))
+_OVERFLOW_ENV = {"BLASTBOX_CONFINEMENT": "require", "BLASTBOX_POOL_RUNTIME": "cascade",
+                 "BLASTBOX_POOL_TIERS": "firecracker:4,gvisor:2",
+                 "BLASTBOX_DISPATCH_WARM_ONLY": "1"}
+
+
+def test_require_unmet_only_by_an_unavailable_overflow_tier_is_a_warn():
+    host = _healthy(files=AL2023, env=_OVERFLOW_ENV)
+    del host.executables["runsc"]            # gvisor overflow tier unavailable: skipped
+    host.landlock_abi = lambda: 4    # type: ignore[method-assign]
+    c = next(c for c in pf.run_preflight(host, ["gvisor", "firecracker"])
+             if c.name == "confinement")
     assert c.status is Status.WARN and "overflow" in c.detail
+
+
+def test_require_unmet_by_an_available_overflow_tier_fails():
+    # runsc present: the dispatcher admits the overflow tier and then refuses to start
+    c = _pf(AL2023, abi=4, env=_OVERFLOW_ENV, tiers=("gvisor", "firecracker"))
+    assert c.status is Status.FAIL
 
 
 def test_preflight_says_whose_context_it_judged():
     assert "as seen by this process" in _pf(UBUNTU).detail
+
+
+def test_cold_runsc_is_judged_as_dockerd_launches_it_not_by_the_caller():
+    """Cold runsc is exec'd by dockerd on the host: the dispatcher's own label/securityfs
+    blockers do not apply to it (they do to the warm tiers it launches itself)."""
+    for files in (CONTAINER, CONTAINER_UNDER_DOCKER_DEFAULT):
+        st = _state(files)
+        assert st.would_use("cold") == "apparmor"
+        assert st.would_use("gvisor") == "none"
+    ro = _state(SELINUX_RO_CONTAINER)
+    assert ro.would_use("cold") == "selinux" and ro.would_use("gvisor") == "none"
+    assert _state(AL2023, abi=4).would_use("cold") == "none"      # Landlock never covers runsc
+
+
+def test_cold_receipt_uses_the_daemon_view(tmp_path, _attest_env):
+    det = cf.detect({}, host=_host(CONTAINER_UNDER_DOCKER_DEFAULT), landlock=0)
+    assert _cold_receipt(tmp_path, "runsc", det)["confinement"]["available"] == "apparmor"

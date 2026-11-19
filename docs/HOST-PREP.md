@@ -214,24 +214,30 @@ Today blastbox reports what the host offers and which LSM each sandbox kind WOUL
 SELinux enforcing  >  AppArmor enabled  >  Landlock (firecracker only)  >  none
 ```
 
-| Host | gVisor (runsc) | Firecracker |
-|---|---|---|
-| Ubuntu / Debian (AppArmor) | apparmor | apparmor |
-| Rocky / RHEL 9 (SELinux enforcing) | selinux | selinux |
-| Amazon Linux 2023 (SELinux **permissive** by default) | none | landlock |
-| Alpine (Landlock only) | none | landlock |
-| container (no `/sys/kernel/security`, or under `docker-default`, or read-only selinuxfs) | none | landlock, if the kernel offers it |
+Three kinds: `cold` (runsc started by dockerd for the cold tier), `gvisor` (the warm tier's runsc)
+and `firecracker`, the last two started by the dispatcher itself.
+
+| Host | cold | gvisor (warm) | firecracker |
+|---|---|---|---|
+| Ubuntu / Debian (AppArmor) | apparmor | apparmor | apparmor |
+| Rocky / RHEL 9 (SELinux enforcing) | selinux | selinux | selinux |
+| Amazon Linux 2023 (SELinux **permissive** by default) | none | none | landlock |
+| Alpine (Landlock only) | none | none | landlock |
+| dispatcher in a container on an AppArmor host (no `/sys/kernel/security`, or under `docker-default`) | apparmor | none | landlock, if the kernel offers it |
+| dispatcher in a container on an SELinux host (read-only or no selinuxfs) | selinux if visible, else none | none | landlock, if the kernel offers it |
 
 Permissive SELinux only logs, so it never counts (`setenforce 1` and `SELINUX=enforcing` in
 `/etc/selinux/config` to change that). Landlock cannot hold runsc, which mounts; for Firecracker
-it is applied inside the jail, after the jailer has set it up. An LSM that is on but cannot be
-used from where the dispatcher runs is reported with the reason and does not count: no
-securityfs to load AppArmor policy through, a caller already confined by another AppArmor
-profile (e.g. `docker-default`, which has no `change_profile` rule), or a read-only selinuxfs.
+it is applied by a launch shim just before firecracker runs. For the kinds the dispatcher starts
+itself, an LSM that is on but cannot be used from the dispatcher's context is reported with the
+reason and does not count: no securityfs to load AppArmor policy through, a caller already
+confined by another AppArmor profile (e.g. `docker-default`, which has no `change_profile`
+rule), or a read-only selinuxfs. `cold` is judged on the host's state alone, because dockerd
+(through a docker runtime wrapper) starts that runsc, not the dispatcher.
 
 `BLASTBOX_CONFINEMENT=auto|require|off` (default `auto`). `require` makes `blastbox dispatch`
-refuse to start, and preflight FAIL, when a sandbox kind the dispatcher can run (the cold tier
-counts as gVisor) has no usable LSM. Any other value is refused rather than read as `off`.
+refuse to start, and preflight FAIL, when a sandbox kind the dispatcher can run (including
+`cold`, the fallback of a non-warm-only warm tier) has no usable LSM. Any other value is refused rather than read as `off`.
 
 Preflight's `confinement` check prints the LSM stack, SELinux mode, AppArmor state and
 `apparmor_parser` version, the Landlock ABI, the runsc release, and firecracker/jailer presence;

@@ -34,7 +34,9 @@ from typing import Protocol
 
 ENV_MODE = "BLASTBOX_CONFINEMENT"
 MODES = ("auto", "require", "off")
-KINDS = ("gvisor", "firecracker")
+#: "cold" is runsc launched by dockerd (``docker run --runtime=...``); "gvisor" is the warm tier's
+#: runsc and "firecracker" the VMM, both launched by the dispatcher itself.
+KINDS = ("cold", "gvisor", "firecracker")
 
 #: First runsc release that ships the Sentry as its own binary (``gvisor-bin/gvisor_sentry``):
 #: only then can AppArmor give the sentry a domain separate from the CLI and gofer.
@@ -99,10 +101,12 @@ def mode_from_env(env: Mapping[str, str] | None = None) -> str:
 
 def kinds_for_tiers(tiers: Iterable[str]) -> list[str]:
     """Sandbox kinds behind dispatcher/preflight tier names. The cold docker tier runs runsc
-    (gVisor); remote tiers run nothing on this host."""
+    (gVisor, launched by dockerd); remote tiers run nothing on this host."""
     t = set(tiers)
     kinds = set()
-    if t & {"cold", "docker", "gvisor"}:
+    if t & {"cold", "docker"}:
+        kinds.add("cold")
+    if "gvisor" in t:
         kinds.add("gvisor")
     if "firecracker" in t:
         kinds.add("firecracker")
@@ -136,9 +140,13 @@ class HostLsm:
             raise ValueError(f"unknown sandbox kind {kind!r}")
         if parse_mode(mode) == "off":
             return "none"
-        if self.selinux == "enforcing" and self.selinux_blocker is None:
+        # The caller-context blockers describe what the DISPATCHER can enter. Cold runsc is
+        # exec'd by dockerd on the host (a docker runtime wrapper enters the domain there), so
+        # only the host-level state counts for it.
+        own = kind != "cold"
+        if self.selinux == "enforcing" and not (own and self.selinux_blocker):
             return "selinux"
-        if self.apparmor and self.apparmor_blocker is None:
+        if self.apparmor and not (own and self.apparmor_blocker):
             return "apparmor"
         if kind == "firecracker" and self.landlock_abi > 0:
             return "landlock"
@@ -282,7 +290,7 @@ def probe(host: HostReader, *, env: Mapping[str, str] | None = None,
     extra: dict[str, object] = {}
     if kinds and state.apparmor:
         extra["apparmor_parser"] = _parser_version(host)
-    if "gvisor" in kinds:
+    if {"cold", "gvisor"} & set(kinds):
         extra["runsc"], extra["runsc_split_sentry"] = _runsc(host, env)
     if "firecracker" in kinds:
         extra["firecracker"], extra["jailer"] = _firecracker(host, env)

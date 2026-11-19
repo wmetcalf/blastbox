@@ -25,3 +25,10 @@ def ingress_client_factory(tmp_path):
         return TestClient(app), log
 
     return _factory
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_confinement_mode(monkeypatch):
+    """Dispatcher construction reads BLASTBOX_CONFINEMENT; keep the suite hermetic to a value
+    exported in the developer's shell (a dispatcher host with its env sourced)."""
+    monkeypatch.delenv("BLASTBOX_CONFINEMENT", raising=False)
