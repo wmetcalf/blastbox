@@ -55,7 +55,7 @@ can show it is down.
 |---|---|---|
 | **docker** (cold) | docker daemon, `runsc` registered as a docker runtime (fail-closed without it) | `docker`, `docker-runsc-runtime`, `runsc-host-root`, `sandbox-confinement` |
 | **gvisor** (warm C/R) | the `runsc` binary with checkpoint/restore (driven directly, no docker; root) | `runsc`, `gvisor-rootfs`, `gvisor-rootless`, `gvisor-userns` (when opted in), `snapshot-age`, `runsc-host-root`, `sandbox-confinement` |
-| **firecracker** (warm/cold) | `/dev/kvm` read/write, `firecracker` ≥ 1.15.1, guest kernel + rootfs | `kvm`, `firecracker`, `fc-guest`, `snapshot-age` (with `BLASTBOX_POOL_WARM_SNAPSHOT`), `sandbox-confinement`, `fc-scratch` |
+| **firecracker** (warm/cold) | the Firecracker jail helper (default; it needs `/dev/kvm` and `firecracker` ≥ 1.15.1), guest kernel + rootfs readable by the dispatcher. Unjailed (`BLASTBOX_FC_JAILER=off`): `/dev/kvm` read/write and `firecracker` ≥ 1.15.1 in the dispatcher | `fc-jailer`, `fc-guest`, `snapshot-age` (with `BLASTBOX_POOL_WARM_SNAPSHOT`), `sandbox-confinement`, `fc-scratch`; unjailed also `kvm`, `firecracker` |
 | **remote** (static / AWS) | nothing runtime-specific locally; the remote box runs the worker image under its own runsc | common checks only (no docker: no cold path) |
 | every tier | a pool the dispatcher accepts, synced clock, scratch off `/tmp`, a valid `BLASTBOX_CONFINEMENT` | `pool-runtime`, `confinement`, `clock`, `scratch` |
 | every local tier | AppArmor state known, CPU flags reviewed | `apparmor`, `bwrap-userns-restrict`, `userns`, `cpu-flags` |
