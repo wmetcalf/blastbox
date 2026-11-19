@@ -748,3 +748,18 @@ def test_an_overloaded_helper_says_busy_and_the_client_retries(tmp_path, monkeyp
         return a
     monkeypatch.setattr(client, "_call_once", once)
     assert client.call("hello")[0]["v"] == 1
+
+
+def test_a_vmm_grown_output_disk_is_refused(env):
+    jail, _ = env.boot(listener=False)
+    with open(jail.root / "outdisk.ext4", "r+b") as f:
+        f.truncate(4 << 30)
+    with pytest.raises(h.HelperError, match="bad_outdisk"):
+        env.helper.op_outdisk(env.owner, {"op": "outdisk", "jail": JID}, [])
+
+
+def test_the_jail_gets_a_file_size_limit(env):
+    env.boot(listener=False)
+    argv = env.argvs[-1]
+    limits = [argv[i + 1] for i, a in enumerate(argv) if a == "--resource-limit"]
+    assert any(x.startswith("fsize=") and int(x.split("=")[1]) >= 64 << 20 for x in limits)

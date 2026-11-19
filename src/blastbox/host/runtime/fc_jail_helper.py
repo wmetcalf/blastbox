@@ -313,7 +313,7 @@ def exec_name(jail_id: str) -> str:
 
 
 def jailer_argv(cfg: "HelperConfig", jail_id: str, uid: int, *, exec_file: str,
-                cgroups: "dict[str, str]", netns_path: str) -> "list[str]":
+                cgroups: "dict[str, str]", netns_path: str, fsize: int = 0) -> "list[str]":
     """The exact command line. Built ONLY from operator config and helper-chosen values; the one
     client-supplied element, the jail id, is pattern-validated before it gets here.
 
@@ -335,6 +335,10 @@ def jailer_argv(cfg: "HelperConfig", jail_id: str, uid: int, *, exec_file: str,
     for key in sorted(cgroups):
         argv += ["--cgroup", f"{key}={cgroups[key]}"]
     argv += ["--resource-limit", f"no-file={cfg.nofile}"]
+    if fsize:
+        # No file the VMM writes may exceed what it legitimately writes (the memory snapshot or
+        # the output disk): a compromised VMM growing a file past it gets SIGXFSZ.
+        argv += ["--resource-limit", f"fsize={fsize}"]
     return argv + ["--", "--api-sock", f"/{JAIL_API_SOCK}"]
 
 
@@ -497,6 +501,9 @@ class Jail:
     netns: str
     cgroup: Path
     mem_mib: int
+    #: The staged output disk's size: the jail's VMM holds that file read-write, so its size
+    #: as seen later is attacker-controlled -- op_outdisk refuses anything else.
+    outdisk_bytes: int = 0
     profile: "str | None" = None
     gen: "str | None" = None
     assets: "list[str]" = field(default_factory=list)
@@ -922,6 +929,7 @@ class Helper:
             # through a name the jail uid can replace.
             jail.outdisk_fd = os.open(JAIL_OUTDISK, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
                                       dir_fd=root_fd)
+            jail.outdisk_bytes = os.fstat(jail.outdisk_fd).st_size
         finally:
             os.close(root_fd)
         listener_fd: "int | None" = None
@@ -970,7 +978,8 @@ class Helper:
                 "cpu.max": f"{(req['vcpus'] + 1) * 100000} 100000",
             }
             argv = jailer_argv(cfg, jail.id, jail.uid, exec_file=str(exec_src), cgroups=cgroups,
-                               netns_path=str(self._netns_dir / jail.netns))
+                               netns_path=str(self._netns_dir / jail.netns),
+                           fsize=max(jail.outdisk_bytes, (jail.mem_mib << 20) + (1 << 20)))
             proc = self._popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, env={}, cwd="/", close_fds=True,
                                start_new_session=True)
@@ -1127,6 +1136,10 @@ class Helper:
         if jail.outdisk_fd is None:
             raise HelperError("no_outdisk", jail.id)
         st = os.fstat(jail.outdisk_fd)
+        if st.st_size != jail.outdisk_bytes:
+            # A compromised VMM grew (or shrank) the image past what was staged: never hand the
+            # client an unbounded copy of a jail-controlled size.
+            raise HelperError("bad_outdisk", f"size {st.st_size} != staged {jail.outdisk_bytes}")
         # A fresh description: the client's reads must not share an offset with ours.
         fd = os.open(f"/proc/self/fd/{jail.outdisk_fd}", os.O_RDONLY | os.O_CLOEXEC)
         return {"size": st.st_size}, [fd]
@@ -1390,6 +1403,9 @@ class Helper:
                     # The client gave up (timed out, died) before learning the jail exists, so
                     # nothing would ever destroy it: undo the spawn here.
                     self._abandon(owner, req["jail"])
+                elif req.get("op") == "publish" and reply.get("ok"):
+                    with contextlib.suppress(Exception):     # nor would it ever discard this
+                        self._discard(str(reply["gen"]))
                 raise
         except (OSError, ValueError) as exc:
             _log.warning("fc_jail.conn_error: %s", exc)

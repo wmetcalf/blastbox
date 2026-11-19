@@ -142,6 +142,11 @@ class JailClient:
             data, got, flags, _ = socket.recv_fds(sock, MAX_MSG + 1, 4)
         except TimeoutError as exc:
             raise JailError("timeout", op) from exc
+        except (ConnectionError, OSError) as exc:
+            # The helper dropped the request unread (a uid it does not allow, or it died mid-
+            # request): ECONNRESET/EPIPE, never a clean EOF. Still a control-plane failure, and
+            # must be attributed to the host, not to a guest.
+            raise JailError("refused", f"{op}: {exc}") from exc
         finally:
             sock.close()
         if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
@@ -392,7 +397,11 @@ class JailedProcess:
             out = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC | os.O_NOFOLLOW,
                           0o600)
             try:
-                sparse_copy(fd, out, size)
+                # Bounded like the other host disk work: a stalled disk must not pin the
+                # dispatch thread (the helper already refused a size other than the staged one).
+                from blastbox.host.runtime.firecracker import disk_timeout_s
+
+                sparse_copy(fd, out, size, deadline=time.monotonic() + disk_timeout_s())
             finally:
                 os.close(out)
         except OSError as exc:

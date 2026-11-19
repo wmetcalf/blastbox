@@ -412,7 +412,7 @@ def test_artifact_and_launcher_must_agree_about_jailing(tmp_path, jailed_launche
     backend = FcSnapshotBackend(tmp_path / "base", launcher)
     gen = None if jailed_launcher else "g" + "d" * 32
     art = FcSnapshotArtifact(tmp_path / "s", tmp_path / "m", tmp_path / "o", jail_gen=gen)
-    with pytest.raises((SnapshotError, FileNotFoundError)):
+    with pytest.raises(SnapshotError, match="disagree about jailing"):
         backend.restore_in(tmp_path / "slots" / "s3", art)
 
 
@@ -677,3 +677,21 @@ def test_restore_reclaimed_tolerates_an_unreachable_helper(tmp_path):
         proc = JailedProcess(jail, JID)
     backend._unreaped[str(tmp_path / "w")] = _H()
     assert backend.restore_reclaimed(str(tmp_path / "w")) is False
+
+
+def test_a_peer_the_helper_drops_unread_is_a_host_side_refusal(tmp_path):
+    path = tmp_path / "h.sock"
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    srv.bind(str(path))
+    srv.listen(1)
+
+    def drop():
+        c, _ = srv.accept()
+        c.close()                       # unread: the client sees ECONNRESET, not EOF
+    t = threading.Thread(target=drop)
+    t.start()
+    with pytest.raises(JailError) as exc:
+        JailClient(str(path)).call("status", jail=JID)
+    t.join()
+    srv.close()
+    assert exc.value.code in ("refused", "busy") and exc.value.host_io
