@@ -1021,8 +1021,7 @@ def test_no_thread_to_reap_a_sink_never_raises_into_a_release(monkeypatch):
         def no_threads(self):
             raise RuntimeError("can't start new thread")
         monkeypatch.setattr(threading.Thread, "start", no_threads)
-        sink._pending = 1                     # looks wedged: it will be killed and replaced
-        sink._sent.append(time.monotonic() - 10)
+        sink._outstanding[999] = time.monotonic() - 10   # looks wedged: killed and replaced
         sink.release([os.open("/dev/null", os.O_RDONLY)])
         monkeypatch.setattr(threading.Thread, "start", real)
     finally:
@@ -1045,3 +1044,105 @@ def test_ordinary_traffic_does_not_replace_a_healthy_sink():
         assert len(started) <= 2               # the first sink and its spare
     finally:
         sink.close()
+
+
+def test_an_executable_symlinked_into_a_writable_directory_is_refused(tmp_path, monkeypatch):
+    """A root-owned target under a user-writable directory: the user swaps it, root runs it."""
+    wdir = tmp_path / "w"
+    wdir.mkdir()
+    (wdir / "fc").write_text("#!/bin/sh\n")
+    (wdir / "fc").chmod(0o755)
+    link = tmp_path / "link"
+    link.symlink_to(wdir / "fc")
+    real_stat, real_lstat = os.stat, os.lstat
+
+    def as_root(st):
+        vals = list(st)
+        vals[4] = 0                                     # st_uid
+        return os.stat_result(vals)
+    monkeypatch.setattr(h.os, "stat", lambda p, *a, **k: as_root(real_stat(p, *a, **k)))
+    monkeypatch.setattr(h.os, "lstat", lambda p, *a, **k: as_root(real_lstat(p, *a, **k)))
+    wdir.chmod(0o777)
+    try:
+        with pytest.raises(RuntimeError, match="not group/other-writable"):
+            h._check_root_owned_exec("firecracker", str(link))
+    finally:
+        wdir.chmod(0o755)
+
+
+def test_a_generation_whose_files_cannot_be_removed_stays_tracked(env, monkeypatch):
+    base, _ = env.boot(listener=False)
+    _snapshot(base)
+    env.kill(base)
+    gen = env.helper.op_publish(env.owner, {"op": "publish", "jail": JID}, [])[0]["gen"]
+    env.helper.op_destroy(env.owner, {"op": "destroy", "jail": JID}, [])
+    real = h.shutil.rmtree
+    monkeypatch.setattr(h.shutil, "rmtree",
+                        lambda p, onerror=None, **k: onerror(None, p, None) if onerror else None)
+    env.helper.op_discard(env.owner, {"op": "discard", "gen": gen}, [])
+    assert gen in env.helper._gens                       # failed removal: still tracked
+    monkeypatch.setattr(h.shutil, "rmtree", real)
+    env.helper.monitor_once()                            # ...and retried
+    assert gen not in env.helper._gens
+
+
+def test_an_asset_copied_for_an_owner_reaped_meanwhile_is_not_kept(env):
+    real = env.helper._copy_asset
+
+    def copy_then_owner_dies(*a, **k):
+        out = real(*a, **k)
+        env.owner.dead = True
+        return out
+    env.helper._copy_asset = copy_then_owner_dies
+    with pytest.raises(h.HelperError, match="unknown_jail"):
+        env.asset("kernel", b"K" * 100)
+    assert not env.helper._assets
+
+
+def test_signals_go_through_the_pidfd_only_under_its_lock(env):
+    jail, _ = env.boot(listener=False)
+    with jail.pidfd_lock:
+        t = threading.Thread(target=env.helper._signal, args=(jail, signal.SIGKILL))
+        t.start()
+        t.join(0.3)
+        assert t.is_alive()                              # waits for the lock destroy also takes
+    t.join(5)
+    jail.proc.wait(5)
+    env.helper.op_destroy(env.owner, {"op": "destroy", "jail": JID}, [])
+    assert jail.pidfd is None
+    env.helper._signal(jail, signal.SIGKILL)             # a closed pidfd is never used
+
+
+def test_a_wedged_close_never_delays_the_next_acknowledgement():
+    """Inside the grace period the wedged sink is still in use: its next ACK must be prompt."""
+    c, peer, srv = _lingering_socket()
+    sink = h.FdSink()
+    try:
+        sink.release([os.open("/dev/null", os.O_RDONLY)])
+        sink.release([c.detach()])                 # its close lingers
+        t0 = time.monotonic()
+        sink.release([os.open("/dev/null", os.O_RDONLY)])   # within the grace: same sink
+        assert time.monotonic() - t0 < 0.5
+    finally:
+        sink.close()
+        peer.close()
+        srv.close()
+
+
+def test_a_batch_stuck_closing_is_caught_even_while_later_batches_complete():
+    """Per-batch accounting: later batches finishing must not hide one stuck forever."""
+    c, peer, srv = _lingering_socket()
+    sink = h.FdSink()
+    try:
+        sink.release([os.open("/dev/null", os.O_RDONLY)])
+        first_proc = sink._proc
+        sink.release([c.detach()])                       # stuck in a lingering close
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and sink._proc is first_proc:
+            sink.release([os.open("/dev/null", os.O_RDONLY)])   # healthy batches keep flowing
+            time.sleep(0.05)
+        assert sink._proc is not first_proc, "the wedged sink was never replaced"
+    finally:
+        sink.close()
+        peer.close()
+        srv.close()

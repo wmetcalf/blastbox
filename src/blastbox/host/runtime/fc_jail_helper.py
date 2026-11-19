@@ -528,6 +528,9 @@ class Jail:
     spawning: bool = True
     log: "deque[bytes]" = field(default_factory=lambda: deque(maxlen=64))
     lock: threading.Lock = field(default_factory=threading.Lock)
+    #: Guards pidfd's lifetime only (never held across slow work): a signal must not be sent
+    #: through a number destroy has closed and the kernel has reused for another process.
+    pidfd_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def exited(self) -> bool:
         if self.proc is None:
@@ -561,26 +564,35 @@ class UidPool:
 
 # --------------------------------------------------------------------------- client-file sink
 _SINK_CODE = r"""
-import os, socket, sys
+import os, socket, sys, threading
 s = socket.socket(fileno=int(sys.argv[1]))
+
+def close_all(seq, fds):
+    for fd in fds:
+        try:
+            os.close(fd)               # the FINAL release -- here, never in the helper
+        except OSError:
+            pass
+    try:
+        s.send(b"D" + seq)             # THIS batch is closed (they finish in any order)
+    except OSError:
+        pass
+
 while True:
     try:
         data, fds, _, _ = socket.recv_fds(s, 16, 253)
     except OSError:
         break
-    if not data:
+    if not data or data[:1] != b"F":
         break
     s.send(b"A")                       # holding them: the helper may drop its copies now
     try:
         s.recv(16)                     # "G": the helper's copies are gone
     except OSError:
         break
-    for fd in fds:
-        try:
-            os.close(fd)               # the FINAL release -- here, never in the helper
-        except OSError:
-            pass
-    s.send(b"D")
+    # Closed on a thread of its own: a close that lingers must not delay the NEXT batch's
+    # acknowledgement (the helper waits for it under a lock every client shares).
+    threading.Thread(target=close_all, args=(data[1:9], fds), daemon=True).start()
 """
 
 
@@ -606,8 +618,11 @@ class FdSink:
         self._lock = threading.Lock()
         self._proc: "subprocess.Popen[bytes] | None" = None
         self._sock: "socket.socket | None" = None
-        self._pending = 0           # batches handed over whose "D" has not arrived
-        self._sent: "deque[float]" = deque()   # when each pending batch was handed over
+        # batch sequence number -> when it was handed over, until ITS "D" arrives. Per batch,
+        # not a count: closes finish out of order, and a count would let later batches' "D"s
+        # hide a batch stuck closing forever.
+        self._outstanding: "dict[int, float]" = {}
+        self._seq = 0
         self._spare_lock = threading.Lock()
         self._spare: "tuple[socket.socket, subprocess.Popen[bytes]] | None" = None
         self._closed = False
@@ -650,8 +665,7 @@ class FdSink:
         if spare is None:
             spare = self._spawn_sink()
         self._sock, self._proc = spare
-        self._pending = 0
-        self._sent.clear()
+        self._outstanding.clear()
         self._refill_spare()
 
     def _kill(self) -> None:
@@ -673,23 +687,29 @@ class FdSink:
         assert self._sock is not None
         poller = select.poll()
         poller.register(self._sock.fileno(), select.POLLIN)
-        while self._pending and poller.poll(0):
+        while self._outstanding and poller.poll(0):
             try:
                 got = self._sock.recv(16)
             except OSError:
                 got = b""
-            if not got:
+            if not self._done(got):
                 self._kill()
                 return
-            for _ in range(got.count(b"D")):
-                if self._pending:
-                    self._pending -= 1
-                    self._sent.popleft()
-        # Wedged only if a batch has been outstanding for longer than closing a handful of
+        # Wedged only if some batch has been outstanding for longer than closing a handful of
         # descriptors can take: a "D" merely not here YET is the normal case on a busy helper,
         # and replacing a healthy sink on it re-forked an interpreter every few requests.
-        if self._pending and time.monotonic() - self._sent[0] > _SINK_GRACE_S:
+        # (The sink closes each batch on its own thread, so a wedged batch never delays the
+        # ACK of the next one -- it is only ever replaced here, never waited for.)
+        if (self._outstanding
+                and time.monotonic() - min(self._outstanding.values()) > _SINK_GRACE_S):
             self._kill()
+
+    def _done(self, msg: bytes) -> bool:
+        """Account a "D<seq>" message; False for anything else (a broken or foreign sink)."""
+        if len(msg) != 9 or msg[:1] != b"D":
+            return False
+        self._outstanding.pop(int.from_bytes(msg[1:], "big"), None)
+        return True
 
     def release(self, fds: "list[int]") -> None:
         """Take ownership of ``fds``. Never blocks on anything a client controls."""
@@ -706,16 +726,16 @@ class FdSink:
                         if self._sock is None:
                             self._start()       # EAGAIN/ENOMEM here must not escape
                         assert self._sock is not None
-                        socket.send_fds(self._sock, [b"F"], batch)
+                        self._seq += 1
+                        seq = self._seq
+                        socket.send_fds(self._sock, [b"F" + seq.to_bytes(8, "big")], batch)
                         while True:
-                            # A "D" for an earlier batch may arrive ahead of this batch's "A".
+                            # An earlier batch's "D" may arrive ahead of this batch's "A".
                             got = self._sock.recv(16)
                             if got == b"A":
                                 break
-                            if got != b"D" or not self._pending:
+                            if not self._done(got):
                                 raise OSError("sink did not acknowledge")
-                            self._pending -= 1
-                            self._sent.popleft()
                     except Exception:  # noqa: BLE001 - OSError, SubprocessError: try a new sink
                         self._kill()
                         continue
@@ -724,8 +744,7 @@ class FdSink:
                             os.close(fd)
                     with contextlib.suppress(OSError):
                         self._sock.send(b"G")
-                    self._pending += 1
-                    self._sent.append(time.monotonic())
+                    self._outstanding[seq] = time.monotonic()
                     break
                 else:
                     # Two fresh sinks could not take them (no processes left?). Keep them open
@@ -934,6 +953,10 @@ class Helper:
         for owner in owners:
             if _pidfd_exited(owner.pidfd):
                 self.reap_owner(owner)
+        with self._lock:
+            stale = [g for g in self._gens.values() if g.retired and not g.refs]
+        for gen in stale:
+            self._remove_gen(gen)         # a previous removal failed: retry it
         for jail in jails:
             if jail.proc is not None:
                 jail.proc.poll()          # reap the zombie promptly
@@ -991,14 +1014,20 @@ class Helper:
                 # with ROOT credentials -- files whose content depends on the opener (sysfs PCI
                 # config) would then hand root-only bytes to the client.
                 existing = self._copy_asset(aid, kind, fds[0], st, key)
+        evicted: "str | None" = None
         with self._lock:
-            if aid not in owner.assets:
+            # Reaped while the copy ran: pinning to a dead owner would keep the copy forever.
+            dead = owner.dead
+            if not dead and aid not in owner.assets:
                 if len(owner.assets) == owner.assets.maxlen:
                     evicted = owner.assets[0]
-                    owner.assets.append(aid)
-                    self._maybe_drop_asset(evicted)
-                else:
-                    owner.assets.append(aid)
+                owner.assets.append(aid)
+        # Outside the state lock (dropping takes the asset's stripe lock first).
+        if evicted is not None:
+            self._maybe_drop_asset(evicted)
+        if dead:
+            self._maybe_drop_asset(aid)
+            raise HelperError("unknown_jail", "client process is gone")
         return {"asset": aid, "identity": list(key)}, []
 
     def _copy_asset(self, aid: str, kind: str, src: int, st: os.stat_result,
@@ -1039,13 +1068,17 @@ class Helper:
         return any(aid in o.assets for o in self._owners.values())
 
     def _maybe_drop_asset(self, aid: str) -> None:
-        with self._lock:
-            asset = self._assets.get(aid)
-            if asset is None or asset.refs > 0 or self._asset_pinned(aid):
-                return
-            del self._assets[aid]
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(asset.path)
+        # Under the asset's stripe lock, like registration: otherwise a registration of the
+        # same file could recreate the path between our registry removal and the unlink, and
+        # the unlink would delete the NEW copy out from under its pinned entry.
+        with self._asset_locks[int(aid[1:9], 16) % len(self._asset_locks)]:
+            with self._lock:
+                asset = self._assets.get(aid)
+                if asset is None or asset.refs > 0 or self._asset_pinned(aid):
+                    return
+                del self._assets[aid]
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(asset.path)
 
     def _unpin_asset(self, aid: str) -> None:
         self._maybe_drop_asset(aid)
@@ -1309,9 +1342,7 @@ class Helper:
 
     def op_signal(self, owner: Owner, req: "dict[str, Any]", fds: "list[int]") -> "tuple[dict[str, Any], list[int]]":
         jail = self._jail_of(owner, req["jail"])
-        if not jail.exited() and jail.pidfd is not None:
-            with contextlib.suppress(ProcessLookupError):
-                signal.pidfd_send_signal(jail.pidfd, SIGNALS[req["sig"]])
+        self._signal(jail, SIGNALS[req["sig"]])
         return {}, []
 
     def op_seal(self, owner: Owner, req: "dict[str, Any]", fds: "list[int]") -> "tuple[dict[str, Any], list[int]]":
@@ -1495,15 +1526,21 @@ class Helper:
     def _kill_and_wait(self, jail: Jail, *, timeout: float) -> bool:
         if jail.exited():
             return True
-        if jail.pidfd is not None:
-            with contextlib.suppress(ProcessLookupError):
-                signal.pidfd_send_signal(jail.pidfd, signal.SIGKILL)
-        assert jail.proc is not None
+        self._signal(jail, signal.SIGKILL)
+        if jail.proc is None:
+            return False
         try:
             jail.proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             return False
         return True
+
+    @staticmethod
+    def _signal(jail: Jail, sig: int) -> None:
+        with jail.pidfd_lock:
+            if jail.pidfd is not None and not jail.exited():
+                with contextlib.suppress(ProcessLookupError):
+                    signal.pidfd_send_signal(jail.pidfd, sig)
 
     def _destroy(self, jail: Jail, *, wait: bool = True) -> None:
         """Remove every trace of an EXITED jail. Idempotent; raises if something is left that
@@ -1533,9 +1570,10 @@ class Helper:
         if jail.outdisk_fd is not None:
             os.close(jail.outdisk_fd)
             jail.outdisk_fd = None
-        if jail.pidfd is not None:
-            os.close(jail.pidfd)
-            jail.pidfd = None
+        with jail.pidfd_lock:
+            if jail.pidfd is not None:
+                os.close(jail.pidfd)
+                jail.pidfd = None
         if jail.profile is not None:
             _remove_profile(jail.profile)
             jail.profile = None
@@ -1580,11 +1618,22 @@ class Helper:
         with self._lock:
             if self._gens.get(gen.id) is not gen or gen.refs:
                 return
+        # The files FIRST: the entry is forgotten only once they are gone, so a transient
+        # failure leaves it tracked (retired, ref-less) for the monitor to retry instead of
+        # stranding a RAM-sized memory file nothing knows about.
+        errs: list[str] = []
+        if os.path.lexists(gen.dir):
+            shutil.rmtree(gen.dir, onerror=lambda fn, p, exc: errs.append(str(p)))
+        if errs:
+            _log.error("fc_jail.gen_remove_failed gen=%s: %s (retried)", gen.id, errs[:3])
+            return
+        with self._lock:
+            if self._gens.get(gen.id) is not gen or gen.refs:
+                return
             del self._gens[gen.id]
             gen.owner.gens.discard(gen.id)
             if gen.rootfs in self._assets:
                 self._assets[gen.rootfs].refs -= 1
-        shutil.rmtree(gen.dir, ignore_errors=True)
         self._maybe_drop_asset(gen.rootfs)
 
     def shutdown(self) -> None:
@@ -1905,9 +1954,13 @@ def _check_root_owned_exec(label: str, path: str) -> None:
     st = os.stat(p)
     if not stat.S_ISREG(st.st_mode) or not st.st_mode & 0o100:
         raise RuntimeError(f"{label} {path} is not an executable file")
-    for node in [p, *p.parents]:
-        nst = os.stat(node)
-        if nst.st_uid != 0 or nst.st_mode & 0o022:
+    # BOTH the configured path (and its links' own directories) and the file it resolves to:
+    # a symlink to a root-owned binary under a user-writable directory would otherwise pass,
+    # and that user could swap the target the helper then executes as root.
+    real = Path(os.path.realpath(p))
+    for node in {p, *p.parents, real, *real.parents}:
+        nst = os.lstat(node) if node.is_symlink() else os.stat(node)
+        if nst.st_uid != 0 or (not stat.S_ISLNK(nst.st_mode) and nst.st_mode & 0o022):
             raise RuntimeError(f"{label}: {node} must be root-owned and not group/other-writable")
 
 

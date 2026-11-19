@@ -1036,7 +1036,7 @@ class VsockHostWarmControl:
         connect_fn: "Callable[[], socket.socket] | None" = None,
         ack_capable: "AckCapability | None" = None,
         ack_generation: "int | None" = None,
-        uds_connect: "Callable[[], socket.socket] | None" = None,
+        uds_connect: "Callable[[float], socket.socket] | None" = None,
     ) -> None:
         # A JAILED slot: the jail helper connects the vsock UDS (this process has no path into
         # the jail) and the CONNECT handshake below runs over that socket unchanged.
@@ -1064,7 +1064,8 @@ class VsockHostWarmControl:
                   else min(self._connect_timeout, max(0.0, deadline - time.monotonic())))
         if getattr(self, "_uds_connect", None) is not None:
             try:
-                s = self._uds_connect()  # type: ignore[misc]
+                # The helper round trip is inside the same budget as the CONNECT handshake.
+                s = self._uds_connect(budget)  # type: ignore[misc]
             except Exception as exc:  # noqa: BLE001 - JailError: report it as a connect failure
                 err = ConnectionError(f"jailed vsock connect failed: {exc}")
                 # The HELPER failing (down, overloaded, refusing us) is this host's problem, not
@@ -1206,12 +1207,12 @@ class _FCProcess:
     config_path: Path
     log_path: Path
 
-    def is_alive(self) -> "bool | None":
+    def is_alive(self, budget_s: "float | None" = None) -> "bool | None":
         alive = getattr(self.proc, "alive", None)
         if callable(alive):
             # JAILED: tri-state. A helper that cannot be asked is UNKNOWN, never "dead" -- the
             # pool's unknown-grace handling owns that case (SlotRuntime.is_alive contract).
-            return alive()  # type: ignore[no-any-return]
+            return alive(budget_s)  # type: ignore[no-any-return]
         return self.proc.poll() is None
 
     def kill(self) -> None:
@@ -1719,11 +1720,16 @@ class FirecrackerSlotRuntime:
     def is_alive(self, slot: Slot) -> "bool | None":
         """True iff the Firecracker process is still running (None: a jailed slot whose helper
         could not be asked -- unknown, not dead)."""
+        return self.is_alive_for_claim(slot)
+
+    def is_alive_for_claim(self, slot: Slot, *, budget_s: "float | None" = None) -> "bool | None":
+        """is_alive() bounded by the pool's remaining claim budget (a jailed slot asks the
+        helper; an unjailed one polls its own child and needs no budget)."""
         with self._lock:
             fc_proc = self._procs.get(slot.slot_id)
         if fc_proc is None:
             return False
-        return fc_proc.is_alive()
+        return fc_proc.is_alive(budget_s)
 
     def reap(self, slot: Slot) -> None:
         """Kill FC if alive, remove the scratch dir.

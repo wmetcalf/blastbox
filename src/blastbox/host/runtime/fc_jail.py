@@ -116,26 +116,37 @@ class JailClient:
         self.info: dict[str, Any] = {}
 
     # ------------------------------------------------------------------ transport
-    def call(self, op: str, *, fds: "tuple[int, ...]" = (), **fields: Any) -> "tuple[dict[str, Any], list[int]]":
+    def call(self, op: str, *, fds: "tuple[int, ...]" = (), timeout_s: "float | None" = None,
+             **fields: Any) -> "tuple[dict[str, Any], list[int]]":
+        """``timeout_s`` bounds the WHOLE call, retries included (a caller with its own deadline
+        -- a warm job's signal_go, a pool claim probe -- must not wait the default 60 s)."""
         delay = 0.05
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
         for attempt in range(_BUSY_RETRIES + 1):
+            left = None if deadline is None else deadline - time.monotonic()
+            if left is not None and left <= 0:
+                raise JailError("timeout", op)
             try:
-                return self._call_once(op, fds=fds, **fields)
+                return self._call_once(op, fds=fds, budget=left, **fields)
             except JailError as exc:
                 # "refused" (dropped unread: ECONNRESET/EPIPE) is retried too -- an overloaded
                 # helper's close can race its "busy" reply. A genuinely disallowed uid just
                 # fails after the retries.
                 if exc.code not in ("busy", "refused") or attempt == _BUSY_RETRIES:
                     raise
+            if deadline is not None and time.monotonic() + delay >= deadline:
+                raise JailError("timeout", op)
             time.sleep(delay)
             delay = min(delay * 2, 1.0)
         raise AssertionError("unreachable")  # pragma: no cover
 
-    def _call_once(self, op: str, *, fds: "tuple[int, ...]" = (), **fields: Any) -> "tuple[dict[str, Any], list[int]]":
+    def _call_once(self, op: str, *, fds: "tuple[int, ...]" = (), budget: "float | None" = None,
+                   **fields: Any) -> "tuple[dict[str, Any], list[int]]":
         msg = encode({"op": op, **fields})
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         try:
-            sock.settimeout(max(self._timeout, _SLOW_OPS.get(op, 0.0)))
+            limit = max(self._timeout, _SLOW_OPS.get(op, 0.0))
+            sock.settimeout(limit if budget is None else max(0.001, min(limit, budget)))
             try:
                 sock.connect(self.socket_path)
             except OSError as exc:
@@ -178,7 +189,7 @@ class JailClient:
         return reply, got
 
     def _one_fd(self, op: str, **fields: Any) -> "tuple[dict[str, Any], int]":
-        reply, fds = self.call(op, **fields)
+        reply, fds = self.call(op, **fields)  # timeout_s passes through to call()
         if len(fds) != 1:
             for fd in fds:
                 os.close(fd)
@@ -240,13 +251,13 @@ class JailClient:
             os.close(fd)
         return None
 
-    def connect(self, jail_id: str, target: str) -> socket.socket:
+    def connect(self, jail_id: str, target: str, timeout_s: "float | None" = None) -> socket.socket:
         """A connected stream socket to the jail's API (``api``) or vsock (``vsock``) UDS."""
-        _, fd = self._one_fd("connect", jail=jail_id, target=target)
+        _, fd = self._one_fd("connect", jail=jail_id, target=target, timeout_s=timeout_s)
         return socket.socket(fileno=fd)
 
-    def status(self, jail_id: str) -> "dict[str, Any]":
-        return self.call("status", jail=jail_id)[0]
+    def status(self, jail_id: str, timeout_s: "float | None" = None) -> "dict[str, Any]":
+        return self.call("status", jail=jail_id, timeout_s=timeout_s)[0]
 
     def signal(self, jail_id: str, sig: str) -> None:
         self.call("signal", jail=jail_id, sig=sig)
@@ -305,11 +316,11 @@ class JailedProcess:
         self._destroyed = False
         self._lock = threading.Lock()
 
-    def poll(self) -> "int | None":
+    def poll(self, timeout_s: "float | None" = None) -> "int | None":
         if self.returncode is not None:
             return self.returncode
         try:
-            rc = self._client.status(self.jail_id).get("returncode")
+            rc = self._client.status(self.jail_id, timeout_s).get("returncode")
         except JailError as exc:
             if exc.code == "unknown_jail":
                 # The helper no longer has it (destroyed, or the helper restarted -- which kills
@@ -369,15 +380,15 @@ class JailedProcess:
     def connect_api(self) -> socket.socket:
         return self._client.connect(self.jail_id, "api")
 
-    def connect_vsock(self) -> socket.socket:
-        return self._client.connect(self.jail_id, "vsock")
+    def connect_vsock(self, timeout_s: "float | None" = None) -> socket.socket:
+        return self._client.connect(self.jail_id, "vsock", timeout_s)
 
-    def alive(self) -> "bool | None":
+    def alive(self, budget_s: "float | None" = None) -> "bool | None":
         """Tri-state liveness for the pool: True, False = CONFIRMED gone, None = the helper could
         not be asked (a control-plane failure is not a dead VM; the pool keeps the slot and asks
-        again within its unknown-grace bound)."""
+        again within its unknown-grace bound). ``budget_s`` bounds the helper round trip."""
         try:
-            return self.poll() is None
+            return self.poll(budget_s) is None
         except JailError:
             return None
 

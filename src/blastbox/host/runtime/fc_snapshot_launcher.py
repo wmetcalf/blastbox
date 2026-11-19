@@ -224,11 +224,11 @@ class _Handle:
         except OSError:
             return False
 
-    def connect_vsock(self) -> "Any":
+    def connect_vsock(self, timeout_s: "float | None" = None) -> "Any":
         """A jailed microVM's vsock UDS, connected by the helper (None when unjailed)."""
         if getattr(self, "_jail", None) is None:
             return None
-        return self.proc.connect_vsock()
+        return self.proc.connect_vsock(timeout_s)
 
     def _checkpoint_jailed(self) -> object:
         """Snapshot a JAILED base and have the helper publish it as a read-only generation.

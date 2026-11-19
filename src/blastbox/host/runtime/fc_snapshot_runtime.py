@@ -287,12 +287,16 @@ class SnapshotSlotRuntime:
     def is_alive(self, slot: Slot) -> "bool | None":
         """True iff the restored Firecracker process is still running; None for a jailed slot
         whose helper could not be asked (unknown, not dead)."""
+        return self.is_alive_for_claim(slot)
+
+    def is_alive_for_claim(self, slot: Slot, *, budget_s: "float | None" = None) -> "bool | None":
+        """is_alive() bounded by the pool's remaining claim budget for a jailed slot."""
         handle = self._get(slot.slot_id)
         if handle is None:
             return False
         alive = getattr(getattr(handle, "proc", None), "alive", None)
         if callable(alive):
-            return alive()  # type: ignore[no-any-return]
+            return alive(budget_s)  # type: ignore[no-any-return]
         return self._proc_alive(handle)
 
     def invalidate_base(self) -> None:

@@ -13,6 +13,7 @@ import os
 import socket
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -227,7 +228,7 @@ class _FakeJail:
             return s
         return None
 
-    def connect(self, jail_id, target):
+    def connect(self, jail_id, target, timeout_s=None):
         self.calls.append(("connect", jail_id, target))
         if target == "api":
             return self.api.connect()
@@ -240,7 +241,7 @@ class _FakeJail:
         self.vsock_peer = b
         return a
 
-    def status(self, jail_id):
+    def status(self, jail_id, timeout_s=None):
         if jail_id not in self.alive:
             raise JailError("unknown_jail", jail_id)
         return {"returncode": None if self.alive[jail_id] else -9, "vsock": True}
@@ -524,7 +525,7 @@ def test_the_ready_signal_adopts_a_helper_bound_listener(tmp_path):
     c.connect(str(path))
     c.sendall(b"READY")
     c.close()
-    import time
+    pass
     deadline = time.monotonic() + 5
     while not sig.is_ready(slot) and time.monotonic() < deadline:
         time.sleep(0.02)
@@ -539,7 +540,7 @@ def test_the_ready_signal_adopts_a_helper_bound_listener(tmp_path):
 def test_a_jailed_vsock_connect_failure_is_attributed(tmp_path, code, host_io):
     from blastbox.host.runtime.firecracker import VsockHostWarmControl
 
-    def connect():
+    def connect(timeout_s=None):
         raise JailError(code, "x")
     ctl = VsockHostWarmControl(tmp_path / "v.sock", uds_connect=connect)
     with pytest.raises(ConnectionError) as exc:
@@ -553,10 +554,10 @@ class _DownJail(_FakeJail):
 
     down = False
 
-    def status(self, jail_id):
+    def status(self, jail_id, timeout_s=None):
         if self.down:
             raise JailError("timeout", "status")
-        return super().status(jail_id)
+        return super().status(jail_id, timeout_s)
 
     def signal(self, jail_id, sig):
         if self.down:
@@ -742,7 +743,7 @@ def test_a_jail_helper_failure_at_signal_go_is_not_worker_evidence(tmp_path):
     slot = tdw._make_slot(tmp_path)
     runtime = tdw._FakeVsockRuntime()
 
-    def helper_dropped():
+    def helper_dropped(timeout_s=None):
         raise JailError("refused", "[Errno 104] Connection reset by peer")
     runtime.host_warm_control = lambda s: VsockHostWarmControl(   # type: ignore[assignment]
         tmp_path / "v.sock", uds_connect=helper_dropped)
@@ -842,7 +843,7 @@ def test_healthy_concurrent_output_copies_are_never_refused(tmp_path, monkeypatc
     real = fj.sparse_copy
     monkeypatch.setattr(fj, "sparse_copy", lambda s, d, n: (time.sleep(0.2), real(s, d, n)))
     import concurrent.futures as cf
-    import time
+    pass
     futs = []
     with cf.ThreadPoolExecutor(12) as ex:
         for i in range(12):                    # STAGGERED: each starts while the others run
@@ -870,7 +871,7 @@ def test_retrying_parked_destroys_never_waits_on_the_spawn_path(tmp_path):
 
         def destroy(self):
             raise JailError("alive", "x")
-    import time
+    pass
     p = _Stubborn()
     with fl._STRANDED_LOCK:
         fl._PENDING_DESTROY.extend([p, p, p])
@@ -879,3 +880,35 @@ def test_retrying_parked_destroys_never_waits_on_the_spawn_path(tmp_path):
     assert time.monotonic() - t0 < 1.0
     with fl._STRANDED_LOCK:
         fl._PENDING_DESTROY[:] = [x for x in fl._PENDING_DESTROY if x is not p]
+
+
+def test_claim_probes_and_vsock_connects_carry_the_callers_budget(tmp_path):
+    jail = _FakeJail(tmp_path)
+    seen = []
+    real_status, real_connect = jail.status, jail.connect
+    jail.status = lambda jid, timeout_s=None: (seen.append(("status", timeout_s)),
+                                               real_status(jid))[1]
+    jail.connect = lambda jid, tgt, timeout_s=None: (seen.append(("connect", timeout_s)),
+                                                     real_connect(jid, tgt))[1]
+    rt = _cold(tmp_path, jail)
+    slot = rt.spawn()
+    seen.clear()
+    assert rt.is_alive_for_claim(slot, budget_s=0.01) is True
+    assert ("status", 0.01) in seen
+    ctl = rt.host_warm_control(slot)
+    ctl._connect(deadline=time.monotonic() + 0.5).close()
+    t = [x for x in seen if x[0] == "connect"][-1][1]
+    assert t is not None and t <= 0.5
+    rt.reap(slot)
+
+
+def test_a_call_with_a_budget_never_waits_the_default_timeout(tmp_path):
+    path = tmp_path / "silent.sock"
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    srv.bind(str(path))
+    srv.listen(1)                                        # accepts (backlog) but never answers
+    t0 = time.monotonic()
+    with pytest.raises(JailError):
+        JailClient(str(path)).status(JID, timeout_s=0.2)
+    assert time.monotonic() - t0 < 1.5
+    srv.close()
