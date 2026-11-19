@@ -55,7 +55,6 @@ import hashlib
 import json
 import logging
 import os
-import queue
 import re
 import resource
 import secrets
@@ -64,6 +63,7 @@ import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -429,8 +429,8 @@ class HelperConfig:
     max_jails_per_owner: int = 256
     max_owners: int = 64
     max_gens_per_owner: int = 4
-    max_conns: int = 64
-    max_conns_per_peer: int = 8
+    max_conns: int = 128
+    max_conns_per_peer: int = 32
     max_asset_bytes: int = 16 << 30
     max_snapshot_bytes: int = 64 << 20
     spawn_timeout_s: float = 10.0
@@ -473,6 +473,8 @@ class Owner:
     gens: "set[str]" = field(default_factory=set)
     assets: "deque[str]" = field(default_factory=lambda: deque(maxlen=8))
     dead: bool = False
+    #: Publishes in flight, reserved against max_gens_per_owner under the state lock.
+    publishing: int = 0
 
 
 @dataclass
@@ -582,9 +584,10 @@ class Helper:
         self._jails: dict[str, Jail] = {}
         self._gens: dict[str, Gen] = {}
         self._assets: dict[str, Asset] = {}
-        self._asset_locks: dict[str, threading.Lock] = {}
+        # STRIPED, bounded: a lock per asset identity would grow with every distinct file a
+        # client ever registers.
+        self._asset_locks = [threading.Lock() for _ in range(64)]
         self._peer_conns: dict[int, int] = {}
-        self._to_close: "queue.SimpleQueue[int]" = queue.SimpleQueue()
         self._uids = UidPool(cfg.uid_min, cfg.uid_max)
         self._stop = threading.Event()
         if apparmor_enabled is None:
@@ -773,9 +776,7 @@ class Helper:
         aid = "a" + hashlib.sha256(repr((kind, key)).encode()).hexdigest()[:32]
         # PER ASSET, not helper-wide: one client's slow (or deliberately stalled) copy must not
         # hold every other dispatcher's registration hostage.
-        with self._lock:
-            lock = self._asset_locks.setdefault(aid, threading.Lock())
-        with lock:
+        with self._asset_locks[int(aid[1:9], 16) % len(self._asset_locks)]:
             with self._lock:
                 existing = self._assets.get(aid)
             if existing is None:
@@ -801,9 +802,15 @@ class Helper:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
         try:
             try:
-                os.ftruncate(fd, st.st_size)
-                _copy_range(src, fd, 0, st.st_size,
-                            deadline=time.monotonic() + self.cfg.copy_timeout_s)
+                # Hole-preserving (a sparse multi-GiB rootfs must not expand onto a tmpfs chroot
+                # base). sparse_copy seeks, and src is the CLIENT's description, so put its
+                # offset back (the client is blocked on this request and opened it privately).
+                pos = os.lseek(src, 0, os.SEEK_CUR)
+                try:
+                    sparse_copy(src, fd, st.st_size,
+                                deadline=time.monotonic() + self.cfg.copy_timeout_s)
+                finally:
+                    os.lseek(src, pos, os.SEEK_SET)
                 if identity(os.fstat(src)) != key:
                     raise HelperError("bad_asset", "the file changed while it was copied")
                 os.fchmod(fd, 0o444)
@@ -1179,8 +1186,18 @@ class Helper:
             raise HelperError("alive", "the jail cgroup still has processes")
         with self._lock:
             live = sum(1 for g in owner.gens if g in self._gens and not self._gens[g].retired)
-        if live >= self.cfg.max_gens_per_owner:
-            raise HelperError("exhausted", "too many live generations; discard one first")
+            # RESERVE under the same lock: concurrent publishes each counting "live" before any
+            # registered would all pass the cap.
+            if live + owner.publishing >= self.cfg.max_gens_per_owner:
+                raise HelperError("exhausted", "too many live generations; discard one first")
+            owner.publishing += 1
+        try:
+            return self._publish(owner, jail)
+        finally:
+            with self._lock:
+                owner.publishing -= 1
+
+    def _publish(self, owner: Owner, jail: Jail) -> "tuple[dict[str, Any], list[int]]":
         gid = "g" + secrets.token_hex(16)
         gdir = self.cfg.gens_dir / gid
         gdir.mkdir(mode=0o711)
@@ -1358,7 +1375,6 @@ class Helper:
         srv.settimeout(1.0)
         threading.Thread(target=self._monitor_loop, daemon=True, name="fcj-monitor").start()
         slots = threading.BoundedSemaphore(self.cfg.max_conns)
-        threading.Thread(target=self._closer_loop, daemon=True, name="fcj-closer").start()
         _log.info("fc_jail.listening socket=%s apparmor=%s firecracker=%s", cfg.socket_path,
                   self.apparmor, self.fc_version)
         if ready is not None:
@@ -1383,6 +1399,13 @@ class Helper:
                 if busy_peer or not slots.acquire(blocking=False):
                     if not busy_peer:
                         self._release_peer(peer)
+                    # DRAIN the already-queued request first: closing with unread data makes the
+                    # client's next recv/send fail ECONNRESET/EPIPE instead of seeing "busy".
+                    with contextlib.suppress(OSError):
+                        _, junk, _, _ = socket.recv_fds(conn, MAX_MSG + 1, MAX_REQUEST_FDS + 1,
+                                                        socket.MSG_DONTWAIT)
+                        for fd in junk:
+                            self._close_client_fd(fd)
                     # Overloaded: SAY so (the client retries "busy"); a silent close is
                     # indistinguishable from a refused uid.
                     with contextlib.suppress(OSError):
@@ -1409,13 +1432,18 @@ class Helper:
             else:
                 self._peer_conns.pop(peer, None)
 
-    def _closer_loop(self) -> None:
-        """Close client-supplied descriptors off the request path: close() of a socket the
-        client set to linger blocks, and must not pin a connection slot while it does."""
-        while True:
-            fd = self._to_close.get()
-            with contextlib.suppress(OSError):
-                os.close(fd)
+    @staticmethod
+    def _close_client_fd(fd: int) -> None:
+        """Close a client-supplied descriptor WITHOUT blocking. close() of a socket the client
+        set to linger (with unsent data) blocks for the linger time; making it abortive first
+        (SO_LINGER 0) turns that into an immediate reset, so a hostile client can neither pin
+        a connection slot nor stall a closer behind which descriptors pile up."""
+        with contextlib.suppress(OSError):
+            if stat.S_ISSOCK(os.fstat(fd).st_mode):
+                with socket.socket(fileno=os.dup(fd)) as s:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        with contextlib.suppress(OSError):
+            os.close(fd)
 
     def _monitor_loop(self) -> None:
         while not self._stop.wait(1.0):
@@ -1472,7 +1500,7 @@ class Helper:
             _log.warning("fc_jail.conn_error: %s", exc)
         finally:
             for fd in fds:
-                self._to_close.put(fd)       # the client's: may block on close (see closer)
+                self._close_client_fd(fd)
             for fd in out_fds:
                 with contextlib.suppress(OSError):
                     os.close(fd)
@@ -1689,6 +1717,10 @@ def parse_args(argv: "list[str] | None" = None) -> HelperConfig:
     ap.add_argument("--jail-pids-max", type=int, default=128)
     ap.add_argument("--max-jails", type=int, default=512)
     ap.add_argument("--max-jails-per-owner", type=int, default=256)
+    ap.add_argument("--max-owners", type=int, default=64)
+    ap.add_argument("--max-gens-per-owner", type=int, default=4)
+    ap.add_argument("--max-conns", type=int, default=128)
+    ap.add_argument("--max-conns-per-peer", type=int, default=32)
     ns = ap.parse_args(argv)
     try:
         gid = int(ns.socket_group)
@@ -1704,7 +1736,9 @@ def parse_args(argv: "list[str] | None" = None) -> HelperConfig:
         uid_min=ns.uid_min, uid_max=ns.uid_max, cgroup_parent_rel=cgroup.strip("/"),
         jails_memory_max=ns.jails_memory_max, jail_mem_overhead_mib=ns.jail_mem_overhead_mib,
         jail_pids_max=ns.jail_pids_max, max_jails=ns.max_jails,
-        max_jails_per_owner=ns.max_jails_per_owner,
+        max_jails_per_owner=ns.max_jails_per_owner, max_owners=ns.max_owners,
+        max_gens_per_owner=ns.max_gens_per_owner, max_conns=ns.max_conns,
+        max_conns_per_peer=ns.max_conns_per_peer,
     )
 
 
@@ -1717,8 +1751,10 @@ def main(argv: "list[str] | None" = None) -> int:
     # Each live jail holds ~3 helper descriptors and each client process one pidfd: the 1024
     # soft default is below max_jails. Raise the soft limit to the hard one.
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    if soft < hard:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    want = 1 << 20 if hard == resource.RLIM_INFINITY else hard
+    if soft != resource.RLIM_INFINITY and soft < want:
+        with contextlib.suppress(ValueError, OSError):
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
     cfg = parse_args(argv)
     helper = Helper(cfg)
     helper.prepare_host()

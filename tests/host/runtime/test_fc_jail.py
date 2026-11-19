@@ -608,7 +608,8 @@ def test_a_snapshot_slot_with_an_unreachable_helper_is_unknown(tmp_path):
     assert rt.is_alive(slot) is True
     jail.down = True
     assert rt.is_alive(slot) is None
-    assert rt.is_ready(slot) is False
+    with pytest.raises(JailError):                 # UNKNOWN for the pool: warming timeout paused
+        rt.is_ready(slot)
 
 
 def test_a_helper_failure_reading_output_is_host_io(tmp_path):
@@ -679,15 +680,21 @@ def test_restore_reclaimed_tolerates_an_unreachable_helper(tmp_path):
     assert backend.restore_reclaimed(str(tmp_path / "w")) is False
 
 
-def test_a_peer_the_helper_drops_unread_is_a_host_side_refusal(tmp_path):
+def test_a_peer_the_helper_drops_unread_is_a_host_side_refusal(tmp_path, monkeypatch):
+    from blastbox.host.runtime import fc_jail as fj
+
+    monkeypatch.setattr(fj.time, "sleep", lambda s: None)
     path = tmp_path / "h.sock"
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     srv.bind(str(path))
-    srv.listen(1)
+    srv.listen(8)
 
     def drop():
-        c, _ = srv.accept()
-        c.close()                       # unread: the client sees ECONNRESET, not EOF
+        for _ in range(fj._BUSY_RETRIES + 1):   # every (retried) attempt is dropped
+            c, _ = srv.accept()
+            time.sleep(0.05)
+            c.close()                   # unread: the client sees ECONNRESET, not EOF
+    import time
     t = threading.Thread(target=drop)
     t.start()
     with pytest.raises(JailError) as exc:
@@ -695,3 +702,59 @@ def test_a_peer_the_helper_drops_unread_is_a_host_side_refusal(tmp_path):
     t.join()
     srv.close()
     assert exc.value.code in ("refused", "busy") and exc.value.host_io
+
+
+def test_a_cold_reap_whose_vm_is_gone_but_destroy_fails_is_not_quarantined(tmp_path):
+    from blastbox.host.runtime import fc_snapshot_launcher as fl
+
+    jail = _FakeJail(tmp_path)
+    rt = _cold(tmp_path, jail)
+    slot = rt.spawn()
+    real = jail.destroy
+    jail.destroy = lambda jid: (_ for _ in ()).throw(JailError("cleanup_failed", "x"))
+    rt.reap(slot)                                  # the VM exit was confirmed: no raise
+    assert slot.slot_id not in rt._procs
+    assert any(getattr(p, "jail_id", None) == slot.slot_id for p in fl._PENDING_DESTROY)
+    jail.destroy = real
+    fl._retry_pending_destroys()
+    assert not any(getattr(p, "jail_id", None) == slot.slot_id for p in fl._PENDING_DESTROY)
+
+
+def test_a_jail_helper_failure_at_signal_go_is_not_worker_evidence(tmp_path):
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import test_dispatch_warm as tdw
+
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    from blastbox.host.runtime.firecracker import VsockHostWarmControl
+
+    store = InMemoryJobStore()
+    job = tdw._make_job()
+    job.input_sha256 = tdw._INPUT_SHA
+    store.create(job)
+    tdw._setup_job_dirs(tmp_path / "jobs", job)
+    slot = tdw._make_slot(tmp_path)
+    runtime = tdw._FakeVsockRuntime()
+
+    def helper_dropped():
+        raise JailError("refused", "[Errno 104] Connection reset by peer")
+    runtime.host_warm_control = lambda s: VsockHostWarmControl(   # type: ignore[assignment]
+        tmp_path / "v.sock", uds_connect=helper_dropped)
+    pool = tdw.FakeWarmPool(slot, runtime=runtime)
+    dispatcher = tdw._make_dispatcher_with_pool(store, job_root=tmp_path / "jobs", pool=pool,
+                                                worker_timeout_s=10)
+    dispatcher.dispatch_once()
+    assert pool.release_fault == ["unknown"]
+
+
+def test_an_overloaded_real_helper_is_retried_not_refused(live_helper, monkeypatch):
+    helper, path = live_helper
+    helper.cfg = h.HelperConfig(**{**helper.cfg.__dict__, "max_conns_per_peer": 0})
+    from blastbox.host.runtime import fc_jail as fj
+    monkeypatch.setattr(fj, "_BUSY_RETRIES", 2)
+    monkeypatch.setattr(fj.time, "sleep", lambda s: None)
+    with pytest.raises(JailError) as exc:
+        JailClient(path).hello()
+    assert exc.value.code in ("busy", "refused") and exc.value.host_io
+    helper.cfg = h.HelperConfig(**{**helper.cfg.__dict__, "max_conns_per_peer": 32})
+    assert JailClient(path).hello()["protocol"] == h.PROTOCOL_VERSION

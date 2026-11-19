@@ -823,3 +823,56 @@ def test_the_profile_grants_no_writable_tree():
                          chroot_base=Path("/srv/j"))
     text = h.render_profile(cfg, JID, boot=False, listener_host_path=None)
     assert "/run/** " not in text and "** rw" not in text
+
+
+def test_a_sparse_asset_stays_sparse_and_the_client_offset_is_restored(env, tmp_path):
+    p = tmp_path / "sparse-rootfs"
+    with open(p, "wb") as f:
+        f.truncate(256 << 20)
+        f.seek(100 << 20)
+        f.write(b"data")
+    fd = os.open(p, os.O_RDONLY)
+    os.lseek(fd, 77, os.SEEK_SET)
+    try:
+        aid = env.helper.op_asset(env.owner, {"op": "asset", "kind": "rootfs"}, [fd])[0]["asset"]
+        assert os.lseek(fd, 0, os.SEEK_CUR) == 77
+    finally:
+        os.close(fd)
+    copy = env.helper._assets[aid].path
+    assert copy.stat().st_size == 256 << 20 and copy.stat().st_blocks * 512 < 16 << 20
+
+
+def test_closing_a_lingering_client_socket_does_not_block():
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    c = socket.create_connection(srv.getsockname())
+    peer, _ = srv.accept()                       # never reads
+    c.setblocking(False)
+    try:
+        while True:
+            c.send(b"x" * 65536)
+    except BlockingIOError:
+        pass
+    c.setblocking(True)
+    import struct
+    c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 30))
+    fd = c.detach()
+    t0 = time.monotonic()
+    h.Helper._close_client_fd(fd)
+    assert time.monotonic() - t0 < 2.0
+    peer.close()
+    srv.close()
+
+
+def test_concurrent_publishes_cannot_exceed_the_generation_cap(env):
+    env.helper.cfg = h.HelperConfig(**{**env.cfg.__dict__, "max_gens_per_owner": 1})
+    base, _ = env.boot(listener=False)
+    _snapshot(base)
+    env.kill(base)
+    env.owner.publishing = 1                     # another publish is in flight
+    with pytest.raises(h.HelperError, match="exhausted"):
+        env.helper.op_publish(env.owner, {"op": "publish", "jail": JID}, [])
+    env.owner.publishing = 0
+    env.helper.op_publish(env.owner, {"op": "publish", "jail": JID}, [])
+    assert env.owner.publishing == 0

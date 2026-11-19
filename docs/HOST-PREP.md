@@ -338,6 +338,10 @@ descriptors, never as paths.
   per client process (`max_jails_per_owner` 256, 4 live generations, 8 concurrent requests, 64
   client processes) bound a misbehaving or compromised dispatcher, but it can still exhaust what
   is shared and deny service to the others. Size the caps for the stacks you run.
+- **Without AppArmor** (`--apparmor off`, or `auto` on a kernel without it) a VMM a guest escaped
+  into is still chrooted, uid-isolated and capped per file (`fsize`), but it can create files in its
+  own jail root on the shared `--chroot-base`. Use `--apparmor require` where AppArmor exists, and
+  keep the chroot base on its own filesystem (or a size-limited tmpfs) so it cannot fill the host's.
 - **Opting out:** `BLASTBOX_FC_JAILER=off` on the dispatcher restores the previous behaviour
   (firecracker as the dispatcher uid in its container, sharing one scratch tree). Not recommended.
 - **Not jailed:** `blastbox`'s build-time CPU-feature probe (`cpu_probe`) still runs firecracker

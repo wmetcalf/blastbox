@@ -2126,7 +2126,8 @@ class Dispatcher:
                 if (getattr(control, "signal_is_transport", False)
                         and not getattr(exc, "host_io", False)):
                     warm_fault = "worker"
-                elif isinstance(exc, OSError) and exc.errno not in HOST_RESOURCE_ERRNOS:
+                elif (isinstance(exc, OSError) and exc.errno not in HOST_RESOURCE_ERRNOS
+                      and not getattr(exc, "host_io", False)):
                     # ...and the FILE handshake has its own worker evidence. ctrl/ is
                     # WORKER-WRITABLE (the gVisor tier bind-mounts it 0o777), so a poisoned
                     # worker can put a directory or a symlink where go.json belongs and

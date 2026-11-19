@@ -468,12 +468,10 @@ class SnapshotSlotRuntime:
     def _proc_alive(handle: object) -> bool:
         proc = getattr(handle, "proc", None)
         # A fake/handle without a proc is treated as alive (tests inject this).
-        if proc is None:
-            return True
-        try:
-            return proc.poll() is None
-        except Exception:  # noqa: BLE001 - a jailed proc whose helper could not be asked
-            return False     # not READY (is_ready); is_alive() reports it as UNKNOWN instead
+        # A jailed proc whose helper cannot be asked RAISES here: from is_ready() that is the
+        # pool's UNKNOWN (the warming timeout is suspended, issue #79), never a "not ready"
+        # that keeps a brownout aging every WARMING slot; is_alive() answers None itself.
+        return proc is None or proc.poll() is None
 
 
 # ---------------------------------------------------------------------------

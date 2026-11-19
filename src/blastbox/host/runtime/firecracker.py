@@ -1416,6 +1416,9 @@ class FirecrackerSlotRuntime:
             d.mkdir(parents=True, exist_ok=True)
 
         if getattr(self, "_jail", None) is not None:
+            from blastbox.host.runtime.fc_snapshot_launcher import _retry_pending_destroys
+
+            _retry_pending_destroys()
             return self._spawn_jailed(slot_id, slot_dir, output_dir, input_dir, control_dir,
                                       checked_key)
 
@@ -1770,13 +1773,22 @@ class FirecrackerSlotRuntime:
         try:
             proc.kill()
             proc.wait(timeout=5.0)
-            proc.destroy()
         except Exception as exc:  # noqa: BLE001 - re-raised as an unconfirmed teardown
             with self._lock:
                 self._procs.setdefault(slot.slot_id, fc_proc)
             _log.warning("fc.jail_reap_unconfirmed slot_id=%s: %s", slot.slot_id, exc)
             raise FCError(f"could not confirm the jailed microVM for slot {slot.slot_id} is gone; "
                           f"quarantining it rather than replacing it: {exc}") from exc
+        # The VM is CONFIRMED gone; only the jail's leftovers remain. Not a quarantine: park it
+        # and retry on later spawns (the helper also reclaims it when this process exits).
+        try:
+            proc.destroy()
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("fc.jail_destroy_deferred slot_id=%s: %s", slot.slot_id, exc)
+            from blastbox.host.runtime.fc_snapshot_launcher import _PENDING_DESTROY, _STRANDED_LOCK
+
+            with _STRANDED_LOCK:
+                _PENDING_DESTROY.append(proc)
 
     # ------------------------------------------------------------------
     # Output-disk read (called by the dispatcher after the VM exits)

@@ -120,7 +120,10 @@ class JailClient:
             try:
                 return self._call_once(op, fds=fds, **fields)
             except JailError as exc:
-                if exc.code != "busy" or attempt == _BUSY_RETRIES:
+                # "refused" (dropped unread: ECONNRESET/EPIPE) is retried too -- an overloaded
+                # helper's close can race its "busy" reply. A genuinely disallowed uid just
+                # fails after the retries.
+                if exc.code not in ("busy", "refused") or attempt == _BUSY_RETRIES:
                     raise
             time.sleep(delay)
             delay = min(delay * 2, 1.0)
@@ -399,9 +402,7 @@ class JailedProcess:
             try:
                 # Bounded like the other host disk work: a stalled disk must not pin the
                 # dispatch thread (the helper already refused a size other than the staged one).
-                from blastbox.host.runtime.firecracker import disk_timeout_s
-
-                sparse_copy(fd, out, size, deadline=time.monotonic() + disk_timeout_s())
+                _copy_bounded(fd, out, size)
             finally:
                 os.close(out)
         except OSError as exc:
@@ -416,6 +417,35 @@ class JailedProcess:
 
         return FcApiClient(f"jail:{self.jail_id}/{JAIL_API_SOCK}", timeout=timeout,
                            connector=self.connect_api)
+
+
+def _copy_bounded(src: int, dst: int, size: int) -> None:
+    """sparse_copy in a worker JOINED with the disk deadline: checking the clock between
+    chunks is only cooperative, and a stalled filesystem blocks inside a single call. This
+    bounds the CALLER (the dispatch thread), as fc_snapshot_launcher._copy_with_deadline does."""
+    from blastbox.errors import HostDiskTimeout
+    from blastbox.host.runtime.firecracker import disk_timeout_s
+
+    timeout = disk_timeout_s()
+    s2, d2 = os.dup(src), os.dup(dst)
+    done: "list[BaseException | None]" = []
+
+    def _run() -> None:
+        try:
+            sparse_copy(s2, d2, size)
+            done.append(None)
+        except BaseException as exc:  # noqa: BLE001 - reported below
+            done.append(exc)
+        finally:
+            os.close(s2)
+            os.close(d2)
+    worker = threading.Thread(target=_run, daemon=True, name="fc-jail-outdisk-copy")
+    worker.start()
+    worker.join(timeout)
+    if not done:
+        raise HostDiskTimeout(cmd="copy jailed output disk", timeout=timeout)
+    if done[0] is not None:
+        raise done[0]
 
 
 def new_jail_id() -> str:
