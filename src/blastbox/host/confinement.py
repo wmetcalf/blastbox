@@ -127,6 +127,9 @@ class HostLsm:
     # read-only selinuxfs (container engines bind it ro).
     apparmor_blocker: str | None = None
     selinux_blocker: str | None = None
+    # Cold runsc is started by the daemon the docker CLI talks to; when that is not this host's
+    # (DOCKER_HOST / DOCKER_CONTEXT elsewhere), this host's LSM view says nothing about it.
+    cold_blocker: str | None = None
     apparmor_parser: str | None = None  # "4.0.1"; None = not found / not probed
     runsc: str | None = None            # "release-20261012.0"
     runsc_split_sentry: bool | None = None
@@ -144,6 +147,8 @@ class HostLsm:
         # exec'd by dockerd on the host (a docker runtime wrapper enters the domain there), so
         # only the host-level state counts for it.
         own = kind != "cold"
+        if not own and self.cold_blocker:
+            return "none"
         if self.selinux == "enforcing" and not (own and self.selinux_blocker):
             return "selinux"
         if self.apparmor and not (own and self.apparmor_blocker):
@@ -169,6 +174,7 @@ class HostLsm:
             "landlock_abi": self.landlock_abi,
             "apparmor_blocker": self.apparmor_blocker,
             "selinux_blocker": self.selinux_blocker,
+            "cold_blocker": self.cold_blocker,
             "apparmor_parser": self.apparmor_parser,
             "runsc": self.runsc,
             "runsc_split_sentry": self.runsc_split_sentry,
@@ -243,6 +249,16 @@ def _se_blocker(host: HostReader) -> str | None:
     return None
 
 
+def _cold_blocker(env: Mapping[str, str]) -> str | None:
+    docker_host = env.get("DOCKER_HOST", "").strip()
+    if docker_host and not docker_host.startswith("unix://"):
+        return f"DOCKER_HOST={docker_host!r}: cold runsc runs on that daemon's host, not this one"
+    context = env.get("DOCKER_CONTEXT", "").strip()
+    if context and context != "default":
+        return f"DOCKER_CONTEXT={context!r}: cold runsc may run on another daemon's host"
+    return None
+
+
 def _parser_version(host: HostReader) -> str | None:
     for name in _AA_PARSERS:
         path = host.which(name)
@@ -287,10 +303,10 @@ def probe(host: HostReader, *, env: Mapping[str, str] | None = None,
     empty ``kinds`` never spawns anything. ``landlock`` is the ABI (None = 0)."""
     env = os.environ if env is None else env
     state = _probe_lsm(host, landlock)
-    extra: dict[str, object] = {}
+    extra: dict[str, object] = {"cold_blocker": _cold_blocker(env)}
     if kinds and state.apparmor:
         extra["apparmor_parser"] = _parser_version(host)
-    if {"cold", "gvisor"} & set(kinds):
+    if "gvisor" in kinds:     # the warm tier's binary; cold runsc is dockerd's registered runtime
         extra["runsc"], extra["runsc_split_sentry"] = _runsc(host, env)
     if "firecracker" in kinds:
         extra["firecracker"], extra["jailer"] = _firecracker(host, env)
@@ -312,7 +328,8 @@ def check_required(state: HostLsm, mode: str, kinds: Iterable[str]) -> None:
             f"{state.selinux}, apparmor={'on' if state.apparmor else 'off'}, landlock_abi="
             f"{state.landlock_abi}; Landlock covers firecracker only, permissive SELinux "
             "does not count"
-            + "".join(f"; {b}" for b in (state.selinux_blocker, state.apparmor_blocker) if b)
+            + "".join(f"; {b}" for b in (state.selinux_blocker, state.apparmor_blocker,
+                                         state.cold_blocker) if b)
             + ")")
 
 
@@ -363,4 +380,4 @@ def detect(env: Mapping[str, str] | None = None, *, host: HostReader | None = No
     mode = mode_from_env(env)
     state = _probe_lsm(_SysReader() if host is None else host,
                        landlock_abi() if landlock is None else landlock)
-    return Detection(mode=mode, state=state)
+    return Detection(mode=mode, state=replace(state, cold_blocker=_cold_blocker(env)))

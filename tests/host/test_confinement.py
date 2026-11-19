@@ -686,3 +686,43 @@ def test_cold_runsc_is_judged_as_dockerd_launches_it_not_by_the_caller():
 def test_cold_receipt_uses_the_daemon_view(tmp_path, _attest_env):
     det = cf.detect({}, host=_host(CONTAINER_UNDER_DOCKER_DEFAULT), landlock=0)
     assert _cold_receipt(tmp_path, "runsc", det)["confinement"]["available"] == "apparmor"
+
+
+def test_no_pool_preview_judges_require_on_cold_only():
+    """No pool, no --tier: the dispatcher runs cold only; warm kinds are a preview."""
+    host = _healthy(files=CONTAINER_UNDER_DOCKER_DEFAULT, env={"BLASTBOX_CONFINEMENT": "require"})
+    host.landlock_abi = lambda: 3    # type: ignore[method-assign]
+    cs = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False)
+    c = next(c for c in cs if c.name == "confinement")
+    assert c.status is Status.WARN and "not selected" in c.detail
+    # an explicit --tier gvisor still gates on it
+    c = next(c for c in pf.run_preflight(host, ["gvisor"]) if c.name == "confinement")
+    assert c.status is Status.FAIL
+
+
+def test_overflow_gvisor_refused_by_rootfs_stamp_counts_as_skipped():
+    host = _healthy(files=AL2023, env=_OVERFLOW_ENV)
+    host.landlock_abi = lambda: 4    # type: ignore[method-assign]
+    host.guest_problems = {"/var/lib/blastbox/gvisor-rootfs": "stamped for another release"}
+    cs = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False)
+    assert next(c for c in cs if c.name == "confinement").status is Status.WARN
+
+
+def test_cold_only_does_not_report_the_warm_runsc_binary():
+    host = _healthy(files=UBUNTU)
+    c = next(c for c in pf.run_preflight(host, ["docker"]) if c.name == "confinement")
+    assert "runsc" not in c.detail.split("would use")[0].split("landlock_abi")[1]
+    assert c.facts is not None and c.facts["host"]["runsc"] is None  # type: ignore[index]
+
+
+@pytest.mark.parametrize("env,blocked", [
+    ({}, False), ({"DOCKER_HOST": "unix:///var/run/docker.sock"}, False),
+    ({"DOCKER_HOST": "tcp://builder:2376"}, True), ({"DOCKER_HOST": "ssh://u@h"}, True),
+    ({"DOCKER_CONTEXT": "remote"}, True), ({"DOCKER_CONTEXT": "default"}, False),
+])
+def test_cold_with_a_remote_docker_daemon_is_not_judged_from_this_host(env, blocked):
+    st = cf.probe(_host(UBUNTU), env=env)
+    assert (st.would_use("cold") == "none") is blocked
+    assert st.would_use("gvisor") == "apparmor"
+    d = cf.detect({**env, "BLASTBOX_CONFINEMENT": "auto"}, host=_host(UBUNTU), landlock=0)
+    assert (d.state.would_use("cold") == "none") is blocked

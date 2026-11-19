@@ -1098,9 +1098,11 @@ def _check_confinement(host: HostView, tiers: Collection[str],
         parts.append("securityfs not readable (container?): LSM stack inferred from "
                      "/sys/module and /sys/fs/selinux")
     parts += [b for b in (st.selinux_blocker, st.apparmor_blocker) if b]
+    if "cold" in kinds and st.cold_blocker:
+        parts.append(st.cold_blocker)
     if st.apparmor and kinds and st.apparmor_parser is None:
         parts.append("apparmor_parser not found: blastbox profiles cannot be loaded")
-    if {"cold", "gvisor"} & set(kinds):
+    if "gvisor" in kinds:     # the warm tier's own binary; cold runsc is dockerd's runtime
         split = {True: "split sentry", False: "single binary", None: "sentry layout unknown"}
         parts.append(f"runsc {st.runsc} ({split[st.runsc_split_sentry]})" if st.runsc
                      else "runsc not found")
@@ -1112,17 +1114,18 @@ def _check_confinement(host: HostView, tiers: Collection[str],
     parts.append("detection only, nothing enforced yet")
     missing = cf.unmet(st, mode, kinds)
     if missing:
-        # A kind reachable only through cascade OVERFLOW tiers that are themselves unavailable
-        # (``skipped``: their tier checks FAILed): the dispatcher skips those at startup. An
-        # AVAILABLE overflow tier is admitted, and then require refuses to start.
+        # ``skipped``: tiers the dispatcher will NOT run here -- an unselected preview tier (no
+        # pool configured: cold only), or a cascade OVERFLOW tier that is itself unavailable
+        # (the dispatcher drops it at startup). An AVAILABLE overflow tier is admitted, and then
+        # require refuses to start, so it stays a FAIL.
         hard = [k for k in missing
                 if not {t for t in reach if cf.kinds_for_tiers({t}) == [k]} <= set(skipped)]
         msg = "; ".join(parts) + f"; require unmet for {', '.join(missing)}"
         if hard:
             return Check("confinement", Status.FAIL, msg, doc, facts)
         return Check("confinement", Status.WARN,
-                     msg + " -- only via cascade overflow tiers, which the dispatcher skips if "
-                     "unavailable at startup (refuses to start if they are available)", doc, facts)
+                     msg + " -- only via tiers this dispatcher will not run (not selected, or "
+                     "cascade overflow tiers unavailable at startup)", doc, facts)
     if st.flags:
         return Check("confinement", Status.WARN,
                      "; ".join(parts) + "; apparmor_parser 4.0.1 compiles `audit deny umount` "
@@ -1251,7 +1254,9 @@ def run_preflight(host: HostView, tiers: Sequence[str], *, explicit: bool = True
         out.append(_check_userns(host, t))
     failed = {c.name for c in out if c.status is Status.FAIL}
     skipped = {tier for tier in _overflow_only_tiers(host.env)
-               if failed & set(_TIER_CHECKS[tier])}
+               if failed & {*_TIER_CHECKS[tier], *_SOFT_CHECKS[tier]}}
+    if not explicit and host.env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower() in ("", "none"):
+        skipped |= {"gvisor", "firecracker"}     # preview: the dispatcher runs cold only
     # remote-only too: dispatch validates the mode
     out.append(_check_confinement(host, t, skipped))
     out.append(_check_clock(host))

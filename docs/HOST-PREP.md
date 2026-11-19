@@ -233,7 +233,9 @@ itself, an LSM that is on but cannot be used from the dispatcher's context is re
 reason and does not count: no securityfs to load AppArmor policy through, a caller already
 confined by another AppArmor profile (e.g. `docker-default`, which has no `change_profile`
 rule), or a read-only selinuxfs. `cold` is judged on the host's state alone, because dockerd
-(through a docker runtime wrapper) starts that runsc, not the dispatcher.
+(through a docker runtime wrapper) starts that runsc, not the dispatcher -- unless
+`DOCKER_HOST`/`DOCKER_CONTEXT` point the docker CLI at another daemon, in which case this host
+says nothing about it and `cold` counts as none.
 
 `BLASTBOX_CONFINEMENT=auto|require|off` (default `auto`). `require` makes `blastbox dispatch`
 refuse to start, and preflight FAIL, when a sandbox kind the dispatcher can run (including
@@ -241,11 +243,13 @@ refuse to start, and preflight FAIL, when a sandbox kind the dispatcher can run 
 
 Preflight's `confinement` check prints the LSM stack, SELinux mode, AppArmor state and
 `apparmor_parser` version, the Landlock ABI, the runsc release, and firecracker/jailer presence;
-`--json` carries the same as `facts`. Usability is judged from the process that runs the check
+`--json` carries the same as `facts`. (The runsc release shown is the warm tier's binary; the
+cold tier's runsc is whatever dockerd has registered, see `docker-runsc-runtime`.) Usability is judged from the process that runs the check
 (its AppArmor label, what it can see of `/sys`), so run preflight where the dispatcher runs:
-inside its container, or under its unit's profile. A kind reached only through cascade overflow
-tiers is a WARN, not a FAIL, since the dispatcher skips an overflow tier that is unavailable at
-startup. Two conditions it calls out:
+inside its container, or under its unit's profile. A `require` miss is a WARN, not a FAIL, when
+it comes only from tiers this dispatcher will not run: the no-pool preview (the dispatcher runs
+cold only), or a cascade overflow tier that is itself unavailable (the dispatcher drops it at
+startup). An available overflow tier is admitted, and then the dispatcher refuses to start. Two conditions it calls out:
 
 - **apparmor_parser 4.0.1** (WARN): pairing `audit deny umount,` with another `audit deny`
   mount-class rule compiles to ALLOW mount (measured with kernel 6.8). This matters today, not
