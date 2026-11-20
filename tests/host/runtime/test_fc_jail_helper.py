@@ -170,7 +170,11 @@ def test_profile_is_per_jail_and_names_the_exact_listener_path(tmp_path):
     assert "deny network inet," in boot and "deny /dev/net/tun rw," in boot
     restore = h.render_profile(cfg, JID, boot=False, listener_host_path=None)
     assert "/warm.mem r," in restore and "warm.mem rw" not in restore
-    assert "/vmlinux" not in restore and "vsock.sock_10000" not in restore.split("/vsock.sock_*")[1]
+    assert "/vmlinux" not in restore and "vsock.sock_" not in restore
+    # No glob may grant write: every writable name is one fixed file (a glob lets an escaped VMM
+    # create unboundedly many files in its own root, AppArmor or not).
+    for profile in (boot, restore):
+        assert not [ln for ln in profile.splitlines() if "*" in ln and " rw," in ln]
 
 
 # --------------------------------------------------------------------------- live helper
@@ -414,6 +418,19 @@ def test_publish_makes_a_root_owned_read_only_generation(env):
     assert not (Path(jail.root) / "warm.mem").exists()      # moved out of the jail's reach
     assert any(c[0] == "f" and c[2:] == (0, 0) for c in env.chowns)
     assert reply["gen"] in env.owner.gens
+    assert gdir.stat().st_mode & 0o777 == 0o700          # root-only, like gens/ itself
+
+
+def test_the_state_tree_is_root_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(h, "_check_root_dir", lambda p: None)
+    fcbin = tmp_path / "fc"
+    fcbin.write_bytes(b"#!fake\n")
+    cfg = _cfg(tmp_path, firecracker=str(fcbin), chroot_base=tmp_path / "base")
+    (tmp_path / "base").mkdir(mode=0o755)
+    helper = h.Helper(cfg, apparmor_enabled=False, lchown=lambda p, u, g: None)
+    helper._prepare_state_tree()
+    for d in (cfg.chroot_base, cfg.assets_dir, cfg.gens_dir, cfg.bin_dir):
+        assert d.stat().st_mode & 0o777 == 0o700, d
 
 
 @pytest.mark.parametrize("plant", ["symlink", "hardlink", "oversized"])
@@ -572,18 +589,21 @@ def test_serve_conn_answers_an_allowed_peer_and_validates(env):
         a.close()
 
 
-def test_serve_conn_drops_a_peer_whose_uid_is_not_allowed(tmp_path):
+def test_serve_conn_refuses_a_peer_whose_uid_is_not_allowed(tmp_path):
     cfg = _cfg(tmp_path, allowed_uids=frozenset({os.getuid() + 1}))
     helper = h.Helper(cfg, apparmor_enabled=False)
     a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     try:
         a.send(h.encode({"op": "hello"}))
         helper.serve_conn(b)
-        try:
-            got = a.recv(h.MAX_MSG)
-        except ConnectionResetError:
-            got = b""
-        assert got == b""                          # closed without an answer
+        reply = h.decode(a.recv(h.MAX_MSG))
+        # Told it is not allowed (decided, never retried as an outage), and nothing it sent
+        # was acted on: no owner registered, no hello answered.
+        assert reply == {"ok": False, "error": "forbidden",
+                         "detail": f"uid {os.getuid()} is not allowed (--allow-uid)"}
+        assert not helper._owners
+        with pytest.raises(ConnectionResetError):   # closed with its request unread
+            a.recv(h.MAX_MSG)
     finally:
         a.close()
 
@@ -1328,3 +1348,27 @@ def test_an_asset_whose_unlink_fails_stays_tracked_and_is_retried(env, monkeypat
     monkeypatch.setattr(h.os, "unlink", real)
     env.helper.monitor_once()
     assert aid not in env.helper._assets
+
+
+@pytest.mark.parametrize("out,ok", [(b"Firecracker v1.16.0\n", True), (b"Firecracker v1.15.1", True),
+                                    (b"Firecracker v1.12.1\n", False), (b"Firecracker v1.15.0", False)])
+def test_the_helper_refuses_a_firecracker_older_than_the_minimum(tmp_path, monkeypatch, out, ok):
+    # The helper enforces it itself: a dispatcher only checks once, at its own start, and a
+    # helper restarted with an older binary must not serve the dispatchers already running.
+    monkeypatch.setattr(h, "_check_root_owned_exec", lambda label, path: None)
+    monkeypatch.setattr(h.Helper, "_prepare_state_tree", lambda self: None)
+    monkeypatch.setattr(h.Helper, "_setup_cgroups", lambda self: None)
+    run = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, out, b"")  # noqa: E731
+    helper = h.Helper(_cfg(tmp_path), apparmor_enabled=False, run=run, lchown=lambda p, u, g: None)
+    monkeypatch.setattr(h.Path, "exists", lambda self: True)
+    if ok:
+        helper.prepare_host()
+    else:
+        with pytest.raises(RuntimeError, match="1.15.1"):
+            helper.prepare_host()
+
+
+def test_the_helper_minimum_matches_the_dispatcher_gate():
+    from blastbox.host.runtime import firecracker as fc
+
+    assert h.MIN_FC_VERSION == fc._MIN_FC_VERSION

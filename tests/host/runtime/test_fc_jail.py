@@ -987,3 +987,132 @@ def test_a_health_check_without_a_budget_still_uses_the_tick_budget(tmp_path):
     assert rt.is_alive(slot) is True
     assert seen and all(t is not None and t <= fc_jail._TICK_BUDGET_S for t in seen)
     rt.reap(slot)
+
+
+# --------------------------------------------------------------------------- decided vs undecided
+import contextlib as _contextlib  # noqa: E402
+
+
+@_contextlib.contextmanager
+def _serving(tmp_path, **cfg_kw):
+    sock_path = tmp_path / "run" / "h.sock"
+    cfg_kw.setdefault("allowed_uids", frozenset({os.getuid()}))
+    cfg = h.HelperConfig(socket_path=sock_path, socket_gid=os.getgid(), firecracker="/x/fc",
+                         jailer="/x/jailer", chroot_base=tmp_path / "jail",
+                         cgroup_parent_rel="x", cgroup_root=tmp_path / "cg", apparmor="off",
+                         **cfg_kw)
+    helper = h.Helper(cfg, apparmor_enabled=False, lchown=lambda p, u, g: None)
+    helper.fc_version = "1.16.0"
+    for d in (cfg.chroot_base, cfg.assets_dir, cfg.gens_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    ready = threading.Event()
+    t = threading.Thread(target=helper.serve, kwargs={"ready": ready.set}, daemon=True)
+    t.start()
+    assert ready.wait(5)
+    try:
+        yield helper, str(sock_path)
+    finally:
+        helper._stop.set()
+        t.join(5)
+
+
+def _classify(monkeypatch, path):
+    from blastbox.host.runtime import cascade
+    from blastbox.host.runtime import firecracker as fc
+
+    monkeypatch.delenv("BLASTBOX_FC_JAILER", raising=False)
+    monkeypatch.setenv("BLASTBOX_FC_JAIL_SOCKET", path)
+    with pytest.raises(fc.FCUnavailable) as exc:
+        fc._jail_client()
+    return exc.value, cascade._is_undecided_availability(exc.value)
+
+
+def test_a_uid_the_helper_does_not_allow_is_a_decided_refusal(monkeypatch, tmp_path):
+    with _serving(tmp_path, allowed_uids=frozenset({os.getuid() + 1})) as (_, path):
+        exc, undecided = _classify(monkeypatch, path)
+    assert not undecided and "allow-uid" in str(exc)
+
+
+def test_a_protocol_mismatch_is_a_decided_refusal(monkeypatch, tmp_path):
+    with _serving(tmp_path) as (_, path):
+        monkeypatch.setattr(fc_jail, "PROTOCOL_VERSION", fc_jail.PROTOCOL_VERSION + 1)
+        exc, undecided = _classify(monkeypatch, path)
+    assert not undecided and "protocol" in str(exc)
+
+
+def test_a_socket_this_uid_may_not_open_is_a_decided_refusal(monkeypatch, tmp_path):
+    def _denied(self, *a, **k):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(socket.socket, "connect", _denied)
+    exc, undecided = _classify(monkeypatch, str(tmp_path / "h.sock"))
+    assert not undecided and "Permission denied" in str(exc)
+
+
+def test_a_helper_at_its_client_cap_is_undecided(monkeypatch, tmp_path):
+    import multiprocessing as mp
+
+    with _serving(tmp_path, max_owners=1) as (_, path):
+        ctx = mp.get_context("fork")
+        started, stop = ctx.Event(), ctx.Event()
+
+        def _child():
+            JailClient(path).hello()
+            started.set()
+            stop.wait(30)
+
+        p = ctx.Process(target=_child)
+        p.start()
+        try:
+            assert started.wait(10)
+            exc, undecided = _classify(monkeypatch, path)
+        finally:
+            stop.set()
+            p.join(10)
+    assert undecided and "exhausted" in str(exc)
+
+
+def _helper_for(tmp_path):
+    cfg = h.HelperConfig(socket_path=tmp_path / "run" / "h.sock", socket_gid=os.getgid(),
+                         allowed_uids=frozenset({os.getuid()}), firecracker="/x/fc",
+                         jailer="/x/jailer", chroot_base=tmp_path / "jail",
+                         cgroup_parent_rel="x", cgroup_root=tmp_path / "cg", apparmor="off")
+    return h.Helper(cfg, apparmor_enabled=False, lchown=lambda p, u, g: None)
+
+
+@pytest.mark.parametrize("mode", [0o777, 0o770, 0o757])
+def test_the_helper_refuses_an_existing_socket_directory_others_can_write(tmp_path, mode):
+    run = tmp_path / "run"
+    run.mkdir()
+    os.chmod(run, mode)
+    with pytest.raises(RuntimeError, match="not group/other-writable"):
+        _helper_for(tmp_path).serve()
+    assert not (run / "h.sock").exists()
+
+
+def test_the_socket_is_bound_0660_without_a_chmod_by_path(tmp_path, monkeypatch):
+    chmodded = []
+    real = os.chmod
+    monkeypatch.setattr(h.os, "chmod", lambda p, m, **k: (chmodded.append(str(p)), real(p, m, **k)))
+    with _serving(tmp_path) as (_, path):
+        assert os.stat(path).st_mode & 0o777 == 0o660
+    assert path not in chmodded
+
+
+def test_an_outdisk_copy_that_cannot_start_its_worker_leaks_no_descriptor(tmp_path, monkeypatch):
+    src, dst = tmp_path / "s", tmp_path / "d"
+    src.write_bytes(b"x" * 4096)
+    s, d = os.open(src, os.O_RDONLY), os.open(dst, os.O_WRONLY | os.O_CREAT)
+
+    def _no_thread(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", _no_thread)
+    before = len(os.listdir("/proc/self/fd"))
+    try:
+        with pytest.raises(RuntimeError, match="new thread"):
+            fc_jail._copy_bounded(s, d, 4096)
+        assert len(os.listdir("/proc/self/fd")) == before
+    finally:
+        os.close(s)
+        os.close(d)

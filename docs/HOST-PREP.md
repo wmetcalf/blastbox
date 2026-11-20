@@ -312,7 +312,9 @@ sudo systemctl daemon-reload && sudo systemctl enable --now blastbox-fc-jail-hel
 ```
 
 Then, in every Firecracker dispatcher container: bind-mount `/run/blastbox-fc-jail` (the helper's
-socket directory, `root:<dispatcher gid> 0750`). A jailed dispatcher no longer needs `/dev/kvm` or a
+socket directory, `root:<dispatcher gid> 0750`; the helper creates it that way, and refuses to start
+on an existing one that is not root-owned or is group/other-writable -- whoever could write it
+could replace the socket and answer every dispatcher). A jailed dispatcher no longer needs `/dev/kvm` or a
 firecracker binary of its own -- the helper has both -- but it must still be able to READ
 `BLASTBOX_FC_KERNEL` and `BLASTBOX_FC_ROOTFS`: they are handed to the helper as open file
 descriptors, never as paths.
@@ -330,8 +332,10 @@ descriptors, never as paths.
   jails together. Each jail is capped at guest RAM + its output disk + 256 MiB
   (`--jail-mem-overhead-mib`), plus guest RAM again for a boot jail (a warm base dumps a
   guest-RAM-sized memory file): on a tmpfs chroot base the files a jail writes are charged to
-  it, and the helper's own copies (assets, generations, restore disks) to the unit -- size
-  `MemoryMax=` for those too.
+  it, and the helper's own copies (assets, restore disks, a generation's output disk) to the
+  unit -- size `MemoryMax=` for those too. A warm generation's memory file is the boot jail's
+  own write, kept by hard link: it stays charged to the jails subtree after that jail is gone,
+  so size `--jails-memory-max` for live guests PLUS every kept generation's guest RAM.
 - **Uids:** `--uid-min`/`--uid-max` (default 200000-200999) must not overlap real users or any
   container's user-namespace mapping; one is used per live microVM.
 - **Lifetime:** jails and generations belong to the dispatcher process that created them; when it
@@ -347,8 +351,10 @@ descriptors, never as paths.
   can saturate. Size the caps for the stacks you run.
 - **Without AppArmor** (`--apparmor off`, or `auto` on a kernel without it) a VMM a guest escaped
   into is still chrooted, uid-isolated and capped per file (`fsize`), but it can create files in its
-  own jail root on the shared `--chroot-base`. Use `--apparmor require` where AppArmor exists, and
-  keep the chroot base on its own filesystem (or a size-limited tmpfs) so it cannot fill the host's.
+  own jail root on the shared `--chroot-base`. Use `--apparmor require` where AppArmor exists: the
+  per-jail profile grants write only to fixed names (no globs). Even then a VMM can unlink and
+  recreate such a name while holding the old file open (up to `no-file` x `fsize`), so keep the
+  chroot base on its own filesystem (or a size-limited tmpfs) so it cannot fill the host's.
 - **Opting out:** `BLASTBOX_FC_JAILER=off` on the dispatcher restores the previous behaviour
   (firecracker as the dispatcher uid in its container, sharing one scratch tree). Not recommended.
 - **Not jailed:** `blastbox`'s build-time CPU-feature probe (`cpu_probe`) still runs firecracker

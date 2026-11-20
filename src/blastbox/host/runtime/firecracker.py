@@ -197,9 +197,10 @@ def _jail_client() -> Any:
     try:
         return require_jail()
     except JailError as exc:
-        if getattr(exc, "host_io", False):
-            # The helper could not be ASKED (not up yet after a reboot, restarting): undecided,
-            # so a cascade defers and retries the tier instead of dropping it for good.
+        if (getattr(exc, "host_io", False) and not exc.decided) or exc.code == "exhausted":
+            # The helper could not be ASKED (not up yet after a reboot, restarting) or is at its
+            # client cap for now: undecided, so a cascade defers and retries the tier instead of
+            # dropping it for good. A decided answer (uid not allowed, protocol skew) is not.
             raise FCHelperNoVerdict(str(exc)) from exc
         raise FCUnavailable(str(exc)) from exc
 

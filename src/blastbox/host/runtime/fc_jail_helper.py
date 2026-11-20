@@ -88,6 +88,8 @@ JAIL_KERNEL = "vmlinux"
 JAIL_ROOTFS = "rootfs.ext4"
 JAIL_OUTDISK = "outdisk.ext4"
 JAIL_VSOCK = "vsock.sock"
+#: The oldest Firecracker the helper runs (as the dispatcher's own gate, firecracker.py).
+MIN_FC_VERSION = (1, 15, 1)
 JAIL_API_SOCK = "fc-api.sock"
 JAIL_SNAPSHOT = "warm.snapshot"
 JAIL_MEM = "warm.mem"
@@ -366,7 +368,6 @@ def render_profile(cfg: "HelperConfig", jail_id: str, *, boot: bool, listener_ho
         f"  /{JAIL_OUTDISK} rw,",
         f"  /{JAIL_API_SOCK} rw,",
         f"  /{JAIL_VSOCK} rw,",
-        f"  /{JAIL_VSOCK}_* rw,",
         "  /run/ r,",
         "  /dev/null rw,",
         "  unix (create, bind, listen, accept, connect, send, receive, getattr, getopt, setopt,"
@@ -854,9 +855,19 @@ class Helper:
             _check_root_owned_exec(label, path)
         if self.apparmor:
             _check_root_owned_exec("apparmor_parser", self.cfg.apparmor_parser)
+        self.fc_version = _version(self._run, self.cfg.firecracker)
+        # Enforced HERE, not only by each dispatcher at its own start: a helper restarted with
+        # an older binary must not serve the dispatchers already running against it.
+        if tuple(int(x) for x in self.fc_version.split(".")) < MIN_FC_VERSION:
+            raise RuntimeError(f"firecracker {self.fc_version} is older than "
+                               f"{'.'.join(map(str, MIN_FC_VERSION))} (guest-reachable "
+                               f"virtio-rng host-memory DoS)")
         if not Path("/dev/kvm").exists():
             raise RuntimeError("/dev/kvm is missing: no hardware virtualisation on this host")
-        self.fc_version = _version(self._run, self.cfg.firecracker)
+        self._prepare_state_tree()
+        self._setup_cgroups()
+
+    def _prepare_state_tree(self) -> None:
         base = self.cfg.chroot_base
         base.mkdir(parents=True, exist_ok=True)
         _check_root_dir(base)
@@ -876,7 +887,6 @@ class Helper:
         shutil.copyfile(self.cfg.firecracker, tmp)
         os.chmod(tmp, 0o755)
         os.replace(tmp, master)
-        self._setup_cgroups()
 
     def _setup_cgroups(self) -> None:
         cfg = self.cfg
@@ -1722,13 +1732,20 @@ class Helper:
             self._lchown(parent, 0, cfg.socket_gid)
             os.chmod(parent, 0o750)
         # An EXISTING directory is never re-owned or re-moded: it may be shared (/run itself, or
-        # another helper instance's), and taking it over would lock its other users out.
+        # another helper instance's), and taking it over would lock its other users out. It is
+        # REFUSED instead when anyone but us could replace the socket in it: whoever can would
+        # answer every dispatcher in the helper's place.
+        _check_owned_dir(parent, os.geteuid())
         with contextlib.suppress(FileNotFoundError):
             cfg.socket_path.unlink()
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        srv.bind(str(cfg.socket_path))
+        # Bound 0660 by the umask: never chmod'ed by path afterwards (a path can be swapped).
+        old_umask = os.umask(0o117)
+        try:
+            srv.bind(str(cfg.socket_path))
+        finally:
+            os.umask(old_umask)
         self._lchown(cfg.socket_path, 0, cfg.socket_gid)
-        os.chmod(cfg.socket_path, 0o660)
         srv.listen(_LISTEN_BACKLOG)
         srv.settimeout(1.0)
         threading.Thread(target=self._monitor_loop, daemon=True, name="fcj-monitor").start()
@@ -1820,6 +1837,11 @@ class Helper:
             pid, uid, _gid = array.array("i", cred).tolist()
             if uid not in self.cfg.allowed_uids or pid <= 0:
                 _log.warning("fc_jail.refused_peer uid=%d pid=%d", uid, pid)
+                # Say so (nothing it sent is read): the client must tell "never allowed" from
+                # "dropped under load", or a startup gate retries a misconfiguration forever.
+                with contextlib.suppress(OSError):
+                    self._reply(conn, {"ok": False, "error": "forbidden",
+                                       "detail": f"uid {uid} is not allowed (--allow-uid)"}, [])
                 return
             # Room for the kernel's per-message maximum: descriptors that do not fit are
             # released BY THE KERNEL inside recvmsg, where a lingering socket's close blocks this
@@ -2078,12 +2100,19 @@ def _resolution_nodes(path: str) -> "list[str]":
 
 
 def _check_root_dir(path: Path) -> None:
-    # Every node the resolution passes through, symlink chains included (as for executables).
+    _check_owned_dir(path, 0)
+
+
+def _check_owned_dir(path: Path, uid: int) -> None:
+    """Refuse ``path`` unless every node its resolution passes through (symlink chains
+    included, as for executables) is owned by root or ``uid`` and not group/other-writable
+    (sticky directories excepted)."""
     for node in _resolution_nodes(str(path)):
         st = os.lstat(node)
-        if st.st_uid != 0 or (not stat.S_ISLNK(st.st_mode) and st.st_mode & 0o022
-                              and not st.st_mode & stat.S_ISVTX):
-            raise RuntimeError(f"{node} must be root-owned and not group/other-writable")
+        if st.st_uid not in (0, uid) or (not stat.S_ISLNK(st.st_mode) and st.st_mode & 0o022
+                                         and not st.st_mode & stat.S_ISVTX):
+            who = "root-owned" if uid == 0 else f"owned by root or uid {uid}"
+            raise RuntimeError(f"{node} must be {who} and not group/other-writable")
 
 
 def _own_cgroup() -> str:

@@ -58,7 +58,8 @@ JAIL_MEM_PATH = "/warm.mem"
 #: Error codes that say the HELPER (this host's control plane) failed, not the guest/VMM. A
 #: failure carrying one of these is host I/O for fault attribution: a helper outage hits every
 #: job at once and must never be charged to -- or burn out -- healthy workers.
-INFRA_CODES = frozenset({"unreachable", "timeout", "refused", "internal", "protocol", "busy"})
+INFRA_CODES = frozenset({"unreachable", "timeout", "refused", "internal", "protocol", "busy",
+                         "forbidden"})
 
 #: Per-op client deadlines. Staging work in the helper (an asset copy, mkfs or a sparse copy of
 #: an output disk, a publish) is bounded by its own copy timeout (600 s): the client must wait
@@ -77,10 +78,13 @@ _BUSY_RETRIES = 6
 class JailError(RuntimeError):
     """The helper refused a request or could not be reached."""
 
-    def __init__(self, code: str, detail: str = "") -> None:
+    def __init__(self, code: str, detail: str = "", *, decided: bool = False) -> None:
         super().__init__(f"fc jail helper: {code}{': ' + detail if detail else ''}")
         self.code = code
         self.detail = detail
+        #: The helper answered and the answer will not change by retrying (this uid is not
+        #: allowed, the protocols disagree): a startup gate must DECIDE on it, not defer it.
+        self.decided = decided or code == "forbidden"
         if code in INFRA_CODES:
             self.host_io = True
 
@@ -166,6 +170,11 @@ class JailClient:
                 sock.connect(self.socket_path)
             except TimeoutError:
                 raise
+            except (PermissionError, ConnectionRefusedError, FileNotFoundError) as exc:
+                # Missing or not listening yet (a reboot, a restart) is undecided; a socket
+                # this uid may not open is decided -- retrying never changes its permissions.
+                code = "forbidden" if isinstance(exc, PermissionError) else "unreachable"
+                raise JailError(code, f"{self.socket_path}: {exc.strerror or exc}") from exc
             except OSError as exc:
                 raise JailError("unreachable", f"{self.socket_path}: {exc.strerror or exc}") from exc
             _arm()
@@ -220,9 +229,10 @@ class JailClient:
         reply, _ = self.call("hello")
         if reply.get("protocol") != PROTOCOL_VERSION:
             raise JailError("protocol", f"helper speaks protocol {reply.get('protocol')}, "
-                                        f"this dispatcher {PROTOCOL_VERSION}")
+                                        f"this dispatcher {PROTOCOL_VERSION}", decided=True)
         if reply.get("ready_port") != READY_PORT:
-            raise JailError("protocol", "helper READY port disagrees with this dispatcher")
+            raise JailError("protocol", "helper READY port disagrees with this dispatcher",
+                            decided=True)
         self.info = reply
         return reply
 
@@ -324,7 +334,8 @@ def require_jail(settings: "JailSettings | None" = None) -> "JailClient | None":
         client.hello()
     except JailError as exc:
         raise JailError(exc.code, f"{exc.detail} -- the Firecracker tier requires the jail "
-                                  f"helper ({ENV_JAILER} defaults to on); {opt_out_hint()}") from exc
+                                  f"helper ({ENV_JAILER} defaults to on); {opt_out_hint()}",
+                        decided=exc.decided) from exc
     return client
 
 
@@ -510,7 +521,13 @@ def _copy_bounded(src: int, dst: int, size: int) -> None:
             # Bounded: a wedged filesystem must not cost a thread and two fds per job forever.
             raise HostDiskTimeout(cmd=f"copy jailed output disk (refused: {len(_ABANDONED)} "
                                       "earlier copies still stuck)", timeout=timeout)
-    worker.start()
+    try:
+        worker.start()
+    except BaseException:
+        # No worker to hand the duplicates to (thread exhaustion): they are ours to close.
+        os.close(s2)
+        os.close(d2)
+        raise
     worker.join(timeout)
     if not done:
         with _ABANDONED_LOCK:
