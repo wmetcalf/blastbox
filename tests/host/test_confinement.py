@@ -911,3 +911,12 @@ def test_local_primary_cascade_with_network_overflow_keeps_the_cold_fallback():
     cs = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False)
     c = next(c for c in cs if c.name == "confinement")
     assert c.status is Status.FAIL and "cold" in c.facts["would_use"]  # type: ignore[index]
+
+
+def test_checking_only_a_skipped_overflow_tier_keeps_the_primarys_cold_fallback():
+    env = {"BLASTBOX_CONFINEMENT": "require", "BLASTBOX_POOL_RUNTIME": "cascade",
+           "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2", "DOCKER_HOST": "tcp://10.1.2.3:2376"}
+    host = _healthy(files=UBUNTU, env=env)
+    host.paths.discard("/dev/kvm")                       # firecracker overflow unavailable
+    c = next(c for c in pf.run_preflight(host, ["firecracker"]) if c.name == "confinement")
+    assert c.status is Status.FAIL and "cold" in c.facts["would_use"]  # type: ignore[index]

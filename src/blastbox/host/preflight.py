@@ -1289,14 +1289,14 @@ def _check_confinement(host: HostView, tiers: Collection[str],
         mode = cf.mode_from_env(host.env)
     except ValueError as exc:
         return Check("confinement", Status.FAIL, f"{exc}; the dispatcher refuses to start", doc)
-    # The kinds the DISPATCHER can reach (dispatch.reachable_tiers): a file-handshake warm tier
-    # also cold-falls-back to docker (runsc) unless warm-only -- not a network-endpoint (remote)
-    # dispatcher, and not through a local tier it skips (resolve_tiers mirrors the same rule).
+    # The kinds the DISPATCHER can reach (dispatch.reachable_tiers): a file-handshake dispatcher
+    # with a warm tier also cold-falls-back to docker (runsc) unless warm-only. Whether it is
+    # file-handshake comes from its configuration (a cascade boots in its primary's style), not
+    # from which tiers are being checked.
     reach = set(tiers)
     warm_only = host.env.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower() in (
         "1", "true", "yes", "on")
-    if (reach - set(skipped)) & {"gvisor", "firecracker"} and not warm_only \
-            and _file_style_dispatcher(host.env):
+    if reach & {"gvisor", "firecracker"} and not warm_only and _file_style_dispatcher(host.env):
         reach.add("docker")
     kinds = cf.kinds_for_tiers(reach)
     st = cf.probe(host, env=host.env, kinds=kinds, landlock=host.landlock_abi())
