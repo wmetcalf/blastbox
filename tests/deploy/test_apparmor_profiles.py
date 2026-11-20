@@ -307,38 +307,17 @@ def test_the_mediation_check_tells_the_spellings_apart(extra: str, mediated: boo
 _CANONICAL_UMOUNT = ("audit deny umount /,", "audit deny umount /**,")
 
 
-_COMMENT = re.compile(r"[ \t]*#( .*)?")             # `# prose` -- never `#include`, `#x`
-_BLANK = re.compile(r"[ \t]*")
-_CLOSED_RULE = re.compile(r"[ \t]*[ -~]*[,{}]")      # printable ASCII, statement closed
-_INCLUDE = re.compile(r"[ \t]*include <[^<>\s]+>")
-
-
-def _profile_shape_ok(text: str) -> bool:
-    """The profile keeps a shape in which comments and rules cannot be confused, so the text
-    guard need not model the parser's (stateful) lexer: every line is blank, a `# ...` comment,
-    an `include <...>` line, or a printable-ASCII rule line holding no `#` or quote and ending
-    its statement (`,` `{` `}`). So no statement is left open for a following `#` line to
-    continue, no `#include` is read as a comment, and nothing hides in a quoted string."""
-    for ln in text.split("\n"):
-        if _BLANK.fullmatch(ln) or _COMMENT.fullmatch(ln) or _INCLUDE.fullmatch(ln):
-            continue
-        if not _CLOSED_RULE.fullmatch(ln) or "#" in ln or '"' in ln:
-            return False
-    return True
-
-
 def _umount_rules_ok(text: str) -> bool:
-    """A strict allowlist rather than a re-implementation of the parser: given the shape above,
-    `umount` (or its synonym `unmount`) may appear outside comments ONLY in the two canonical
-    denies, each alone on its line. Any other umount rule -- however spelled -- must first be
-    checked against the compiled DFA on a parser <= 4.0.x and then added here deliberately."""
-    if not _profile_shape_ok(text):
-        return False
-    rules = [ln for ln in text.split("\n") if not _COMMENT.fullmatch(ln)]
-    mentions = re.findall(r"\b(?:umount|unmount)\b", "\n".join(rules))
-    stripped = [ln.strip() for ln in rules]
+    """A strict allowlist that does not try to tell comments from rules (the parser's lexer is
+    stateful: `#` is a comment only at some token boundaries, and a list, escape, quote or
+    open statement can carry it into a rule). Anywhere in the file, comments included, the
+    keyword `umount` (or its synonym `unmount`) may appear ONLY in the two canonical denies,
+    each alone on its line. Any other umount rule -- or prose naming the keyword -- must first
+    be checked against the compiled DFA on a parser <= 4.0.x and then allowed here."""
+    mentions = re.findall(r"\b(?:umount|unmount)\b", text)
+    lines = [ln.strip() for ln in text.split("\n")]
     return len(mentions) == len(_CANONICAL_UMOUNT) and all(
-        stripped.count(rule) == 1 for rule in _CANONICAL_UMOUNT)
+        lines.count(rule) == 1 for rule in _CANONICAL_UMOUNT)
 
 
 def test_umount_denies_are_spelled_with_a_path() -> None:
@@ -346,9 +325,8 @@ def test_umount_denies_are_spelled_with_a_path() -> None:
     the compiled check cannot see the bug (a umount deny that can match the empty mountpoint
     unmediates the mount class on apparmor_parser <= 4.0.x)."""
     assert _umount_rules_ok((_PROFILE_DIR / "blastbox-sandbox").read_text()), (
-        f"blastbox-sandbox may contain no umount rule but {_CANONICAL_UMOUNT}, and must keep "
-        "the line shape _profile_shape_ok describes: check any other umount rule against the "
-        "compiled DFA (test_the_child_profile_mediates_the_mount_class on a "
+        f"blastbox-sandbox may name the umount keyword only in {_CANONICAL_UMOUNT} (comments "
+        "count too): check any other umount rule against the compiled DFA (test_the_child_profile_mediates_the_mount_class on a "
         "<= 4.0.x parser) and extend _CANONICAL_UMOUNT deliberately"
     )
 
@@ -371,6 +349,8 @@ def test_umount_denies_are_spelled_with_a_path() -> None:
     "  change_profile ->\n\x0c#x, audit deny umount,",
     "  #include if exists <local/blastbox-sandbox> audit deny umount,",
     "  #include <abstractions/base>audit deny umount,",
+    "  audit deny mount fstype=(proc,\n  # sysfs), audit deny umount,",
+    "  audit deny mount fstype=a\\,\n  # -> /m/, audit deny umount,",
 ])
 def test_the_text_guard_rejects_any_other_umount_rule(extra: str) -> None:
     text = (_PROFILE_DIR / "blastbox-sandbox").read_text().replace(
@@ -378,9 +358,10 @@ def test_the_text_guard_rejects_any_other_umount_rule(extra: str) -> None:
     assert not _umount_rules_ok(text)
 
 
-def test_the_text_guard_ignores_umount_in_comments() -> None:
-    text = (_PROFILE_DIR / "blastbox-sandbox").read_text() + "\n# audit deny umount, (prose)\n"
-    assert _umount_rules_ok(text)
+def test_the_text_guard_counts_comments_too() -> None:
+    """A '#' line is not always a comment to the parser, so the guard does not exempt any."""
+    text = (_PROFILE_DIR / "blastbox-sandbox").read_text() + "\n# audit deny umount,\n"
+    assert not _umount_rules_ok(text)
 
 
 def test_the_child_profile_loads_on_the_oldest_supported_apparmor() -> None:
@@ -459,6 +440,3 @@ def test_the_oracle_checks_every_profile_in_the_file() -> None:
         "  profile helper {\n    /usr/bin/true rix,\n    audit deny umount,\n  }\n}\n")
     assert _mediates_mount(shipped) and not _mediates_mount(bad_child)
 
-
-def test_the_shipped_profile_keeps_the_guarded_shape() -> None:
-    assert _profile_shape_ok((_PROFILE_DIR / "blastbox-sandbox").read_text())
