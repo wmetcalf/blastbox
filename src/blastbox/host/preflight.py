@@ -1346,8 +1346,12 @@ def _jailed(p: _Proc) -> bool | None:
 
 
 def _helper_vmm(p: _Proc) -> bool:
-    """A VMM the jail helper started: its exec file is ``firecracker-<jail id>``."""
-    return bool(p.argv) and os.path.basename(p.argv[0]).startswith("firecracker-")
+    """A VMM the jail helper started: its exec file is ``firecracker-<jail id>``, the id as the
+    helper validates it (so a renamed release binary, firecracker-v1.16.0-x86_64, is not)."""
+    from blastbox.host.runtime.fc_jail_helper import JAIL_ID_RE  # noqa: PLC0415
+
+    name = os.path.basename(p.argv[0]) if p.argv else ""
+    return name.startswith("firecracker-") and bool(JAIL_ID_RE.match(name[len("firecracker-"):]))
 
 
 def _jail_id(p: _Proc) -> str:

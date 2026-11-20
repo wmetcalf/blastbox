@@ -639,7 +639,7 @@ _HELLO_NO_AA = ({"protocol": 1, "firecracker": "1.16.0", "apparmor": False}, "",
 def test_jailed_firecracker_outside_its_per_jail_profile_warns():
     """The helper says it loads a per-jail profile: a jailed VMM in any OTHER profile is not
     the confinement the helper reported (enforcing or not)."""
-    p = _proc(300, ["/firecracker-a", "--id", "a", "--start-time-us", "1"], uid=10001,
+    p = _proc(300, ["/firecracker-jail0aaa", "--id", "jail0aaa", "--start-time-us", "1"], uid=10001,
               aa="docker-default (enforce)\n")
     c = _by_name(pf.run_preflight(_with_procs(p), ["firecracker"]))["sandbox-confinement"]
     assert c.status is Status.WARN
@@ -647,7 +647,7 @@ def test_jailed_firecracker_outside_its_per_jail_profile_warns():
 
 
 def test_unconfined_jailed_firecracker_names_the_helper_without_apparmor():
-    p = _proc(300, ["/firecracker-a", "--id", "a", "--start-time-us", "1"], uid=10001,
+    p = _proc(300, ["/firecracker-jail0aaa", "--id", "jail0aaa", "--start-time-us", "1"], uid=10001,
               aa="unconfined\n")
     host = _with_procs(p)
     host.jail = _HELLO_NO_AA
@@ -1880,7 +1880,7 @@ def test_every_firecracker_vmm_counts_but_firecracker_containerd_does_not():
 
 
 def test_jailed_vmm_problems_get_jailer_aware_advice():
-    p = _proc(300, ["/firecracker-a", "--id", "a", "--start-time-us", "1"], uid=10001,
+    p = _proc(300, ["/firecracker-jail0aaa", "--id", "jail0aaa", "--start-time-us", "1"], uid=10001,
               aa="unconfined\n")
     c = _by_name(pf.run_preflight(_with_procs(p), ["firecracker"]))["sandbox-confinement"]
     assert c.status is Status.WARN
@@ -1899,7 +1899,7 @@ def test_another_jailer_users_vmm_in_its_own_profile_is_not_off_profile():
 
 
 def test_jailed_vmm_advice_does_not_claim_an_answer_the_helper_never_gave():
-    p = _proc(300, ["/firecracker-a", "--id", "a", "--start-time-us", "1"], uid=10001,
+    p = _proc(300, ["/firecracker-jail0aaa", "--id", "jail0aaa", "--start-time-us", "1"], uid=10001,
               aa="unconfined\n")
     host = _with_procs(p)
     host.jail = (None, "unreachable", "gone")
@@ -1910,7 +1910,17 @@ def test_jailed_vmm_advice_does_not_claim_an_answer_the_helper_never_gave():
 
 
 def test_a_helper_vmm_in_a_sibling_jails_profile_is_off_profile():
-    p = _proc(300, ["/firecracker-a", "--id", "a", "--start-time-us", "1"], uid=10001,
-              aa="blastbox-fc-jail-b (enforce)\n")
+    p = _proc(300, ["/firecracker-jail0aaa", "--id", "jail0aaa", "--start-time-us", "1"], uid=10001,
+              aa="blastbox-fc-jail-jail0bbb (enforce)\n")
     c = _by_name(pf.run_preflight(_with_procs(p), ["firecracker"]))["sandbox-confinement"]
     assert c.status is Status.WARN and "per-jail" in c.detail
+
+
+
+def test_a_firecracker_named_binary_that_is_no_jail_id_is_not_a_helper_vmm():
+    """firecracker-v1.16.0-x86_64 is a renamed release binary, not firecracker-<jail id>
+    (fc_jail_helper.JAIL_ID_RE): its own profile is not the helper's business."""
+    p = _proc(300, ["/usr/local/bin/firecracker-v1.16.0-x86_64", "--id", "vm1",
+                    "--start-time-us", "1"], uid=10001, aa="containerd-fc (enforce)\n")
+    c = _by_name(pf.run_preflight(_with_procs(p), ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.PASS, c.detail
