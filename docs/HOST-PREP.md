@@ -316,7 +316,9 @@ socket directory, `root:<dispatcher gid> 0750`; the helper creates it that way, 
 on an existing one that is not root-owned or is group/other-writable -- whoever could write it
 could replace the socket and answer every dispatcher. The unit creates it in `ExecStartPre`
 and orders itself before `docker.service`, so dockerd never creates it first as a bind-mount
-source; if one was made by hand or by docker, `install -d` re-owns it. A dispatcher container
+source. (`install -d` takes over an existing directory at that path -- root:<gid> 0750 --
+so the helper's own refusal applies to directories the unit did not make, e.g. a custom
+`--socket`.) A dispatcher container
 started BEFORE the directory was replaced still sees the old one: restart it). A jailed dispatcher no longer needs `/dev/kvm` or a
 firecracker binary of its own -- the helper has both -- but it must still be able to READ
 `BLASTBOX_FC_KERNEL` and `BLASTBOX_FC_ROOTFS`: they are handed to the helper as open file

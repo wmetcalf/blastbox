@@ -1748,11 +1748,12 @@ class Helper:
         # write the directory -- checked above -- so the by-path chmod cannot be redirected.)
         prefix = f".{cfg.socket_path.name}."
         for name in os.listdir(parent):
-            # Earlier instances' private names (a start that failed before its rename): only
-            # this helper can write here, so every such name is ours to sweep.
+            # Earlier instances' private names (a start that failed before its rename). Only
+            # SOCKETS are ours: anything else under such a name is left alone, never fatal.
             if name.startswith(prefix) and name[len(prefix):].isdigit():
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink(parent / name)
+                with contextlib.suppress(OSError):
+                    if stat.S_ISSOCK(os.lstat(parent / name).st_mode):
+                        os.unlink(parent / name)
         tmp = parent / f"{prefix}{os.getpid()}"
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         try:

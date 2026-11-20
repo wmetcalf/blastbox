@@ -1258,3 +1258,13 @@ def test_a_refused_peer_that_sends_nothing_frees_its_slot_quickly(tmp_path):
         assert time.monotonic() - t0 < 2.0     # not the 10 s connection timeout
     finally:
         a.close()
+
+
+def test_the_sweep_touches_only_sockets(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir(mode=0o750)
+    (run / ".h.sock.5").mkdir()                # not a socket: never ours, never fatal
+    (run / ".h.sock.6").write_text("x")
+    with _serving(tmp_path) as (_, path):
+        JailClient(path).hello()
+    assert (run / ".h.sock.5").is_dir() and (run / ".h.sock.6").is_file()
