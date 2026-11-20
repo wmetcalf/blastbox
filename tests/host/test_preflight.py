@@ -986,6 +986,25 @@ def test_cascade_member_names_are_case_sensitive_like_the_dispatcher():
     assert pf.resolve_tiers([], env) == ["docker", "firecracker"]
 
 
+def test_cascade_cold_docker_tier_follows_the_primary_not_any_remote_member():
+    """The cold docker fallback exists on a file-handshake dispatcher, and a cascade boots in its
+    PRIMARY member's style (an other-style overflow member must be skipped to boot). A local
+    primary with a network overflow still cold-falls-back, so its docker checks must run; a
+    network primary never does, whatever local overflow it lists."""
+    local_primary = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "firecracker:2,static:4"}
+    assert pf.resolve_tiers([], local_primary) == ["docker", "firecracker", "remote"]
+    checks = _by_name(pf.run_preflight(_healthy(env=local_primary),
+                                       pf.resolve_tiers([], local_primary)))
+    assert "docker-runsc-runtime" in checks
+    warm_only = {**local_primary, "BLASTBOX_DISPATCH_WARM_ONLY": "1"}
+    assert pf.resolve_tiers([], warm_only) == ["firecracker", "remote"]
+    remote_primary = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "static:4,gvisor:2"}
+    assert pf.resolve_tiers([], remote_primary) == ["gvisor", "remote"]
+    # Refused configs keep the cold checks next to the pool-runtime FAIL, as before.
+    assert pf.resolve_tiers([], {"BLASTBOX_POOL_RUNTIME": "cascade"}) == ["docker"]
+    assert pf.resolve_tiers([], {"BLASTBOX_POOL_RUNTIME": "firecrakcer"}) == ["docker"]
+
+
 def test_cascade_primary_skips_empty_items_like_the_parser():
     env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": ",firecracker:2"}
     host = _healthy(env=env)

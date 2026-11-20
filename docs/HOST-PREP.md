@@ -33,7 +33,9 @@ docker only. Pass `--tier` to gate on a tier. Otherwise, without `--tier`, prefl
 each member named in `BLASTBOX_POOL_TIERS` (local `firecracker` / `gvisor` members get their local
 checks, `static` / `aws-*` members map to `remote`). The cold docker tier is added only for a local
 (file-handshake) dispatcher that is not `BLASTBOX_DISPATCH_WARM_ONLY`: network-endpoint pools have
-no cold path. The `pool-runtime` check FAILs a pool name or cascade spec the dispatcher refuses
+no cold path. A cascade takes its primary member's style, so a remote overflow member (which the
+dispatcher must skip at startup to boot a local primary; a selectable one is a refused mix) does
+not drop the cold docker checks. The `pool-runtime` check FAILs a pool name or cascade spec the dispatcher refuses
 (unknown or set-but-empty name, unknown cascade primary, missing/zero capacity, a mix of local and
 remote tiers, worker-mTLS and public-TLS tiers mixed under `BLASTBOX_DISPATCH_TLS_CA`,
 `BLASTBOX_DISPATCH_WARM_ONLY` without a pool) and WARNs on an unknown overflow member,
