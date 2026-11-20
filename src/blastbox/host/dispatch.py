@@ -20,6 +20,7 @@ Security properties (review will check):
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import contextlib
 import logging
@@ -58,6 +59,7 @@ from blastbox.contract.envelope import (
 )
 from blastbox.errors import HOST_RESOURCE_ERRNOS, OutputTrustError, OutputTrustUnknown, WarmTimeout, sanitize_public_error
 from blastbox.host import attest as _attest
+from blastbox.host import confinement as _confinement
 from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
 from blastbox.host.canary import (
     CanaryFailure,
@@ -511,7 +513,11 @@ class Dispatcher:
         blob_retry_backoff_s: float = _BLOB_RETRY_BACKOFF_S,
         attest_key: object = _attest.FROM_ENV,
         claim_untargeted_after_s: float = 0.0,
+        confinement: "_confinement.Detection | None" = None,
     ) -> None:
+        # Host-LSM confinement detection (host/confinement.py), fixed at startup. Detection only:
+        # it gates BLASTBOX_CONFINEMENT=require and is logged; receipts do not carry it yet.
+        self._confinement = confinement
         # Execution-receipt signing key (host/attest.py): an AttestKey, None (no receipts), or
         # FROM_ENV (BLASTBOX_ATTEST_KEY only -- strictly opt-in; unset = no receipts). A
         # key that cannot be loaded is logged loudly and disables receipts -- never jobs.
@@ -733,6 +739,21 @@ class Dispatcher:
         enforce_allowed_runtimes(
             self._engines, reachable_tiers(self._pool, self._tier, self._warm_only)
         )
+        # BLASTBOX_CONFINEMENT here too, for the same reason: an invalid mode is refused, and
+        # require fails closed for embedders that did not pass a detection.
+        env_mode = _confinement.mode_from_env()     # validated even when a detection is passed
+        if self._confinement is None and env_mode == "require":
+            self._confinement = _confinement.detect()
+        if self._confinement is not None:
+            kinds = _confinement.kinds_for_tiers(
+                reachable_tiers(self._pool, self._tier, self._warm_only))
+            # The env's require binds too, whatever mode the passed detection was built with --
+            # and the log reports the mode actually applied.
+            if env_mode == "require" and self._confinement.mode != "require":
+                self._confinement = dataclasses.replace(self._confinement, mode="require")
+            _log.info("confinement (detection only, nothing enforced): %s",
+                      self._confinement.summary(kinds))
+            _confinement.check_required(self._confinement.state, self._confinement.mode, kinds)
         # OPT-IN engine scoping for SHARED multi-dispatcher stores: when set, claim only jobs for
         # engines this dispatcher handles, so it can't grab (and fail "unknown engine") a job that a
         # co-resident VM/other-engine dispatcher owns. Default OFF preserves the single-dispatcher

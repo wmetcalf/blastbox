@@ -220,6 +220,12 @@ network-style cascade — all run by `VmJobDispatcher`) omits the posture: its e
 declaration, not something the dispatcher enforces. Timestamps are integer epoch milliseconds;
 the signed JSON contains no floats.
 
+Verifiers accept, and `VerifiedReceipt.confinement` exposes, an optional
+`confinement: {mode, available, applied}` record (`BLASTBOX_CONFINEMENT`, the host LSM the
+sandbox's host processes are confined with, the one applied). Dispatchers do not sign it yet;
+the confinement tier's enforcement change will ([HOST-PREP.md](HOST-PREP.md#confinement-tier)).
+Older verifiers refuse unknown fields, so verifiers must be upgraded before that ships.
+
 **What it does not prove:** that detections are true (the envelope is still the worker's account).
 And, plainly: **any pinned key whose holder can write the shared results prefix can attach a
 receipt to a job it never ran.** Pin only keys of hosts you trust as much as the control plane.
@@ -611,6 +617,7 @@ counts cheap.
 
 | Var | Default | Notes |
 |---|---|---|
+| `BLASTBOX_CONFINEMENT` | `auto` | Host-LSM confinement mode: `auto`, `require` (refuse to start when a local sandbox kind has no usable LSM), `off`. Detection only for now ([HOST-PREP.md](HOST-PREP.md#confinement-tier)). |
 | `BLASTBOX_FC_BIN` / `BLASTBOX_FC_KERNEL` / `BLASTBOX_FC_ROOTFS` | — | Paths to the firecracker binary, guest `vmlinux`, and `rootfs.ext4`. |
 | `BLASTBOX_FC_VCPU` | `1` | **Pinned at 1** — the vsock stream-corruption mitigation. Do not raise without validating the guest vsock driver under concurrency. |
 | `BLASTBOX_FC_MEM_MIB` | `512` | Guest RAM (compose sets 2048 for LibreOffice). |

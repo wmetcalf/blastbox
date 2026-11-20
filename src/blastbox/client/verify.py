@@ -78,6 +78,7 @@ from blastbox.attest_wire import (
 __all__ = [
     "ALG",
     "VERSION",
+    "AttestedConfinement",
     "AttestedNetwork",
     "BadSignature",
     "FetchError",
@@ -385,6 +386,21 @@ def _as_pinned(keys: object) -> PinnedKeys:
 
 
 @dataclass(frozen=True)
+class AttestedConfinement:
+    """The host-LSM confinement a signing dispatcher recorded for a run (``confinement``).
+    Accepted ahead of time: current dispatchers do not sign it yet (detection only), the
+    confinement tier's enforcement change will. Only present when the receipt carries it."""
+
+    #: ``BLASTBOX_CONFINEMENT`` on the signer: "auto", "require" or "off".
+    mode: str
+    #: The host LSM the sandbox's host processes would be confined with ("selinux",
+    #: "apparmor", "landlock" or "none").
+    available: str
+    #: The LSM actually applied ("none" when nothing was).
+    applied: str
+
+
+@dataclass(frozen=True)
 class AttestedNetwork:
     """The network posture the signing dispatcher ENFORCED (and, for a containment claim,
     verified) for this run. Only present when the receipt carries it."""
@@ -429,6 +445,8 @@ class VerifiedReceipt:
     metadata_bound: bool
     #: The exact signed document (read-only).
     signed: Mapping[str, object] = field(repr=False, compare=False, hash=False)
+    #: Host-LSM confinement record; ``None`` when the receipt carries none.
+    confinement: AttestedConfinement | None = None
 
     @property
     def network_attested(self) -> bool:
@@ -461,6 +479,10 @@ class VerifiedReceipt:
                 "downgraded": net.downgraded,
                 "inspect": net.inspect,
             },
+            # Only when signed, so a receipt without it renders exactly as before.
+            **({} if self.confinement is None else {"confinement": {
+                "mode": self.confinement.mode, "available": self.confinement.available,
+                "applied": self.confinement.applied}}),
         }
 
 
@@ -539,6 +561,8 @@ _REQUIRED_FIELDS: dict[str, type | tuple[type, ...]] = {
 }
 #: Present only where the signer enforced the posture, and then together.
 _NET_FIELDS = ("net_policy_effective", "net_exit", "net_downgraded", "net_inspect")
+#: Optional, accepted ahead of the dispatchers that will sign it (none does yet).
+_CONFINEMENT_KEYS = frozenset({"mode", "available", "applied"})
 
 
 def _check_doc(doc: Mapping[str, object]) -> dict[str, object]:
@@ -546,7 +570,7 @@ def _check_doc(doc: Mapping[str, object]) -> dict[str, object]:
     for k in doc:
         if not isinstance(k, str):
             raise ReceiptMalformed(f"receipt field name {_shown(k)} is not a string")
-    unknown = set(doc) - set(_REQUIRED_FIELDS) - set(_NET_FIELDS)
+    unknown = set(doc) - set(_REQUIRED_FIELDS) - set(_NET_FIELDS) - {"confinement"}
     if unknown:
         raise ReceiptMalformed(
             f"receipt v{VERSION} carries unknown field(s) "
@@ -579,7 +603,21 @@ def _check_doc(doc: Mapping[str, object]) -> dict[str, object]:
         stray = [n for n in _NET_FIELDS if n in doc]
         if stray:
             raise ReceiptMalformed(f"receipt carries {stray[0]} without net_policy_effective")
+    if "confinement" in doc:
+        conf = doc["confinement"]
+        if not isinstance(conf, Mapping) or set(conf) != _CONFINEMENT_KEYS or not all(
+                isinstance(conf[k], str) for k in _CONFINEMENT_KEYS):
+            raise ReceiptMalformed("receipt field confinement must be an object of exactly "
+                                   "string mode, available and applied")
     return dict(doc)
+
+
+def _confinement(doc: Mapping[str, object]) -> AttestedConfinement | None:
+    conf = doc.get("confinement")
+    if not isinstance(conf, Mapping):   # shape checked by _check_doc
+        return None
+    return AttestedConfinement(mode=str(conf["mode"]), available=str(conf["available"]),
+                               applied=str(conf["applied"]))
 
 
 def _decode_signature(sig: str) -> bytes:
@@ -801,9 +839,13 @@ def verify_receipt(
         finished_at_ms=_int("finished_at_ms"),
         issued_at_ms=_int("issued_at_ms"),
         network=network,
+        confinement=_confinement(doc),
         input_bound=want_input is not None,
         metadata_bound=want_metadata is not None,
-        signed=MappingProxyType(doc),
+        # Nested values copied, so the view is not shared with the caller's body (and stays
+        # plain dicts, JSON-serialisable like every other field).
+        signed=MappingProxyType({k: dict(val) if isinstance(val, Mapping) else val
+                                 for k, val in doc.items()}),
     )
 
 

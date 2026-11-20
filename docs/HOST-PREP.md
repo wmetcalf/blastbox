@@ -50,7 +50,7 @@ which the dispatcher skips at startup.
 | **gvisor** (warm C/R) | the `runsc` binary with checkpoint/restore (driven directly, no docker; root) | `runsc`, `gvisor-rootfs`, `gvisor-rootless`, `gvisor-userns` (when opted in), `snapshot-age`, `runsc-host-root`, `sandbox-confinement` |
 | **firecracker** (warm/cold) | `/dev/kvm` read/write, `firecracker` ≥ 1.15.1, guest kernel + rootfs | `kvm`, `firecracker`, `fc-guest`, `snapshot-age` (with `BLASTBOX_POOL_WARM_SNAPSHOT`), `sandbox-confinement`, `fc-scratch` |
 | **remote** (static / AWS) | nothing runtime-specific locally; the remote box runs the worker image under its own runsc | common checks only (no docker: no cold path) |
-| every tier | a pool the dispatcher accepts, synced clock, scratch off `/tmp` | `pool-runtime`, `clock`, `scratch` |
+| every tier | a pool the dispatcher accepts, synced clock, scratch off `/tmp`, a valid `BLASTBOX_CONFINEMENT` | `pool-runtime`, `confinement`, `clock`, `scratch` |
 | every local tier | AppArmor state known, CPU flags reviewed | `apparmor`, `bwrap-userns-restrict`, `userns`, `cpu-flags` |
 
 Prefer the **warm Firecracker** tier where KVM exists: it is the stronger boundary and, with
@@ -295,6 +295,69 @@ those it reports `unknown (run as root)` and does not fail. A firecracker inside
 container shows the container's profile (e.g. `docker-default (enforce)`), which counts as
 confined, but it is not jailed.
 
+### Confinement tier
+
+*Detection only in this release: nothing is enforced yet.* The confinement tier will put the
+HOST-side sandbox processes (runsc's CLI, gofer and sentry; firecracker) into blastbox's own LSM
+policy -- runsc ignores the OCI `apparmorProfile`/`selinuxLabel` and firecracker has no LSM hook.
+Today blastbox reports what the host offers and which LSM each sandbox kind WOULD use:
+
+```text
+SELinux enforcing  >  AppArmor enabled  >  Landlock (firecracker only)  >  none
+```
+
+Three kinds: `cold` (runsc started by dockerd for the cold tier), `gvisor` (the warm tier's runsc)
+and `firecracker`, the last two started by the dispatcher itself.
+
+| Host | cold | gvisor (warm) | firecracker |
+|---|---|---|---|
+| Ubuntu / Debian (AppArmor) | apparmor | apparmor | apparmor |
+| Rocky / RHEL 9 (SELinux enforcing) | selinux | selinux | selinux |
+| Amazon Linux 2023 (SELinux **permissive** by default) | none | none | landlock |
+| Alpine (Landlock only) | none | none | landlock |
+| dispatcher in a container on an AppArmor host (no `/sys/kernel/security`, or under `docker-default`) | apparmor | none | landlock, if the kernel offers it |
+| dispatcher in a container on an SELinux host (read-only or no selinuxfs) | selinux if visible, else none | none | landlock, if the kernel offers it |
+
+Permissive SELinux only logs, so it never counts (`setenforce 1` and `SELINUX=enforcing` in
+`/etc/selinux/config` to change that). Landlock cannot hold runsc, which mounts; for Firecracker
+it is applied by a launch shim just before firecracker runs. For the kinds the dispatcher starts
+itself, an LSM that is on but cannot be used from the dispatcher's context is reported with the
+reason and does not count: no securityfs to load AppArmor policy through, a caller already
+confined by another AppArmor profile (e.g. `docker-default`, which has no `change_profile`
+rule), or a read-only selinuxfs. `cold` is judged on the host's state alone, because dockerd
+(through a docker runtime wrapper) starts that runsc, not the dispatcher -- but only with the
+default docker endpoint. Any other endpoint configuration counts as another daemon, and `cold`
+as none, without resolving where it points: `DOCKER_HOST`, `DOCKER_TLS_VERIFY`/`DOCKER_TLS`, a
+`DOCKER_CONTEXT` other than `default`, a `docker context use` choice in `config.json`, or a
+`config.json` that cannot be read.
+
+`BLASTBOX_CONFINEMENT=auto|require|off` (default `auto`). `require` makes `blastbox dispatch`
+refuse to start, and preflight FAIL, when a sandbox kind the dispatcher can run (including
+`cold`, the fallback of a non-warm-only warm tier) has no usable LSM. Any other value is refused rather than read as `off`.
+
+Preflight's `confinement` check prints the LSM stack, SELinux mode, AppArmor state and
+`apparmor_parser` version, the Landlock ABI, the runsc release, and firecracker/jailer presence;
+`--json` carries the same as `facts`. (The runsc release shown is the warm tier's binary; the
+cold tier's runsc is whatever dockerd has registered, see `docker-runsc-runtime`.) Usability is judged from the process that runs the check
+(its AppArmor label, what it can see of `/sys`), so run preflight where the dispatcher runs:
+inside its container, or under its unit's profile. A `require` miss is a WARN, not a FAIL, when
+it comes only from tiers this dispatcher will not run: the no-pool preview (the dispatcher runs
+cold only), or a cascade overflow tier that is itself unavailable (the dispatcher drops it at
+startup). An available overflow tier is admitted, and then the dispatcher refuses to start. Two conditions it calls out:
+
+- **apparmor_parser 4.0.1** (WARN): pairing `audit deny umount,` with another `audit deny`
+  mount-class rule compiles to ALLOW mount (measured with kernel 6.8). This matters today, not
+  only for the future tier: the shipped `deploy/apparmor/blastbox-sandbox` child profile has
+  that pair (`audit deny mount,` + `audit deny umount,`).
+- **runsc older than `release-20261012`** ships the Sentry inside the runsc binary, so AppArmor
+  cannot give it a domain separate from the CLI and gofer ("single binary" in the report).
+
+The dispatcher logs its detection at startup (`confinement (detection only, nothing
+enforced): mode=..., cold=..., gvisor=..., firecracker=...`). Signed receipts do not carry it
+yet. `blastbox.client.verify` accepts an optional receipt `confinement: {mode, available,
+applied}` from this release on, so that the enforcement change can sign it. Verifiers older than
+that refuse unknown receipt fields: upgrade every verifier before any dispatcher signs it.
+
 ## AppArmor and user namespaces
 
 Ubuntu 24.04+ sets `kernel.apparmor_restrict_unprivileged_userns=1`. What that means per tier:
@@ -422,7 +485,7 @@ Preflight reads `/proc/cpuinfo` and warns on flags with operational consequences
 
 ## AWS and static workers
 
-A `remote` dispatcher host needs only the common checks (pool-runtime, clock, scratch; preflight
+A `remote` dispatcher host needs only the common checks (pool-runtime, confinement, clock, scratch; preflight
 skips the AppArmor, userns and CPU-flag checks there) plus network reach to its
 workers. Each static box or cloud worker is its own host: prepare it as a **docker + gVisor** host
 (the worker image runs under runsc there) and run `blastbox preflight --tier docker` on it. AWS

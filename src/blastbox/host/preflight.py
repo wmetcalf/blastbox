@@ -67,6 +67,7 @@ class Check:
     status: Status
     detail: str
     doc: str = ""          # "docs/HOST-PREP.md#anchor", printed as the fix pointer
+    facts: Mapping[str, object] | None = None   # structured detail, emitted by --json
 
 
 class NotReadOnly(RuntimeError):
@@ -130,6 +131,10 @@ class HostView:
         """Run a read-only query; None if it could not be spawned or timed out."""
         raise NotImplementedError
 
+    def landlock_abi(self) -> int:
+        """Landlock ABI (a VERSION query; creates no ruleset). 0 = unavailable."""
+        return 0
+
     def stat_path(self, path: str) -> tuple[int, int, int, bool] | None:
         """``(st_mode, st_uid, st_gid, has_posix_acl)`` following symlinks; None if unstat-able."""
         raise NotImplementedError
@@ -143,6 +148,17 @@ class RealHost(HostView):
     def __init__(self) -> None:
         self.env = os.environ
         self.euid = os.geteuid()
+
+    def landlock_abi(self) -> int:
+        from blastbox.host.confinement import landlock_abi  # noqa: PLC0415
+
+        return landlock_abi()
+
+    def absent(self, path: str) -> bool:
+        """ENOENT through symlinks, as open() would see it (other errors: not absent)."""
+        from blastbox.host.confinement import _stat_absent  # noqa: PLC0415
+
+        return _stat_absent(path)
 
     def read(self, path: str) -> str | None:
         # Chunked: a /proc/sys handler fails ONE large read() with ENOMEM (a 4 MiB read of
@@ -479,7 +495,9 @@ def _check_gvisor_rootfs(host: HostView) -> Check:
         # another release/arch/runtime is refused; an unstamped (legacy) one is allowed.
         problem = host.guest_problem(rootfs, "gvisor")
         if problem:
-            return Check("gvisor-rootfs", Status.FAIL, f"rootfs {rootfs}: {problem}", doc)
+            # facts["refused"]: the runtime refuses this tier at selection (a cascade drops it).
+            return Check("gvisor-rootfs", Status.FAIL, f"rootfs {rootfs}: {problem}", doc,
+                         {"refused": True})
         return Check("gvisor-rootfs", Status.PASS, f"rootfs {rootfs}")
     pool = host.env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower()
     selected = pool == "gvisor" or (pool == "cascade" and "gvisor" in _cascade_members(host.env))
@@ -1246,6 +1264,91 @@ def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc]) -> Check:
                      else ""))
 
 
+def _file_style_dispatcher(env: Mapping[str, str]) -> bool:
+    """Whether the configured dispatcher is the file-handshake one (the only kind with a cold
+    fallback, dispatch.reachable_tiers), judged from the configuration -- an explicit
+    `--tier remote` says nothing about it. A cascade cannot mix dispatch styles, so it boots in
+    its PRIMARY member's style (an other-style overflow member must be skipped to boot)."""
+    pool = env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower()
+    if pool in ("", "none", "gvisor", "firecracker"):
+        return True
+    if pool == "cascade":
+        members = _cascade_members(env)
+        return bool(members) and members[0] in ("gvisor", "firecracker")
+    return False
+
+
+def _check_confinement(host: HostView, tiers: Collection[str],
+                       skipped: Collection[str] = ()) -> Check:
+    """Which host LSM each local sandbox kind WOULD be confined with (detection only: nothing
+    is enforced yet), and whether BLASTBOX_CONFINEMENT=require can be met."""
+    from blastbox.host import confinement as cf  # noqa: PLC0415
+
+    doc = f"{DOC}#confinement-tier"
+    try:
+        mode = cf.mode_from_env(host.env)
+    except ValueError as exc:
+        return Check("confinement", Status.FAIL, f"{exc}; the dispatcher refuses to start", doc)
+    # The kinds the DISPATCHER can reach (dispatch.reachable_tiers): a file-handshake dispatcher
+    # with a warm tier also cold-falls-back to docker (runsc) unless warm-only. Whether it is
+    # file-handshake comes from its configuration (a cascade boots in its primary's style), not
+    # from which tiers are being checked.
+    reach = set(tiers)
+    warm_only = host.env.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower() in (
+        "1", "true", "yes", "on")
+    if reach & {"gvisor", "firecracker"} and not warm_only and _file_style_dispatcher(host.env):
+        reach.add("docker")
+    kinds = cf.kinds_for_tiers(reach)
+    st = cf.probe(host, env=host.env, kinds=kinds, landlock=host.landlock_abi())
+    would = {k: st.would_use(k, mode) for k in kinds}
+    facts = {"mode": mode, "enforced": False, "host": st.as_dict(), "would_use": would}
+    head = (f"mode={mode} (as seen by this process, uid {host.euid}; run where the dispatcher "
+            f"runs); lsm={','.join(st.lsms) if st.lsms is not None else 'unknown'} "
+            f"selinux={st.selinux} apparmor={'on' if st.apparmor else 'off'}"
+            + (f" (parser {st.apparmor_parser})" if st.apparmor_parser else "")
+            + f" landlock_abi={st.landlock_abi}")
+    parts = [head]
+    if st.lsms is None:
+        parts.append("securityfs not readable (container?): LSM stack inferred from "
+                     "/sys/module and /sys/fs/selinux")
+    parts += cf._blockers(st, kinds)
+    if st.apparmor and kinds and st.apparmor_parser is None:
+        parts.append("apparmor_parser not found: blastbox profiles cannot be loaded")
+    elif st.apparmor_parser == "present (--version failed)":
+        parts.append("apparmor_parser present but `--version` failed")
+    if "gvisor" in kinds:     # the warm tier's own binary; cold runsc is dockerd's runtime
+        split = {True: "split sentry", False: "single binary", None: "sentry layout unknown"}
+        parts.append(f"runsc {st.runsc} ({split[st.runsc_split_sentry]})" if st.runsc
+                     else "runsc not found")
+    if "firecracker" in kinds:
+        parts.append(f"firecracker {st.firecracker or 'not found'}, jailer "
+                     f"{st.jailer or 'not found'}")
+    if would:
+        parts.append("would use: " + ", ".join(f"{k}={v}" for k, v in would.items()))
+    parts.append("detection only, nothing enforced yet")
+    missing = cf.unmet(st, mode, kinds)
+    if missing:
+        # ``skipped``: tiers the dispatcher will NOT run here -- an unselected preview tier (no
+        # pool configured: cold only), or a cascade OVERFLOW tier that is itself unavailable
+        # (the dispatcher drops it at startup). An AVAILABLE overflow tier is admitted, and then
+        # require refuses to start, so it stays a FAIL.
+        hard = [k for k in missing
+                if not {t for t in reach if cf.kinds_for_tiers({t}) == [k]} <= set(skipped)]
+        msg = "; ".join(parts) + f"; require unmet for {', '.join(missing)}"
+        if hard:
+            return Check("confinement", Status.FAIL, msg, doc, facts)
+        return Check("confinement", Status.WARN,
+                     msg + " -- only via tiers this dispatcher will not run (not selected, or "
+                     "cascade overflow tiers unavailable at startup)", doc, facts)
+    if st.flags:
+        return Check("confinement", Status.WARN,
+                     "; ".join(parts) + "; apparmor_parser 4.0.1 compiles `audit deny umount` "
+                     "paired with another `audit deny` mount rule into ALLOW mount -- the "
+                     "shipped deploy/apparmor/blastbox-sandbox child profile has that pair "
+                     "today", doc, facts)
+    return Check("confinement", Status.PASS, "; ".join(parts), facts=facts)
+
+
 _TIER_CHECKS = {
     "firecracker": ("kvm", "firecracker", "fc-guest"),
     "gvisor": ("runsc", "gvisor-rootless", "gvisor-userns"),
@@ -1302,6 +1405,21 @@ def _downgrade_overflow(checks: list[Check], env: Mapping[str, str]) -> list[Che
                       "admitted but never becomes ready, so the cascade runs without it", c.doc)
         out.append(c)
     return out
+
+
+def _skipped_overflow_tiers(checks: Sequence[Check], env: Mapping[str, str]) -> set[str]:
+    """The overflow tiers the cascade drops at startup, as _downgrade_overflow judges them: a
+    FAILed startup gate (not a non-rw /dev/kvm or a missing gVisor rootfs, which are admitted),
+    a gVisor rootfs whose stamp the runtime refuses, or Firecracker overflow with no guest
+    configured (FCConfig.from_env refuses blank knobs)."""
+    overflow = _overflow_only_tiers(env)
+    names = {n: tier for tier in overflow for n in (*_TIER_CHECKS[tier], *_SOFT_CHECKS[tier])}
+    skipped = {names[c.name] for c in checks if c.name in names and c.status is Status.FAIL
+               and (_is_startup_gate(c) or (c.facts or {}).get("refused"))}
+    if ("firecracker" in overflow and not env.get("BLASTBOX_FC_KERNEL", "").strip()
+            and not env.get("BLASTBOX_FC_ROOTFS", "").strip()):
+        skipped.add("firecracker")
+    return skipped
 
 
 def _warm_snapshot(env: Mapping[str, str]) -> bool:
@@ -1366,6 +1484,11 @@ def run_preflight(host: HostView, tiers: Sequence[str], *, explicit: bool = True
         out.append(_check_apparmor(host))
         out.append(_check_bwrap_stock_profile(host, t))
         out.append(_check_userns(host, t))
+    skipped = _skipped_overflow_tiers(out, host.env)
+    if not explicit and host.env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower() in ("", "none"):
+        skipped |= {"gvisor", "firecracker"}     # preview: the dispatcher runs cold only
+    # remote-only too: dispatch validates the mode
+    out.append(_check_confinement(host, t, skipped))
     out.append(_check_clock(host))
     if local:
         out.append(_check_cpu_flags(host))
@@ -1417,5 +1540,6 @@ def render_json(checks: Sequence[Check], tiers: Sequence[str], *, strict: bool =
         "ok": exit_code(checks, strict=strict, ack=ack) == 0,
         "counts": _counts(checks),
         "checks": [{"name": c.name, "status": c.status.value, "detail": c.detail,
-                    "doc": c.doc} for c in checks],
+                    "doc": c.doc, **({"facts": dict(c.facts)} if c.facts is not None else {})}
+                   for c in checks],
     }, indent=2, sort_keys=True)

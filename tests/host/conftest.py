@@ -25,3 +25,12 @@ def ingress_client_factory(tmp_path):
         return TestClient(app), log
 
     return _factory
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_confinement_mode(monkeypatch):
+    """Dispatcher construction reads BLASTBOX_CONFINEMENT (and the docker endpoint for the cold
+    kind); keep the suite hermetic to values exported in the developer's or CI's shell."""
+    for name in ("BLASTBOX_CONFINEMENT", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY",
+                 "DOCKER_TLS", "DOCKER_CONFIG"):
+        monkeypatch.delenv(name, raising=False)
