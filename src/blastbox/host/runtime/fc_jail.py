@@ -523,8 +523,9 @@ def _copy_bounded(src: int, dst: int, size: int) -> None:
                                       "earlier copies still stuck)", timeout=timeout)
     try:
         worker.start()
-    except BaseException:
-        # No worker to hand the duplicates to (thread exhaustion): they are ours to close.
+    except RuntimeError:
+        # No worker was created (thread exhaustion): the duplicates are ours to close. (Any
+        # other exception may arrive after the worker started -- it owns them then.)
         os.close(s2)
         os.close(d2)
         raise

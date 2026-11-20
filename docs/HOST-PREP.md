@@ -314,7 +314,9 @@ sudo systemctl daemon-reload && sudo systemctl enable --now blastbox-fc-jail-hel
 Then, in every Firecracker dispatcher container: bind-mount `/run/blastbox-fc-jail` (the helper's
 socket directory, `root:<dispatcher gid> 0750`; the helper creates it that way, and refuses to start
 on an existing one that is not root-owned or is group/other-writable -- whoever could write it
-could replace the socket and answer every dispatcher). A jailed dispatcher no longer needs `/dev/kvm` or a
+could replace the socket and answer every dispatcher; the unit orders itself before
+`docker.service` so dockerd never creates it first as a bind-mount source -- if it did, remove it
+and restart the helper). A jailed dispatcher no longer needs `/dev/kvm` or a
 firecracker binary of its own -- the helper has both -- but it must still be able to READ
 `BLASTBOX_FC_KERNEL` and `BLASTBOX_FC_ROOTFS`: they are handed to the helper as open file
 descriptors, never as paths.

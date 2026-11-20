@@ -1736,17 +1736,23 @@ class Helper:
         # REFUSED instead when anyone but us could replace the socket in it: whoever can would
         # answer every dispatcher in the helper's place.
         _check_owned_dir(parent, os.geteuid())
+        if os.lstat(parent).st_mode & 0o022:
+            # Sticky does not help HERE: in a sticky world-writable directory anyone can take
+            # the socket's name while the helper is down (a restart) and answer dispatchers.
+            raise RuntimeError(f"{parent} must not be group/other-writable (sticky or not)")
+        # Bound, owned and listening under a private name, THEN renamed over the configured
+        # path: a dispatcher probing during a restart sees the old socket or the new one, never
+        # a root:root (EACCES -- decided, for good) or not-yet-listening one. (Nobody else can
+        # write the directory -- checked above -- so the by-path chmod cannot be redirected.)
+        tmp = parent / f".{cfg.socket_path.name}.{os.getpid()}"
         with contextlib.suppress(FileNotFoundError):
-            cfg.socket_path.unlink()
+            tmp.unlink()
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        # Bound 0660 by the umask: never chmod'ed by path afterwards (a path can be swapped).
-        old_umask = os.umask(0o117)
-        try:
-            srv.bind(str(cfg.socket_path))
-        finally:
-            os.umask(old_umask)
-        self._lchown(cfg.socket_path, 0, cfg.socket_gid)
+        srv.bind(str(tmp))
+        self._lchown(tmp, 0, cfg.socket_gid)
+        os.chmod(tmp, 0o660)
         srv.listen(_LISTEN_BACKLOG)
+        os.rename(tmp, cfg.socket_path)
         srv.settimeout(1.0)
         threading.Thread(target=self._monitor_loop, daemon=True, name="fcj-monitor").start()
         slots = threading.BoundedSemaphore(self.cfg.max_conns)
@@ -1837,8 +1843,13 @@ class Helper:
             pid, uid, _gid = array.array("i", cred).tolist()
             if uid not in self.cfg.allowed_uids or pid <= 0:
                 _log.warning("fc_jail.refused_peer uid=%d pid=%d", uid, pid)
-                # Say so (nothing it sent is read): the client must tell "never allowed" from
-                # "dropped under load", or a startup gate retries a misconfiguration forever.
+                # Say so: the client must tell "never allowed" from "dropped under load", or a
+                # startup gate retries a misconfiguration forever. Its request is TAKEN first
+                # (never parsed or acted on; its descriptors go to the sink below): closing
+                # with it still queued is an ECONNRESET the client reads INSTEAD of the reply.
+                with contextlib.suppress(OSError):
+                    _, fds, _, _ = socket.recv_fds(conn, MAX_MSG + 1, SCM_MAX_FD,
+                                                   socket.MSG_DONTWAIT)
                 with contextlib.suppress(OSError):
                     self._reply(conn, {"ok": False, "error": "forbidden",
                                        "detail": f"uid {uid} is not allowed (--allow-uid)"}, [])

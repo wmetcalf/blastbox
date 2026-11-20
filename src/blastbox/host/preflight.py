@@ -821,7 +821,9 @@ def _check_fc_jailer(host: HostView) -> Check:
                      doc)
     info, code, detail = host.jail_hello(settings.socket_path)
     if info is None:
-        if code == "refused" and host.euid == 0:
+        # The helper never allows uid 0: it says "forbidden" (an older helper just closed the
+        # connection: "refused"). For a root preflight that is the expected answer, not a fault.
+        if code in ("forbidden", "refused") and host.euid == 0:
             return Check("fc-jailer", Status.WARN,
                          f"jail helper at {settings.socket_path} answers only the dispatcher "
                          "uid(s) it allows; run preflight as that uid (e.g. inside the "

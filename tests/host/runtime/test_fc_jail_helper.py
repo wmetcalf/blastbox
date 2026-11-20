@@ -596,14 +596,16 @@ def test_serve_conn_refuses_a_peer_whose_uid_is_not_allowed(tmp_path):
     try:
         a.send(h.encode({"op": "hello"}))
         helper.serve_conn(b)
+        time.sleep(0.5)          # the sink has closed the connection by now, warm or cold
+        # The reply survives the close: the request was read (not left queued, which makes the
+        # close an ECONNRESET the client sees INSTEAD of the reply -- "refused", undecided).
         reply = h.decode(a.recv(h.MAX_MSG))
         # Told it is not allowed (decided, never retried as an outage), and nothing it sent
         # was acted on: no owner registered, no hello answered.
         assert reply == {"ok": False, "error": "forbidden",
                          "detail": f"uid {os.getuid()} is not allowed (--allow-uid)"}
         assert not helper._owners
-        with pytest.raises(ConnectionResetError):   # closed with its request unread
-            a.recv(h.MAX_MSG)
+        assert a.recv(h.MAX_MSG) == b""
     finally:
         a.close()
 

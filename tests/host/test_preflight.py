@@ -1720,9 +1720,12 @@ def test_jail_helper_without_apparmor_warns():
     assert c.status is Status.WARN and "AppArmor" in c.detail
 
 
-def test_jail_helper_refusing_root_is_a_warning_not_a_failure():
-    _, c = _jail_check(jail=(None, "refused", "closed"), euid=0)
+@pytest.mark.parametrize("code", ["forbidden", "refused"])   # current helper / older helper
+def test_jail_helper_refusing_root_is_a_warning_not_a_failure(code):
+    _, c = _jail_check(jail=(None, code, "uid 0 is not allowed (--allow-uid)"), euid=0)
     assert c.status is Status.WARN and "dispatcher" in c.detail
+    _, c = _jail_check(jail=(None, code, "uid 1000 is not allowed (--allow-uid)"), euid=1000)
+    assert c.status is Status.FAIL
 
 
 def test_a_jailed_firecracker_process_is_recognised_by_its_per_jail_name():

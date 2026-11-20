@@ -1080,17 +1080,29 @@ def _helper_for(tmp_path):
     return h.Helper(cfg, apparmor_enabled=False, lchown=lambda p, u, g: None)
 
 
-@pytest.mark.parametrize("mode", [0o777, 0o770, 0o757])
+@pytest.mark.parametrize("mode", [0o777, 0o770, 0o757, 0o1777])
 def test_the_helper_refuses_an_existing_socket_directory_others_can_write(tmp_path, mode):
     run = tmp_path / "run"
     run.mkdir()
     os.chmod(run, mode)
-    with pytest.raises(RuntimeError, match="not group/other-writable"):
-        _helper_for(tmp_path).serve()
-    assert not (run / "h.sock").exists()
+    helper = _helper_for(tmp_path)
+    ready, raised = threading.Event(), []
+
+    def _serve():
+        try:
+            helper.serve(ready=ready.set)
+        except RuntimeError as exc:
+            raised.append(exc)
+    t = threading.Thread(target=_serve, daemon=True)
+    t.start()
+    t.join(5)
+    helper._stop.set()                      # a regression must FAIL here, never hang
+    t.join(5)
+    assert not ready.is_set() and raised and "group/other-writable" in str(raised[0])
+    assert not [n for n in os.listdir(run)]
 
 
-def test_the_socket_is_bound_0660_without_a_chmod_by_path(tmp_path, monkeypatch):
+def test_the_published_socket_is_0660_and_never_chmodded_at_its_final_path(tmp_path, monkeypatch):
     chmodded = []
     real = os.chmod
     monkeypatch.setattr(h.os, "chmod", lambda p, m, **k: (chmodded.append(str(p)), real(p, m, **k)))
@@ -1116,3 +1128,30 @@ def test_an_outdisk_copy_that_cannot_start_its_worker_leaks_no_descriptor(tmp_pa
     finally:
         os.close(s)
         os.close(d)
+
+
+def test_the_socket_appears_only_once_it_is_owned_and_listening(tmp_path):
+    # A restart must never expose a root:root (EACCES) or not-yet-listening socket at the
+    # configured path: a dispatcher probing then would decide "forbidden" for good.
+    sock = tmp_path / "run" / "h.sock"
+    seen = []
+    with _serving(tmp_path):            # a previous instance: the directory and a stale socket
+        pass
+    cfg = h.HelperConfig(socket_path=sock, socket_gid=os.getgid(),
+                         allowed_uids=frozenset({os.getuid()}), firecracker="/x/fc",
+                         jailer="/x/jailer", chroot_base=tmp_path / "jail",
+                         cgroup_parent_rel="x", cgroup_root=tmp_path / "cg", apparmor="off")
+    helper = h.Helper(cfg, apparmor_enabled=False,
+                      lchown=lambda p, u, g: seen.append((str(p), os.path.exists(sock))))
+    ready = threading.Event()
+    t = threading.Thread(target=helper.serve, kwargs={"ready": ready.set}, daemon=True)
+    t.start()
+    try:
+        assert ready.wait(5)
+        assert seen and all(p != str(sock) for p, _ in seen)
+        assert os.stat(sock).st_mode & 0o777 == 0o660
+        JailClient(str(sock)).hello()
+        assert not [n for n in os.listdir(sock.parent) if n != "h.sock"]
+    finally:
+        helper._stop.set()
+        t.join(5)

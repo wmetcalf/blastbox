@@ -15,7 +15,10 @@
 
 [Unit]
 Description=blastbox Firecracker jail helper (root launcher for jailed microVMs)
+# Before docker: dispatcher containers bind-mount the socket directory, and a missing bind
+# source is created by dockerd (not root-owned under userns-remap: the helper refuses it).
 After=local-fs.target apparmor.service
+Before=docker.service
 Wants=apparmor.service
 
 [Service]
