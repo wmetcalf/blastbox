@@ -50,6 +50,7 @@ POLICY blastbox_deny {
     umount,
     pivot_root,
     chroot,
+    SYSCALL[472],  // fchroot
 
     // The new mount API (Linux 5.2+): builds and attaches mounts without mount(2). By NUMBER,
     // not name: an nsjail whose bundled kafel predates a name (open_tree_attr is Linux 6.15)

@@ -13,7 +13,7 @@ arg-filtered ``clone``), and ``ERRNO(1)`` on ``clone`` when **any** new-namespac
 *distro* package (not on PyPI); where it's absent the builder returns ``None`` and the bwrap
 backend keeps marking itself insecure on the seccomp axis (fail-safe).
 
-**Mount surface.** Besides ``mount``/``umount2``/``pivot_root`` the list denies ``chroot`` and the
+**Mount surface.** Besides ``mount``/``umount2``/``pivot_root`` the list denies ``chroot``/``fchroot`` and the
 whole new mount API (``fsopen``/``fsconfig``/``fsmount``/``fspick``/``move_mount``/``open_tree``/
 ``open_tree_attr``/``mount_setattr``) -- otherwise a child that ever holds CAP_SYS_ADMIN in its
 namespace can build or reflag a mount without calling mount(2). The other tiers: the docker JSON
@@ -39,7 +39,7 @@ DENY_ERRNO1: tuple[str, ...] = (
     # libseccomp needs the REAL x86_64 syscall `umount2` (`umount` resolves to a pseudo that never
     # matches); the nsjail KAFEL policy names the same syscall `umount` (KAFEL can't lex `umount2` —
     # see the .policy header). Same intent, backend-appropriate name — the parity test normalizes it.
-    "mount", "umount2", "pivot_root", "chroot",
+    "mount", "umount2", "pivot_root", "chroot", "fchroot",
     # The new mount API (Linux 5.2+) builds and attaches mounts without mount(2): fsopen ->
     # fsconfig -> fsmount -> move_mount; open_tree/open_tree_attr clone a subtree; fspick
     # reconfigures an existing mount; mount_setattr flips a mount's flags (e.g. clears `ro`).
@@ -61,7 +61,7 @@ DENY_ERRNO1: tuple[str, ...] = (
 )
 
 # Numbers for names a distro libseccomp may predate (2.5.5, Ubuntu 24.04's, has no
-# open_tree_attr, which is Linux 6.15). Without a fallback the fail-closed builder below would
+# open_tree_attr, which is Linux 6.15, nor fchroot, 7.1). Without a fallback the fail-closed builder below would
 # drop the WHOLE filter on such a host. These calls sit in the unified asm-generic range, so the
 # number is the same on x86_64 and aarch64; keyed by arch anyway so a port can't silently reuse
 # an x86_64 number for an arch where it differs.
@@ -74,6 +74,7 @@ _FALLBACK_NR: dict[str, dict[str, int]] = {
     "fspick": {"x86_64": 433, "aarch64": 433},
     "mount_setattr": {"x86_64": 442, "aarch64": 442},
     "open_tree_attr": {"x86_64": 467, "aarch64": 467},
+    "fchroot": {"x86_64": 472, "aarch64": 472},   # Linux 7.1; chroot by fd
 }
 
 

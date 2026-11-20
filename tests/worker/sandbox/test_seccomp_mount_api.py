@@ -3,7 +3,8 @@
 `mount`, `umount2` and `pivot_root` were denied, but Linux 5.2+ can build and attach a mount
 without ever calling mount(2): `fsopen` -> `fsconfig` -> `fsmount` -> `move_mount`, plus
 `open_tree` / `open_tree_attr` (clone a subtree), `fspick` (reconfigure an existing mount) and
-`mount_setattr` (flip a mount's flags, e.g. drop `ro`/`nosuid`). A denylist that names only
+`mount_setattr` (flip a mount's flags, e.g. drop `ro`/`nosuid`). `fchroot` (Linux 7.1) is
+chroot by fd. A denylist that names only
 the old calls lets a child that ever gains CAP_SYS_ADMIN in its namespace remount around the
 `ro` binds the backends rely on. `chroot` rides along: the docker JSON profile already denies
 it (allowlist), the namespace backends did not.
@@ -44,6 +45,8 @@ MOUNT_API_NR: dict[str, int] = {
     "fspick": 433,
     "mount_setattr": 442,
     "open_tree_attr": 467,
+    # Not mount API, but the fd form of chroot (Linux 7.1): denying chroot alone leaves it.
+    "fchroot": 472,
 }
 CHROOT_NR = {"x86_64": 161, "aarch64": 51}
 NEW_DENIES = (*MOUNT_API_NR, "chroot")
@@ -218,7 +221,8 @@ def test_the_bpf_returns_eperm_for_each_new_mount_syscall(bpf: bytes, name: str)
 
 # Run inside the sandbox. Arguments are chosen so an UNFILTERED unprivileged call returns
 # something other than EPERM wherever the kernel allows it (open_tree/open_tree_attr: an fd;
-# fsconfig/mount_setattr: EBADF/EINVAL), so an EPERM there is the filter's. fsopen, fsmount,
+# fsconfig/mount_setattr: EBADF/EINVAL; fchroot: EBADF, or ENOSYS before 7.1), so an EPERM
+# there is the filter's. fsopen, fsmount,
 # fspick, move_mount and chroot are EPERM unprivileged regardless; layer 2 is their proof.
 _PROBE = r"""
 import ctypes, json, os, platform
@@ -236,6 +240,7 @@ calls = {
     "fspick": (433, AT_FDCWD, b"/", 0),
     "mount_setattr": (442, -1, b"", 0, None, 0),
     "chroot": (chroot_nr, b"/"),
+    "fchroot": (472, -1),
 }
 out = {}
 for name, (nr, *args) in calls.items():
