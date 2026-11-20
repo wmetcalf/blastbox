@@ -502,13 +502,17 @@ def _kafel_deny_names() -> set[str]:
     block = text[text.index("ERRNO(1) {"):text.index("USE ")]
     names: set[str] = set()
     for line in block.splitlines():
-        line = line.split("//", 1)[0].strip()
-        if "{" in line or "}" in line:
+        code, _, comment = line.partition("//")
+        code = code.strip()
+        if "{" in code or "}" in code:
             continue
-        for tok in line.split(","):
+        for tok in code.split(","):
             tok = tok.strip()
             if tok and tok.isidentifier():
                 names.add(tok)
+            elif tok.startswith("SYSCALL["):
+                # Numbered entries name their syscall in the trailing comment.
+                names.add(comment.strip())
     return names
 
 
