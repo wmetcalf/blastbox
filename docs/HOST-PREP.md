@@ -424,6 +424,14 @@ as none, without resolving where it points: `DOCKER_HOST`, `DOCKER_TLS_VERIFY`/`
 `DOCKER_CONTEXT` other than `default`, a `docker context use` choice in `config.json`, or a
 `config.json` that cannot be read.
 
+**With the Firecracker jail helper (the default)** firecracker is not started by the dispatcher:
+the root helper confines each jailed VMM with its own per-jail AppArmor profile on the host
+(see "Firecracker jail helper"). The `firecracker` column above describes only what the
+dispatcher itself could apply (the unjailed path); it does not yet account for the helper's
+profile, so under `require` a containerised jailed dispatcher can be refused for `firecracker`
+although its VMMs are AppArmor-confined. Run the helper with `--apparmor require` for that
+guarantee until detection learns about the helper.
+
 `BLASTBOX_CONFINEMENT=auto|require|off` (default `auto`). `require` makes `blastbox dispatch`
 refuse to start, and preflight FAIL, when a sandbox kind the dispatcher can run (including
 `cold`, the fallback of a non-warm-only warm tier) has no usable LSM. Any other value is refused rather than read as `off`.
