@@ -884,3 +884,13 @@ def test_symlinked_config_errors_match_the_cli(tmp_path, make, reader):
     assert (blocker is None) is (make == "dangling")
     if blocker:
         assert str(cfg / "config.json") in blocker and "exists" not in blocker
+
+
+def test_remote_cascade_with_a_skipped_local_overflow_has_no_cold_fallback():
+    env = {"BLASTBOX_CONFINEMENT": "require", "BLASTBOX_POOL_RUNTIME": "cascade",
+           "BLASTBOX_POOL_TIERS": "static:4,gvisor:2"}
+    host = _healthy(files=ALPINE_BARE, env=env)
+    del host.executables["runsc"]                      # gvisor overflow unavailable: skipped
+    cs = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False)
+    c = next(c for c in cs if c.name == "confinement")
+    assert c.status is not Status.FAIL and "cold" not in c.facts["would_use"]  # type: ignore[index]

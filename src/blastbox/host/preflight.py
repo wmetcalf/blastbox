@@ -1276,11 +1276,13 @@ def _check_confinement(host: HostView, tiers: Collection[str],
     except ValueError as exc:
         return Check("confinement", Status.FAIL, f"{exc}; the dispatcher refuses to start", doc)
     # The kinds the DISPATCHER can reach (dispatch.reachable_tiers): a file-handshake warm tier
-    # also cold-falls-back to docker (runsc) unless warm-only.
+    # also cold-falls-back to docker (runsc) unless warm-only -- not a network-endpoint (remote)
+    # dispatcher, and not through a local tier it skips (resolve_tiers mirrors the same rule).
     reach = set(tiers)
     warm_only = host.env.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower() in (
         "1", "true", "yes", "on")
-    if reach & {"gvisor", "firecracker"} and not warm_only:
+    if (reach - set(skipped)) & {"gvisor", "firecracker"} and not warm_only \
+            and "remote" not in reach:
         reach.add("docker")
     kinds = cf.kinds_for_tiers(reach)
     st = cf.probe(host, env=host.env, kinds=kinds, landlock=host.landlock_abi())
