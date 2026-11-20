@@ -1451,6 +1451,11 @@ def _downgrade_overflow(checks: list[Check], env: Mapping[str, str]) -> list[Che
             c = Check(c.name, Status.WARN,
                       f"{c.detail} -- {tier} is an overflow tier of this cascade, so the "
                       "dispatcher skips it at startup and runs without it", c.doc)
+        elif tier in overflow and c.status is Status.FAIL and (c.facts or {}).get("admitted"):
+            c = Check(c.name, Status.WARN,
+                      f"{c.detail} -- {tier} is an overflow tier of this cascade, and its "
+                      "selector does not run this probe, so the dispatcher still admits it",
+                      c.doc, c.facts)
         elif tier in warm and c.status is Status.FAIL:
             # Admitted, but its warm base never builds: the cascade never spawns there and
             # serves on the other tiers.

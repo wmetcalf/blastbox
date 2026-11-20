@@ -1646,3 +1646,12 @@ def test_a_plain_static_pool_the_selector_refuses_fails():
     assert c.status is Status.FAIL and "BLASTBOX_STATIC_WORKERS" in c.detail, c.detail
     c = _by_name(pf.run_preflight(_healthy(env={**env, **_WORKERS}), ["remote"]))["pool-runtime"]
     assert c.status is Status.PASS, c.detail
+
+
+def test_an_admitted_runsc_overflow_fail_is_not_reported_as_never_ready():
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "firecracker:2,gvisor:2"}
+    host = _healthy(env=env)
+    host.commands[("/usr/bin/runsc", "--version")] = (1, "", "boom\n")
+    c = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False))["runsc"]
+    assert c.status is Status.WARN and "still admits" in c.detail, c.detail
+    assert "never becomes ready" not in c.detail
