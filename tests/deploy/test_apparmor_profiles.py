@@ -315,9 +315,10 @@ def _umount_rules_ok(text: str) -> bool:
     each alone on its line. Any other umount rule -- or prose naming the keyword -- must first
     be checked against the compiled DFA on a parser <= 4.0.x and then allowed here."""
     lines = [ln.strip() for ln in text.split("\n")]
-    # `deny all,` implies a bare umount deny without naming the keyword (rule-shaped only, so
+    # `deny all` implies a bare umount deny without naming the keyword (rule lines only, so
     # prose such as "would deny all SOCK_RAW" in a comment does not trip it).
-    if any(re.fullmatch(r"(audit\s+|quiet\s+)*deny\s+all\s*,", ln) for ln in lines):
+    if any(re.search(r"\bdeny\s+all\b", ln, re.ASCII) for ln in lines
+           if not ln.startswith("#")):
         return False
     # Every line naming the keyword must be exactly a canonical deny (a hat or child profile
     # may repeat them), each line naming it once; both canonical denies must be present.
@@ -362,6 +363,8 @@ def test_umount_denies_are_spelled_with_a_path() -> None:
     "  audit deny mount fstype=(proc,\n  # sysfs), audit deny umount,",
     "  audit deny mount fstype=a\\,\n  # -> /m/, audit deny umount,",
     "  profile helper {\n    deny all,\n  }",
+    "  audit deny mount, audit deny all,",
+    "  deny all, # everything",
     "  audit deny umount\u00b2,",
 ])
 def test_the_text_guard_rejects_any_other_umount_rule(extra: str) -> None:
