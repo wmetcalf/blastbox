@@ -90,6 +90,8 @@ JAIL_OUTDISK = "outdisk.ext4"
 JAIL_VSOCK = "vsock.sock"
 #: sun_path holds 108 bytes including the terminating NUL.
 _SUN_PATH_MAX = 107
+#: A cleanup the monitor keeps retrying is logged once, then every this many retries.
+_DOOMED_LOG_EVERY = 600
 #: The oldest Firecracker the helper runs (as the dispatcher's own gate, firecracker.py).
 MIN_FC_VERSION = (1, 15, 1)
 JAIL_API_SOCK = "fc-api.sock"
@@ -835,6 +837,7 @@ class Helper:
         #: Directories a failed publish could not remove (never registered as generations, so
         #: nothing else would ever retry them): the monitor does, until they are gone.
         self._doomed: set[str] = set()
+        self._doomed_tries: dict[str, int] = {}
         self._assets: dict[str, Asset] = {}
         # STRIPED, bounded: a lock per asset identity would grow with every distinct file a
         # client ever registers.
@@ -1005,15 +1008,22 @@ class Helper:
             gone = True
         except FileNotFoundError:
             gone = True
-        except OSError as exc:
+        except Exception as exc:  # noqa: BLE001 - kept for a retry, whatever the failure
             # Kept on ANY other failure -- even when the path cannot be stat'ed now (the same
-            # EIO): only a removal that succeeded, or found nothing, drops it.
-            _log.error("fc_jail.cleanup_failed path=%s: %s (retried by the monitor)", path, exc)
+            # EIO): only a removal that succeeded, or found nothing, drops it. Logged on the
+            # first failure and then every _DOOMED_LOG_EVERY retries (the monitor ticks 1/s).
+            with self._lock:
+                tries = self._doomed_tries.get(path, 0)
+            if tries % _DOOMED_LOG_EVERY == 0:
+                _log.error("fc_jail.cleanup_failed path=%s tries=%d: %s (retried by the "
+                           "monitor)", path, tries + 1, exc)
         with self._lock:
             if gone:
                 self._doomed.discard(path)
+                self._doomed_tries.pop(path, None)
             else:
                 self._doomed.add(path)
+                self._doomed_tries[path] = self._doomed_tries.get(path, 0) + 1
 
     def monitor_once(self) -> None:
         with self._lock:

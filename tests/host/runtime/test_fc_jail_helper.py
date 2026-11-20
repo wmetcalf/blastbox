@@ -1459,3 +1459,25 @@ def test_an_unexpected_cleanup_error_does_not_stop_the_monitor(env, monkeypatch)
     monkeypatch.setattr(h, "_pidfd_exited", lambda fd: True)
     env.helper.monitor_once()
     assert reaped
+
+
+def test_an_undeletable_cleanup_is_logged_once_not_every_tick(env, monkeypatch, caplog):
+    gdir = env.cfg.gens_dir / "gstuck"
+    gdir.mkdir()
+    monkeypatch.setattr(h.shutil, "rmtree", lambda p, *a, **k: (_ for _ in ()).throw(
+        PermissionError(13, "Permission denied")))
+    env.helper._remove_unregistered(str(gdir))
+    with caplog.at_level("ERROR", logger="blastbox.fc_jail_helper"):
+        for _ in range(50):
+            env.helper.monitor_once()
+    assert str(gdir) in env.helper._doomed
+    assert sum("cleanup_failed" in r.getMessage() for r in caplog.records) <= 1
+
+
+def test_a_non_os_error_cleanup_stays_tracked(env, monkeypatch):
+    gdir = env.cfg.gens_dir / "godd"
+    gdir.mkdir()
+    monkeypatch.setattr(h.shutil, "rmtree", lambda p, *a, **k: (_ for _ in ()).throw(
+        RuntimeError("odd")))
+    env.helper._remove_unregistered(str(gdir))
+    assert str(gdir) in env.helper._doomed
