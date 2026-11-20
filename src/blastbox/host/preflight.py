@@ -274,10 +274,15 @@ def resolve_tiers(requested: Sequence[str], env: Mapping[str, str]) -> list[str]
                 elif member in _REMOTE_POOL_RUNTIMES:
                     chosen.add("remote")
             # The cold docker path exists only on a file-handshake (local) dispatcher that is not
-            # warm-only; network-endpoint pools requeue instead (dispatch.py, "no cold path").
+            # warm-only; network-endpoint pools requeue instead (dispatch.py, "no cold path"). A
+            # cascade's style is its PRIMARY's, so a remote overflow member does not remove it.
+            # (An unknown pool or primary keeps the docker checks: the dispatcher refuses it, and
+            # pool-runtime says so, but the operator still sees the cold tier's state.)
             warm_only = env.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower() in (
                 "1", "true", "yes", "on")
-            if not (chosen & {"remote"}) and not warm_only:
+            primary = members[0] if members else ""
+            network = primary in _REMOTE_POOL_RUNTIMES and primary != "cascade"
+            if not network and not warm_only:
                 chosen.add("docker")
     return [t for t in TIERS if t in chosen]
 
