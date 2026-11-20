@@ -146,6 +146,10 @@ class FcSnapshotArtifact:
     # while stamping the other two meant a rebuild could rewrite it under an in-flight restore --
     # the exact corruption the stamping was introduced to prevent (upstream, PR #82).
     outdisk_path: Path | None = None
+    # Set when the generation lives in the root jail helper (BLASTBOX_FC_JAILER=on). The paths
+    # above are then the helper's own host paths, for logs only: this process never opens,
+    # links or unlinks them -- restores name the generation, and discard asks the helper.
+    jail_gen: "str | None" = None
 
 
 class _OrphanProc:
@@ -193,8 +197,15 @@ class FcSnapshotBackend:
         if handle is None:
             return False
         proc = getattr(handle, "proc", None)
-        if proc is not None and proc.poll() is not None:
+        try:
+            exited = proc is not None and proc.poll() is not None
+        except Exception:  # noqa: BLE001 - a jailed proc whose helper could not be asked
+            exited = False     # unknown: keep holding the pin and ask again next tick
+        if exited:
             self._unreaped.pop(str(workdir), None)
+            destroy = getattr(handle, "_destroy_jail", None)
+            if callable(destroy):
+                destroy()
             # The manager kept this workdir while the VM might still use it; now it is ours to
             # remove -- or park with the launcher's retryable partials if that fails.
             errs: list[str] = []
@@ -247,6 +258,9 @@ class FcSnapshotBackend:
             _log.warning("fc_snapshot: refusing to discard unknown artifact type %r",
                          type(artifact).__name__)
             return
+        if artifact.jail_gen is not None:
+            self._discard_jailed(artifact)
+            return
         failed: list[str] = []
         for path in (artifact.snapshot_path, artifact.mem_path, artifact.outdisk_path):
             if path is None:
@@ -262,6 +276,25 @@ class FcSnapshotBackend:
                 _log.warning("fc_snapshot: could not unlink %s: %s", path, exc)
         if failed:
             raise OSError("could not unlink generation files: " + "; ".join(failed))
+        pin = getattr(self, "_pin", None)
+        if pin is not None:
+            pin.forget(artifact)
+
+    def _discard_jailed(self, artifact: FcSnapshotArtifact) -> None:
+        """Retire a helper-held generation. The HELPER enforces the drain rule: it deletes the
+        files only once no jail references them, so this cannot unlink memory a live microVM
+        maps even if the manager's own refcount were wrong."""
+        from blastbox.host.runtime.fc_jail import JailError
+
+        jail = getattr(self._launcher, "_jail", None)
+        if jail is None:
+            raise OSError(f"cannot discard jailed generation {artifact.jail_gen}: no jail client")
+        try:
+            jail.discard(artifact.jail_gen)
+        except JailError as exc:
+            if exc.code != "unknown_gen":     # already gone (helper restart): nothing to do
+                # OSError so SnapshotManager keeps the artifact retired and retries.
+                raise OSError(f"jail helper could not discard {artifact.jail_gen}: {exc}") from exc
         pin = getattr(self, "_pin", None)
         if pin is not None:
             pin.forget(artifact)
@@ -358,7 +391,12 @@ class FcSnapshotBackend:
             except RootfsStampError as exc:
                 raise SnapshotStale(str(exc)) from exc
         try:
-            handle = self._launcher.restore_in(slot_workdir, outdisk_src=artifact.outdisk_path)
+            if artifact.jail_gen is not None:
+                handle = self._launcher.restore_in(slot_workdir, outdisk_src=None,
+                                                   jail_gen=artifact.jail_gen)
+            else:
+                handle = self._launcher.restore_in(slot_workdir,
+                                                   outdisk_src=artifact.outdisk_path)
         except BaseException as exc:
             # A failure BEFORE any handle (the outdisk copy, say) whose terminate could not be
             # confirmed: the manager holds the pin, so keep the process for restore_reclaimed().
@@ -367,9 +405,18 @@ class FcSnapshotBackend:
                 self._unreaped[str(slot_workdir)] = _OrphanProc(orphan)
             raise
         try:
-            _restore_from_snapshot(
-                handle.api, str(artifact.snapshot_path), str(artifact.mem_path)
-            )
+            if artifact.jail_gen is not None:
+                from blastbox.host.runtime.fc_jail import JAIL_MEM_PATH, JAIL_SNAPSHOT_PATH
+
+                # Names INSIDE the jail: the helper linked this generation's files there.
+                _restore_from_snapshot(handle.api, JAIL_SNAPSHOT_PATH, JAIL_MEM_PATH)
+                # Not usable until the helper has checked every thread of the restored VMM:
+                # seccomp filter, no_new_privs, no capabilities, its AppArmor profile.
+                handle.proc.seal()
+            else:
+                _restore_from_snapshot(
+                    handle.api, str(artifact.snapshot_path), str(artifact.mem_path)
+                )
             # AGAIN, now that firecracker holds the drive open: the check above samples the
             # PATH, and a publish landing between it and the snapshot load paired the old
             # memory with the new disk. From here the VM keeps the inode it opened, so a later

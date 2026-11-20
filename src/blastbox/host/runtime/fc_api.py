@@ -18,7 +18,7 @@ from __future__ import annotations
 import http.client
 import json
 import socket
-from typing import Any
+from typing import Any, Callable
 
 
 class FcApiError(RuntimeError):
@@ -33,14 +33,22 @@ class FcApiError(RuntimeError):
 class _UdsHTTPConnection(http.client.HTTPConnection):
     """``HTTPConnection`` that dials a Unix domain socket instead of TCP."""
 
-    def __init__(self, uds_path: str, timeout: float) -> None:
+    def __init__(self, uds_path: str, timeout: float,
+                 connector: "Callable[[], socket.socket] | None" = None) -> None:
         super().__init__("localhost", timeout=timeout)
         self._uds_path = uds_path
+        self._connector = connector
 
     def connect(self) -> None:  # noqa: D401 - override
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if self._connector is not None:
+            # A jailed firecracker: the jail helper hands over an already-connected socket (the
+            # dispatcher has no path into the jail).
+            sock = self._connector()
+        else:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            sock.connect(self._uds_path)
         sock.settimeout(self.timeout)
-        sock.connect(self._uds_path)
         self.sock = sock
 
 
@@ -52,12 +60,14 @@ class FcApiClient:
     :class:`FcApiError` on any >=400 response so callers fail loudly.
     """
 
-    def __init__(self, uds_path: str, timeout: float = 30.0) -> None:
+    def __init__(self, uds_path: str, timeout: float = 30.0, *,
+                 connector: "Callable[[], socket.socket] | None" = None) -> None:
         self._uds_path = uds_path
         self._timeout = timeout
+        self._connector = connector
 
     def _request(self, method: str, path: str, body: Any = None) -> tuple[int, str]:
-        conn = _UdsHTTPConnection(self._uds_path, self._timeout)
+        conn = _UdsHTTPConnection(self._uds_path, self._timeout, self._connector)
         try:
             payload = json.dumps(body) if body is not None else None
             headers = {"Accept": "application/json"}

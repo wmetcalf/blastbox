@@ -180,7 +180,7 @@ def _is_undecided_availability(exc: BaseException) -> bool:
         # ask"), so same treatment. Matched by NAME so this module keeps no import dependency on the
         # runtimes, which are optional and may not be installed.
         if any(c.__name__ in ("AwsNoVerdict", "AwsThrottled", "AwsProbeTimeout",
-                              "StaticPoolNoVerdict")
+                              "StaticPoolNoVerdict", "FCHelperNoVerdict")
                for c in type(cur).__mro__):
             return True
         cur = cur.__cause__ or cur.__context__

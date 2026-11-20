@@ -896,6 +896,14 @@ class _PinnedBoot:
         # The BASE, like a restore: a publish rolled back between before_boot() and here leaves
         # the path at the checked file while the base opened another -- and the pin would then
         # bless every restore of memory captured against the wrong disk.
+        # A JAILED base cannot be observed through /proc (another pid namespace), but the jail
+        # helper reports the identity of the exact file it copied for the boot: compare that.
+        booted = getattr(self._inner, "opened_rootfs_identity", None)
+        if booted is not None and self._key is not None and tuple(booted) != tuple(self._key):
+            raise RootfsStale(
+                f"{self._pin.gate.rootfs}: the jailed base booted a different file than the one "
+                "that was checked (a republish landed during the base boot); not checkpointing it"
+            )
         pid = getattr(getattr(self._inner, "proc", None), "pid", None)
         if pid and opened_matches(pid, self._pin.gate.rootfs, self._key, strict=True) is False:
             raise RootfsStale(

@@ -1,0 +1,53 @@
+# blastbox Firecracker jail helper -- the root launcher every Firecracker microVM runs under.
+#
+# See docs/HOST-PREP.md, "Firecracker jail helper". Install:
+#   sudo install -d -o root -g root -m 0755 /usr/local/libexec/blastbox
+#   sudo install -o root -g root -m 0644 <site-packages>/blastbox/host/runtime/fc_jail_helper.py \
+#       /usr/local/libexec/blastbox/fc_jail_helper.py
+#   sudo install -o root -g root -m 0755 firecracker-v1.16.0-x86_64 /usr/local/libexec/blastbox/firecracker
+#   sudo install -o root -g root -m 0755 jailer-v1.16.0-x86_64      /usr/local/libexec/blastbox/jailer
+#   sudo install -o root -g root -m 0644 blastbox-fc-jail-helper.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now blastbox-fc-jail-helper
+#
+# Then bind-mount /run/blastbox-fc-jail into every Firecracker dispatcher container.
+# Removal: systemctl disable --now blastbox-fc-jail-helper; rm the unit, /usr/local/libexec/blastbox
+# and the --chroot-base directory (/srv/blastbox-fc-jail).
+
+[Unit]
+Description=blastbox Firecracker jail helper (root launcher for jailed microVMs)
+# Before docker, with the socket directory made by ExecStartPre (which completes before the
+# unit counts as started): dispatcher containers bind-mount it, and a missing bind source is
+# created by dockerd -- not root-owned under userns-remap, which the helper refuses.
+After=local-fs.target apparmor.service
+Before=docker.service
+Wants=apparmor.service
+
+[Service]
+Type=simple
+# --socket-group / --allow-uid: the dispatcher container's gid / uid (10001 in the shipped images).
+# The chroot base must be root-owned, on a filesystem with room for every live slot's output disk
+# plus each warm generation's memory file; put it on tmpfs to keep snapshots in RAM.
+# The gid here and --socket-group below must match.
+ExecStartPre=/usr/bin/install -d -o root -g 10001 -m 0750 /run/blastbox-fc-jail
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/blastbox/fc_jail_helper.py \
+    --socket /run/blastbox-fc-jail/helper.sock \
+    --socket-group 10001 --allow-uid 10001 \
+    --firecracker /usr/local/libexec/blastbox/firecracker \
+    --jailer /usr/local/libexec/blastbox/jailer \
+    --chroot-base /srv/blastbox-fc-jail \
+    --cgroup-parent auto
+# The helper owns this cgroup subtree: every jail is a leaf under <this unit>/jails, so the cap
+# below bounds ALL microVMs together, and stopping the unit kills every one of them.
+Delegate=yes
+KillMode=control-group
+# Host-level cap over every jailed microVM (guest RAM + VMM overhead). Size it for
+# (sum of warm/ceiling slots across every FC dispatcher) x (BLASTBOX_FC_MEM_MIB + 256 MiB),
+# and -- with --chroot-base on tmpfs -- add every slot's output disk, each warm generation's
+# memory file + disk, and the kernel/rootfs copies (tmpfs pages are charged here).
+MemoryMax=64G
+LimitNOFILE=65536
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

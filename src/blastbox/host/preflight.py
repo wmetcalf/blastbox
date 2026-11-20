@@ -143,6 +143,11 @@ class HostView:
         """The target of a symlink; None when ``path`` is not one (or cannot be read)."""
         raise NotImplementedError
 
+    def jail_hello(self, socket_path: str) -> "tuple[dict[str, object] | None, str, str]":
+        """The Firecracker jail helper's ``hello`` (read-only): ``(info, error_code, detail)``,
+        info None when it could not be asked."""
+        return None, "unreachable", "not implemented"
+
 
 class RealHost(HostView):
     def __init__(self) -> None:
@@ -223,6 +228,16 @@ class RealHost(HostView):
             return os.readlink(path)
         except OSError:
             return None
+
+    def jail_hello(self, socket_path: str) -> "tuple[dict[str, object] | None, str, str]":
+        from blastbox.host.runtime.fc_jail import JailClient, JailError  # noqa: PLC0415
+
+        try:
+            return JailClient(socket_path, timeout_s=5.0).hello(), "", ""
+        except JailError as exc:
+            return None, exc.code, exc.detail
+        except Exception as exc:  # noqa: BLE001 -- never raise on host state
+            return None, "error", str(exc)
 
     def run(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str] | None:
         if not is_read_only(argv):
@@ -779,6 +794,70 @@ def _check_firecracker(host: HostView) -> Check:
     return Check("firecracker", Status.PASS, f"{path}: v{shown}")
 
 
+def _fc_jailed(env: Mapping[str, str]) -> bool:
+    """Jailing on (the default) -- or a bad value, which fc-jailer reports as a FAIL."""
+    from blastbox.host.runtime.fc_jail import JailSettings  # noqa: PLC0415
+
+    try:
+        return JailSettings.from_env(dict(env)).enabled
+    except ValueError:
+        return True
+
+
+def _check_fc_jailer(host: HostView) -> Check:
+    """The Firecracker jail helper: ON by default, and the FC tier fails closed without it."""
+    from blastbox.host.runtime.fc_jail import ENV_JAILER, JailSettings, opt_out_hint  # noqa: PLC0415
+    from blastbox.host.runtime.firecracker import _MIN_FC_VERSION  # noqa: PLC0415
+
+    doc = f"{DOC}#firecracker-jail-helper"
+    try:
+        settings = JailSettings.from_env(dict(host.env))
+    except ValueError as exc:
+        return Check("fc-jailer", Status.FAIL, f"{exc}; the dispatcher refuses to start", doc)
+    if not settings.enabled:
+        return Check("fc-jailer", Status.WARN,
+                     f"{ENV_JAILER}=off: firecracker runs UNJAILED as the dispatcher uid, sharing "
+                     "its filesystem view, cgroup and network namespace with every other slot",
+                     doc)
+    # As resolve_mem_dir() reads them (a path; a truthy toggle).
+    mem_knobs = ([k for k in ("BLASTBOX_SNAPSHOT_MEM_DIR",) if host.env.get(k, "").strip()]
+                 + [k for k in ("BLASTBOX_SNAPSHOT_MEM_TMPFS",) if host.env.get(k, "").strip()
+                    .lower() not in ("", "0", "false", "no")])
+    if mem_knobs and _warm_snapshot(host.env):
+        # As the snapshot runtime refuses it at startup: jailed snapshots are the helper's.
+        return Check("fc-jailer", Status.FAIL,
+                     f"{' / '.join(mem_knobs)} cannot apply under the jailer: jailed snapshots "
+                     "live in the jail helper's --chroot-base (put THAT on tmpfs to preload "
+                     f"them); the warm snapshot tier refuses to start. {opt_out_hint()}", doc)
+    info, code, detail = host.jail_hello(settings.socket_path)
+    if info is None:
+        # The helper never allows uid 0: it says "forbidden" (an older helper just closed the
+        # connection: "refused"). For a root preflight that is the expected answer, not a fault.
+        if code in ("forbidden", "refused") and host.euid == 0:
+            return Check("fc-jailer", Status.WARN,
+                         f"jail helper at {settings.socket_path} answers only the dispatcher "
+                         "uid(s) it allows; run preflight as that uid (e.g. inside the "
+                         "dispatcher container) to verify it", doc)
+        return Check("fc-jailer", Status.FAIL,
+                     f"jail helper not usable at {settings.socket_path} ({code}: {detail}); the "
+                     f"Firecracker tier fails closed at startup. {opt_out_hint()}", doc)
+    raw = str(info.get("firecracker", ""))
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)$", raw)
+    ver = (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+    minimum = ".".join(map(str, _MIN_FC_VERSION))
+    if ver is None or ver < _MIN_FC_VERSION:
+        return Check("fc-jailer", Status.FAIL,
+                     f"the jail helper runs firecracker {raw or 'of unknown version'}; need >= "
+                     f"{minimum}", doc)
+    if not info.get("apparmor"):
+        return Check("fc-jailer", Status.WARN,
+                     f"jail helper at {settings.socket_path} (firecracker v{raw}) runs WITHOUT "
+                     "per-jail AppArmor profiles (AppArmor off on this kernel, or --apparmor "
+                     "off)", doc)
+    return Check("fc-jailer", Status.PASS,
+                 f"jail helper at {settings.socket_path}: firecracker v{raw}, per-jail AppArmor")
+
+
 def _primary_pool(env: Mapping[str, str]) -> str:
     pool = env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower()
     if pool == "cascade":
@@ -1148,6 +1227,12 @@ class _Proc:
     argv: tuple[str, ...]
 
 
+#: argv[0] basename prefix of the firecracker-* tools that are NOT a VMM (firecracker-containerd
+#: and its shim). Judged only on a READABLE argv: its 15-char comm ("firecracker-con") is also
+#: what a VMM with a jail id starting "con" shows.
+_NOT_A_VMM_PREFIX = "firecracker-containerd"
+
+
 def _sandbox_processes(host: HostView) -> list[_Proc]:
     """Running runsc sandbox/gofer and firecracker processes, found by argv[0] (runsc re-execs
     itself with argv[0] ``runsc-sandbox``/``runsc-gofer``; its comm is often just ``exe``) or
@@ -1162,7 +1247,15 @@ def _sandbox_processes(host: HostView) -> list[_Proc]:
         if argv:
             names.add(os.path.basename(argv[0]))
         for role in (*_RUNSC_ROLES, "firecracker"):
-            if role in names or (role == "firecracker" and fc_name and fc_name in names):
+            # A jailed VMM runs as the jail helper's per-jail copy, /firecracker-<jail id> (comm
+            # truncated to 15 chars), and a renamed VMM is any firecracker-*: counted, except a
+            # known non-VMM tool. Erring on counting is deliberate -- a missed VMM would read as
+            # confined, a miscounted tool only WARNs.
+            if role in names or (role == "firecracker" and (
+                    (fc_name and fc_name in names)
+                    or (any(n.startswith("firecracker-") for n in names)
+                        and not (argv and os.path.basename(argv[0])
+                                 .startswith(_NOT_A_VMM_PREFIX))))):
                 found.append(_Proc(pid, role, argv))
                 break
     return found
@@ -1400,7 +1493,7 @@ def _check_confinement(host: HostView, tiers: Collection[str],
 
 
 _TIER_CHECKS = {
-    "firecracker": ("kvm", "firecracker", "fc-guest"),
+    "firecracker": ("kvm", "firecracker", "fc-jailer", "fc-guest"),
     "gvisor": ("runsc", "gvisor-rootless", "gvisor-userns"),
 }
 #: Per-tier checks that are not startup gates (see _is_startup_gate) but are moot once the tier
@@ -1519,8 +1612,15 @@ def run_preflight(host: HostView, tiers: Sequence[str], *, explicit: bool = True
         if userns is not None:
             out.append(userns)
     if "firecracker" in t:
-        out.append(_check_kvm(host))
-        out.append(_check_firecracker(host))
+        if _fc_jailed(host.env):
+            # JAILED (the default): the helper opens /dev/kvm and runs its own firecracker (it
+            # refuses to start without either, and fc-jailer reports its version), so a jailed
+            # dispatcher container legitimately has neither.
+            out.append(_check_fc_jailer(host))
+        else:
+            out.append(_check_kvm(host))
+            out.append(_check_firecracker(host))
+            out.append(_check_fc_jailer(host))
         out.append(_check_fc_guest(host))
     # Snapshot age matters only where warm bases are restored: gVisor always, FC with snapshots.
     if "gvisor" in t or ("firecracker" in t and _warm_snapshot(host.env)):

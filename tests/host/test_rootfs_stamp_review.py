@@ -550,6 +550,7 @@ def test_the_fc_tiers_name_the_guest_problem_when_they_refuse(monkeypatch, which
     from blastbox.host.runtime import fc_snapshot_runtime as sr
     from blastbox.host.runtime import firecracker as fc
 
+    monkeypatch.setenv("BLASTBOX_FC_JAILER", "off")     # the refusal under test is the guest's
     monkeypatch.setattr(fc, "firecracker_available", lambda cfg=None: False)
     monkeypatch.setattr(sr, "firecracker_available", lambda cfg=None: False, raising=False)
     monkeypatch.setattr(fc, "_guest_refusal", lambda cfg: "guest is blastbox 0.0.1")

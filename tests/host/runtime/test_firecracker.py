@@ -1393,6 +1393,7 @@ class TestSelectFcRuntime:
             "blastbox.host.runtime.firecracker.firecracker_available",
             lambda *args, **kwargs: True,
         )
+        monkeypatch.setenv("BLASTBOX_FC_JAILER", "off")   # the unjailed construction path
         runner = _FakeSubprocessRunner()
         signal = _FakeReadySignal()
         result = select_fc_runtime(

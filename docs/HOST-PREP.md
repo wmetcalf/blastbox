@@ -55,7 +55,7 @@ can show it is down.
 |---|---|---|
 | **docker** (cold) | docker daemon, `runsc` registered as a docker runtime (fail-closed without it) | `docker`, `docker-runsc-runtime`, `runsc-host-root`, `sandbox-confinement` |
 | **gvisor** (warm C/R) | the `runsc` binary with checkpoint/restore (driven directly, no docker; root) | `runsc`, `gvisor-rootfs`, `gvisor-rootless`, `gvisor-userns` (when opted in), `snapshot-age`, `runsc-host-root`, `sandbox-confinement` |
-| **firecracker** (warm/cold) | `/dev/kvm` read/write, `firecracker` ≥ 1.15.1, guest kernel + rootfs | `kvm`, `firecracker`, `fc-guest`, `snapshot-age` (with `BLASTBOX_POOL_WARM_SNAPSHOT`), `sandbox-confinement`, `fc-scratch` |
+| **firecracker** (warm/cold) | the Firecracker jail helper (default; it needs `/dev/kvm` and `firecracker` ≥ 1.15.1), guest kernel + rootfs readable by the dispatcher. Unjailed (`BLASTBOX_FC_JAILER=off`): `/dev/kvm` read/write and `firecracker` ≥ 1.15.1 in the dispatcher | `fc-jailer`, `fc-guest`, `snapshot-age` (with `BLASTBOX_POOL_WARM_SNAPSHOT`), `sandbox-confinement`, `fc-scratch`; unjailed also `kvm`, `firecracker` |
 | **remote** (static / AWS) | nothing runtime-specific locally; the remote box runs the worker image under its own runsc | common checks only (no docker: no cold path) |
 | every tier | a pool the dispatcher accepts, synced clock, scratch off `/tmp`, a valid `BLASTBOX_CONFINEMENT` | `pool-runtime`, `confinement`, `clock`, `scratch` |
 | every local tier | AppArmor state known, CPU flags reviewed | `apparmor`, `bwrap-userns-restrict`, `userns`, `cpu-flags` |
@@ -280,18 +280,104 @@ firecracker --version               # >= v1.15.1 (older: virtio-rng entropy DoS)
   userns restrictions are irrelevant to Firecracker itself (a KVM hypervisor, not a userns
   sandbox); confinement inside the guest is the guest's business (nono works there).
 
+### Firecracker jail helper
+
+**Firecracker runs under the upstream `jailer` by default** (`BLASTBOX_FC_JAILER=on`). The dispatcher
+has no privileges, so a small root daemon, `blastbox-fc-jail-helper`, starts every microVM -- the warm
+snapshot base, every restored slot, every cold slot -- and the dispatcher talks to it over a unix
+socket. **When jailing is on and the helper is not reachable, the Firecracker tier fails closed at
+startup** with an error naming the opt-out; it never falls back to running firecracker unjailed.
+
+Each microVM gets: a private chroot (pivot_root) holding only its own drives and sockets; a uid/gid
+unique among live jails (so another slot's disk, sockets, `/proc/<pid>` and signals are out of reach);
+an empty network namespace; its own cgroup v2 leaf under a delegated subtree with a host-level
+`memory.max` (it has left the dispatcher container's memcg); a bounding set reduced to the jailer's
+own needs plus `no_new_privs`; Firecracker's seccomp filters; and a per-jail AppArmor profile naming
+that jail's exact paths. A slot is handed to the pool only after the helper has verified, on every
+thread of the VMM, a seccomp filter, `NoNewPrivs: 1`, empty effective/permitted/inheritable/ambient
+capabilities, a non-root uid and the jail's own AppArmor label (`seal`).
+
+```sh
+# 1. The binaries (root-owned, not group/other-writable, nor any directory above them)
+sudo install -d -o root -g root -m 0755 /usr/local/libexec/blastbox
+sudo install -o root -g root -m 0755 firecracker-v1.16.0-x86_64 /usr/local/libexec/blastbox/firecracker
+sudo install -o root -g root -m 0755 jailer-v1.16.0-x86_64      /usr/local/libexec/blastbox/jailer
+# 2. The helper: one stdlib-only file, from the installed blastbox wheel
+sudo install -o root -g root -m 0644 \
+    "$(python3 -c 'import blastbox.host.runtime.fc_jail_helper as m; print(m.__file__)')" \
+    /usr/local/libexec/blastbox/fc_jail_helper.py
+# 3. The unit (edit --allow-uid/--socket-group to the dispatcher uid/gid, and MemoryMax=)
+sudo install -o root -g root -m 0644 deploy/systemd/blastbox-fc-jail-helper.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now blastbox-fc-jail-helper
+```
+
+Then, in every Firecracker dispatcher container: bind-mount `/run/blastbox-fc-jail` (the helper's
+socket directory, `root:<dispatcher gid> 0750`; the helper creates it that way, and refuses to start
+on an existing one that is not root-owned or is group/other-writable -- whoever could write it
+could replace the socket and answer every dispatcher. The unit creates it in `ExecStartPre`
+and orders itself before `docker.service`, so dockerd never creates it first as a bind-mount
+source. (`install -d` takes over an existing directory at that path -- root:<gid> 0750 --
+so the helper's own refusal applies to directories the unit did not make, e.g. a custom
+`--socket`.) A dispatcher container
+started BEFORE the directory was replaced still sees the old one: restart it). A jailed dispatcher no longer needs `/dev/kvm` or a
+firecracker binary of its own -- the helper has both -- but it must still be able to READ
+`BLASTBOX_FC_KERNEL` and `BLASTBOX_FC_ROOTFS`: they are handed to the helper as open file
+descriptors, never as paths.
+
+- **Host requirements:** cgroup v2 (unified), `setpriv` and `ip` (util-linux / iproute2),
+  `mkfs.ext4`, and AppArmor (`--apparmor auto`, the default, uses it when the kernel has it;
+  `require` refuses to start without it). The helper refuses to start unless its binaries and every
+  directory above them are root-owned and not group/other-writable.
+- **Disk:** `--chroot-base` (default `/srv/blastbox-fc-jail`) holds one copy of each booted kernel and
+  rootfs, every warm generation (its memory file is guest-RAM-sized) and each live slot's output disk.
+  Jail trees, generations and copies are hard links within it, so it must be ONE filesystem. To keep
+  snapshots in RAM, put it on tmpfs (`BLASTBOX_SNAPSHOT_MEM_DIR` / `_TMPFS` are refused under the
+  jailer: the snapshot files are no longer the dispatcher's).
+- **Memory cap:** the unit's `MemoryMax=` (and `--jails-memory-max`, default 75% of RAM) bound all
+  jails together. Each jail is capped at guest RAM + its output disk + 256 MiB
+  (`--jail-mem-overhead-mib`), plus guest RAM again for a boot jail (a warm base dumps a
+  guest-RAM-sized memory file): on a tmpfs chroot base the files a jail writes are charged to
+  it, and the helper's own copies (assets, restore disks, a generation's output disk) to the
+  unit -- size `MemoryMax=` for those too. A warm generation's memory file is the boot jail's
+  own write, kept by hard link: it stays charged to the jails subtree after that jail is gone,
+  so size `--jails-memory-max` for live guests PLUS every kept generation's guest RAM.
+- **Uids:** `--uid-min`/`--uid-max` (default 200000-200999) must not overlap real users or any
+  container's user-namespace mapping; one is used per live microVM.
+- **Lifetime:** jails and generations belong to the dispatcher process that created them; when it
+  exits the helper kills and removes them. Stopping or restarting the helper kills every microVM
+  (they are in its cgroup); dispatchers rebuild their warm base on the next spawn.
+- **Shared capacity (residual):** dispatchers cannot touch each other's microVMs, but they share
+  the helper's capacity -- `--max-jails`, the uid range, the memory cap and the chroot base. Limits
+  per client process (`max_jails_per_owner` 256, 4 live generations, 32 concurrent requests, 64
+  client processes; `--max-jails-per-owner`, `--max-gens-per-owner`, `--max-conns-per-peer`,
+  `--max-conns` (128 helper-wide), `--max-owners`) bound a misbehaving or compromised dispatcher, but it can still exhaust what
+  is shared and deny service to the others -- including CPU: the helper and its descriptor
+  sinks are capped at 2 CPUs (its `supervisor` cgroup), which a client forcing sink restarts
+  can saturate. Size the caps for the stacks you run.
+- **Without AppArmor** (`--apparmor off`, or `auto` on a kernel without it) a VMM a guest escaped
+  into is still chrooted, uid-isolated and capped per file (`fsize`), but it can create files in its
+  own jail root on the shared `--chroot-base`. Use `--apparmor require` where AppArmor exists: the
+  per-jail profile grants write only to fixed names (no globs). Even then a VMM can unlink and
+  recreate such a name while holding the old file open (up to `no-file` x `fsize`), so keep the
+  chroot base on its own filesystem (or a size-limited tmpfs) so it cannot fill the host's.
+- **Opting out:** `BLASTBOX_FC_JAILER=off` on the dispatcher restores the previous behaviour
+  (firecracker as the dispatcher uid in its container, sharing one scratch tree). Not recommended.
+- **Not jailed:** `blastbox`'s build-time CPU-feature probe (`cpu_probe`) still runs firecracker
+  directly; it boots the operator's own image, never a sample.
+
+Removal: `sudo systemctl disable --now blastbox-fc-jail-helper && sudo rm
+/etc/systemd/system/blastbox-fc-jail-helper.service && sudo rm -r /usr/local/libexec/blastbox
+/srv/blastbox-fc-jail` (the helper removes its network namespaces, `bbfcj-*`, and AppArmor profiles,
+`blastbox-fc-jail-*`, as each jail goes; a crashed helper's leftovers are removed when it next starts).
+
 ### Confining firecracker and runsc processes
 
-Warm Firecracker slots share one scratch tree (`/tmp/blastbox-fc-slots`): the base's `warm-*.mem`
-snapshot (written before any job runs; slots restore it copy-on-write, so job memory itself never
-lands there) and, per slot, `outdisk.ext4`, `in/`, and the slot's `fc-api.sock` / `vsock.sock`. A
-firecracker process that is not jailed and not confined by AppArmor, sharing a uid with the others,
-can read another slot's input and output disks or drive another slot's VMM through its API socket
-if it is compromised. Recommended:
-
-- start firecracker through the **jailer** (chroot, its own uid/gid, cgroup and namespaces), so a
-  slot's VMM only sees its own files;
-- attach a **per-slot AppArmor profile** that allows only that slot's files.
+With jailing off, warm Firecracker slots share one scratch tree (`/tmp/blastbox-fc-slots`): the
+base's `warm-*.mem` snapshot and, per slot, `outdisk.ext4`, `in/`, and the slot's `fc-api.sock` /
+`vsock.sock`. A firecracker process that is not jailed and not confined by AppArmor, sharing a uid
+with the others, can read another slot's input and output disks or drive another slot's VMM
+through its API socket if it is compromised. That is what the jail helper (above, the default)
+removes.
 
 Preflight's `sandbox-confinement` check warns when a firecracker or runsc process is not confined
 by AppArmor (its AppArmor label, `/proc/<pid>/attr/apparmor/current` or else an AppArmor-shaped
@@ -337,6 +423,16 @@ default docker endpoint. Any other endpoint configuration counts as another daem
 as none, without resolving where it points: `DOCKER_HOST`, `DOCKER_TLS_VERIFY`/`DOCKER_TLS`, a
 `DOCKER_CONTEXT` other than `default`, a `docker context use` choice in `config.json`, or a
 `config.json` that cannot be read.
+
+**With the Firecracker jail helper (the default)** firecracker is not started by the dispatcher:
+the root helper confines each jailed VMM with its own per-jail AppArmor profile on the host
+(see "Firecracker jail helper"). The `firecracker` column above describes only what the
+dispatcher itself could apply (the unjailed path; jailed, no Landlock shim runs either) and does
+not yet account for the helper, in EITHER direction: under `require` a containerised jailed
+dispatcher can be refused for `firecracker` although its VMMs are AppArmor-confined, and
+`require` can pass (e.g. on Landlock) while a helper running without AppArmor leaves them with
+no LSM at all (preflight's `fc-jailer` WARNs then). Run the helper with `--apparmor require` for
+the guarantee until detection learns about the helper.
 
 `BLASTBOX_CONFINEMENT=auto|require|off` (default `auto`). `require` makes `blastbox dispatch`
 refuse to start, and preflight FAIL, when a sandbox kind the dispatcher can run (including

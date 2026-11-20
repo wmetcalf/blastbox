@@ -78,6 +78,14 @@ class FakeHost(pf.HostView):
     def guest_problem(self, rootfs: str, runtime: str) -> str:
         return getattr(self, "guest_problems", {}).get(rootfs, "")
 
+    #: A healthy Firecracker jail helper unless a test says otherwise.
+    jail = ({"protocol": 1, "firecracker": "1.16.0", "apparmor": True, "ready_port": 10000},
+            "", "")
+
+    def jail_hello(self, socket_path: str):
+        self.jail_asked = socket_path
+        return self.jail
+
     def listdir(self, path: str) -> list[str] | None:
         prefix = path.rstrip("/") + "/"
         names = {p[len(prefix):].split("/", 1)[0] for p in self.paths if p.startswith(prefix)}
@@ -99,6 +107,13 @@ class FakeHost(pf.HostView):
             return None
         rc, out, err = self.commands[key]
         return subprocess.CompletedProcess(list(argv), rc, out, err)
+
+
+def _unjailed(**over) -> FakeHost:
+    """A prepared host whose dispatcher runs firecracker itself (BLASTBOX_FC_JAILER=off): the
+    local /dev/kvm and firecracker checks apply."""
+    over["env"] = {"BLASTBOX_FC_JAILER": "off", **over.get("env", {})}
+    return _healthy(**over)
 
 
 def _healthy(**over) -> FakeHost:
@@ -183,7 +198,7 @@ def test_a_prepared_host_has_no_failures_or_warnings():
     bad = [c for c in checks if c.status is not Status.PASS]
     assert bad == []
     names = {c.name for c in checks}
-    assert {"kvm", "firecracker", "runsc", "docker", "docker-runsc-runtime", "userns",
+    assert {"fc-jailer", "runsc", "docker", "docker-runsc-runtime", "userns",
             "apparmor", "bwrap-userns-restrict", "clock", "cpu-flags", "scratch"} <= names
 
 
@@ -196,26 +211,26 @@ def test_only_the_selected_tiers_are_checked():
 # --- firecracker ------------------------------------------------------------------------
 
 def test_missing_kvm_fails_the_firecracker_tier():
-    host = _healthy(paths={"/var/lib/blastbox/jobs"}, rw=set())
+    host = _unjailed(paths={"/var/lib/blastbox/jobs"}, rw=set())
     c = _by_name(pf.run_preflight(host, ["firecracker"]))["kvm"]
     assert c.status is Status.FAIL and "/dev/kvm" in c.detail
 
 
 def test_kvm_without_rw_access_fails_and_names_the_kvm_group():
-    host = _healthy(rw=set())
+    host = _unjailed(rw=set())
     c = _by_name(pf.run_preflight(host, ["firecracker"]))["kvm"]
     assert c.status is Status.FAIL and "kvm group" in c.detail
 
 
 def test_firecracker_below_the_minimum_version_fails():
-    host = _healthy(commands={("/usr/local/bin/firecracker", "--version"):
+    host = _unjailed(commands={("/usr/local/bin/firecracker", "--version"):
                               (0, "Firecracker v1.10.0\n", "")})
     c = _by_name(pf.run_preflight(host, ["firecracker"]))["firecracker"]
     assert c.status is Status.FAIL and "1.10.0" in c.detail
 
 
 def test_firecracker_binary_comes_from_the_env_knob_first():
-    host = _healthy(env={"BLASTBOX_FC_BIN": "/opt/fc/firecracker"},
+    host = _unjailed(env={"BLASTBOX_FC_BIN": "/opt/fc/firecracker"},
                     executables={"fcx": "/opt/fc/firecracker"},
                     commands={("/opt/fc/firecracker", "--version"): (0, "v1.15.1\n", "")})
     c = _by_name(pf.run_preflight(host, ["firecracker"]))["firecracker"]
@@ -223,7 +238,7 @@ def test_firecracker_binary_comes_from_the_env_knob_first():
 
 
 def test_missing_firecracker_binary_fails():
-    host = _healthy(executables={"docker": "/usr/bin/docker"})
+    host = _unjailed(executables={"docker": "/usr/bin/docker"})
     c = _by_name(pf.run_preflight(host, ["firecracker"]))["firecracker"]
     assert c.status is Status.FAIL
 
@@ -790,7 +805,7 @@ def test_unconfined_or_complain_mode_profiles_are_not_confinement(label):
 
 @pytest.mark.parametrize("result", [None, (0, "no version here\n", "")])
 def test_firecracker_whose_version_cannot_be_read_fails(result):
-    host = _healthy()
+    host = _unjailed()
     if result is None:
         del host.commands[("/usr/local/bin/firecracker", "--version")]
     else:
@@ -862,7 +877,7 @@ def test_stock_bwrap_profile_only_warns_when_something_nests_bwrap():
 
 
 def test_kvm_as_root_says_the_dispatcher_user_is_unverified():
-    c = _by_name(pf.run_preflight(_healthy(euid=0), ["firecracker"]))["kvm"]
+    c = _by_name(pf.run_preflight(_unjailed(euid=0), ["firecracker"]))["kvm"]
     assert c.status is Status.PASS and "dispatcher user" in c.detail
 
 
@@ -1068,7 +1083,7 @@ def test_rootless_gvisor_knob_is_a_userns_need_only_on_the_gvisor_tier():
 def test_fc_overflow_problems_warn_because_the_dispatcher_skips_the_tier(drop):
     env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2",
            "BLASTBOX_POOL_WARM_SNAPSHOT": "1"}
-    host = _healthy(env=env, kernels={"/var/lib/blastbox/fc/vmlinux": (5, 10)},
+    host = _unjailed(env=env, kernels={"/var/lib/blastbox/fc/vmlinux": (5, 10)},
                     paths={"/var/lib/blastbox/jobs", "/var/lib/blastbox/fc/vmlinux",
                            "/var/lib/blastbox/fc/rootfs.ext4", "/var/lib/blastbox/gvisor-rootfs/x"})
     for k in drop:
@@ -1134,7 +1149,7 @@ def test_only_the_configured_sandboxs_profile_is_required():
 # --- full-PR sweep on #208 -----------------------------------------------------------------
 
 def test_default_tiers_on_an_unconfigured_host_warn_rather_than_fail_unselected_tiers():
-    host = _healthy(paths={"/var/lib/blastbox/jobs"}, rw=set())
+    host = _unjailed(paths={"/var/lib/blastbox/jobs"}, rw=set())
     host.executables.pop("firecracker")
     checks = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False)
     by = _by_name(checks)
@@ -1160,18 +1175,18 @@ def test_overflow_non_gate_problems_on_warm_tiers_warn_never_ready():
     """A missing gVisor rootfs / non-rw kvm on a WARM overflow tier is admitted, its base never
     builds, and the cascade serves on the primary: degraded (WARN), not refused."""
     env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "firecracker:2,gvisor:2"}
-    host = _healthy(env=env, paths={"/dev/kvm", "/var/lib/blastbox/jobs",
+    host = _unjailed(env=env, paths={"/dev/kvm", "/var/lib/blastbox/jobs",
                                     "/var/lib/blastbox/fc/vmlinux", "/var/lib/blastbox/fc/rootfs.ext4"})
     c = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False))["gvisor-rootfs"]
     assert c.status is Status.WARN and "never" in c.detail
     env2 = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2",
             "BLASTBOX_POOL_WARM_SNAPSHOT": "1"}
-    host2 = _healthy(env=env2, rw=set())
+    host2 = _unjailed(env=env2, rw=set())
     assert _by_name(pf.run_preflight(host2, pf.resolve_tiers([], host2.env), explicit=False))["kvm"].status \
         is Status.WARN
     # A COLD firecracker overflow tier really spawns on a non-rw kvm, and every spawn fails.
     env3 = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2"}
-    host3 = _healthy(env=env3, rw=set())
+    host3 = _unjailed(env=env3, rw=set())
     assert _by_name(pf.run_preflight(host3, pf.resolve_tiers([], host3.env), explicit=False))["kvm"].status \
         is Status.FAIL
 
@@ -1240,7 +1255,7 @@ def test_remote_only_hosts_skip_local_worker_checks():
 
 def test_a_skipped_overflow_tier_downgrades_all_its_fails():
     env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2"}
-    host = _healthy(env=env, rw=set())          # /dev/kvm present but not rw (not a gate)
+    host = _unjailed(env=env, rw=set())          # /dev/kvm present but not rw (not a gate)
     host.executables.pop("firecracker")         # ...but the binary is missing (a gate)
     by = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False))
     assert by["firecracker"].status is Status.WARN
@@ -1257,7 +1272,7 @@ def test_snapshot_age_only_matters_for_warm_snapshot_tiers():
 
 def test_fc_overflow_skipped_for_unset_guest_knobs_downgrades_kvm():
     env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2"}
-    host = _healthy(env=env, rw=set())
+    host = _unjailed(env=env, rw=set())
     del host.env["BLASTBOX_FC_KERNEL"], host.env["BLASTBOX_FC_ROOTFS"]
     checks = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False)
     assert _by_name(checks)["kvm"].status is Status.WARN
@@ -1334,7 +1349,7 @@ def test_runc_with_the_default_container_backend_needs_no_userns():
 
 def test_explicit_tier_keeps_overflow_fails():
     env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2"}
-    host = _healthy(env=env)
+    host = _unjailed(env=env)
     host.executables.pop("firecracker")
     assert _by_name(pf.run_preflight(host, ["firecracker"], explicit=True))["firecracker"].status \
         is Status.FAIL
@@ -1585,7 +1600,7 @@ def test_unconfigured_static_overflow_is_skipped_so_the_mix_only_warns():
 
 def test_unavailable_local_overflow_under_a_static_primary_only_warns():
     env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "static:4,firecracker:2",
-           **_WORKERS}
+           **_WORKERS, "BLASTBOX_FC_JAILER": "off"}     # unjailed: the local binary is the gate
     host_over = {"executables": {"timedatectl": "/usr/bin/timedatectl", "docker": "/usr/bin/docker",
                                  "runsc": "/usr/bin/runsc"}}       # no firecracker binary: a gate
     c, _ = _pool_runtime(env, **host_over)
@@ -1655,3 +1670,144 @@ def test_an_admitted_runsc_overflow_fail_is_not_reported_as_never_ready():
     c = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False))["runsc"]
     assert c.status is Status.WARN and "still admits" in c.detail, c.detail
     assert "never becomes ready" not in c.detail
+
+# --- firecracker jail helper ---------------------------------------------------------------
+
+def _jail_check(env: "dict[str, str] | None" = None, jail=None, euid: int = 1000):
+    host = _healthy(env=dict(env or {}))
+    host.euid = euid
+    if jail is not None:
+        host.jail = jail
+    return host, _by_name(pf.run_preflight(host, ["firecracker"]))["fc-jailer"]
+
+
+def test_jail_helper_is_checked_by_default_and_passes_when_healthy():
+    host, c = _jail_check()
+    assert c.status is Status.PASS and "1.16.0" in c.detail
+    assert host.jail_asked == "/run/blastbox-fc-jail/helper.sock"
+
+
+def test_jail_socket_knob_is_honoured():
+    host, _ = _jail_check({"BLASTBOX_FC_JAIL_SOCKET": "/run/x/h.sock"})
+    assert host.jail_asked == "/run/x/h.sock"
+
+
+def test_unreachable_jail_helper_fails_and_names_the_opt_out():
+    _, c = _jail_check(jail=(None, "unreachable", "no such file"))
+    assert c.status is Status.FAIL
+    assert "BLASTBOX_FC_JAILER=off" in c.detail and "fails closed" in c.detail
+    assert c.doc.endswith("#firecracker-jail-helper")
+
+
+def test_jailer_off_warns_that_firecracker_runs_unjailed():
+    host, c = _jail_check({"BLASTBOX_FC_JAILER": "off"})
+    assert c.status is Status.WARN and "UNJAILED" in c.detail
+    assert not hasattr(host, "jail_asked")
+
+
+def test_a_jailer_typo_fails_rather_than_disabling_the_jail():
+    _, c = _jail_check({"BLASTBOX_FC_JAILER": "of"})
+    assert c.status is Status.FAIL
+
+
+def test_jail_helper_with_an_old_firecracker_fails():
+    _, c = _jail_check(jail=({"protocol": 1, "firecracker": "1.12.1", "apparmor": True}, "", ""))
+    assert c.status is Status.FAIL and "1.12.1" in c.detail
+
+
+def test_jail_helper_without_apparmor_warns():
+    _, c = _jail_check(jail=({"protocol": 1, "firecracker": "1.16.0", "apparmor": False}, "", ""))
+    assert c.status is Status.WARN and "AppArmor" in c.detail
+
+
+@pytest.mark.parametrize("code", ["forbidden", "refused"])   # current helper / older helper
+def test_jail_helper_refusing_root_is_a_warning_not_a_failure(code):
+    _, c = _jail_check(jail=(None, code, "uid 0 is not allowed (--allow-uid)"), euid=0)
+    assert c.status is Status.WARN and "dispatcher" in c.detail
+    _, c = _jail_check(jail=(None, code, "uid 1000 is not allowed (--allow-uid)"), euid=1000)
+    assert c.status is Status.FAIL
+
+
+def test_a_jailed_firecracker_process_is_recognised_by_its_per_jail_name():
+    jailed = _proc(300, ["/firecracker-0b4f6d1e-1111-4222-8333-944455556666", "--id", "x",
+                         "--start-time-us", "1", "--api-sock", "/fc-api.sock"], uid=200001,
+                   aa="blastbox-fc-jail-0b4f6d1e-1111-4222-8333-944455556666 (enforce)\n")
+    c = _by_name(pf.run_preflight(_with_procs(jailed), ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.PASS and "jailed" in c.detail
+
+
+def test_a_jailed_dispatcher_needs_no_local_kvm_or_firecracker():
+    """The jailed container has neither; the helper does. No FAIL for their absence."""
+    host = _healthy(paths={"/var/lib/blastbox/jobs", "/var/lib/blastbox/fc/vmlinux",
+                                     "/var/lib/blastbox/fc/rootfs.ext4"}, rw=set(), executables={})
+    by = _by_name(pf.run_preflight(host, ["firecracker"]))
+    assert "kvm" not in by and "firecracker" not in by
+    assert by["fc-jailer"].status is Status.PASS
+
+
+def test_an_unjailed_dispatcher_still_checks_local_kvm_and_firecracker():
+    by = _by_name(pf.run_preflight(_unjailed(), ["firecracker"]))
+    assert by["kvm"].status is Status.PASS and by["firecracker"].status is Status.PASS
+    assert by["fc-jailer"].status is Status.WARN
+
+
+@pytest.mark.parametrize("knob", [{"BLASTBOX_SNAPSHOT_MEM_TMPFS": "1"},
+                                  {"BLASTBOX_SNAPSHOT_MEM_DIR": "/dev/shm/bb"}])
+def test_a_jailed_warm_tier_with_a_snapshot_mem_dir_fails_as_the_runtime_refuses(knob):
+    env = {"BLASTBOX_POOL_WARM_SNAPSHOT": "1", **knob}
+    _, c = _jail_check(env=env)
+    assert c.status is Status.FAIL and "chroot-base" in c.detail
+    _, c = _jail_check(env={**knob})                  # no warm snapshots: the knob is unused
+    assert c.status is Status.PASS
+    _, c = _jail_check(env={"BLASTBOX_POOL_WARM_SNAPSHOT": "1",
+                            "BLASTBOX_SNAPSHOT_MEM_TMPFS": "0"})   # off: not refused
+    assert c.status is Status.PASS
+
+
+def _jailed_cascade(tiers, jail):
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": tiers, **_WORKERS}
+    host = _healthy(env=env)
+    host.env.update(env)
+    host.jail = jail
+    checks = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False)
+    return _by_name(checks), checks
+
+
+_UNREACHABLE = (None, "unreachable", "/run/blastbox-fc-jail/helper.sock: No such file")
+
+
+def test_an_fc_overflow_tier_whose_helper_is_unreachable_is_dropped_with_a_warn():
+    by, checks = _jailed_cascade("gvisor:2,firecracker:2", _UNREACHABLE)
+    assert by["fc-jailer"].status is Status.WARN and "overflow" in by["fc-jailer"].detail
+    assert pf.exit_code(checks) == 0
+    # A static primary would refuse the mix with an admitted FC tier; dropped, it only warns.
+    by, _ = _jailed_cascade("static:4,firecracker:2", _UNREACHABLE)
+    by_ok, _ = _jailed_cascade("static:4,firecracker:2", _healthy().jail)
+    assert by["pool-runtime"].status is Status.WARN, by["pool-runtime"].detail
+    assert by_ok["pool-runtime"].status is Status.FAIL
+
+
+def test_an_fc_primary_whose_helper_is_unreachable_fails():
+    by, checks = _jailed_cascade("firecracker:2,gvisor:2", _UNREACHABLE)
+    assert by["fc-jailer"].status is Status.FAIL and "fails closed" in by["fc-jailer"].detail
+    assert pf.exit_code(checks) != 0
+
+
+def test_every_firecracker_vmm_counts_but_firecracker_containerd_does_not():
+    jid = "0b4f6d1e-1111-4222-8333-944455556666"
+    vmm = ["--id", "x", "--start-time-us", "1", "--api-sock", "/fc-api.sock"]
+    for argv, is_vmm in (([f"/firecracker-{jid}", *vmm], True),
+                         (["/firecracker-xyz12345", "--api-sock=/fc-api.sock"], True),
+                         (["/usr/local/bin/firecracker-v1.16.0-x86_64", "--no-api",
+                           "--config-file", "/tmp/fc.json"], True),
+                         (["/firecracker-abc"], True),                  # flagless, renamed
+                         (["/firecracker-abc", "--log-path", "/x"], True),
+                         (["/usr/bin/firecracker-containerd", "--config", "/etc/x"], False),
+                         (["/usr/bin/firecracker-containerd-shim", "-namespace", "x"], False)):
+        host = _with_procs(_proc(77, argv))
+        roles = [p.role for p in pf._sandbox_processes(host)]
+        assert (roles == ["firecracker"]) is is_vmm, (argv, roles)
+    # argv unreadable (hidepid): judged by comm alone, still counted.
+    for comm in ("firecracker-xyz", "firecracker-con"):   # "con": a jail id, or containerd
+        host = _with_procs({"/proc/78/cmdline": "", "/proc/78/comm": comm + "\n"})
+        assert [p.role for p in pf._sandbox_processes(host)] == ["firecracker"], comm
