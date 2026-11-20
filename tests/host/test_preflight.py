@@ -1600,7 +1600,7 @@ def test_unconfigured_static_overflow_is_skipped_so_the_mix_only_warns():
 
 def test_unavailable_local_overflow_under_a_static_primary_only_warns():
     env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "static:4,firecracker:2",
-           **_WORKERS}
+           **_WORKERS, "BLASTBOX_FC_JAILER": "off"}     # unjailed: the local binary is the gate
     host_over = {"executables": {"timedatectl": "/usr/bin/timedatectl", "docker": "/usr/bin/docker",
                                  "runsc": "/usr/bin/runsc"}}       # no firecracker binary: a gate
     c, _ = _pool_runtime(env, **host_over)
@@ -1762,3 +1762,32 @@ def test_a_jailed_warm_tier_with_a_snapshot_mem_dir_fails_as_the_runtime_refuses
     _, c = _jail_check(env={"BLASTBOX_POOL_WARM_SNAPSHOT": "1",
                             "BLASTBOX_SNAPSHOT_MEM_TMPFS": "0"})   # off: not refused
     assert c.status is Status.PASS
+
+
+def _jailed_cascade(tiers, jail):
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": tiers, **_WORKERS}
+    host = _healthy(env=env)
+    host.env.update(env)
+    host.jail = jail
+    checks = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False)
+    return _by_name(checks), checks
+
+
+_UNREACHABLE = (None, "unreachable", "/run/blastbox-fc-jail/helper.sock: No such file")
+
+
+def test_an_fc_overflow_tier_whose_helper_is_unreachable_is_dropped_with_a_warn():
+    by, checks = _jailed_cascade("gvisor:2,firecracker:2", _UNREACHABLE)
+    assert by["fc-jailer"].status is Status.WARN and "overflow" in by["fc-jailer"].detail
+    assert pf.exit_code(checks) == 0
+    # A static primary would refuse the mix with an admitted FC tier; dropped, it only warns.
+    by, _ = _jailed_cascade("static:4,firecracker:2", _UNREACHABLE)
+    by_ok, _ = _jailed_cascade("static:4,firecracker:2", _healthy().jail)
+    assert by["pool-runtime"].status is Status.WARN, by["pool-runtime"].detail
+    assert by_ok["pool-runtime"].status is Status.FAIL
+
+
+def test_an_fc_primary_whose_helper_is_unreachable_fails():
+    by, checks = _jailed_cascade("firecracker:2,gvisor:2", _UNREACHABLE)
+    assert by["fc-jailer"].status is Status.FAIL and "fails closed" in by["fc-jailer"].detail
+    assert pf.exit_code(checks) != 0
