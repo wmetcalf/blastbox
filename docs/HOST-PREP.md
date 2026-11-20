@@ -426,20 +426,31 @@ as none, without resolving where it points: `DOCKER_HOST`, `DOCKER_TLS_VERIFY`/`
 
 **With the Firecracker jail helper (the default)** firecracker is not started by the dispatcher:
 the root helper confines each jailed VMM with its own per-jail AppArmor profile on the host
-(see "Firecracker jail helper"). The `firecracker` column above describes only what the
-dispatcher itself could apply (the unjailed path; jailed, no Landlock shim runs either) and does
-not yet account for the helper, in EITHER direction: under `require` a containerised jailed
-dispatcher can be refused for `firecracker` although its VMMs are AppArmor-confined, and
-`require` can pass (e.g. on Landlock) while a helper running without AppArmor leaves them with
-no LSM at all (preflight's `fc-jailer` WARNs then). Run the helper with `--apparmor require` for
-the guarantee until detection learns about the helper.
+(see "Firecracker jail helper"), so the `firecracker` column above describes only the unjailed
+path (`BLASTBOX_FC_JAILER=off`; jailed, no Landlock shim runs either). Jailed, the helper's
+`hello` decides, whatever the dispatcher's own context. It is reported even with
+`BLASTBOX_CONFINEMENT=off`: the helper loads its profiles regardless, it is the truth about the
+host, and `off` only means "do not gate on it":
+
+| Jail helper | firecracker |
+|---|---|
+| answers, per-jail AppArmor on | apparmor (also from a containerised dispatcher under `docker-default`) |
+| answers, AppArmor off where it runs or `--apparmor off` | none (Landlock is never offered: the dispatcher does not launch the VMM) |
+| unreachable (down, restarting, or not this uid's to ask) | none -- unknown until it answers; `require` fails closed |
+| refuses for good (protocol skew), or a `BLASTBOX_FC_JAILER` typo | none |
+
+The dispatcher asks the helper once at startup, and only when a firecracker tier is reachable.
+Preflight's `sandbox-confinement` check also flags a jailed VMM outside its
+`blastbox-fc-jail-<id>` profile when the helper says it loads one; jailed VMMs live in the
+host's pid namespace, so from a dispatcher container none are visible -- run it on the host.
 
 `BLASTBOX_CONFINEMENT=auto|require|off` (default `auto`). `require` makes `blastbox dispatch`
 refuse to start, and preflight FAIL, when a sandbox kind the dispatcher can run (including
 `cold`, the fallback of a non-warm-only warm tier) has no usable LSM. Any other value is refused rather than read as `off`.
 
 Preflight's `confinement` check prints the LSM stack, SELinux mode, AppArmor state and
-`apparmor_parser` version, the Landlock ABI, the runsc release, and firecracker/jailer presence;
+`apparmor_parser` version, the Landlock ABI, the runsc release, and the jail helper's answer
+(firecracker/jailer presence when unjailed);
 `--json` carries the same as `facts`. (The runsc release shown is the warm tier's binary; the
 cold tier's runsc is whatever dockerd has registered, see `docker-runsc-runtime`.) Usability is judged from the process that runs the check
 (its AppArmor label, what it can see of `/sys`), so run preflight where the dispatcher runs:

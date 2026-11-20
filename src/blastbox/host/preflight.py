@@ -230,6 +230,16 @@ class RealHost(HostView):
             return None
 
     def jail_hello(self, socket_path: str) -> "tuple[dict[str, object] | None, str, str]":
+        # Asked once per socket per run: fc-jailer, sandbox-confinement and confinement all
+        # judge the SAME answer (and a stalled helper costs its timeout once, not three times).
+        cache: dict[str, tuple[dict[str, object] | None, str, str]] = self.__dict__.setdefault(
+            "_jail_hellos", {})
+        if socket_path not in cache:
+            cache[socket_path] = self._jail_hello(socket_path)
+        return cache[socket_path]
+
+    @staticmethod
+    def _jail_hello(socket_path: str) -> "tuple[dict[str, object] | None, str, str]":
         from blastbox.host.runtime.fc_jail import JailClient, JailError  # noqa: PLC0415
 
         try:
@@ -1347,15 +1357,26 @@ def _is_unconfined(label: str) -> bool:
     return name == "unconfined" or mode.rstrip(")").strip() in ("unconfined", "complain")
 
 
-def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc]) -> Check:
+#: The jail helper's per-jail AppArmor profile names (fc_jail_helper.profile_name).
+_JAIL_PROFILE_PREFIX = "blastbox-fc-jail-"
+
+
+def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc],
+                               fc_jail: "str | None" = None) -> Check:
+    """``fc_jail``: confinement.HostLsm.fc_jail when firecracker is checked (None otherwise)."""
     doc = f"{DOC}#confining-firecracker-and-runsc-processes"
+    jailing = fc_jail not in (None, "off")
     if not procs:
         return Check("sandbox-confinement", Status.PASS,
-                     "no running firecracker/runsc processes to inspect")
+                     "no running firecracker/runsc processes to inspect" + (
+                         " (jailed firecrackers run in the jail helper's pid namespace -- the "
+                         "host's -- so from a container none are visible; run preflight on "
+                         "the host to inspect them)" if jailing else ""))
     unconfined: list[_Proc] = []
     unjailed: list[_Proc] = []
     unknown: list[_Proc] = []
     foreign: list[_Proc] = []
+    off_profile: list[_Proc] = []      # jailed, but not in the helper's per-jail profile
     for p in procs:
         # attr/apparmor/current is AppArmor's own label under LSM stacking; attr/current is the
         # display LSM's (an SELinux context on a non-AppArmor host), so only trust an
@@ -1381,13 +1402,28 @@ def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc]) -> Check:
                 unknown.append(p)
             elif jailed is False:
                 unjailed.append(p)
+            elif (jailed and fc_jail == "apparmor" and label and p not in unconfined
+                  and not label.strip().startswith(_JAIL_PROFILE_PREFIX)):
+                off_profile.append(p)
     problems = []
+    jailed_unconfined = [p for p in unconfined if p.role == "firecracker" and _jailed(p)]
     if unconfined:
         problems.append(f"not confined by AppArmor (unconfined, or a profile in unconfined/"
                         f"complain mode): {_pids(unconfined)}")
+    if off_profile:
+        problems.append("jailed firecracker outside its per-jail AppArmor profile "
+                        f"({_JAIL_PROFILE_PREFIX}<jail id>, which the jail helper says it "
+                        f"loads): {_pids(off_profile)}")
     if unjailed:
         problems.append(f"firecracker without the jailer: {_pids(unjailed)}")
     if problems:
+        if fc_jail == "no-apparmor" and jailed_unconfined and not unjailed and not (
+                set(unconfined) - set(jailed_unconfined)) and not off_profile:
+            # Under the jailer already: the missing piece is the helper's AppArmor.
+            return Check("sandbox-confinement", Status.WARN,
+                         "; ".join(problems) + ". The jail helper runs without per-jail "
+                         "AppArmor profiles (AppArmor off where it runs, or --apparmor off): "
+                         "enable them so a VMM is confined by more than its chroot", doc)
         return Check("sandbox-confinement", Status.WARN,
                      "; ".join(problems) + ". Slots share one scratch tree (other slots' "
                      "disks and API/vsock sockets); run firecracker under the jailer with a "
@@ -1454,7 +1490,9 @@ def _check_confinement(host: HostView, tiers: Collection[str],
         parts.append("securityfs not readable (container?): LSM stack inferred from "
                      "/sys/module and /sys/fs/selinux")
     parts += cf._blockers(st, kinds)
-    if st.apparmor and kinds and st.apparmor_parser is None:
+    # A jailed firecracker's profiles are the HELPER's to load, with its own parser.
+    own = [k for k in kinds if not (k == "firecracker" and st.fc_jail not in (None, "off"))]
+    if st.apparmor and own and st.apparmor_parser is None:
         parts.append("apparmor_parser not found: blastbox profiles cannot be loaded")
     elif st.apparmor_parser == "present (--version failed)":
         parts.append("apparmor_parser present but `--version` failed")
@@ -1463,8 +1501,14 @@ def _check_confinement(host: HostView, tiers: Collection[str],
         parts.append(f"runsc {st.runsc} ({split[st.runsc_split_sentry]})" if st.runsc
                      else "runsc not found")
     if "firecracker" in kinds:
-        parts.append(f"firecracker {st.firecracker or 'not found'}, jailer "
-                     f"{st.jailer or 'not found'}")
+        if st.fc_jail in (None, "off"):
+            parts.append(f"firecracker {st.firecracker or 'not found'}, jailer "
+                         f"{st.jailer or 'not found'}")
+        else:
+            # JAILED: the helper on the host runs its own firecracker and loads the profiles.
+            parts.append(f"firecracker jailed by the jail helper ({st.fc_jail_detail}): "
+                         "per-jail AppArmor" if st.fc_jail == "apparmor" else
+                         f"firecracker jailed by the jail helper: {st.jail_blocker()}")
     if would:
         parts.append("would use: " + ", ".join(f"{k}={v}" for k, v in would.items()))
     parts.append("detection only, nothing enforced yet")
@@ -1633,7 +1677,12 @@ def run_preflight(host: HostView, tiers: Sequence[str], *, explicit: bool = True
         procs = [p for p in _sandbox_processes(host) if p.role in roles]
         if t & {"docker", "gvisor"}:
             out.append(_check_runsc_host_root(host, procs))
-        out.append(_check_sandbox_confinement(host, procs))
+        fc_jail = None
+        if "firecracker" in t:
+            from blastbox.host.confinement import _fc_jail  # noqa: PLC0415
+
+            fc_jail = _fc_jail(host, host.env)[0]
+        out.append(_check_sandbox_confinement(host, procs, fc_jail))
     local = bool(t - {"remote"})
     if local:   # a remote-only dispatcher runs no worker, runsc or JVM engine here
         out.append(_check_apparmor(host))

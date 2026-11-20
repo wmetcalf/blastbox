@@ -18,6 +18,15 @@ Landlock is not offered for gVisor: runsc mounts, which a Landlock domain forbid
 closed when a kind this host runs has no usable LSM), ``off``. Anything else is an error, never
 "off": a typo must not be what disables confinement.
 
+Firecracker is JAILED by default (``BLASTBOX_FC_JAILER``, runtime/fc_jail.py): the dispatcher
+never execs it; the root jail helper on the HOST does, under a per-jail AppArmor profile when its
+``hello`` says so. A jailed VMM's confinement is therefore the HELPER's answer -- the dispatcher's
+own label, securityfs view and Landlock say nothing about it -- and it is reported whatever
+``BLASTBOX_CONFINEMENT`` says: it is the truth about the host, and ``off`` only means "do
+not gate on it".
+An unreachable helper is UNKNOWN (counted as none, so ``require`` fails closed); with jailing off
+the dispatcher launches firecracker itself and its own context decides, as above.
+
 Degrades cleanly: a container without securityfs (``/sys/kernel/security`` unmounted) falls
 back to ``/sys/module/apparmor`` and ``/sys/fs/selinux``; a kernel without Landlock answers
 ENOSYS/EOPNOTSUPP (ABI 0); a missing tool is reported absent, never raised.
@@ -67,6 +76,15 @@ class HostReader(Protocol):
     def which(self, name: str) -> str | None: ...
     def realpath(self, path: str) -> str: ...
     def run(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str] | None: ...
+
+
+#: ``HostLsm.fc_jail``: how a firecracker VMM is launched, as far as confinement goes.
+#:   off          BLASTBOX_FC_JAILER=off: the dispatcher execs firecracker itself
+#:   apparmor     jailed; the helper answered and loads a per-jail AppArmor profile
+#:   no-apparmor  jailed; the helper answered and loads none (AppArmor off there, --apparmor off)
+#:   unknown      jailed; the helper could not be asked (down, restarting, not this uid's to ask)
+#:   unusable     jailed; the helper refused for good (protocol skew), or a BLASTBOX_FC_JAILER typo
+FC_JAIL_STATES = ("off", "apparmor", "no-apparmor", "unknown", "unusable")
 
 
 class ConfinementUnavailable(RuntimeError):
@@ -137,14 +155,19 @@ class HostLsm:
     apparmor_parser: str | None = None  # "4.0.1"; None = not found / not probed
     runsc: str | None = None            # "release-20261012.0"
     runsc_split_sentry: bool | None = None
-    firecracker: str | None = None      # resolved path
-    jailer: str | None = None           # resolved path
+    firecracker: str | None = None      # resolved path (unjailed only: the helper runs its own)
+    jailer: str | None = None           # resolved path (unjailed only)
+    fc_jail: str | None = None          # FC_JAIL_STATES; None = not probed (dispatcher's own view)
+    fc_jail_detail: str | None = None   # the helper's socket and, when not answered, why
 
     def would_use(self, kind: str, mode: str = "auto") -> str:
         """The LSM ``kind``'s host processes would be confined with: selinux | apparmor |
         landlock | none. Pure."""
         if kind not in KINDS:
             raise ValueError(f"unknown sandbox kind {kind!r}")
+        if kind == "firecracker" and self.fc_jail not in (None, "off"):
+            # The jail helper, not this process, launches the VMM: only its answer counts.
+            return "apparmor" if self.fc_jail == "apparmor" else "none"
         if parse_mode(mode) == "off":
             return "none"
         # The caller-context blockers describe what the DISPATCHER can enter. Cold runsc is
@@ -160,6 +183,27 @@ class HostLsm:
         if kind == "firecracker" and self.landlock_abi > 0:
             return "landlock"
         return "none"
+
+    def jail_blocker(self) -> str | None:
+        """Why a JAILED firecracker has no LSM (None when it has one, or is not jailed)."""
+        where = f" ({self.fc_jail_detail})" if self.fc_jail_detail else ""
+        return {
+            "no-apparmor": "jail helper runs without per-jail AppArmor profiles (AppArmor off "
+                           "where it runs, or --apparmor off)" + where,
+            "unknown": "jail helper unreachable: a jailed firecracker's confinement is unknown "
+                       "until it answers" + where,
+            "unusable": "jail helper not usable: the firecracker tier does not run" + where,
+        }.get(self.fc_jail or "")
+
+    def blockers_for(self, kind: str) -> list[str]:
+        """Why ``kind`` gets no LSM: cold has its own daemon-view blocker; a jailed firecracker
+        the helper's; the kinds the dispatcher launches itself its caller-context blockers."""
+        if kind == "cold":
+            return [self.cold_blocker] if self.cold_blocker else []
+        if kind == "firecracker" and self.fc_jail not in (None, "off"):
+            jb = self.jail_blocker()
+            return [jb] if jb else []
+        return [b for b in (self.selinux_blocker, self.apparmor_blocker) if b]
 
     @property
     def flags(self) -> list[str]:
@@ -184,6 +228,8 @@ class HostLsm:
             "runsc_split_sentry": self.runsc_split_sentry,
             "firecracker": self.firecracker,
             "jailer": self.jailer,
+            "fc_jail": self.fc_jail,
+            "fc_jail_detail": self.fc_jail_detail,
             "flags": self.flags,
         }
 
@@ -374,11 +420,38 @@ def _firecracker(host: HostReader, env: Mapping[str, str]) -> tuple[str | None, 
     return fc, jailer
 
 
+def _fc_jail(host: HostReader, env: Mapping[str, str]) -> tuple[str, str | None]:
+    """``(state, detail)`` for HostLsm.fc_jail. Asks the helper (one ``hello`` over its socket;
+    nothing is spawned) only when jailing is on."""
+    from blastbox.host.runtime.fc_jail import JailSettings  # noqa: PLC0415
+
+    try:
+        settings = JailSettings.from_env(dict(env))
+    except ValueError as exc:
+        return "unusable", str(exc)
+    if not settings.enabled:
+        return "off", None
+    ask = getattr(host, "jail_hello", None)
+    if not callable(ask):
+        return "unknown", f"{settings.socket_path}: not asked from here"
+    try:
+        info, code, detail = ask(settings.socket_path)
+    except Exception as exc:  # noqa: BLE001 -- never raise on host state
+        info, code, detail = None, "error", f"{type(exc).__name__}: {exc}"
+    if info is not None:
+        return ("apparmor" if info.get("apparmor") else "no-apparmor"), settings.socket_path
+    why = f"{settings.socket_path}: {code}" + (f": {detail}" if detail else "")
+    # A protocol/READY-port skew is DECIDED (the runtime drops the tier); everything else --
+    # down, timing out, busy, or a uid it does not answer (root preflight) -- is not known.
+    return ("unusable" if code == "protocol" else "unknown"), why
+
+
 def probe(host: HostReader, *, env: Mapping[str, str] | None = None,
           kinds: Collection[str] = (), landlock: int | None = None) -> HostLsm:
-    """Read the host. Tool versions are probed only for ``kinds`` (runsc for gvisor;
-    firecracker/jailer presence for firecracker) and the parser only when AppArmor is on, so an
-    empty ``kinds`` never spawns anything. ``landlock`` is the ABI (None = 0)."""
+    """Read the host. Tool versions are probed only for ``kinds`` (runsc for gvisor; for
+    firecracker the jail helper's ``hello`` when jailing is on, else firecracker/jailer
+    presence) and the parser only when AppArmor is on, so an empty ``kinds`` never spawns or
+    connects anything. ``landlock`` is the ABI (None = 0)."""
     env = os.environ if env is None else env
     state = _probe_lsm(host, landlock)
     extra: dict[str, object] = {"cold_blocker": _cold_blocker(env, host)}
@@ -387,7 +460,9 @@ def probe(host: HostReader, *, env: Mapping[str, str] | None = None,
     if "gvisor" in kinds:     # the warm tier's binary; cold runsc is dockerd's registered runtime
         extra["runsc"], extra["runsc_split_sentry"] = _runsc(host, env)
     if "firecracker" in kinds:
-        extra["firecracker"], extra["jailer"] = _firecracker(host, env)
+        extra["fc_jail"], extra["fc_jail_detail"] = _fc_jail(host, env)
+        if extra["fc_jail"] == "off":
+            extra["firecracker"], extra["jailer"] = _firecracker(host, env)
     return replace(state, **extra)  # type: ignore[arg-type]
 
 
@@ -411,14 +486,10 @@ def check_required(state: HostLsm, mode: str, kinds: Iterable[str]) -> None:
 
 
 def _blockers(state: HostLsm, kinds: Iterable[str]) -> list[str]:
-    """The blockers that apply to ``kinds``: cold ignores the caller-context ones and has its
-    own; the kinds the dispatcher starts itself are blocked by those."""
-    kinds = set(kinds)
+    """The blockers that apply to ``kinds`` (HostLsm.blockers_for), each once, in kind order."""
     out: list[str] = []
-    if kinds - {"cold"}:
-        out += [b for b in (state.selinux_blocker, state.apparmor_blocker) if b]
-    if "cold" in kinds and state.cold_blocker:
-        out.append(state.cold_blocker)
+    for kind in [k for k in KINDS if k in set(kinds)]:
+        out += [b for b in state.blockers_for(kind) if b not in out]
     return out
 
 
@@ -436,9 +507,11 @@ class Detection:
         parts = [f"mode={self.mode}"]
         for kind in kinds:
             use = st.would_use(kind, self.mode)
-            why = [] if use != "none" or self.mode == "off" else [
-                b for b in ((st.cold_blocker,) if kind == "cold" else
-                            (st.selinux_blocker, st.apparmor_blocker)) if b]
+            jailed = kind == "firecracker" and st.fc_jail not in (None, "off")
+            if use != "none":
+                why = ["jail helper"] if jailed else []
+            else:
+                why = [] if self.mode == "off" and not jailed else st.blockers_for(kind)
             parts.append(f"{kind}={use}" + (f" ({'; '.join(why)})" if why else ""))
         return ", ".join(parts)
 
@@ -475,13 +548,32 @@ class _SysReader:
     def run(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str] | None:
         return None
 
+    def jail_hello(self, socket_path: str) -> tuple[dict[str, object] | None, str, str]:
+        """The jail helper's ``hello`` -- one connection, nothing spawned, bounded."""
+        from blastbox.host.runtime.fc_jail import JailClient, JailError  # noqa: PLC0415
+
+        try:
+            return JailClient(socket_path, timeout_s=_JAIL_HELLO_S).hello(), "", ""
+        except JailError as exc:
+            return None, exc.code, exc.detail
+        except Exception as exc:  # noqa: BLE001 -- never raise on host state
+            return None, "error", str(exc)
+
+
+#: Bound on the startup ``hello`` to the jail helper: a stalled helper costs seconds, not 60.
+_JAIL_HELLO_S = 5.0
+
 
 def detect(env: Mapping[str, str] | None = None, *, host: HostReader | None = None,
-           landlock: int | None = None) -> Detection:
-    """The dispatcher's startup detection: file reads and the Landlock query, no spawns.
-    Raises ValueError on an invalid mode."""
+           landlock: int | None = None, kinds: Collection[str] = ()) -> Detection:
+    """The dispatcher's startup detection: file reads, the Landlock query and -- only when
+    ``kinds`` holds firecracker and jailing is on -- one ``hello`` to the jail helper; never a
+    spawn. Raises ValueError on an invalid mode."""
     env = os.environ if env is None else env
     mode = mode_from_env(env)
     reader = _SysReader() if host is None else host
     state = _probe_lsm(reader, landlock_abi() if landlock is None else landlock)
-    return Detection(mode=mode, state=replace(state, cold_blocker=_cold_blocker(env, reader)))
+    extra: dict[str, object] = {"cold_blocker": _cold_blocker(env, reader)}
+    if "firecracker" in kinds:
+        extra["fc_jail"], extra["fc_jail_detail"] = _fc_jail(reader, env)
+    return Detection(mode=mode, state=replace(state, **extra))  # type: ignore[arg-type]

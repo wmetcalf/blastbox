@@ -936,10 +936,11 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     # BEFORE pool.start(), so no slot is spawned.
     from blastbox.host import confinement as _confinement
 
-    confinement = _confinement.detect()
-    _confinement.check_required(
-        confinement.state, confinement.mode,
-        _confinement.kinds_for_tiers(reachable_tiers(pool, tier, warm_only)))
+    # Told the reachable kinds: a reachable firecracker tier's confinement is the jail helper's
+    # (one hello), and a dispatcher that cannot reach one never connects to it.
+    conf_kinds = _confinement.kinds_for_tiers(reachable_tiers(pool, tier, warm_only))
+    confinement = _confinement.detect(kinds=conf_kinds)
+    _confinement.check_required(confinement.state, confinement.mode, conf_kinds)
 
     # Capability-based routing: the runtime declares its dispatch_style. A network-endpoint pool
     # (aws / static / cascade) drives workers over http_agent + remote_http via VmJobDispatcher; every

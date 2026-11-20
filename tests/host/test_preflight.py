@@ -622,9 +622,68 @@ def test_firecracker_without_the_jailer_warns():
 def test_jailed_and_confined_firecracker_passes():
     jailed = _proc(300, ["firecracker", "--id", "a", "--start-time-us", "1",
                          "--start-time-cpu-us", "2"], uid=10001,
-                   aa="blastbox-fc-slot-3 (enforce)\n")
+                   aa="blastbox-fc-jail-a (enforce)\n")
     c = _by_name(pf.run_preflight(_with_procs(jailed), ["firecracker"]))["sandbox-confinement"]
     assert c.status is Status.PASS, c.detail
+    # Unjailed dispatcher (its own jailer launch): any enforcing profile is its business.
+    other = _proc(300, ["firecracker", "--id", "a", "--start-time-us", "1"], uid=10001,
+                  aa="blastbox-fc-slot-3 (enforce)\n")
+    host = _with_procs(other, env={"BLASTBOX_FC_JAILER": "off"})
+    c = _by_name(pf.run_preflight(host, ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.PASS, c.detail
+
+
+_HELLO_NO_AA = ({"protocol": 1, "firecracker": "1.16.0", "apparmor": False}, "", "")
+
+
+def test_jailed_firecracker_outside_its_per_jail_profile_warns():
+    """The helper says it loads a per-jail profile: a jailed VMM in any OTHER profile is not
+    the confinement the helper reported (enforcing or not)."""
+    p = _proc(300, ["/firecracker-a", "--id", "a", "--start-time-us", "1"], uid=10001,
+              aa="docker-default (enforce)\n")
+    c = _by_name(pf.run_preflight(_with_procs(p), ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.WARN
+    assert "per-jail" in c.detail and "300" in c.detail
+
+
+def test_unconfined_jailed_firecracker_names_the_helper_without_apparmor():
+    p = _proc(300, ["/firecracker-a", "--id", "a", "--start-time-us", "1"], uid=10001,
+              aa="unconfined\n")
+    host = _with_procs(p)
+    host.jail = _HELLO_NO_AA
+    c = _by_name(pf.run_preflight(host, ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.WARN
+    assert "jail helper runs without per-jail AppArmor" in c.detail
+    assert "run firecracker under the jailer" not in c.detail   # it IS under the jailer
+
+
+def test_no_visible_vmm_with_jailing_on_says_where_they_run():
+    c = _by_name(pf.run_preflight(_healthy(), ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.PASS
+    assert "jail helper" in c.detail and "pid namespace" in c.detail
+    off = _healthy(env={"BLASTBOX_FC_JAILER": "off"})
+    c = _by_name(pf.run_preflight(off, ["firecracker"]))["sandbox-confinement"]
+    assert "jail helper" not in c.detail
+
+
+def test_real_host_asks_the_jail_helper_once_per_socket(monkeypatch):
+    from blastbox.host.runtime import fc_jail
+
+    calls = []
+
+    class _Client:
+        def __init__(self, path, *, timeout_s):
+            calls.append(path)
+
+        def hello(self):
+            return {"protocol": 1, "apparmor": True}
+
+    monkeypatch.setattr(fc_jail, "JailClient", _Client)
+    host = pf.RealHost()
+    assert host.jail_hello("/run/a.sock")[0] == {"protocol": 1, "apparmor": True}
+    host.jail_hello("/run/a.sock")
+    host.jail_hello("/run/b.sock")
+    assert calls == ["/run/a.sock", "/run/b.sock"]
 
 
 def test_a_chrooted_or_containerised_firecracker_is_not_taken_for_jailed():

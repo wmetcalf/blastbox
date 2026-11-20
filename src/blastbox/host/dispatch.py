@@ -742,11 +742,11 @@ class Dispatcher:
         # BLASTBOX_CONFINEMENT here too, for the same reason: an invalid mode is refused, and
         # require fails closed for embedders that did not pass a detection.
         env_mode = _confinement.mode_from_env()     # validated even when a detection is passed
+        kinds = _confinement.kinds_for_tiers(
+            reachable_tiers(self._pool, self._tier, self._warm_only))
         if self._confinement is None and env_mode == "require":
-            self._confinement = _confinement.detect()
+            self._confinement = _confinement.detect(kinds=kinds)
         if self._confinement is not None:
-            kinds = _confinement.kinds_for_tiers(
-                reachable_tiers(self._pool, self._tier, self._warm_only))
             # The env's require binds too, whatever mode the passed detection was built with --
             # and the log reports the mode actually applied.
             if env_mode == "require" and self._confinement.mode != "require":
