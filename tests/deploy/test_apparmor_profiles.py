@@ -304,19 +304,53 @@ def test_the_mediation_check_tells_the_spellings_apart(extra: str, mediated: boo
     assert _mediates_mount(text) is mediated
 
 
+#: A statement ending in an absolute mountpoint: `/path`, or a quoted `"/pa th"`.
+_ABS_MOUNTPOINT = r"""\s(/\S*|"/[^"]*")$"""
+
+
+def _statements(text: str) -> list[str]:
+    """The profile's rules as whitespace-normalised statements: comments stripped, split on the
+    commas that end a rule (not those inside a parenthesised list), whatever the line layout."""
+    body = " ".join(ln.split("#", 1)[0] for ln in text.splitlines())
+    out, depth, cur = [], 0, []
+    for ch in body:
+        depth += ch == "("
+        depth -= ch == ")"
+        if ch == "," and depth == 0:
+            out.append(" ".join("".join(cur).replace("{", " { ").replace("}", " } ").split()))
+            cur = []
+        else:
+            cur.append(ch)
+    return out
+
+
 def test_umount_denies_are_spelled_with_a_path() -> None:
     """The text-level guard, for hosts without apparmor_parser AND for parsers >= 4.1, where
-    the compiled check cannot see the bug: no umount deny that matches the empty mountpoint."""
-    rules = [ln.split("#", 1)[0].strip() for ln in
-             (_PROFILE_DIR / "blastbox-sandbox").read_text().splitlines()]
-    # Every umount deny names an explicit absolute mountpoint, on one line: anything else
-    # (bare, `*`, `**`, conditionals only, a rule split over lines) can match the empty
-    # mountpoint and unmediate the class on apparmor_parser <= 4.0.x.
-    umount = [r for r in rules if re.match(r"(audit\s+)?deny\s+umount\b", r)]
-    bad = [r for r in umount
-           if not re.fullmatch(r"(audit\s+)?deny\s+umount\s+(\S+=\S+\s+)*/\S*\s*,", r)]
+    the compiled check cannot see the bug: every umount deny ends in an explicit absolute
+    mountpoint (anything else -- bare, `*`, `**`, conditionals only -- can match the empty
+    mountpoint and unmediate the class on apparmor_parser <= 4.0.x)."""
+    stmts = _statements((_PROFILE_DIR / "blastbox-sandbox").read_text())
+    umount = [st.split("}")[-1].strip() for st in stmts if re.search(r"\bdeny umount\b", st)]
+    bad = [st for st in umount if not re.search(_ABS_MOUNTPOINT, st)]
     assert not bad, f"umount denies without an explicit mountpoint: {bad}"
-    assert "audit deny umount /," in rules and "audit deny umount /**," in rules
+    assert "audit deny umount /" in umount and "audit deny umount /**" in umount
+
+
+@pytest.mark.parametrize("rules,ok", [
+    ("  audit deny umount /,\n  audit deny umount /**,", True),
+    ('  audit deny umount "/mnt/a b",', True),
+    ("  audit deny umount fstype in (tmpfs ramfs) /tmp,", True),
+    ("  audit deny umount fstype=(tmpfs, ramfs) /tmp,", True),
+    ("  audit deny umount,", False),
+    ("  audit deny umount **,", False),
+    ("  audit deny umount fstype=tmpfs,", False),
+    ("  audit deny pivot_root, audit deny umount,", False),
+    ("  audit deny\n    umount,", False),
+])
+def test_the_text_guard_reads_statements_not_lines(rules: str, ok: bool) -> None:
+    stmts = _statements("profile p {\n" + rules + "\n}\n")
+    umount = [st.split("}")[-1].strip() for st in stmts if re.search(r"\bdeny umount\b", st)]
+    assert umount and all(re.search(_ABS_MOUNTPOINT, st) for st in umount) is ok
 
 
 def test_the_child_profile_loads_on_the_oldest_supported_apparmor() -> None:
@@ -389,3 +423,8 @@ def test_the_oracle_checks_every_profile_in_the_file() -> None:
         pytest.skip("this apparmor_parser compiles mediation markers above any deny (>= 4.1)")
     child = bare.rstrip().rstrip("}") + "  profile helper {\n    /usr/bin/true rix,\n  }\n}\n"
     assert not _mediates_mount(bare) and not _mediates_mount(child)
+    # and the converse: a clean parent with a bad child is not mediated either
+    shipped = (_PROFILE_DIR / "blastbox-sandbox").read_text()
+    bad_child = shipped.rstrip().rstrip("}") + (
+        "  profile helper {\n    /usr/bin/true rix,\n    audit deny umount,\n  }\n}\n")
+    assert _mediates_mount(shipped) and not _mediates_mount(bad_child)
