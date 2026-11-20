@@ -1791,3 +1791,13 @@ def test_an_fc_primary_whose_helper_is_unreachable_fails():
     by, checks = _jailed_cascade("firecracker:2,gvisor:2", _UNREACHABLE)
     assert by["fc-jailer"].status is Status.FAIL and "fails closed" in by["fc-jailer"].detail
     assert pf.exit_code(checks) != 0
+
+
+def test_only_the_jail_helpers_own_exec_name_counts_as_a_jailed_vmm():
+    jid = "0b4f6d1e-1111-4222-8333-944455556666"
+    for argv0, is_vmm in ((f"/firecracker-{jid}", True),
+                          ("/usr/bin/firecracker-containerd", False),
+                          ("/usr/local/bin/firecracker-ctl", False)):
+        host = _with_procs(_proc(77, [argv0, "--x"]))
+        roles = [p.role for p in pf._sandbox_processes(host)]
+        assert (roles == ["firecracker"]) is is_vmm, (argv0, roles)

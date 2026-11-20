@@ -1227,6 +1227,11 @@ class _Proc:
     argv: tuple[str, ...]
 
 
+#: The jail helper's per-jail exec name (argv[0] basename), or its 15-char comm truncation.
+_JAILED_FC_NAME = re.compile(r"firecracker-(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                             r"[0-9a-f]{12}|[0-9a-f]{3})")
+
+
 def _sandbox_processes(host: HostView) -> list[_Proc]:
     """Running runsc sandbox/gofer and firecracker processes, found by argv[0] (runsc re-execs
     itself with argv[0] ``runsc-sandbox``/``runsc-gofer``; its comm is often just ``exe``) or
@@ -1241,11 +1246,12 @@ def _sandbox_processes(host: HostView) -> list[_Proc]:
         if argv:
             names.add(os.path.basename(argv[0]))
         for role in (*_RUNSC_ROLES, "firecracker"):
-            # A jailed VMM runs as the jail helper's per-jail copy, /firecracker-<jail id>
-            # (comm truncated to 15 chars): still a firecracker.
+            # A jailed VMM runs as the jail helper's per-jail copy, /firecracker-<jail uuid>
+            # (comm truncated to 15 chars): still a firecracker -- but not every
+            # firecracker-* tool (firecracker-containerd) is one.
             if role in names or (role == "firecracker" and (
                     (fc_name and fc_name in names)
-                    or any(n.startswith("firecracker-") for n in names))):
+                    or any(_JAILED_FC_NAME.fullmatch(n) for n in names))):
                 found.append(_Proc(pid, role, argv))
                 break
     return found
