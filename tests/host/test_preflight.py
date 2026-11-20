@@ -622,9 +622,73 @@ def test_firecracker_without_the_jailer_warns():
 def test_jailed_and_confined_firecracker_passes():
     jailed = _proc(300, ["firecracker", "--id", "a", "--start-time-us", "1",
                          "--start-time-cpu-us", "2"], uid=10001,
-                   aa="blastbox-fc-slot-3 (enforce)\n")
+                   aa="blastbox-fc-jail-a (enforce)\n")
     c = _by_name(pf.run_preflight(_with_procs(jailed), ["firecracker"]))["sandbox-confinement"]
     assert c.status is Status.PASS, c.detail
+    # Unjailed dispatcher (its own jailer launch): any enforcing profile is its business.
+    other = _proc(300, ["firecracker", "--id", "a", "--start-time-us", "1"], uid=10001,
+                  aa="blastbox-fc-slot-3 (enforce)\n")
+    host = _with_procs(other, env={"BLASTBOX_FC_JAILER": "off"})
+    c = _by_name(pf.run_preflight(host, ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.PASS, c.detail
+
+
+_HELLO_NO_AA = ({"protocol": 1, "firecracker": "1.16.0", "apparmor": False}, "", "")
+
+
+def test_jailed_firecracker_outside_its_per_jail_profile_warns():
+    """The helper says it loads a per-jail profile: a jailed VMM in any OTHER profile is not
+    the confinement the helper reported (enforcing or not)."""
+    p = _proc(300, ["/firecracker-jail0aaa", "--id", "jail0aaa", "--start-time-us", "1"], uid=10001,
+              aa="docker-default (enforce)\n")
+    c = _by_name(pf.run_preflight(_with_procs(p), ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.WARN
+    assert "per-jail" in c.detail and "300" in c.detail
+
+
+def test_unconfined_jailed_firecracker_names_the_helper_without_apparmor():
+    p = _proc(300, ["/firecracker-jail0aaa", "--id", "jail0aaa", "--start-time-us", "1"], uid=10001,
+              aa="unconfined\n")
+    host = _with_procs(p)
+    host.jail = _HELLO_NO_AA
+    c = _by_name(pf.run_preflight(host, ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.WARN
+    assert "jail helper runs without per-jail AppArmor" in c.detail
+    assert "run firecracker under the jailer" not in c.detail   # it IS under the jailer
+
+
+def test_no_visible_vmm_with_jailing_on_says_where_they_run():
+    c = _by_name(pf.run_preflight(_healthy(), ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.PASS
+    assert "jail helper" in c.detail and "pid namespace" in c.detail
+    off = _healthy(env={"BLASTBOX_FC_JAILER": "off"})
+    c = _by_name(pf.run_preflight(off, ["firecracker"]))["sandbox-confinement"]
+    assert "jail helper" not in c.detail
+
+
+def test_real_host_asks_the_jail_helper_once_per_socket(monkeypatch):
+    from blastbox.host.runtime import fc_jail
+
+    calls = []
+
+    class _Client:
+        def __init__(self, path, *, timeout_s):
+            calls.append(path)
+
+        def hello(self):
+            return {"protocol": 1, "apparmor": True}
+
+    monkeypatch.setattr(fc_jail, "JailClient", _Client)
+    host = pf.RealHost()
+    assert host.jail_hello("/run/a.sock")[0] == {"protocol": 1, "apparmor": True}
+    host.jail_hello("/run/a.sock")
+    host.jail_hello("/run/b.sock")
+    assert calls == ["/run/a.sock", "/run/b.sock"]
+    # ...per RUN: a RealHost reused for a second preflight asks again (the helper may have
+    # restarted with other settings in between).
+    host.env = {"BLASTBOX_POOL_RUNTIME": "firecracker", "BLASTBOX_FC_JAIL_SOCKET": "/run/a.sock"}
+    pf.run_preflight(host, ["firecracker"])
+    assert calls.count("/run/a.sock") == 2
 
 
 def test_a_chrooted_or_containerised_firecracker_is_not_taken_for_jailed():
@@ -1812,3 +1876,51 @@ def test_every_firecracker_vmm_counts_but_firecracker_containerd_does_not():
     for comm in ("firecracker-xyz", "firecracker-con"):   # "con": a jail id, or containerd
         host = _with_procs({"/proc/78/cmdline": "", "/proc/78/comm": comm + "\n"})
         assert [p.role for p in pf._sandbox_processes(host)] == ["firecracker"], comm
+
+
+
+def test_jailed_vmm_problems_get_jailer_aware_advice():
+    p = _proc(300, ["/firecracker-jail0aaa", "--id", "jail0aaa", "--start-time-us", "1"], uid=10001,
+              aa="unconfined\n")
+    c = _by_name(pf.run_preflight(_with_procs(p), ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.WARN
+    assert "already under the jailer" in c.detail
+    assert "run firecracker under the jailer" not in c.detail
+
+
+def test_another_jailer_users_vmm_in_its_own_profile_is_not_off_profile():
+    """A VMM another launcher put under the jailer (exec file not firecracker-<jail id>, e.g.
+    firecracker-containerd's /usr/bin/firecracker) keeps its own profile."""
+    p = _proc(300, ["/usr/bin/firecracker", "--id", "vm1", "--start-time-us", "1"], uid=10001,
+              aa="containerd-fc (enforce)\n")
+    c = _by_name(pf.run_preflight(_with_procs(p), ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.PASS, c.detail
+
+
+
+def test_jailed_vmm_advice_does_not_claim_an_answer_the_helper_never_gave():
+    p = _proc(300, ["/firecracker-jail0aaa", "--id", "jail0aaa", "--start-time-us", "1"], uid=10001,
+              aa="unconfined\n")
+    host = _with_procs(p)
+    host.jail = (None, "unreachable", "gone")
+    c = _by_name(pf.run_preflight(host, ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.WARN and "reports loading" not in c.detail
+    assert "already under the jailer" in c.detail and "unknown" in c.detail
+
+
+
+def test_a_helper_vmm_in_a_sibling_jails_profile_is_off_profile():
+    p = _proc(300, ["/firecracker-jail0aaa", "--id", "jail0aaa", "--start-time-us", "1"], uid=10001,
+              aa="blastbox-fc-jail-jail0bbb (enforce)\n")
+    c = _by_name(pf.run_preflight(_with_procs(p), ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.WARN and "per-jail" in c.detail
+
+
+
+def test_a_firecracker_named_binary_that_is_no_jail_id_is_not_a_helper_vmm():
+    """firecracker-v1.16.0-x86_64 is a renamed release binary, not firecracker-<jail id>
+    (fc_jail_helper.JAIL_ID_RE): its own profile is not the helper's business."""
+    p = _proc(300, ["/usr/local/bin/firecracker-v1.16.0-x86_64", "--id", "vm1",
+                    "--start-time-us", "1"], uid=10001, aa="containerd-fc (enforce)\n")
+    c = _by_name(pf.run_preflight(_with_procs(p), ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.PASS, c.detail

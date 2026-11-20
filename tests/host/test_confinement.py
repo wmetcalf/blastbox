@@ -201,10 +201,11 @@ def test_parser_4_0_1_is_flagged_only_with_apparmor_on():
 
 def test_firecracker_and_jailer_presence():
     host = _tools(ALPINE)
-    st = cf.probe(host, env={}, kinds=["firecracker"])
+    off = {"BLASTBOX_FC_JAILER": "off"}      # jailed, the helper runs its own binaries
+    st = cf.probe(host, env=off, kinds=["firecracker"])
     assert (st.firecracker, st.jailer) == ("/usr/local/bin/firecracker", None)
     host.executables["jailer"] = "/usr/local/bin/jailer"
-    assert cf.probe(host, env={}, kinds=["firecracker"]).jailer == "/usr/local/bin/jailer"
+    assert cf.probe(host, env=off, kinds=["firecracker"]).jailer == "/usr/local/bin/jailer"
     assert ("/usr/local/bin/firecracker", "--version") not in host.ran   # presence only
 
 
@@ -231,7 +232,7 @@ def test_preflight_ubuntu_reports_would_use():
 
 
 def test_preflight_al2023_permissive():
-    c = _pf(AL2023, abi=4)
+    c = _pf(AL2023, abi=4, env={"BLASTBOX_FC_JAILER": "off"})   # Landlock: dispatcher-launched
     assert c.status is Status.PASS and "selinux=permissive" in c.detail
     assert "gvisor=none" in c.detail and "firecracker=landlock" in c.detail
 
@@ -378,8 +379,11 @@ def _start(monkeypatch, *, mode: str, files: dict[str, str]):
         seen.update(kw)
         raise _Built
 
-    monkeypatch.setattr(cf, "detect", lambda: _REAL_DETECT(
-        {"BLASTBOX_CONFINEMENT": mode}, host=_host(files), landlock=3))
+    def fake_detect(**kw):
+        seen["detect_kw"] = kw
+        return _REAL_DETECT({"BLASTBOX_CONFINEMENT": mode}, host=_host(files), landlock=3, **kw)
+
+    monkeypatch.setattr(cf, "detect", fake_detect)
     monkeypatch.setattr(factory, "build_job_store_from_env", InMemoryJobStore)
     monkeypatch.setattr(dispatch_mod, "Dispatcher", fake)
     monkeypatch.delenv("BLASTBOX_POOL_RUNTIME", raising=False)
@@ -938,5 +942,337 @@ def test_firecracker_overflow_with_no_guest_configured_is_skipped():
 
 
 def test_firecracker_overflow_with_a_non_rw_kvm_is_admitted_so_require_fails():
-    c = _fc_overflow_pf({}, kvm_rw=False)
+    # Unjailed: the dispatcher's own /dev/kvm is what the runtime probes.
+    c = _fc_overflow_pf({"BLASTBOX_FC_JAILER": "off"}, kvm_rw=False)
     assert c.status is Status.FAIL and "firecracker" in c.detail
+
+
+# --- the Firecracker jail helper decides a jailed VMM's confinement ------------------------
+#
+# With BLASTBOX_FC_JAILER on (the default) the dispatcher never execs firecracker: the root jail
+# helper on the HOST does, under a per-jail AppArmor profile when its `hello` says so. So the
+# dispatcher's own context (its label, a missing securityfs, Landlock it could self-apply) says
+# nothing about a jailed VMM -- the helper's answer does.
+
+_HELLO_AA = ({"protocol": 1, "firecracker": "1.16.0", "apparmor": True, "ready_port": 10000},
+             "", "")
+_HELLO_NO_AA = ({"protocol": 1, "firecracker": "1.16.0", "apparmor": False,
+                 "ready_port": 10000}, "", "")
+_HELLO_DOWN = (None, "unreachable", "/run/blastbox-fc-jail/helper.sock: No such file")
+_HELLO_SKEW = (None, "protocol", "helper speaks protocol 2, this dispatcher 1")
+_JAIL_OFF = {"BLASTBOX_FC_JAILER": "off"}
+
+
+def _jailed(files, hello, *, env=None, abi=0) -> cf.HostLsm:
+    host = _host(files)
+    host.jail = hello
+    return cf.probe(host, env=dict(env or {}), kinds=["firecracker"], landlock=abi)
+
+
+def test_jailed_firecracker_takes_the_helpers_apparmor_not_the_callers_blockers():
+    # Dispatcher inside docker-default: it could never enter a profile itself, but the helper
+    # (root, on the host) loads one per jail. Old answer: none -- confinement under-reported.
+    st = _jailed(CONTAINER_UNDER_DOCKER_DEFAULT, _HELLO_AA)
+    assert st.fc_jail == "apparmor"
+    assert st.would_use("firecracker") == "apparmor"
+    assert cf.unmet(st, "require", ["firecracker"]) == []
+    # ...and the caller-context blockers do not apply to it (they still do to warm runsc).
+    assert st.would_use("gvisor") == "none"
+    assert cf._blockers(st, ["firecracker"]) == []
+
+
+def test_jailed_firecracker_without_helper_apparmor_is_unconfined_even_on_an_apparmor_host():
+    # Ubuntu, dispatcher unconfined: the dispatcher COULD enter a profile, but it does not launch
+    # the VMM -- a helper run with AppArmor off confines nothing. Old answer: apparmor (over-report).
+    st = _jailed(UBUNTU, _HELLO_NO_AA, abi=6)
+    assert st.fc_jail == "no-apparmor"
+    assert st.would_use("firecracker") == "none"
+    assert st.would_use("gvisor") == "apparmor"
+    assert cf.unmet(st, "require", ["firecracker"]) == ["firecracker"]
+    assert any("without per-jail AppArmor" in b for b in cf._blockers(st, ["firecracker"]))
+
+
+def test_jailed_firecracker_never_gets_landlock_the_dispatcher_would_have_applied():
+    st = _jailed(ALPINE, _HELLO_NO_AA, abi=4)
+    assert st.would_use("firecracker") == "none"
+
+
+def test_unreachable_helper_is_unknown_and_require_fails_closed():
+    st = _jailed(UBUNTU, _HELLO_DOWN, abi=6)
+    assert st.fc_jail == "unknown"
+    assert st.would_use("firecracker") == "none"
+    assert cf.unmet(st, "require", ["firecracker"]) == ["firecracker"]
+    why = cf._blockers(st, ["firecracker"])
+    assert any("jail helper" in b and "unreachable" in b for b in why)
+
+
+def test_a_helper_that_refuses_for_good_is_unusable():
+    st = _jailed(UBUNTU, _HELLO_SKEW)
+    assert st.fc_jail == "unusable"
+    assert st.would_use("firecracker") == "none"
+
+
+def test_jailing_off_keeps_the_dispatchers_own_view():
+    host = _host(CONTAINER_UNDER_DOCKER_DEFAULT)
+    st = cf.probe(host, env=_JAIL_OFF, kinds=["firecracker"], landlock=4)
+    assert st.fc_jail == "off"
+    assert not hasattr(host, "jail_asked")               # never asks a helper it will not use
+    assert st.would_use("firecracker") == "landlock"     # its own context, as before
+    st = cf.probe(_host(UBUNTU), env=_JAIL_OFF, kinds=["firecracker"], landlock=4)
+    assert st.would_use("firecracker") == "apparmor"
+
+
+def test_jailed_probe_does_not_report_the_dispatchers_own_binaries():
+    """A jailed dispatcher container legitimately has no firecracker/jailer: the helper runs
+    its own, so 'not found' would be noise."""
+    st = _jailed(ALPINE, _HELLO_AA)
+    assert (st.firecracker, st.jailer) == (None, None)
+
+
+def test_helper_is_only_asked_when_firecracker_is_a_kind():
+    host = _host(UBUNTU)
+    cf.probe(host, env={}, kinds=["gvisor"])
+    assert not hasattr(host, "jail_asked")
+
+
+def test_a_jailed_apparmor_vmm_is_confined_whatever_the_confinement_mode():
+    """BLASTBOX_CONFINEMENT governs blastbox's own (future) confinement tier; the helper loads
+    its per-jail profiles regardless, so `off` must not report them away."""
+    st = _jailed(UBUNTU, _HELLO_AA)
+    assert st.would_use("firecracker", "off") == "apparmor"
+    assert _jailed(UBUNTU, _HELLO_NO_AA).would_use("firecracker", "off") == "none"
+
+
+def test_as_dict_carries_the_jail_state():
+    d = _jailed(UBUNTU, _HELLO_DOWN).as_dict()
+    assert d["fc_jail"] == "unknown" and "unreachable" in str(d["fc_jail_detail"])
+
+
+def test_detect_asks_the_helper_only_for_firecracker():
+    host = _host(CONTAINER_UNDER_DOCKER_DEFAULT)
+    host.jail = _HELLO_AA
+    assert cf.detect({}, host=host, landlock=0).state.fc_jail is None
+    assert not hasattr(host, "jail_asked")
+    det = cf.detect({}, host=host, landlock=0, kinds=["firecracker"])
+    assert det.state.would_use("firecracker") == "apparmor"
+    assert host.jail_asked == "/run/blastbox-fc-jail/helper.sock"
+
+
+def test_detect_summary_names_why_a_jailed_vmm_is_unconfined():
+    host = _host(UBUNTU)
+    host.jail = _HELLO_DOWN
+    det = cf.detect({}, host=host, landlock=0, kinds=["firecracker"])
+    s = det.summary(["firecracker"])
+    assert s.startswith("mode=auto, firecracker=none (") and "jail helper" in s
+    host.jail = _HELLO_AA
+    det = cf.detect({}, host=host, landlock=0, kinds=["firecracker"])
+    assert det.summary(["firecracker"]) == "mode=auto, firecracker=apparmor (jail helper)"
+
+
+def test_require_error_names_the_jail_reason():
+    st = _jailed(UBUNTU, _HELLO_NO_AA)
+    with pytest.raises(cf.ConfinementUnavailable, match="without per-jail AppArmor"):
+        cf.check_required(st, "require", ["firecracker"])
+
+
+def test_a_jailer_typo_is_unusable_not_off():
+    st = cf.probe(_host(UBUNTU), env={"BLASTBOX_FC_JAILER": "of"}, kinds=["firecracker"],
+                  landlock=0)
+    assert st.fc_jail == "unusable" and st.would_use("firecracker") == "none"
+
+
+def test_sys_reader_asks_the_real_helper(monkeypatch):
+    from blastbox.host.runtime import fc_jail
+
+    seen = {}
+
+    class _Client:
+        def __init__(self, path, *, timeout_s):
+            seen["args"] = (path, timeout_s)
+
+        def hello(self):
+            raise fc_jail.JailError("unreachable", "gone")
+
+    monkeypatch.setattr(fc_jail, "JailClient", _Client)
+    assert cf._SysReader().jail_hello("/run/x.sock") == (None, "unreachable", "gone")
+    assert seen["args"][0] == "/run/x.sock" and seen["args"][1] <= 5.0
+
+
+# --- preflight: the confinement check reports the jail -----------------------------------
+
+def _pf_jail(files, hello, *, env=None, abi=0, tiers=("firecracker",)):
+    host = _healthy(files=files, env={"BLASTBOX_DISPATCH_WARM_ONLY": "1", **(env or {})})
+    host.jail = hello
+    host.landlock_abi = lambda: abi    # type: ignore[method-assign]
+    return next(c for c in pf.run_preflight(host, list(tiers)) if c.name == "confinement")
+
+
+def test_preflight_jailed_in_a_container_meets_require_through_the_helper():
+    c = _pf_jail(CONTAINER_UNDER_DOCKER_DEFAULT, _HELLO_AA, env={"BLASTBOX_CONFINEMENT": "require"})
+    assert c.status is Status.PASS, c.detail
+    assert "firecracker=apparmor" in c.detail and "per-jail AppArmor" in c.detail
+    assert c.facts is not None and c.facts["host"]["fc_jail"] == "apparmor"  # type: ignore[index]
+    assert "jailer not found" not in c.detail
+
+
+def test_preflight_helper_without_apparmor_fails_require_on_an_apparmor_host():
+    c = _pf_jail(UBUNTU, _HELLO_NO_AA, env={"BLASTBOX_CONFINEMENT": "require"})
+    assert c.status is Status.FAIL and "require unmet for firecracker" in c.detail
+    assert "without per-jail AppArmor" in c.detail
+
+
+def test_preflight_unreachable_helper_is_reported_not_guessed():
+    c = _pf_jail(UBUNTU, _HELLO_DOWN)
+    assert c.status is Status.PASS        # auto: reported, not gated (fc-jailer gates the tier)
+    assert "firecracker=none" in c.detail and "unreachable" in c.detail
+
+
+def test_preflight_jailing_off_reports_the_dispatchers_binaries():
+    c = _pf_jail(UBUNTU, _HELLO_AA, env=_JAIL_OFF)
+    assert "firecracker /usr/local/bin/firecracker, jailer not found" in c.detail
+    assert "firecracker=apparmor" in c.detail
+
+
+def test_dispatch_cmd_detects_for_the_kinds_it_can_reach(monkeypatch):
+    """The startup detection is told the reachable kinds, so it asks the jail helper exactly
+    when a firecracker tier is reachable (a cold-only dispatcher never connects to it)."""
+    seen = _start(monkeypatch, mode="auto", files=UBUNTU)
+    assert list(seen["detect_kw"]["kinds"]) == ["cold"]
+
+
+def test_embedded_require_detection_is_told_the_kinds(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_detect(env=None, **kw):
+        seen.update(kw)
+        return _REAL_DETECT(env, host=_host(ROCKY), landlock=3, **kw)
+
+    from blastbox.host.dispatch import Dispatcher, EngineSpec
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    from tests.host.test_dispatch import _fake_runtime, _limits
+
+    monkeypatch.setattr(cf, "detect", fake_detect)
+    monkeypatch.setenv("BLASTBOX_CONFINEMENT", "require")
+    Dispatcher(job_store=InMemoryJobStore(),
+               engines={"e": EngineSpec(name="e", image="i", worker_argv=["w"])},
+               limits=_limits(), job_root=tmp_path, runtime_selector=_fake_runtime,
+               attest_key=None)
+    assert "kinds" in seen and "cold" in list(seen["kinds"])
+
+
+# --- round 1: the helper's refusal classes mirror the runtime; a passed Detection is completed --
+
+def test_forbidden_is_decided_for_the_dispatcher_like_the_runtime():
+    """_jail_client treats `forbidden` as DECIDED (FCUnavailable: the tier is dropped), and
+    `refused` as undecided (FCHelperNoVerdict: deferred) -- detection says the same."""
+    assert _jailed(UBUNTU, (None, "forbidden", "uid 1000 not allowed")).fc_jail == "unusable"
+    assert _jailed(UBUNTU, (None, "refused", "reset")).fc_jail == "unknown"
+
+
+def test_root_preflight_cannot_verify_and_does_not_fail_require():
+    """The helper never answers uid 0: a root preflight learns nothing about the dispatcher's
+    view, so `confinement` must not claim the dispatcher refuses to start (fc-jailer WARNs)."""
+    for code in ("forbidden", "refused"):
+        host = _healthy(files=UBUNTU, euid=0,
+                        env={"BLASTBOX_CONFINEMENT": "require", "BLASTBOX_DISPATCH_WARM_ONLY": "1"})
+        host.jail = (None, code, "uid 0 is not allowed")
+        c = next(c for c in pf.run_preflight(host, ["firecracker"]) if c.name == "confinement")
+        assert c.status is Status.WARN, c.detail
+        assert "as the dispatcher uid" in c.detail
+        assert c.facts["host"]["fc_jail"] == "unverified"  # type: ignore[index]
+    # ...while the same refusal to a non-root caller is the dispatcher's own (decided) answer.
+    host = _healthy(files=UBUNTU, euid=1000,
+                    env={"BLASTBOX_CONFINEMENT": "require", "BLASTBOX_DISPATCH_WARM_ONLY": "1"})
+    host.jail = (None, "forbidden", "uid 1000 is not allowed")
+    c = next(c for c in pf.run_preflight(host, ["firecracker"]) if c.name == "confinement")
+    assert c.status is Status.FAIL
+
+
+def test_dispatcher_completes_a_passed_detection_that_never_asked_the_helper(monkeypatch):
+    """An embedder's detect() without kinds has fc_jail=None (the dispatcher's own view); with a
+    firecracker tier reachable the dispatcher asks the helper itself before judging require."""
+    st = cf._probe_lsm(_host(UBUNTU), 6)
+    det = cf.Detection(mode="require", state=st)
+    assert det.state.would_use("firecracker") == "apparmor"          # the stale own-context view
+    host = _host(UBUNTU)
+    host.jail = _HELLO_NO_AA
+    done = cf.complete_for(det, ["firecracker"], env={}, host=host)
+    assert done.state.fc_jail == "no-apparmor"
+    with pytest.raises(cf.ConfinementUnavailable):
+        cf.check_required(done.state, done.mode, ["firecracker"])
+    # Already probed, or no firecracker kind: returned unchanged, the helper not asked again.
+    host2 = _host(UBUNTU)
+    assert cf.complete_for(done, ["firecracker"], env={}, host=host2) is done
+    assert cf.complete_for(det, ["cold"], env={}, host=host2) is det
+    assert not hasattr(host2, "jail_asked")
+
+
+def test_embedded_dispatcher_completes_a_passed_detection(tmp_path, monkeypatch):
+    from blastbox.host.dispatch import Dispatcher, EngineSpec
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    from tests.host.test_dispatch import _fake_runtime, _limits
+
+    seen = {}
+    real = cf.complete_for
+
+    def spy(det, kinds, **kw):
+        seen["kinds"] = list(kinds)
+        return real(det, kinds, **kw)
+
+    monkeypatch.setattr(cf, "complete_for", spy)
+    det = cf.detect({}, host=_host(ROCKY), landlock=0)
+    Dispatcher(job_store=InMemoryJobStore(),
+               engines={"e": EngineSpec(name="e", image="i", worker_argv=["w"])},
+               limits=_limits(), job_root=tmp_path, runtime_selector=_fake_runtime,
+               attest_key=None, confinement=det)
+    assert "cold" in seen["kinds"]          # the reachable kinds, not an empty list
+
+
+def test_a_garbled_hello_reply_is_undecided_like_the_runtime():
+    from blastbox.host.runtime.fc_jail import JailError
+
+    assert cf.jail_code(JailError("protocol", "skew", decided=True)) == "protocol"
+    assert cf.jail_code(JailError("protocol", "truncated reply")) == "protocol-transient"
+    assert cf.jail_code(JailError("busy")) == "busy"
+    assert _jailed(UBUNTU, (None, "protocol-transient", "truncated")).fc_jail == "unknown"
+    assert _jailed(UBUNTU, _HELLO_SKEW).fc_jail == "unusable"
+
+
+
+def test_jailed_firecracker_blocker_is_reported_once():
+    c = _pf_jail(UBUNTU, _HELLO_DOWN)
+    assert c.detail.count("jail helper unreachable") == 1, c.detail
+
+
+def test_missing_apparmor_parser_is_noted_only_for_kinds_the_dispatcher_confines_itself():
+    jailed = _pf_jail(UBUNTU, _HELLO_AA)                       # healthy fake has no parser
+    assert "apparmor_parser not found" not in jailed.detail
+    off = _pf_jail(UBUNTU, _HELLO_AA, env=_JAIL_OFF)
+    assert "apparmor_parser not found" in off.detail
+
+
+
+def test_a_detection_judged_for_another_jail_configuration_is_re_judged():
+    """detect() with jailing off (or another socket), then a dispatcher whose env jails: the old
+    answer describes another launch path, so the helper is asked."""
+    off = cf.detect(_JAIL_OFF, host=_host(UBUNTU), landlock=0, kinds=["firecracker"])
+    assert off.state.fc_jail == "off" and off.state.would_use("firecracker") == "apparmor"
+    host = _host(UBUNTU)
+    host.jail = _HELLO_NO_AA
+    now = cf.complete_for(off, ["firecracker"], env={}, host=host)
+    assert now.state.fc_jail == "no-apparmor"
+    other = cf.complete_for(now, ["firecracker"], env={"BLASTBOX_FC_JAIL_SOCKET": "/run/o.sock"},
+                            host=host)
+    assert host.jail_asked == "/run/o.sock" and other.state.fc_jail_for == "socket:/run/o.sock"
+    same = _host(UBUNTU)
+    assert cf.complete_for(now, ["firecracker"], env={}, host=same) is now
+    assert not hasattr(same, "jail_asked")
+
+
+
+def test_a_socket_named_off_does_not_pass_for_jailing_off():
+    off = cf.detect(_JAIL_OFF, host=_host(UBUNTU), landlock=0, kinds=["firecracker"])
+    host = _host(UBUNTU)
+    host.jail = _HELLO_NO_AA
+    now = cf.complete_for(off, ["firecracker"], env={"BLASTBOX_FC_JAIL_SOCKET": "off"}, host=host)
+    assert now.state.fc_jail == "no-apparmor" and host.jail_asked == "off"
