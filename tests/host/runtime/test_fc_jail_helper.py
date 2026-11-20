@@ -1398,3 +1398,28 @@ def test_a_failed_publish_whose_cleanup_fails_is_retried_by_the_monitor(env, mon
     assert list(env.cfg.gens_dir.iterdir())         # the RAM-sized leftover is still there...
     env.helper.monitor_once()
     assert not list(env.cfg.gens_dir.iterdir())     # ...and the monitor removes it on recovery
+
+
+def test_a_publish_whose_owner_died_meanwhile_and_whose_cleanup_fails_is_retried(env, monkeypatch):
+    jail, _ = env.boot(listener=False)
+    _snapshot(jail)
+    env.kill(jail)
+    real_rmtree, real_copy = h.shutil.rmtree, h.sparse_copy
+    fail = {"left": 1}
+
+    def _flaky_rmtree(path, *a, **k):
+        if fail["left"]:
+            fail["left"] -= 1
+            raise OSError(5, "Input/output error")
+        return real_rmtree(path, *a, **k)
+
+    def _copy_then_owner_dies(*a, **k):
+        real_copy(*a, **k)
+        env.owner.dead = True
+    monkeypatch.setattr(h.shutil, "rmtree", _flaky_rmtree)
+    monkeypatch.setattr(h, "sparse_copy", _copy_then_owner_dies)
+    with pytest.raises(h.HelperError, match="unknown_jail"):
+        env.helper.op_publish(env.owner, {"op": "publish", "jail": JID}, [])
+    assert list(env.cfg.gens_dir.iterdir())
+    env.helper.monitor_once()
+    assert not list(env.cfg.gens_dir.iterdir())
