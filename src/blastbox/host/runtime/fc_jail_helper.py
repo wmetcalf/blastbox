@@ -995,17 +995,25 @@ class Helper:
     def _remove_unregistered(self, path: str) -> None:
         """Remove a directory no registry holds; one that survives (the same filesystem
         incident that failed the operation) is kept for the monitor to retry. Never raises."""
+        with self._lock:
+            if any(g.dir == path for g in self._gens.values()):
+                self._doomed.discard(path)        # registered: _remove_gen owns it, never us
+                return
+        gone = False
         try:
             shutil.rmtree(path)
+            gone = True
         except FileNotFoundError:
-            pass
+            gone = True
         except OSError as exc:
+            # Kept on ANY other failure -- even when the path cannot be stat'ed now (the same
+            # EIO): only a removal that succeeded, or found nothing, drops it.
             _log.error("fc_jail.cleanup_failed path=%s: %s (retried by the monitor)", path, exc)
         with self._lock:
-            if os.path.lexists(path):
-                self._doomed.add(path)
-            else:
+            if gone:
                 self._doomed.discard(path)
+            else:
+                self._doomed.add(path)
 
     def monitor_once(self) -> None:
         with self._lock:
@@ -1013,7 +1021,10 @@ class Helper:
             jails = list(self._jails.values())
             doomed = list(self._doomed)
         for path in doomed:
-            self._remove_unregistered(path)
+            try:
+                self._remove_unregistered(path)
+            except Exception as exc:  # noqa: BLE001 - never let a cleanup stop the monitor
+                _log.error("fc_jail.cleanup_error path=%s: %s", path, exc)
         for owner in owners:
             if _pidfd_exited(owner.pidfd):
                 self.reap_owner(owner)

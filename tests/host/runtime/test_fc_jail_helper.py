@@ -1423,3 +1423,39 @@ def test_a_publish_whose_owner_died_meanwhile_and_whose_cleanup_fails_is_retried
     assert list(env.cfg.gens_dir.iterdir())
     env.helper.monitor_once()
     assert not list(env.cfg.gens_dir.iterdir())
+
+
+def test_a_cleanup_whose_path_cannot_even_be_stat_ed_stays_tracked(env, monkeypatch):
+    gdir = env.cfg.gens_dir / "gdead"
+    gdir.mkdir()
+    real_rmtree = h.shutil.rmtree
+    monkeypatch.setattr(h.shutil, "rmtree", lambda p, *a, **k: (_ for _ in ()).throw(
+        OSError(5, "Input/output error")))
+    monkeypatch.setattr(h.os.path, "lexists", lambda p: False)        # EIO reads as absent
+    env.helper._remove_unregistered(str(gdir))
+    assert str(gdir) in env.helper._doomed
+    monkeypatch.setattr(h.shutil, "rmtree", real_rmtree)
+    monkeypatch.undo()
+    env.helper.monitor_once()
+    assert not gdir.exists() and not env.helper._doomed
+
+
+def test_a_retried_cleanup_never_touches_a_registered_generation(env):
+    gen = h.Gen(id="gx", owner=env.owner, dir=str(env.cfg.gens_dir / "gx"), rootfs="r",
+                mem_bytes=0)
+    Path(gen.dir).mkdir()
+    env.helper._gens["gx"] = gen
+    env.helper._doomed.add(gen.dir)
+    env.helper.monitor_once()
+    assert Path(gen.dir).is_dir() and gen.dir not in env.helper._doomed
+
+
+def test_an_unexpected_cleanup_error_does_not_stop_the_monitor(env, monkeypatch):
+    env.helper._doomed.add(str(env.cfg.gens_dir / "gweird"))
+    monkeypatch.setattr(env.helper, "_remove_unregistered",
+                        lambda p: (_ for _ in ()).throw(ValueError("odd")))
+    reaped = []
+    monkeypatch.setattr(env.helper, "reap_owner", lambda o: reaped.append(o))
+    monkeypatch.setattr(h, "_pidfd_exited", lambda fd: True)
+    env.helper.monitor_once()
+    assert reaped
