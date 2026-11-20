@@ -1754,7 +1754,9 @@ class Helper:
                 with contextlib.suppress(OSError):
                     if stat.S_ISSOCK(os.lstat(parent / name).st_mode):
                         os.unlink(parent / name)
-        tmp = parent / f"{prefix}{os.getpid()}"
+        # A free private name (a stray non-socket entry may sit at the obvious one).
+        tmp = next(p for p in (parent / f"{prefix}{os.getpid()}{n or ''}" for n in range(1000))
+                   if not os.path.lexists(p))
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         try:
             srv.bind(str(tmp))

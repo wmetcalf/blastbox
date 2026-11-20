@@ -1268,3 +1268,21 @@ def test_the_sweep_touches_only_sockets(tmp_path):
     with _serving(tmp_path) as (_, path):
         JailClient(path).hello()
     assert (run / ".h.sock.5").is_dir() and (run / ".h.sock.6").is_file()
+
+
+def test_a_non_socket_at_the_helpers_own_private_name_is_not_fatal(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir(mode=0o750)
+    (run / f".h.sock.{os.getpid()}").mkdir()   # pid reuse after a stray entry
+    with _serving(tmp_path) as (_, path):
+        JailClient(path).hello()
+    assert (run / f".h.sock.{os.getpid()}").is_dir()
+
+
+def test_a_failed_publish_reports_its_own_error(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir(mode=0o750)
+    (run / "h.sock").mkdir()                   # the rename over it fails
+    ready, raised = _serve_raises(tmp_path)
+    assert not ready and isinstance(raised[0], IsADirectoryError)
+    assert "h.sock" in str(raised[0]) and not raised[0].__context__
