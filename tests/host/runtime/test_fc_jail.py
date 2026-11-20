@@ -1238,10 +1238,10 @@ def test_a_symlinked_socket_directory_is_judged_by_what_it_points_at(tmp_path):
 def test_a_failed_publish_leaves_no_private_socket_and_old_ones_are_swept(tmp_path):
     run = tmp_path / "run"
     run.mkdir(mode=0o750)
-    stale = run / ".h.sock.999999"
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    s.bind(str(stale))
-    s.close()
+    for name in (".h.sock.999999", ".h.sock.999998-3"):     # a pid's own name and a fallback
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        s.bind(str(run / name))
+        s.close()
     (run / "h.sock").mkdir()                  # the rename over it fails
     ready, raised = _serve_raises(tmp_path)
     assert not ready and raised
@@ -1311,3 +1311,16 @@ def test_a_fallback_private_name_never_reads_as_another_pid(tmp_path):
         with _serving(tmp_path) as (_, path):
             JailClient(path).hello()
     assert f".h.sock.{os.getpid()}-1" in names
+
+
+def test_a_socket_path_near_the_af_unix_limit_still_publishes(tmp_path):
+    # The configured path fits (the clients connect by it); the longer private name must not
+    # be what limits it.
+    room = 104 - len(str(tmp_path / "run" / "h.sock"))
+    base = tmp_path / ("d" * max(room, 1))
+    base.mkdir(mode=0o755)
+    sock = base / "run" / "h.sock"
+    assert len(str(sock)) <= 107
+    with _serving(base) as (_, path):
+        assert path == str(sock)
+        JailClient(path).hello()

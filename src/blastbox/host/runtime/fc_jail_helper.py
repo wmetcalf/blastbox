@@ -1762,8 +1762,11 @@ class Helper:
         if tmp is None:
             raise RuntimeError(f"{parent}: no free private socket name (stray {prefix}* entries)")
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        dir_fd = os.open(parent, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
-            srv.bind(str(tmp))
+            # Through the directory's fd: the private name is longer than the configured one,
+            # and only the configured path has to fit sun_path (the clients connect by it).
+            srv.bind(f"/proc/self/fd/{dir_fd}/{tmp.name}")
             self._lchown(tmp, 0, cfg.socket_gid)
             os.chmod(tmp, 0o660)
             srv.listen(_LISTEN_BACKLOG)
@@ -1773,6 +1776,8 @@ class Helper:
             with contextlib.suppress(FileNotFoundError):
                 tmp.unlink()
             raise
+        finally:
+            os.close(dir_fd)
         srv.settimeout(1.0)
         threading.Thread(target=self._monitor_loop, daemon=True, name="fcj-monitor").start()
         slots = threading.BoundedSemaphore(self.cfg.max_conns)
