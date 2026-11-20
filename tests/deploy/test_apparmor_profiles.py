@@ -304,53 +304,67 @@ def test_the_mediation_check_tells_the_spellings_apart(extra: str, mediated: boo
     assert _mediates_mount(text) is mediated
 
 
-#: A statement ending in an absolute mountpoint: `/path`, or a quoted `"/pa th"`.
-_ABS_MOUNTPOINT = r"""\s(/\S*|"/[^"]*")$"""
+_CANONICAL_UMOUNT = ("audit deny umount /,", "audit deny umount /**,")
 
 
-def _statements(text: str) -> list[str]:
-    """The profile's rules as whitespace-normalised statements: comments stripped, split on the
-    commas that end a rule (not those inside a parenthesised list), whatever the line layout."""
-    body = " ".join(ln.split("#", 1)[0] for ln in text.splitlines())
-    out, depth, cur = [], 0, []
-    for ch in body:
-        depth += ch == "("
-        depth -= ch == ")"
-        if ch == "," and depth == 0:
-            out.append(" ".join("".join(cur).replace("{", " { ").replace("}", " } ").split()))
-            cur = []
-        else:
-            cur.append(ch)
-    return out
+def _strip_comments(text: str) -> str:
+    """The profile without comments: `#` starts one only outside a quoted string."""
+    out = []
+    for line in text.splitlines():
+        quoted, cut = False, len(line)
+        for i, ch in enumerate(line):
+            if ch == '"':
+                quoted = not quoted
+            elif ch == "#" and not quoted:
+                cut = i
+                break
+        out.append(line[:cut])
+    return "\n".join(out)
+
+
+def _umount_rules_ok(text: str) -> bool:
+    """A strict allowlist rather than a re-implementation of the parser: outside comments,
+    `umount` (and its synonym `unmount`) may appear ONLY in the two canonical denies, each
+    alone on its line. Any other umount rule -- however spelled -- must first be checked
+    against the compiled DFA on a parser <= 4.0.x and then added here deliberately."""
+    body = _strip_comments(text)
+    mentions = re.findall(r"\b(?:umount|unmount)\b", body)
+    lines = [ln.strip() for ln in body.splitlines()]
+    return len(mentions) == len(_CANONICAL_UMOUNT) and all(
+        lines.count(rule) == 1 for rule in _CANONICAL_UMOUNT)
 
 
 def test_umount_denies_are_spelled_with_a_path() -> None:
     """The text-level guard, for hosts without apparmor_parser AND for parsers >= 4.1, where
-    the compiled check cannot see the bug: every umount deny ends in an explicit absolute
-    mountpoint (anything else -- bare, `*`, `**`, conditionals only -- can match the empty
-    mountpoint and unmediate the class on apparmor_parser <= 4.0.x)."""
-    stmts = _statements((_PROFILE_DIR / "blastbox-sandbox").read_text())
-    umount = [st.split("}")[-1].strip() for st in stmts if re.search(r"\bdeny umount\b", st)]
-    bad = [st for st in umount if not re.search(_ABS_MOUNTPOINT, st)]
-    assert not bad, f"umount denies without an explicit mountpoint: {bad}"
-    assert "audit deny umount /" in umount and "audit deny umount /**" in umount
+    the compiled check cannot see the bug (a umount deny that can match the empty mountpoint
+    unmediates the mount class on apparmor_parser <= 4.0.x)."""
+    assert _umount_rules_ok((_PROFILE_DIR / "blastbox-sandbox").read_text()), (
+        f"blastbox-sandbox may contain no umount rule but {_CANONICAL_UMOUNT}: check any "
+        "other against the compiled DFA (test_the_child_profile_mediates_the_mount_class on a "
+        "<= 4.0.x parser) and extend _CANONICAL_UMOUNT deliberately"
+    )
 
 
-@pytest.mark.parametrize("rules,ok", [
-    ("  audit deny umount /,\n  audit deny umount /**,", True),
-    ('  audit deny umount "/mnt/a b",', True),
-    ("  audit deny umount fstype in (tmpfs ramfs) /tmp,", True),
-    ("  audit deny umount fstype=(tmpfs, ramfs) /tmp,", True),
-    ("  audit deny umount,", False),
-    ("  audit deny umount **,", False),
-    ("  audit deny umount fstype=tmpfs,", False),
-    ("  audit deny pivot_root, audit deny umount,", False),
-    ("  audit deny\n    umount,", False),
+@pytest.mark.parametrize("extra", [
+    "  audit deny umount,",
+    "  audit deny unmount,",
+    "  audit deny umount {/a,**},",
+    "  audit deny umount fstype= /x,",
+    '  "/tmp/#x" r, audit deny umount,',
+    '  "/mnt/x(y" r,\n  audit deny umount,',
+    "  audit deny pivot_root, audit deny umount /,",
+    "  audit deny\n    umount,",
+    "  umount,",
 ])
-def test_the_text_guard_reads_statements_not_lines(rules: str, ok: bool) -> None:
-    stmts = _statements("profile p {\n" + rules + "\n}\n")
-    umount = [st.split("}")[-1].strip() for st in stmts if re.search(r"\bdeny umount\b", st)]
-    assert umount and all(re.search(_ABS_MOUNTPOINT, st) for st in umount) is ok
+def test_the_text_guard_rejects_any_other_umount_rule(extra: str) -> None:
+    text = (_PROFILE_DIR / "blastbox-sandbox").read_text().replace(
+        "  network netlink raw,", "  network netlink raw,\n" + extra)
+    assert not _umount_rules_ok(text)
+
+
+def test_the_text_guard_ignores_umount_in_comments() -> None:
+    text = (_PROFILE_DIR / "blastbox-sandbox").read_text() + "\n# audit deny umount, (prose)\n"
+    assert _umount_rules_ok(text)
 
 
 def test_the_child_profile_loads_on_the_oldest_supported_apparmor() -> None:
