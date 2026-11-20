@@ -314,8 +314,11 @@ def _umount_rules_ok(text: str) -> bool:
     keyword `umount` (or its synonym `unmount`) may appear ONLY in the two canonical denies,
     each alone on its line. Any other umount rule -- or prose naming the keyword -- must first
     be checked against the compiled DFA on a parser <= 4.0.x and then allowed here."""
-    mentions = re.findall(r"\b(?:umount|unmount)\b", text)
+    mentions = re.findall(r"\b(?:umount|unmount)\b", text, re.ASCII)
     lines = [ln.strip() for ln in text.split("\n")]
+    # `deny all,` implies a bare (non-quiet) umount deny too, without naming the keyword.
+    if re.search(r"\bdeny\s+all\b", text, re.ASCII):
+        return False
     return len(mentions) == len(_CANONICAL_UMOUNT) and all(
         lines.count(rule) == 1 for rule in _CANONICAL_UMOUNT)
 
@@ -351,6 +354,8 @@ def test_umount_denies_are_spelled_with_a_path() -> None:
     "  #include <abstractions/base>audit deny umount,",
     "  audit deny mount fstype=(proc,\n  # sysfs), audit deny umount,",
     "  audit deny mount fstype=a\\,\n  # -> /m/, audit deny umount,",
+    "  profile helper {\n    deny all,\n  }",
+    "  audit deny umount\u00b2,",
 ])
 def test_the_text_guard_rejects_any_other_umount_rule(extra: str) -> None:
     text = (_PROFILE_DIR / "blastbox-sandbox").read_text().replace(
