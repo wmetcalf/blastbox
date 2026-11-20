@@ -1276,3 +1276,25 @@ def test_a_socket_named_off_does_not_pass_for_jailing_off():
     host.jail = _HELLO_NO_AA
     now = cf.complete_for(off, ["firecracker"], env={"BLASTBOX_FC_JAIL_SOCKET": "off"}, host=host)
     assert now.state.fc_jail == "no-apparmor" and host.jail_asked == "off"
+
+
+def test_a_deferred_fc_overflow_tier_is_judged_by_require_not_skipped():
+    """#220 + #221: with the helper not answering, the cascade DEFERS the firecracker overflow
+    tier (it joins later, unchecked), and detection counts its confinement as unknown -- so
+    require FAILs in preflight exactly as the dispatcher refuses to start."""
+    env = {"BLASTBOX_CONFINEMENT": "require", "BLASTBOX_POOL_RUNTIME": "cascade",
+           "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:2", "BLASTBOX_DISPATCH_WARM_ONLY": "1"}
+    host = _healthy(files=UBUNTU, env=env)
+    host.jail = (None, "unreachable", "gone")
+    host.landlock_abi = lambda: 6    # type: ignore[method-assign]
+    checks = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False)
+    c = next(c for c in checks if c.name == "confinement")
+    assert c.status is Status.FAIL and "require unmet for firecracker" in c.detail, c.detail
+    assert "will not run" not in c.detail
+    jailer = next(c for c in checks if c.name == "fc-jailer")
+    assert jailer.status is Status.WARN and "defers" in jailer.detail
+    # ...and a decided refusal still drops it: require is then judged without it.
+    host.jail = (None, "forbidden", "uid 1000 is not allowed")
+    checks = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False)
+    c = next(c for c in checks if c.name == "confinement")
+    assert c.status is not Status.FAIL, c.detail

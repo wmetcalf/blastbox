@@ -588,7 +588,16 @@ Preflight reads `/proc/cpuinfo` and warns on flags with operational consequences
   `fc-guest`, `runsc`, `gvisor-rootless`, `gvisor-userns`) are reported as WARNs saying so. A non-rw `/dev/kvm` or a
   missing gVisor rootfs is not a startup gate: a warm overflow tier is admitted but its base never
   builds, so the cascade runs without it (WARN); a cold Firecracker overflow tier really spawns
-  there and every spawn fails (FAIL). With `--tier <that tier>` its prerequisites gate as usual.
+  there and every spawn fails (FAIL). A Firecracker overflow tier whose jail helper cannot be
+  *asked* (`fc-jailer`: unreachable, timing out, busy, reset, an internal error, a garbled reply
+  or at its client cap) is not skipped either:
+  the dispatcher defers it and retries it while running, admitting it once the helper answers, so
+  the WARN says that, `require` still counts the tier, and a static/aws primary still refuses the
+  style mix. A guest config `FCConfig` refuses (a blank or unparsable `BLASTBOX_FC_*` knob) still
+  drops it at startup: that is read before the helper is asked, and `fc-guest` names the knob. Its other problems (`fc-guest`)
+  are met on the retry that reaches the helper, so they WARN that the tier is dropped then; so is
+  a warm tier's `BLASTBOX_SNAPSHOT_MEM_*` under the jailer. A helper that answers no (this uid not allowed, protocol
+  skew) drops it at startup. With `--tier <that tier>` its prerequisites gate as usual.
 - `gvisor-rootfs` and `fc-guest` also apply the runtime's rootfs stamp check: a tree stamped for another release,
   architecture or runtime FAILs; an unstamped legacy tree is allowed.
 - `BLASTBOX_JOB_ROOT` must be the same path for serve, dispatch and the worker mount, and must

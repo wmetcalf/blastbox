@@ -820,6 +820,16 @@ def _fc_jailed(env: Mapping[str, str]) -> bool:
         return True
 
 
+#: Helper ``hello`` failures that leave the FC tier UNDECIDED, as runtime.firecracker._jail_client
+#: judges them (a host-I/O JailError that is not decided, or the helper at its client cap): it
+#: raises FCHelperNoVerdict, so a cascade DEFERS an overflow FC tier and retries it. ``forbidden``
+#: and a hello ``protocol`` skew (decided=True) are decided (the tier is dropped); so is anything
+#: else. A garbled/truncated reply is ``protocol`` WITHOUT decided: RealHost.jail_hello reports
+#: it as ``protocol-transient``.
+_JAIL_UNDECIDED = frozenset({"unreachable", "timeout", "refused", "internal", "busy",
+                             "exhausted", "protocol-transient"})
+
+
 def _check_fc_jailer(host: HostView) -> Check:
     """The Firecracker jail helper: ON by default, and the FC tier fails closed without it."""
     from blastbox.host.runtime.fc_jail import ENV_JAILER, JailSettings, opt_out_hint  # noqa: PLC0415
@@ -839,24 +849,45 @@ def _check_fc_jailer(host: HostView) -> Check:
     mem_knobs = ([k for k in ("BLASTBOX_SNAPSHOT_MEM_DIR",) if host.env.get(k, "").strip()]
                  + [k for k in ("BLASTBOX_SNAPSHOT_MEM_TMPFS",) if host.env.get(k, "").strip()
                     .lower() not in ("", "0", "false", "no")])
+    info, code, detail = host.jail_hello(settings.socket_path)
+    if info is None:
+        # The helper never allows uid 0: it says "forbidden" (an older helper just closed the
+        # connection: "refused"). For a root preflight that is the expected answer, not a fault.
+        if code in ("forbidden", "refused") and host.euid == 0:
+            if mem_knobs and _warm_snapshot(host.env):
+                return Check("fc-jailer", Status.FAIL,
+                             f"{' / '.join(mem_knobs)} cannot apply under the jailer: jailed "
+                             "snapshots live in the jail helper's --chroot-base; the warm "
+                             f"snapshot tier refuses to start. {opt_out_hint()}", doc)
+            return Check("fc-jailer", Status.WARN,
+                         f"jail helper at {settings.socket_path} answers only the dispatcher "
+                         "uid(s) it allows; run preflight as that uid (e.g. inside the "
+                         "dispatcher container) to verify it", doc)
+        if code in _JAIL_UNDECIDED:
+            # Could not be ASKED: never an unjailed fallback, but not a verdict either -- unless
+            # FCConfig refuses the config first (fc-guest names it): then the tier never asks.
+            overflow = ("a cascade overflow one is dropped anyway: its Firecracker config is "
+                        "refused before the helper is asked (see fc-guest)"
+                        if _fc_config_refusal(host.env) else
+                        "a cascade overflow one is deferred and retried" + (
+                            f" (and then refused for {' / '.join(mem_knobs)}, which cannot apply "
+                            "under the jailer)" if mem_knobs and _warm_snapshot(host.env) else ""))
+            return Check("fc-jailer", Status.FAIL,
+                         f"jail helper not reachable at {settings.socket_path} ({code}: "
+                         f"{detail}); the Firecracker tier fails closed until it answers -- an "
+                         "only or primary firecracker tier refuses to start (retry once the "
+                         f"helper is up), {overflow}. {opt_out_hint()}", doc,
+                         {"undecided": True})
+        return Check("fc-jailer", Status.FAIL,
+                     f"jail helper not usable at {settings.socket_path} ({code}: {detail}); the "
+                     f"Firecracker tier fails closed at startup. {opt_out_hint()}", doc)
+    # Only once the helper ANSWERED: select_snapshot_runtime asks it before this refusal.
     if mem_knobs and _warm_snapshot(host.env):
         # As the snapshot runtime refuses it at startup: jailed snapshots are the helper's.
         return Check("fc-jailer", Status.FAIL,
                      f"{' / '.join(mem_knobs)} cannot apply under the jailer: jailed snapshots "
                      "live in the jail helper's --chroot-base (put THAT on tmpfs to preload "
                      f"them); the warm snapshot tier refuses to start. {opt_out_hint()}", doc)
-    info, code, detail = host.jail_hello(settings.socket_path)
-    if info is None:
-        # The helper never allows uid 0: it says "forbidden" (an older helper just closed the
-        # connection: "refused"). For a root preflight that is the expected answer, not a fault.
-        if code in ("forbidden", "refused") and host.euid == 0:
-            return Check("fc-jailer", Status.WARN,
-                         f"jail helper at {settings.socket_path} answers only the dispatcher "
-                         "uid(s) it allows; run preflight as that uid (e.g. inside the "
-                         "dispatcher container) to verify it", doc)
-        return Check("fc-jailer", Status.FAIL,
-                     f"jail helper not usable at {settings.socket_path} ({code}: {detail}); the "
-                     f"Firecracker tier fails closed at startup. {opt_out_hint()}", doc)
     raw = str(info.get("firecracker", ""))
     m = re.match(r"^(\d+)\.(\d+)\.(\d+)$", raw)
     ver = (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
@@ -913,6 +944,12 @@ def _check_fc_guest(host: HostView) -> Check:
     if missing:
         return Check("fc-guest", Status.FAIL,
                      "missing guest artifact (not a regular file): " + ", ".join(missing), doc)
+    refusal = _fc_config_refusal(host.env)
+    if refusal:
+        # FCConfig.from_env refuses it before anything else (the jail helper included).
+        return Check("fc-guest", Status.FAIL,
+                     f"Firecracker config refused ({refusal}); the dispatcher does not start the "
+                     "firecracker tier", doc)
     from blastbox.host.runtime.firecracker import _MIN_SNAPSHOT_KERNEL  # noqa: PLC0415
 
     # The warm snapshot tier (BLASTBOX_POOL_WARM_SNAPSHOT, read as pool_config._bool does)
@@ -1614,22 +1651,80 @@ def _is_startup_gate(c: Check) -> bool:
     return c.name != "gvisor-rootfs"
 
 
+def _fc_config_refusal(env: Mapping[str, str]) -> str:
+    """Why FCConfig.from_env would refuse this env ('' = it builds) -- read from ``env``, as it
+    reads os.environ: either guest knob blank, an unparsable integer knob, or a value its
+    __post_init__ rejects. It runs BEFORE the jail helper is asked, so such a tier is dropped at
+    startup whatever the helper says."""
+    from blastbox.host.runtime import firecracker as fc  # noqa: PLC0415
+
+    values: dict[str, object] = {}
+    for key, field in ((fc._ENV_FC_BIN, "fc_bin"), (fc._ENV_FC_KERNEL, "fc_kernel"),
+                       (fc._ENV_FC_ROOTFS, "fc_rootfs")):
+        if env.get(key, "").strip():
+            values[field] = env[key].strip()
+    for key, field in ((fc._ENV_FC_VCPU, "fc_vcpu_count"), (fc._ENV_FC_MEM_MIB, "fc_mem_mib"),
+                       (fc._ENV_FC_OUTDISK_MIB, "fc_outdisk_mib")):
+        raw = env.get(key, "").strip()
+        if raw:
+            try:
+                values[field] = int(raw)
+            except ValueError:
+                return f"invalid integer for {key}={raw!r}"
+    for key, field in ((fc._ENV_FC_KERNEL, "fc_kernel"), (fc._ENV_FC_ROOTFS, "fc_rootfs")):
+        if not values.get(field):
+            return f"{key} must be set to use the Firecracker runtime"
+    try:
+        fc.FCConfig(**values)  # type: ignore[arg-type]
+    except (ValueError, TypeError) as exc:
+        return str(exc)
+    return ""
+
+
+def _deferred_overflow_tiers(checks: Sequence[Check], env: Mapping[str, str]) -> set[str]:
+    """Overflow tiers the cascade DEFERS at startup and retries: the FC tier whose jail helper
+    could not be asked. select_*_runtime asks the helper right after FCConfig.from_env and
+    before firecracker_available(), so only a config FCConfig.from_env refuses (refused first)
+    still drops it at startup; any other problem of the tier is met on the retry that reaches
+    the helper."""
+    overflow = _overflow_only_tiers(env)
+    if "firecracker" not in overflow or _fc_config_refusal(env):
+        return set()
+    undecided = any(c.name == "fc-jailer" and c.status is Status.FAIL
+                    and (c.facts or {}).get("undecided") for c in checks)
+    return {"firecracker"} if undecided else set()
+
+
 def _downgrade_overflow(checks: list[Check], env: Mapping[str, str]) -> list[Check]:
     overflow = _overflow_only_tiers(env)
     names = {n: tier for tier in overflow for n in (*_TIER_CHECKS[tier], *_SOFT_CHECKS[tier])}
-    # A tier any of whose startup gates FAILs is skipped whole, so its other FAILs are moot too.
+    deferred = _deferred_overflow_tiers(checks, env)
+    # A tier any of whose startup gates FAILs is skipped whole, so its other FAILs are moot too
+    # -- unless it is deferred (its availability could not be decided yet).
     skipped = {names[c.name] for c in checks
-               if c.name in names and c.status is Status.FAIL and _is_startup_gate(c)}
+               if c.name in names and c.status is Status.FAIL and _is_startup_gate(c)} - deferred
     # FCConfig.from_env refuses blank guest knobs, so the FC overflow tier is skipped then too
     # (fc-guest already reports that as a WARN, not a FAIL).
-    if ("firecracker" in overflow and not env.get("BLASTBOX_FC_KERNEL", "").strip()
-            and not env.get("BLASTBOX_FC_ROOTFS", "").strip()):
+    if "firecracker" in overflow and _fc_config_refusal(env):
         skipped.add("firecracker")
     warm = {"gvisor"} | ({"firecracker"} if _warm_snapshot(env) else set())
     out = []
     for c in checks:
         tier = names.get(c.name)
-        if tier in skipped and c.status is Status.FAIL:
+        if tier in deferred and c.status is Status.FAIL:
+            if (c.facts or {}).get("undecided"):
+                c = Check(c.name, Status.WARN,
+                          f"{c.detail} -- {tier} is an overflow tier of this cascade: the "
+                          "dispatcher defers it, retries it while running and admits it once "
+                          "the helper answers, serving on the other tiers until then", c.doc,
+                          {**(c.facts or {}), "deferred": True})
+            else:
+                c = Check(c.name, Status.WARN,
+                          f"{c.detail} -- {tier} is a deferred overflow tier of this cascade "
+                          "(its jail helper could not be asked): this is judged once the "
+                          "helper answers, and if it still holds the cascade drops the tier "
+                          "then and runs without it", c.doc, {**(c.facts or {}), "deferred": True})
+        elif tier in skipped and c.status is Status.FAIL:
             c = Check(c.name, Status.WARN,
                       f"{c.detail} -- {tier} is an overflow tier of this cascade, so the "
                       "dispatcher skips it at startup and runs without it", c.doc)
@@ -1655,10 +1750,11 @@ def _skipped_overflow_tiers(checks: Sequence[Check], env: Mapping[str, str]) -> 
     configured (FCConfig.from_env refuses blank knobs)."""
     overflow = _overflow_only_tiers(env)
     names = {n: tier for tier in overflow for n in (*_TIER_CHECKS[tier], *_SOFT_CHECKS[tier])}
+    # A DEFERRED tier is not dropped: it joins once the helper answers, so require judges it.
     skipped = {names[c.name] for c in checks if c.name in names and c.status is Status.FAIL
-               and (_is_startup_gate(c) or (c.facts or {}).get("refused"))}
-    if ("firecracker" in overflow and not env.get("BLASTBOX_FC_KERNEL", "").strip()
-            and not env.get("BLASTBOX_FC_ROOTFS", "").strip()):
+               and (_is_startup_gate(c) or (c.facts or {}).get("refused"))
+               } - _deferred_overflow_tiers(checks, env)
+    if "firecracker" in overflow and _fc_config_refusal(env):
         skipped.add("firecracker")
     return skipped
 

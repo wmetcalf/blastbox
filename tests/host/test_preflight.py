@@ -1840,14 +1840,17 @@ def _jailed_cascade(tiers, jail):
 _UNREACHABLE = (None, "unreachable", "/run/blastbox-fc-jail/helper.sock: No such file")
 
 
-def test_an_fc_overflow_tier_whose_helper_is_unreachable_is_dropped_with_a_warn():
+def test_an_fc_overflow_tier_whose_helper_is_unreachable_is_deferred_with_a_warn():
     by, checks = _jailed_cascade("gvisor:2,firecracker:2", _UNREACHABLE)
     assert by["fc-jailer"].status is Status.WARN and "overflow" in by["fc-jailer"].detail
+    assert "defers" in by["fc-jailer"].detail
     assert pf.exit_code(checks) == 0
-    # A static primary would refuse the mix with an admitted FC tier; dropped, it only warns.
+    # DEFERRED, not dropped: the cascade counts a deferred tier's declared transport, so a
+    # static primary refuses the mix whether or not the helper answers (measured:
+    # build_cascade_runtime defers firecracker, then dispatch_style raises CascadeMisconfigured).
     by, _ = _jailed_cascade("static:4,firecracker:2", _UNREACHABLE)
     by_ok, _ = _jailed_cascade("static:4,firecracker:2", _healthy().jail)
-    assert by["pool-runtime"].status is Status.WARN, by["pool-runtime"].detail
+    assert by["pool-runtime"].status is Status.FAIL, by["pool-runtime"].detail
     assert by_ok["pool-runtime"].status is Status.FAIL
 
 
@@ -1924,3 +1927,163 @@ def test_a_firecracker_named_binary_that_is_no_jail_id_is_not_a_helper_vmm():
                     "--start-time-us", "1"], uid=10001, aa="containerd-fc (enforce)\n")
     c = _by_name(pf.run_preflight(_with_procs(p), ["firecracker"]))["sandbox-confinement"]
     assert c.status is Status.PASS, c.detail
+
+
+# --- an overflow FC tier whose jail helper cannot be ASKED is deferred, not skipped ----------
+#
+# _jail_client raises FCHelperNoVerdict when the helper could not be asked (down, restarting,
+# timing out, busy, at its client cap): the cascade DEFERS that overflow tier and retries it while
+# running, admitting it once the helper answers. Only a decided refusal (this uid not allowed,
+# protocol skew) drops it at startup.
+
+_FC_OVERFLOW = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "gvisor:2,firecracker:4"}
+
+
+def _fc_overflow(jail, env=None):
+    host = _healthy(env={**_FC_OVERFLOW, **(env or {})})
+    host.jail = jail
+    checks = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False)
+    return host, checks
+
+
+def _skipped(host):
+    """The tiers run_preflight judges dropped (it reads the checks before any downgrade)."""
+    raw = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=True)
+    return pf._skipped_overflow_tiers(raw, host.env)
+
+
+@pytest.mark.parametrize("code", ["unreachable", "timeout", "busy", "exhausted", "internal",
+                                  "refused"])
+def test_unreachable_helper_on_an_fc_overflow_tier_is_deferred_and_retried(code):
+    host, checks = _fc_overflow((None, code, "helper.sock: No such file or directory"))
+    c = _by_name(checks)["fc-jailer"]
+    assert c.status is Status.WARN
+    assert "skips" not in c.detail and "fails closed at startup" not in c.detail
+    assert "defers" in c.detail and "retries" in c.detail and "admits it" in c.detail
+    assert (c.facts or {}).get("deferred") is True
+    assert "firecracker" not in _skipped(host)
+
+
+@pytest.mark.parametrize("jail", [(None, "forbidden", "uid 1000 is not allowed"),
+                                  (None, "protocol", "helper speaks protocol 2"),
+                                  (None, "error", "boom")])
+def test_a_decided_helper_refusal_still_skips_the_fc_overflow_tier(jail):
+    host, checks = _fc_overflow(jail)
+    c = _by_name(checks)["fc-jailer"]
+    assert c.status is Status.WARN and "skips it at startup" in c.detail
+    assert not (c.facts or {}).get("deferred")
+    assert "firecracker" in _skipped(host)
+
+
+def test_a_deferred_warm_fc_overflow_tier_is_not_called_never_ready():
+    _, checks = _fc_overflow((None, "unreachable", "gone"),
+                             env={"BLASTBOX_POOL_WARM_SNAPSHOT": "1"})
+    c = _by_name(checks)["fc-jailer"]
+    assert "defers" in c.detail and "never becomes ready" not in c.detail
+
+
+def test_an_unreachable_helper_on_a_primary_or_only_fc_tier_still_fails_closed():
+    _, c = _jail_check(jail=(None, "unreachable", "gone"))
+    assert c.status is Status.FAIL and "refuses to start" in c.detail
+    assert "retry" in c.detail                      # transient: a restart once it is up fixes it
+    host = _healthy(env={"BLASTBOX_POOL_RUNTIME": "cascade",
+                         "BLASTBOX_POOL_TIERS": "firecracker:4,gvisor:2"})
+    host.jail = (None, "unreachable", "gone")
+    checks = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False)
+    assert _by_name(checks)["fc-jailer"].status is Status.FAIL
+
+
+def test_deferred_fc_overflow_still_counts_for_require():
+    """Deferred is not dropped: the tier joins once the helper answers, so require judges it."""
+    host, checks = _fc_overflow((None, "unreachable", "gone"),
+                                env={"BLASTBOX_CONFINEMENT": "require",
+                                     "BLASTBOX_DISPATCH_WARM_ONLY": "1"})
+    assert "firecracker" not in _skipped(host)
+
+
+def test_a_deferred_fc_overflow_tier_is_judged_on_the_rest_only_when_the_helper_answers():
+    """select_*_runtime asks the helper BEFORE firecracker_available(): with the helper not
+    answering, a guest problem cannot drop the tier at startup -- it is deferred, and that
+    problem drops it on the retry that reaches it."""
+    host = _healthy(env=_FC_OVERFLOW)
+    host.jail = (None, "unreachable", "gone")
+    host.guest_problems = {"/var/lib/blastbox/fc/rootfs.ext4": "rootfs stamped for gvisor"}
+    raw = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=True))
+    assert raw["fc-guest"].status is Status.FAIL          # the precondition this test needs
+    assert "firecracker" not in _skipped(host)
+    by = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False))
+    assert by["fc-jailer"].status is Status.WARN and "defers" in by["fc-jailer"].detail
+    g = by["fc-guest"]
+    assert g.status is Status.WARN and "skips it at startup" not in g.detail
+    assert "once the helper answers" in g.detail
+    assert (g.facts or {}).get("deferred") is True
+
+
+# --- round 1: what FCConfig.from_env refuses comes BEFORE the helper; a garbled reply defers --
+
+@pytest.mark.parametrize("env", [{"BLASTBOX_FC_ROOTFS": ""}, {"BLASTBOX_FC_KERNEL": ""},
+                                 {"BLASTBOX_FC_VCPU": "x"}, {"BLASTBOX_FC_MEM_MIB": "32"}])
+def test_a_guest_config_from_env_refuses_drops_the_tier_even_with_the_helper_down(env):
+    host, checks = _fc_overflow((None, "unreachable", "gone"), env=env)
+    assert "firecracker" in _skipped(host)
+    c = _by_name(checks)["fc-jailer"]
+    assert "defers" not in c.detail and "skips it at startup" in c.detail
+    assert "deferred and retried" not in c.detail and "refused before the helper" in c.detail
+
+
+def test_a_garbled_hello_reply_defers_like_the_runtime(monkeypatch):
+    from blastbox.host.runtime import fc_jail
+
+    class _Client:
+        def __init__(self, path, *, timeout_s):
+            pass
+
+        def hello(self):
+            raise fc_jail.JailError("protocol", "truncated reply")
+
+    monkeypatch.setattr(fc_jail, "JailClient", _Client)
+    assert pf.RealHost().jail_hello("/run/x.sock")[1] == "protocol-transient"
+    _, checks = _fc_overflow((None, "protocol-transient", "truncated reply"))
+    assert "defers" in _by_name(checks)["fc-jailer"].detail
+
+
+def test_a_hello_protocol_skew_stays_decided(monkeypatch):
+    from blastbox.host.runtime import fc_jail
+
+    class _Client:
+        def __init__(self, path, *, timeout_s):
+            pass
+
+        def hello(self):
+            raise fc_jail.JailError("protocol", "helper speaks protocol 2", decided=True)
+
+    monkeypatch.setattr(fc_jail, "JailClient", _Client)
+    assert pf.RealHost().jail_hello("/run/x.sock")[1] == "protocol"
+
+
+@pytest.mark.parametrize("env,knob", [({"BLASTBOX_FC_VCPU": "x"}, "BLASTBOX_FC_VCPU"),
+                                      ({"BLASTBOX_FC_MEM_MIB": "32"}, "fc_mem_mib"),
+                                      ({"BLASTBOX_FC_OUTDISK_MIB": "2.0"}, "BLASTBOX_FC_OUTDISK_MIB")])
+def test_a_refused_fc_knob_is_named_and_skips_the_overflow_tier_with_a_healthy_helper(env, knob):
+    host, checks = _fc_overflow(_healthy().jail, env=env)
+    g = _by_name(checks)["fc-guest"]
+    assert g.status is Status.WARN and knob in g.detail and "skips it at startup" in g.detail
+    assert "firecracker" in _skipped(host)
+    # an only/primary firecracker tier FAILs on it: the dispatcher refuses to start
+    by = _by_name(pf.run_preflight(_healthy(env=env), ["firecracker"]))
+    assert by["fc-guest"].status is Status.FAIL and knob in by["fc-guest"].detail
+
+
+def test_a_snapshot_mem_knob_under_an_unanswering_helper_is_deferred_like_the_runtime():
+    """select_snapshot_runtime asks the helper BEFORE refusing BLASTBOX_SNAPSHOT_MEM_* under the
+    jailer: with the helper not answering the warm FC overflow tier is deferred, and the knob
+    refuses it on the retry that reaches the helper."""
+    env = {"BLASTBOX_POOL_WARM_SNAPSHOT": "1", "BLASTBOX_SNAPSHOT_MEM_TMPFS": "1"}
+    host, checks = _fc_overflow((None, "unreachable", "gone"), env=env)
+    c = _by_name(checks)["fc-jailer"]
+    assert "defers" in c.detail and "BLASTBOX_SNAPSHOT_MEM_TMPFS" in c.detail
+    assert "firecracker" not in _skipped(host)
+    # answered: the knob is the refusal, at startup
+    host, checks = _fc_overflow(_healthy().jail, env=env)
+    c = _by_name(checks)["fc-jailer"]
+    assert "cannot apply under the jailer" in c.detail and "skips it at startup" in c.detail
