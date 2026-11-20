@@ -1227,6 +1227,11 @@ class _Proc:
     argv: tuple[str, ...]
 
 
+#: Flags only the firecracker VMM takes (as --flag or --flag=value).
+_FC_VMM_FLAGS = frozenset({"--api-sock", "--no-api", "--config-file", "--id", "--seccomp-filter",
+                           "--no-seccomp", "--boot-timer", "--start-time-us"})
+
+
 def _sandbox_processes(host: HostView) -> list[_Proc]:
     """Running runsc sandbox/gofer and firecracker processes, found by argv[0] (runsc re-execs
     itself with argv[0] ``runsc-sandbox``/``runsc-gofer``; its comm is often just ``exe``) or
@@ -1242,13 +1247,15 @@ def _sandbox_processes(host: HostView) -> list[_Proc]:
             names.add(os.path.basename(argv[0]))
         for role in (*_RUNSC_ROLES, "firecracker"):
             # A jailed VMM runs as the jail helper's per-jail copy, /firecracker-<jail id> (comm
-            # truncated to 15 chars), always with firecracker's own --api-sock: still a
-            # firecracker. Another firecracker-* tool (firecracker-containerd) is not; when
-            # argv cannot be read, err on counting it (a missed VMM would read as confined).
+            # truncated to 15 chars) -- as does any renamed one: a firecracker-* process carrying
+            # one of firecracker's own flags is a VMM. Another firecracker-* tool
+            # (firecracker-containerd) is not; when argv cannot be read, err on counting it (a
+            # missed VMM would read as confined).
             if role in names or (role == "firecracker" and (
                     (fc_name and fc_name in names)
                     or (any(n.startswith("firecracker-") for n in names)
-                        and (not argv or "--api-sock" in argv)))):
+                        and (not argv or any(a.split("=", 1)[0] in _FC_VMM_FLAGS
+                                             for a in argv[1:]))))):
                 found.append(_Proc(pid, role, argv))
                 break
     return found
