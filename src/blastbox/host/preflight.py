@@ -1407,6 +1407,21 @@ def _downgrade_overflow(checks: list[Check], env: Mapping[str, str]) -> list[Che
     return out
 
 
+def _skipped_overflow_tiers(checks: Sequence[Check], env: Mapping[str, str]) -> set[str]:
+    """The overflow tiers the cascade drops at startup, as _downgrade_overflow judges them: a
+    FAILed startup gate (not a non-rw /dev/kvm or a missing gVisor rootfs, which are admitted),
+    a gVisor rootfs whose stamp the runtime refuses, or Firecracker overflow with no guest
+    configured (FCConfig.from_env refuses blank knobs)."""
+    overflow = _overflow_only_tiers(env)
+    names = {n: tier for tier in overflow for n in (*_TIER_CHECKS[tier], *_SOFT_CHECKS[tier])}
+    skipped = {names[c.name] for c in checks if c.name in names and c.status is Status.FAIL
+               and (_is_startup_gate(c) or (c.facts or {}).get("refused"))}
+    if ("firecracker" in overflow and not env.get("BLASTBOX_FC_KERNEL", "").strip()
+            and not env.get("BLASTBOX_FC_ROOTFS", "").strip()):
+        skipped.add("firecracker")
+    return skipped
+
+
 def _warm_snapshot(env: Mapping[str, str]) -> bool:
     raw = env.get("BLASTBOX_POOL_WARM_SNAPSHOT", "").strip().lower()
     return bool(raw) and raw not in ("0", "false", "no", "off")
@@ -1469,13 +1484,7 @@ def run_preflight(host: HostView, tiers: Sequence[str], *, explicit: bool = True
         out.append(_check_apparmor(host))
         out.append(_check_bwrap_stock_profile(host, t))
         out.append(_check_userns(host, t))
-    # A tier check FAIL refuses the tier; of the soft checks only an explicit refusal does (a
-    # missing gVisor rootfs is admitted and booted anyway, see _is_startup_gate).
-    soft_names = {n for soft in _SOFT_CHECKS.values() for n in soft}
-    failed = {c.name for c in out if c.status is Status.FAIL and (
-        c.name not in soft_names or (c.facts or {}).get("refused"))}
-    skipped = {tier for tier in _overflow_only_tiers(host.env)
-               if failed & {*_TIER_CHECKS[tier], *_SOFT_CHECKS[tier]}}
+    skipped = _skipped_overflow_tiers(out, host.env)
     if not explicit and host.env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower() in ("", "none"):
         skipped |= {"gvisor", "firecracker"}     # preview: the dispatcher runs cold only
     # remote-only too: dispatch validates the mode

@@ -920,3 +920,23 @@ def test_checking_only_a_skipped_overflow_tier_keeps_the_primarys_cold_fallback(
     host.paths.discard("/dev/kvm")                       # firecracker overflow unavailable
     c = next(c for c in pf.run_preflight(host, ["firecracker"]) if c.name == "confinement")
     assert c.status is Status.FAIL and "cold" in c.facts["would_use"]  # type: ignore[index]
+
+
+def _fc_overflow_pf(env_extra, *, kvm_rw=True):
+    env = {"BLASTBOX_CONFINEMENT": "require", "BLASTBOX_POOL_RUNTIME": "cascade",
+           "BLASTBOX_POOL_TIERS": "static:4,firecracker:2", **env_extra}
+    host = _healthy(files=ALPINE_BARE, env=env)
+    if not kvm_rw:
+        host.rw.discard("/dev/kvm")
+    cs = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False)
+    return next(c for c in cs if c.name == "confinement")
+
+
+def test_firecracker_overflow_with_no_guest_configured_is_skipped():
+    c = _fc_overflow_pf({"BLASTBOX_FC_KERNEL": "", "BLASTBOX_FC_ROOTFS": ""})
+    assert c.status is not Status.FAIL
+
+
+def test_firecracker_overflow_with_a_non_rw_kvm_is_admitted_so_require_fails():
+    c = _fc_overflow_pf({}, kvm_rw=False)
+    assert c.status is Status.FAIL and "firecracker" in c.detail
