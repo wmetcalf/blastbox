@@ -324,9 +324,11 @@ def _umount_rules_ok(text: str) -> bool:
 
 
 def test_umount_denies_are_spelled_with_a_path() -> None:
-    """The text-level guard, for hosts without apparmor_parser AND for parsers >= 4.1, where
-    the compiled check cannot see the bug (a umount deny that can match the empty mountpoint
-    unmediates the mount class on apparmor_parser <= 4.0.x)."""
+    """The text-level tripwire, for hosts without apparmor_parser AND for parsers >= 4.1, where
+    the compiled check cannot see the bug. It catches the ways a maintainer would plausibly
+    reintroduce it; the AUTHORITY is the compiled check, which CI's sandbox job runs on Ubuntu
+    24.04 (apparmor_parser 4.0.x, which has the bug). The bug: a umount deny that can match
+    the empty mountpoint unmediates the mount class on apparmor_parser <= 4.0.x."""
     assert _umount_rules_ok((_PROFILE_DIR / "blastbox-sandbox").read_text()), (
         f"blastbox-sandbox may name the umount keyword only in {_CANONICAL_UMOUNT} (comments "
         "count too): check any other umount rule against the compiled DFA (test_the_child_profile_mediates_the_mount_class on a "
