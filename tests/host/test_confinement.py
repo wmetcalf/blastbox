@@ -1263,7 +1263,16 @@ def test_a_detection_judged_for_another_jail_configuration_is_re_judged():
     assert now.state.fc_jail == "no-apparmor"
     other = cf.complete_for(now, ["firecracker"], env={"BLASTBOX_FC_JAIL_SOCKET": "/run/o.sock"},
                             host=host)
-    assert host.jail_asked == "/run/o.sock" and other.state.fc_jail_for == "/run/o.sock"
+    assert host.jail_asked == "/run/o.sock" and other.state.fc_jail_for == "socket:/run/o.sock"
     same = _host(UBUNTU)
     assert cf.complete_for(now, ["firecracker"], env={}, host=same) is now
     assert not hasattr(same, "jail_asked")
+
+
+
+def test_a_socket_named_off_does_not_pass_for_jailing_off():
+    off = cf.detect(_JAIL_OFF, host=_host(UBUNTU), landlock=0, kinds=["firecracker"])
+    host = _host(UBUNTU)
+    host.jail = _HELLO_NO_AA
+    now = cf.complete_for(off, ["firecracker"], env={"BLASTBOX_FC_JAIL_SOCKET": "off"}, host=host)
+    assert now.state.fc_jail == "no-apparmor" and host.jail_asked == "off"

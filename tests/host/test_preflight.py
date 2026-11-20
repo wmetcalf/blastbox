@@ -1895,3 +1895,22 @@ def test_another_jailer_users_vmm_in_its_own_profile_is_not_off_profile():
               aa="containerd-fc (enforce)\n")
     c = _by_name(pf.run_preflight(_with_procs(p), ["firecracker"]))["sandbox-confinement"]
     assert c.status is Status.PASS, c.detail
+
+
+
+def test_jailed_vmm_advice_does_not_claim_an_answer_the_helper_never_gave():
+    p = _proc(300, ["/firecracker-a", "--id", "a", "--start-time-us", "1"], uid=10001,
+              aa="unconfined\n")
+    host = _with_procs(p)
+    host.jail = (None, "unreachable", "gone")
+    c = _by_name(pf.run_preflight(host, ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.WARN and "reports loading" not in c.detail
+    assert "already under the jailer" in c.detail and "unknown" in c.detail
+
+
+
+def test_a_helper_vmm_in_a_sibling_jails_profile_is_off_profile():
+    p = _proc(300, ["/firecracker-a", "--id", "a", "--start-time-us", "1"], uid=10001,
+              aa="blastbox-fc-jail-b (enforce)\n")
+    c = _by_name(pf.run_preflight(_with_procs(p), ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.WARN and "per-jail" in c.detail

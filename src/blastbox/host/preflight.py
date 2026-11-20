@@ -1350,6 +1350,11 @@ def _helper_vmm(p: _Proc) -> bool:
     return bool(p.argv) and os.path.basename(p.argv[0]).startswith("firecracker-")
 
 
+def _jail_id(p: _Proc) -> str:
+    """The jail id in a helper VMM's exec name (fc_jail_helper.exec_name)."""
+    return os.path.basename(p.argv[0])[len("firecracker-"):] if p.argv else ""
+
+
 def _apparmor_on(host: HostView) -> bool:
     raw = host.read("/sys/module/apparmor/parameters/enabled")
     return raw is not None and raw.strip().upper().startswith("Y")
@@ -1415,9 +1420,10 @@ def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc],
                 unjailed.append(p)
             elif (jailed and fc_jail == "apparmor" and label and p not in unconfined
                   and _helper_vmm(p)
-                  and not label.strip().startswith(_JAIL_PROFILE_PREFIX)):
+                  and label.strip().partition(" (")[0] != _JAIL_PROFILE_PREFIX + _jail_id(p)):
                 # Only the helper's OWN VMMs (exec name firecracker-<jail id>) are expected in
-                # its profiles: another jailer user's VMM keeps its own.
+                # its profiles -- each in ITS jail's, not a sibling's; another jailer user's VMM
+                # keeps its own.
                 off_profile.append(p)
     problems = []
     jailed_unconfined = [p for p in unconfined if p.role == "firecracker" and _jailed(p)]
@@ -1439,12 +1445,18 @@ def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc],
                          "; ".join(problems) + ". The jail helper runs without per-jail "
                          "AppArmor profiles (AppArmor off where it runs, or --apparmor off): "
                          "enable them so a VMM is confined by more than its chroot", doc)
-        if only_jailed:
+        if only_jailed and fc_jail == "apparmor":
             # Jailed, and the helper says it confines them: the profile is not the one it loads.
             return Check("sandbox-confinement", Status.WARN,
                          "; ".join(problems) + ". These VMMs are already under the jailer, but "
                          "not in the per-jail AppArmor profile the jail helper reports loading: "
                          "check the helper's apparmor_parser load and its logs", doc)
+        if only_jailed:
+            # Jailed, but the helper gave no answer about its profiles (fc-jailer says why).
+            return Check("sandbox-confinement", Status.WARN,
+                         "; ".join(problems) + f". These VMMs are already under the jailer; the "
+                         f"jail helper's AppArmor could not be learned here ({fc_jail}: see "
+                         "fc-jailer), so whether it should have confined them is unknown", doc)
         return Check("sandbox-confinement", Status.WARN,
                      "; ".join(problems) + ". Slots share one scratch tree (other slots' "
                      "disks and API/vsock sockets); run firecracker under the jailer with a "

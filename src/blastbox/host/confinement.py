@@ -165,7 +165,7 @@ class HostLsm:
     jailer: str | None = None           # resolved path (unjailed only)
     fc_jail: str | None = None          # FC_JAIL_STATES; None = not probed (dispatcher's own view)
     fc_jail_detail: str | None = None   # the helper's socket and, when not answered, why
-    #: The jail configuration fc_jail was judged for (_jail_key): "off", the helper socket, or
+    #: The jail configuration fc_jail was judged for (_jail_key): "off", "socket:<path>" or
     #: "invalid" -- so a Detection judged under another configuration is not reused.
     fc_jail_for: str | None = None
 
@@ -433,14 +433,15 @@ def _firecracker(host: HostReader, env: Mapping[str, str]) -> tuple[str | None, 
 
 
 def _jail_key(env: Mapping[str, str]) -> str:
-    """Which jail configuration ``env`` selects: "off", the helper socket, or "invalid"."""
+    """Which jail configuration ``env`` selects: "off", "invalid", or "socket:<path>" (prefixed,
+    so no socket path can collide with the other two)."""
     from blastbox.host.runtime.fc_jail import JailSettings  # noqa: PLC0415
 
     try:
         settings = JailSettings.from_env(dict(env))
     except ValueError:
         return "invalid"
-    return settings.socket_path if settings.enabled else "off"
+    return f"socket:{settings.socket_path}" if settings.enabled else "off"
 
 
 def _fc_jail(host: HostReader, env: Mapping[str, str]) -> tuple[str, str | None]:
