@@ -1227,8 +1227,10 @@ class _Proc:
     argv: tuple[str, ...]
 
 
-#: firecracker-* names that are NOT a VMM (firecracker-containerd, and its 15-char comm).
-_NOT_A_VMM = frozenset({"firecracker-containerd", "firecracker-con"})
+#: argv[0] basename prefix of the firecracker-* tools that are NOT a VMM (firecracker-containerd
+#: and its shim). Judged only on a READABLE argv: its 15-char comm ("firecracker-con") is also
+#: what a VMM with a jail id starting "con" shows.
+_NOT_A_VMM_PREFIX = "firecracker-containerd"
 
 
 def _sandbox_processes(host: HostView) -> list[_Proc]:
@@ -1251,8 +1253,9 @@ def _sandbox_processes(host: HostView) -> list[_Proc]:
             # confined, a miscounted tool only WARNs.
             if role in names or (role == "firecracker" and (
                     (fc_name and fc_name in names)
-                    or any(n.startswith("firecracker-") and n not in _NOT_A_VMM
-                           for n in names))):
+                    or (any(n.startswith("firecracker-") for n in names)
+                        and not (argv and os.path.basename(argv[0])
+                                 .startswith(_NOT_A_VMM_PREFIX))))):
                 found.append(_Proc(pid, role, argv))
                 break
     return found
