@@ -1201,6 +1201,9 @@ def test_the_client_reads_a_reply_queued_behind_a_reset(monkeypatch, tmp_path):
     assert exc.value.code == "forbidden" and exc.value.decided
 
 
+_PFX = h.private_socket_prefix(Path("h.sock"))
+
+
 def _serve_raises(tmp_path):
     helper = _helper_for(tmp_path)
     ready, raised = threading.Event(), []
@@ -1238,7 +1241,7 @@ def test_a_symlinked_socket_directory_is_judged_by_what_it_points_at(tmp_path):
 def test_a_failed_publish_leaves_no_private_socket_and_old_ones_are_swept(tmp_path):
     run = tmp_path / "run"
     run.mkdir(mode=0o750)
-    for name in (".h.sock.999999", ".h.sock.999998-3"):     # a pid's own name and a fallback
+    for name in (f"{_PFX}999999", f"{_PFX}999998-3"):     # a pid's own name and a fallback
         s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         s.bind(str(run / name))
         s.close()
@@ -1263,20 +1266,20 @@ def test_a_refused_peer_that_sends_nothing_frees_its_slot_quickly(tmp_path):
 def test_the_sweep_touches_only_sockets(tmp_path):
     run = tmp_path / "run"
     run.mkdir(mode=0o750)
-    (run / ".h.sock.5").mkdir()                # not a socket: never ours, never fatal
-    (run / ".h.sock.6").write_text("x")
+    (run / f"{_PFX}5").mkdir()                # not a socket: never ours, never fatal
+    (run / f"{_PFX}6").write_text("x")
     with _serving(tmp_path) as (_, path):
         JailClient(path).hello()
-    assert (run / ".h.sock.5").is_dir() and (run / ".h.sock.6").is_file()
+    assert (run / f"{_PFX}5").is_dir() and (run / f"{_PFX}6").is_file()
 
 
 def test_a_non_socket_at_the_helpers_own_private_name_is_not_fatal(tmp_path):
     run = tmp_path / "run"
     run.mkdir(mode=0o750)
-    (run / f".h.sock.{os.getpid()}").mkdir()   # pid reuse after a stray entry
+    (run / f"{_PFX}{os.getpid()}").mkdir()   # pid reuse after a stray entry
     with _serving(tmp_path) as (_, path):
         JailClient(path).hello()
-    assert (run / f".h.sock.{os.getpid()}").is_dir()
+    assert (run / f"{_PFX}{os.getpid()}").is_dir()
 
 
 def test_a_failed_publish_reports_its_own_error(tmp_path):
@@ -1299,7 +1302,7 @@ def test_no_free_private_name_is_a_clear_refusal(tmp_path, monkeypatch):
 def test_a_fallback_private_name_never_reads_as_another_pid(tmp_path):
     run = tmp_path / "run"
     run.mkdir(mode=0o750)
-    (run / f".h.sock.{os.getpid()}").mkdir()
+    (run / f"{_PFX}{os.getpid()}").mkdir()
     names = []
     real_bind = socket.socket.bind
 
@@ -1310,7 +1313,7 @@ def test_a_fallback_private_name_never_reads_as_another_pid(tmp_path):
     with _m.patch.object(socket.socket, "bind", _bind):
         with _serving(tmp_path) as (_, path):
             JailClient(path).hello()
-    assert f".h.sock.{os.getpid()}-1" in names
+    assert f"{_PFX}{os.getpid()}-1" in names
 
 
 def test_a_socket_path_near_the_af_unix_limit_still_publishes(tmp_path):
@@ -1324,3 +1327,33 @@ def test_a_socket_path_near_the_af_unix_limit_still_publishes(tmp_path):
     with _serving(base) as (_, path):
         assert path == str(sock)
         JailClient(path).hello()
+
+
+def test_a_long_socket_name_near_the_af_unix_limit_still_publishes():
+    import shutil
+    import tempfile
+
+    short = Path(tempfile.mkdtemp(prefix="fcj", dir="/tmp"))     # a SHORT directory
+    try:
+        _long_name_publishes(short)
+    finally:
+        shutil.rmtree(short, ignore_errors=True)
+
+
+def _long_name_publishes(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir(mode=0o750)
+    name = "s" * (106 - len(str(run)))
+    sock = run / name
+    assert len(str(sock)) <= 107
+    helper = _helper_for(tmp_path)
+    object.__setattr__(helper.cfg, "socket_path", sock)
+    ready = threading.Event()
+    t = threading.Thread(target=helper.serve, kwargs={"ready": ready.set}, daemon=True)
+    t.start()
+    try:
+        assert ready.wait(5)
+        JailClient(str(sock)).hello()
+    finally:
+        helper._stop.set()
+        t.join(5)

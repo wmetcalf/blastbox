@@ -1746,7 +1746,7 @@ class Helper:
         # path: a dispatcher probing during a restart sees the old socket or the new one, never
         # a root:root (EACCES -- decided, for good) or not-yet-listening one. (Nobody else can
         # write the directory -- checked above -- so the by-path chmod cannot be redirected.)
-        prefix = f".{cfg.socket_path.name}."
+        prefix = private_socket_prefix(cfg.socket_path)
         for name in os.listdir(parent):
             # Earlier instances' private names (a start that failed before its rename). Only
             # SOCKETS are ours: anything else under such a name is left alone, never fatal.
@@ -1761,11 +1761,11 @@ class Helper:
                     if not os.path.lexists(p)), None)
         if tmp is None:
             raise RuntimeError(f"{parent}: no free private socket name (stray {prefix}* entries)")
-        srv = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         dir_fd = os.open(parent, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         try:
-            # Through the directory's fd: the private name is longer than the configured one,
-            # and only the configured path has to fit sun_path (the clients connect by it).
+            # Through the directory's fd, under a short fixed-length name: only the configured
+            # path has to fit sun_path (the clients connect by it), however long its parts.
             srv.bind(f"/proc/self/fd/{dir_fd}/{tmp.name}")
             self._lchown(tmp, 0, cfg.socket_gid)
             os.chmod(tmp, 0o660)
@@ -2135,6 +2135,12 @@ def _resolution_nodes(path: str) -> "list[str]":
             continue
         cur = nxt
     return seen
+
+
+def private_socket_prefix(socket_path: Path) -> str:
+    """The prefix of the names a helper binds before renaming its socket into place: short and
+    fixed-length (sun_path), and distinct per configured socket name (a shared directory)."""
+    return f".fcj-{hashlib.sha256(socket_path.name.encode()).hexdigest()[:8]}."
 
 
 def _check_root_dir(path: Path) -> None:
