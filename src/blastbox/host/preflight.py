@@ -1264,6 +1264,20 @@ def _check_sandbox_confinement(host: HostView, procs: Sequence[_Proc]) -> Check:
                      else ""))
 
 
+def _file_style_dispatcher(env: Mapping[str, str]) -> bool:
+    """Whether the configured dispatcher is the file-handshake one (the only kind with a cold
+    fallback, dispatch.reachable_tiers), judged from the configuration -- an explicit
+    `--tier remote` says nothing about it. A cascade cannot mix dispatch styles, so it boots in
+    its PRIMARY member's style (an other-style overflow member must be skipped to boot)."""
+    pool = env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower()
+    if pool in ("", "none", "gvisor", "firecracker"):
+        return True
+    if pool == "cascade":
+        members = _cascade_members(env)
+        return bool(members) and members[0] in ("gvisor", "firecracker")
+    return False
+
+
 def _check_confinement(host: HostView, tiers: Collection[str],
                        skipped: Collection[str] = ()) -> Check:
     """Which host LSM each local sandbox kind WOULD be confined with (detection only: nothing
@@ -1282,7 +1296,7 @@ def _check_confinement(host: HostView, tiers: Collection[str],
     warm_only = host.env.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower() in (
         "1", "true", "yes", "on")
     if (reach - set(skipped)) & {"gvisor", "firecracker"} and not warm_only \
-            and "remote" not in reach:
+            and _file_style_dispatcher(host.env):
         reach.add("docker")
     kinds = cf.kinds_for_tiers(reach)
     st = cf.probe(host, env=host.env, kinds=kinds, landlock=host.landlock_abi())

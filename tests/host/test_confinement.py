@@ -894,3 +894,20 @@ def test_remote_cascade_with_a_skipped_local_overflow_has_no_cold_fallback():
     cs = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False)
     c = next(c for c in cs if c.name == "confinement")
     assert c.status is not Status.FAIL and "cold" not in c.facts["would_use"]  # type: ignore[index]
+
+
+def test_explicit_remote_tier_does_not_hide_a_local_dispatchers_cold_fallback():
+    env = {"BLASTBOX_CONFINEMENT": "require", "BLASTBOX_POOL_RUNTIME": "firecracker"}
+    c = _pf(ALPINE, abi=3, env=env, tiers=("firecracker", "remote"))
+    assert c.status is Status.FAIL and "cold" in c.facts["would_use"]  # type: ignore[index]
+
+
+def test_local_primary_cascade_with_network_overflow_keeps_the_cold_fallback():
+    """It boots only with the network overflow skipped, i.e. as a file-style cascade."""
+    env = {"BLASTBOX_CONFINEMENT": "require", "BLASTBOX_POOL_RUNTIME": "cascade",
+           "BLASTBOX_POOL_TIERS": "firecracker:2,static:4"}
+    host = _healthy(files=ALPINE, env=env)
+    host.landlock_abi = lambda: 3    # type: ignore[method-assign]
+    cs = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False)
+    c = next(c for c in cs if c.name == "confinement")
+    assert c.status is Status.FAIL and "cold" in c.facts["would_use"]  # type: ignore[index]
