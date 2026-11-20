@@ -1371,3 +1371,31 @@ def test_a_socket_that_cannot_be_created_leaks_no_directory_fd(tmp_path, monkeyp
         helper.serve()
     monkeypatch.undo()
     assert len(os.listdir("/proc/self/fd")) == before
+
+
+def test_a_socket_path_no_client_could_reach_is_refused():
+    import shutil
+    import tempfile
+
+    short = Path(tempfile.mkdtemp(prefix="fcj", dir="/tmp"))
+    try:
+        run = short / "run"
+        run.mkdir(mode=0o750)
+        helper = _helper_for(short)
+        object.__setattr__(helper.cfg, "socket_path", run / ("s" * 120))
+        ready, raised = threading.Event(), []
+
+        def _serve():
+            try:
+                helper.serve(ready=ready.set)
+            except RuntimeError as exc:
+                raised.append(exc)
+        t = threading.Thread(target=_serve, daemon=True)
+        t.start()
+        t.join(5)
+        helper._stop.set()                  # a regression must FAIL here, never hang
+        t.join(5)
+        assert not ready.is_set() and raised and "too long" in str(raised[0])
+        assert not os.listdir(run)
+    finally:
+        shutil.rmtree(short, ignore_errors=True)

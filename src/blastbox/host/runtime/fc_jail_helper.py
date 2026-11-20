@@ -88,6 +88,8 @@ JAIL_KERNEL = "vmlinux"
 JAIL_ROOTFS = "rootfs.ext4"
 JAIL_OUTDISK = "outdisk.ext4"
 JAIL_VSOCK = "vsock.sock"
+#: sun_path holds 108 bytes including the terminating NUL.
+_SUN_PATH_MAX = 107
 #: The oldest Firecracker the helper runs (as the dispatcher's own gate, firecracker.py).
 MIN_FC_VERSION = (1, 15, 1)
 JAIL_API_SOCK = "fc-api.sock"
@@ -1725,6 +1727,10 @@ class Helper:
     # ------------------------------------------------------------------ socket loop
     def serve(self, *, ready: "Callable[[], None] | None" = None) -> None:
         cfg = self.cfg
+        if len(os.fsencode(cfg.socket_path)) > _SUN_PATH_MAX:
+            # The rename would publish it, but no client can connect() to it.
+            raise RuntimeError(f"--socket {cfg.socket_path} is too long for a unix socket path "
+                               f"(max {_SUN_PATH_MAX} bytes)")
         parent = cfg.socket_path.parent
         if not parent.exists():
             # Ours: make it the dispatcher group's (0750) so the socket can be bind-mounted.
@@ -2144,7 +2150,7 @@ def _resolution_nodes(path: str) -> "list[str]":
 def private_socket_prefix(socket_path: Path) -> str:
     """The prefix of the names a helper binds before renaming its socket into place: short and
     fixed-length (sun_path), and distinct per configured socket name (a shared directory)."""
-    return f".fcj-{hashlib.sha256(socket_path.name.encode()).hexdigest()[:8]}."
+    return f".fcj-{hashlib.sha256(os.fsencode(socket_path.name)).hexdigest()[:16]}."
 
 
 def _check_root_dir(path: Path) -> None:
