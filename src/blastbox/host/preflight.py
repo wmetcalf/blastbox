@@ -526,6 +526,11 @@ def _check_pool_runtime(host: HostView, skipped: Collection[str] = ()) -> Check 
                          f"BLASTBOX_POOL_TIERS overflow member(s) {'; '.join(why)}: the dispatcher "
                          f"skips them and runs on {', '.join(dict.fromkeys(members))}", doc)
         return Check("pool-runtime", Status.PASS, f"cascade of {', '.join(members)}")
+    if pool == "static" and (refusal := _static_refusal(host)):
+        # build_warm_pool selects a non-cascade pool with require_available, like a primary.
+        return Check("pool-runtime", Status.FAIL,
+                     f"BLASTBOX_POOL_RUNTIME=static is unavailable ({refusal}); the dispatcher "
+                     "refuses to start", doc)
     return Check("pool-runtime", Status.PASS, f"BLASTBOX_POOL_RUNTIME={pool}")
 
 

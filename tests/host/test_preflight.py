@@ -1636,3 +1636,13 @@ def test_a_runsc_version_failure_alone_does_not_skip_a_gvisor_overflow():
     host.executables.pop("runsc")                       # no binary: selector refuses, skipped
     checks = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False))
     assert checks["pool-runtime"].status is Status.WARN, checks["pool-runtime"].detail
+
+
+def test_a_plain_static_pool_the_selector_refuses_fails():
+    """build_warm_pool selects BLASTBOX_POOL_RUNTIME=static with require_available, so the same
+    pre-probe refusal that fails a static cascade primary fails the plain pool."""
+    env = {"BLASTBOX_POOL_RUNTIME": "static"}
+    c = _by_name(pf.run_preflight(_healthy(env=env), ["remote"]))["pool-runtime"]
+    assert c.status is Status.FAIL and "BLASTBOX_STATIC_WORKERS" in c.detail, c.detail
+    c = _by_name(pf.run_preflight(_healthy(env={**env, **_WORKERS}), ["remote"]))["pool-runtime"]
+    assert c.status is Status.PASS, c.detail
