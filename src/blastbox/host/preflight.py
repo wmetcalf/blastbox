@@ -420,17 +420,27 @@ def _check_runsc_binary(host: HostView) -> Check:
 _KNOWN_POOL_RUNTIMES = {"none", "firecracker", "gvisor", "cascade", *_REMOTE_POOL_RUNTIMES}
 
 
-def _static_refusal(env: Mapping[str, str]) -> str:
-    """Why select_static_pool_runtime refuses before probing any worker (no BLASTBOX_STATIC_WORKERS,
-    or a knob StaticPoolConfig.from_env cannot parse), else "". Past this gate the verdict needs a
-    live /healthz probe, which preflight does not make."""
+def _static_refusal(host: HostView) -> str:
+    """Why select_static_pool_runtime refuses before probing any worker, else "": a knob
+    StaticPoolConfig.from_env cannot parse, no BLASTBOX_STATIC_WORKERS, or a dispatcher TLS config
+    dispatch_ssl_context_from_env raises on (partial, or a named file that is not there). Past this
+    the verdict needs the CA/key contents and a live /healthz probe, which preflight does not make."""
     from blastbox.host.runtime.static_pool import StaticPoolConfig  # noqa: PLC0415
 
+    env = host.env
     try:
         cfg = StaticPoolConfig.from_env(env.get)
     except Exception as exc:  # noqa: BLE001 -- the selector raises on it; report, never raise
         return f"BLASTBOX_STATIC_* does not parse: {exc}"
-    return "" if cfg.workers else "BLASTBOX_STATIC_WORKERS is empty"
+    if not cfg.workers:
+        return "BLASTBOX_STATIC_WORKERS is empty"
+    ca, cert, key = (env.get(f"BLASTBOX_DISPATCH_TLS_{k}") or "" for k in ("CA", "CERT", "KEY"))
+    if not ca:
+        return "BLASTBOX_DISPATCH_TLS_CERT/KEY set without _CA" if cert or key else ""
+    if bool(cert) != bool(key):
+        return "BLASTBOX_DISPATCH_TLS_CERT and _KEY are not set together"
+    missing = [p for p in (ca, cert, key) if p and not host.is_file(p)]
+    return f"dispatcher TLS file(s) {', '.join(missing)} not found" if missing else ""
 
 
 def _check_pool_runtime(host: HostView, skipped: Collection[str] = ()) -> Check | None:
@@ -476,7 +486,7 @@ def _check_pool_runtime(host: HostView, skipped: Collection[str] = ()) -> Check 
             return Check("pool-runtime", Status.FAIL,
                          f"BLASTBOX_POOL_TIERS primary {members[0]!r} is unknown/invalid; the "
                          "dispatcher refuses the cascade", doc)
-        static_why = _static_refusal(host.env) if "static" in members else ""
+        static_why = _static_refusal(host) if "static" in members else ""
         if members[0] == "static" and static_why:
             return Check("pool-runtime", Status.FAIL,
                          f"BLASTBOX_POOL_TIERS primary 'static' is unavailable ({static_why}); the "
@@ -1405,6 +1415,10 @@ def _is_startup_gate(c: Check) -> bool:
     admitted and every spawn fails; a missing gVisor rootfs is booted anyway."""
     if c.name == "kvm":
         return c.detail.startswith(_KVM_MISSING)
+    if c.name == "runsc":
+        # GvisorSnapshotBackend.available() asks only for the binary and `runsc help` listing
+        # checkpoint/restore; a failing `runsc --version` alone does not keep the tier out.
+        return "not found" in c.detail or "checkpoint/restore" in c.detail
     return c.name != "gvisor-rootfs"
 
 
