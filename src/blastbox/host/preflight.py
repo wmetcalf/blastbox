@@ -420,9 +420,23 @@ def _check_runsc_binary(host: HostView) -> Check:
 _KNOWN_POOL_RUNTIMES = {"none", "firecracker", "gvisor", "cascade", *_REMOTE_POOL_RUNTIMES}
 
 
-def _check_pool_runtime(host: HostView) -> Check | None:
+def _static_refusal(env: Mapping[str, str]) -> str:
+    """Why select_static_pool_runtime refuses before probing any worker (no BLASTBOX_STATIC_WORKERS,
+    or a knob StaticPoolConfig.from_env cannot parse), else "". Past this gate the verdict needs a
+    live /healthz probe, which preflight does not make."""
+    from blastbox.host.runtime.static_pool import StaticPoolConfig  # noqa: PLC0415
+
+    try:
+        cfg = StaticPoolConfig.from_env(env.get)
+    except Exception as exc:  # noqa: BLE001 -- the selector raises on it; report, never raise
+        return f"BLASTBOX_STATIC_* does not parse: {exc}"
+    return "" if cfg.workers else "BLASTBOX_STATIC_WORKERS is empty"
+
+
+def _check_pool_runtime(host: HostView, skipped: Collection[str] = ()) -> Check | None:
     """An unknown BLASTBOX_POOL_RUNTIME (or cascade member) is refused by the dispatcher; the
-    tier preflight would have checked for it is unknowable, so say so instead of passing."""
+    tier preflight would have checked for it is unknowable, so say so instead of passing.
+    ``skipped``: local overflow tiers the cascade drops at startup (_skipped_overflow_tiers)."""
     doc = f"{DOC}#what-each-tier-needs"
     if "BLASTBOX_POOL_RUNTIME" in host.env and not host.env["BLASTBOX_POOL_RUNTIME"].strip():
         # PoolConfig.from_env defaults only an ABSENT variable to "none"; a set-but-empty one
@@ -462,8 +476,17 @@ def _check_pool_runtime(host: HostView) -> Check | None:
             return Check("pool-runtime", Status.FAIL,
                          f"BLASTBOX_POOL_TIERS primary {members[0]!r} is unknown/invalid; the "
                          "dispatcher refuses the cascade", doc)
+        static_why = _static_refusal(host.env) if "static" in members else ""
+        if members[0] == "static" and static_why:
+            return Check("pool-runtime", Status.FAIL,
+                         f"BLASTBOX_POOL_TIERS primary 'static' is unavailable ({static_why}); the "
+                         "dispatcher refuses the cascade", doc)
         dropped = [m for m in members[1:] if _bad(m)]
-        members = [m for m in members if not _bad(m)]
+        # build_cascade_runtime skips an overflow tier its selector refuses at startup, so the
+        # style/TLS mix is judged on the tiers it admits, as CascadingRuntime does.
+        gone = set(skipped) | ({"static"} if static_why else set())
+        unused = list(dict.fromkeys(m for m in members[1:] if m in gone and m != members[0]))
+        members = [m for m in members if not _bad(m) and m not in unused]
         local = {m for m in members if m in ("firecracker", "gvisor")}
         if local and len(local) != len(set(members)):
             return Check("pool-runtime", Status.FAIL,
@@ -479,12 +502,14 @@ def _check_pool_runtime(host: HostView) -> Check | None:
                          f"with BLASTBOX_DISPATCH_TLS_CA set, {', '.join(sorted(mtls))} use worker "
                          f"mTLS but {', '.join(sorted(public))} public TLS: the dispatcher refuses "
                          "the mixed cascade (use separate pools)", doc)
-        if dropped:
+        if dropped or unused:
             # build_cascade_runtime skips an unavailable overflow tier at startup and boots
             # on the rest -- a typo there silently shrinks the pool.
+            why = [f"{', '.join(dropped)} unknown"] if dropped else []
+            why += [f"{', '.join(unused)} unavailable at startup"] if unused else []
             return Check("pool-runtime", Status.WARN,
-                         f"BLASTBOX_POOL_TIERS overflow member(s) {', '.join(dropped)} are unknown; "
-                         f"the dispatcher skips them and runs on {', '.join(members)}", doc)
+                         f"BLASTBOX_POOL_TIERS overflow member(s) {'; '.join(why)}: the dispatcher "
+                         f"skips them and runs on {', '.join(dict.fromkeys(members))}", doc)
         return Check("pool-runtime", Status.PASS, f"cascade of {', '.join(members)}")
     return Check("pool-runtime", Status.PASS, f"BLASTBOX_POOL_RUNTIME={pool}")
 
@@ -1450,9 +1475,6 @@ def run_preflight(host: HostView, tiers: Sequence[str], *, explicit: bool = True
     """Run every check relevant to ``tiers``. Pure reads; never raises on host state."""
     t = set(tiers)
     out: list[Check] = []
-    pool = _check_pool_runtime(host)
-    if pool is not None:
-        out.append(pool)
     if "docker" in t:
         # The warm gVisor tier drives runsc directly against an exported rootfs; docker is
         # needed only for the cold docker tier.
@@ -1490,6 +1512,10 @@ def run_preflight(host: HostView, tiers: Sequence[str], *, explicit: bool = True
         out.append(_check_bwrap_stock_profile(host, t))
         out.append(_check_userns(host, t))
     skipped = _skipped_overflow_tiers(out, host.env)
+    # Judged after the tier checks: a cascade's mix depends on which overflow tiers it skips.
+    pool = _check_pool_runtime(host, skipped)
+    if pool is not None:
+        out.insert(0, pool)
     if not explicit and host.env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower() in ("", "none"):
         skipped |= {"gvisor", "firecracker"}     # preview: the dispatcher runs cold only
     # remote-only too: dispatch validates the mode
