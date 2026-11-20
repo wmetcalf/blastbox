@@ -832,6 +832,9 @@ class Helper:
         self._owners: dict[int, Owner] = {}
         self._jails: dict[str, Jail] = {}
         self._gens: dict[str, Gen] = {}
+        #: Directories a failed publish could not remove (never registered as generations, so
+        #: nothing else would ever retry them): the monitor does, until they are gone.
+        self._doomed: set[str] = set()
         self._assets: dict[str, Asset] = {}
         # STRIPED, bounded: a lock per asset identity would grow with every distinct file a
         # client ever registers.
@@ -989,10 +992,28 @@ class Helper:
         with contextlib.suppress(OSError):
             os.close(owner.pidfd)
 
+    def _remove_unregistered(self, path: str) -> None:
+        """Remove a directory no registry holds; one that survives (the same filesystem
+        incident that failed the operation) is kept for the monitor to retry. Never raises."""
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            _log.error("fc_jail.cleanup_failed path=%s: %s (retried by the monitor)", path, exc)
+        with self._lock:
+            if os.path.lexists(path):
+                self._doomed.add(path)
+            else:
+                self._doomed.discard(path)
+
     def monitor_once(self) -> None:
         with self._lock:
             owners = list(self._owners.values())
             jails = list(self._jails.values())
+            doomed = list(self._doomed)
+        for path in doomed:
+            self._remove_unregistered(path)
         for owner in owners:
             if _pidfd_exited(owner.pidfd):
                 self.reap_owner(owner)
@@ -1567,11 +1588,11 @@ class Helper:
                 os.close(root_fd)
                 os.close(gen_fd)
         except BaseException:
-            shutil.rmtree(gdir, ignore_errors=True)
+            self._remove_unregistered(gdir)
             raise
         with self._lock:
             if owner.dead:
-                shutil.rmtree(gdir, ignore_errors=True)
+                self._remove_unregistered(gdir)
                 raise HelperError("unknown_jail", jail.id)
             rootfs = jail.assets[1]
             self._assets[rootfs].refs += 1

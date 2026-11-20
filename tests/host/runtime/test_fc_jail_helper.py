@@ -1374,3 +1374,27 @@ def test_the_helper_minimum_matches_the_dispatcher_gate():
     from blastbox.host.runtime import firecracker as fc
 
     assert h.MIN_FC_VERSION == fc._MIN_FC_VERSION
+
+
+def test_a_failed_publish_whose_cleanup_fails_is_retried_by_the_monitor(env, monkeypatch):
+    jail, _ = env.boot(listener=False)
+    _snapshot(jail)
+    env.kill(jail)
+    real_rmtree = h.shutil.rmtree
+    fail = {"left": 1}
+
+    def _flaky_rmtree(path, *a, **k):
+        if fail["left"]:
+            fail["left"] -= 1
+            raise OSError(5, "Input/output error")      # the incident that failed the copy
+        return real_rmtree(path, *a, **k)
+
+    def _broken_copy(*a, **k):
+        raise OSError(5, "Input/output error")
+    monkeypatch.setattr(h.shutil, "rmtree", _flaky_rmtree)
+    monkeypatch.setattr(h, "sparse_copy", _broken_copy)
+    with pytest.raises(OSError):
+        env.helper.op_publish(env.owner, {"op": "publish", "jail": JID}, [])
+    assert list(env.cfg.gens_dir.iterdir())         # the RAM-sized leftover is still there...
+    env.helper.monitor_once()
+    assert not list(env.cfg.gens_dir.iterdir())     # ...and the monitor removes it on recovery
