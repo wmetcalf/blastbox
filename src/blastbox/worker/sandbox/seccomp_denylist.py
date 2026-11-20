@@ -123,11 +123,12 @@ def build_bpf_bytes() -> bytes | None:
         import seccomp  # type: ignore[import-not-found]
     except Exception:
         return None
+    arch = {"amd64": "x86_64"}.get(platform.machine(), platform.machine())
     try:
         f = seccomp.SyscallFilter(defaction=seccomp.ALLOW)
         for name in DENY_ERRNO1:
             try:
-                f.add_rule(seccomp.ERRNO(1), _syscall_ref(seccomp, name, "x86_64"))
+                f.add_rule(seccomp.ERRNO(1), _syscall_ref(seccomp, name, arch))
             except Exception as e:  # noqa: BLE001
                 _log.warning("seccomp: cannot add deny rule for %r (%s) — failing closed", name, e)
                 return None

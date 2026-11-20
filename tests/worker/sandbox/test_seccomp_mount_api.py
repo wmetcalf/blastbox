@@ -23,6 +23,7 @@ from __future__ import annotations
 import errno
 import json
 import platform
+import re
 import shutil
 import struct
 from pathlib import Path
@@ -59,10 +60,19 @@ def _kafel_errno1_names() -> set[str]:
     block = text[text.index("ERRNO(1) {"):text.index("USE ")]
     names: set[str] = set()
     for line in block.splitlines():
-        line = line.split("//", 1)[0].strip()
-        if "{" in line or "}" in line:
+        code, _, comment = line.partition("//")
+        code = code.strip()
+        if "{" in code or "}" in code:
             continue
-        names.update(t.strip() for t in line.split(",") if t.strip().isidentifier())
+        for tok in (t.strip() for t in code.split(",")):
+            m = re.fullmatch(r"SYSCALL\[(\d+)\]", tok)
+            if m:
+                # A numbered entry must carry its name in the comment AND the right number.
+                name = comment.strip()
+                assert MOUNT_API_NR.get(name) == int(m.group(1)), (tok, name)
+                names.add(name)
+            elif tok.isidentifier():
+                names.add(tok)
     return names
 
 
@@ -165,7 +175,7 @@ def _run_cbpf(prog: bytes, nr: int, arch: int, args: tuple[int, ...] = (0,) * 6)
             pc += 1 + (jt if hit else jf)
             continue
         elif cls == 6:                                            # RET
-            return a if code & 0x18 == 0x10 else k
+            return {0x00: k, 0x08: x, 0x10: a}[code & 0x18]
         elif cls == 7:                                            # TAX / TXA
             if code & 0xF8 == 0x00:
                 x = a
@@ -207,8 +217,9 @@ def test_the_bpf_returns_eperm_for_each_new_mount_syscall(bpf: bytes, name: str)
 # --- layer 3: inside the real sandboxes ---------------------------------------------------
 
 # Run inside the sandbox. Arguments are chosen so an UNFILTERED unprivileged call returns
-# something other than EPERM wherever the kernel allows it (fd or EBADF/EINVAL), so an EPERM
-# here is the filter's, not a missing capability's.
+# something other than EPERM wherever the kernel allows it (open_tree/open_tree_attr: an fd;
+# fsconfig/mount_setattr: EBADF/EINVAL), so an EPERM there is the filter's. fsopen, fsmount,
+# fspick, move_mount and chroot are EPERM unprivileged regardless; layer 2 is their proof.
 _PROBE = r"""
 import ctypes, json, os, platform
 libc = ctypes.CDLL(None, use_errno=True)

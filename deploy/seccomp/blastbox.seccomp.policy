@@ -51,15 +51,17 @@ POLICY blastbox_deny {
     pivot_root,
     chroot,
 
-    // The new mount API (Linux 5.2+): builds and attaches mounts without mount(2)
-    fsopen,
-    fsconfig,
-    fsmount,
-    fspick,
-    move_mount,
-    open_tree,
-    open_tree_attr,
-    mount_setattr,
+    // The new mount API (Linux 5.2+): builds and attaches mounts without mount(2). By NUMBER,
+    // not name: an nsjail whose bundled kafel predates a name (open_tree_attr is Linux 6.15)
+    // would fail to compile the whole policy. Unified asm-generic numbers, same on aarch64.
+    SYSCALL[428],  // open_tree
+    SYSCALL[429],  // move_mount
+    SYSCALL[430],  // fsopen
+    SYSCALL[431],  // fsconfig
+    SYSCALL[432],  // fsmount
+    SYSCALL[433],  // fspick
+    SYSCALL[442],  // mount_setattr
+    SYSCALL[467],  // open_tree_attr
 
     // Kernel exec / reboot
     kexec_load,
