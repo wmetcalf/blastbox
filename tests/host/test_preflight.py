@@ -1793,19 +1793,19 @@ def test_an_fc_primary_whose_helper_is_unreachable_fails():
     assert pf.exit_code(checks) != 0
 
 
-def test_only_a_firecracker_started_by_the_helper_counts_as_a_jailed_vmm():
+def test_every_firecracker_vmm_counts_but_firecracker_containerd_does_not():
     jid = "0b4f6d1e-1111-4222-8333-944455556666"
     vmm = ["--id", "x", "--start-time-us", "1", "--api-sock", "/fc-api.sock"]
     for argv, is_vmm in (([f"/firecracker-{jid}", *vmm], True),
-                         (["/firecracker-xyz12345", *vmm], True),     # any id the helper allows
                          (["/firecracker-xyz12345", "--api-sock=/fc-api.sock"], True),
                          (["/usr/local/bin/firecracker-v1.16.0-x86_64", "--no-api",
-                           "--config-file", "/tmp/fc.json"], True),     # a renamed, API-less VMM
-                         (["/usr/bin/firecracker-containerd", "--config", "/etc/x"], False),
-                         (["/usr/local/bin/firecracker-ctl", "ls"], False)):
+                           "--config-file", "/tmp/fc.json"], True),
+                         (["/firecracker-abc"], True),                  # flagless, renamed
+                         (["/firecracker-abc", "--log-path", "/x"], True),
+                         (["/usr/bin/firecracker-containerd", "--config", "/etc/x"], False)):
         host = _with_procs(_proc(77, argv))
         roles = [p.role for p in pf._sandbox_processes(host)]
         assert (roles == ["firecracker"]) is is_vmm, (argv, roles)
-    # argv unreadable (hidepid): counted, so an unconfined VMM can never read as confined.
+    # argv unreadable (hidepid): judged by comm alone, still counted.
     host = _with_procs({"/proc/78/cmdline": "", "/proc/78/comm": "firecracker-xyz\n"})
     assert [p.role for p in pf._sandbox_processes(host)] == ["firecracker"]
