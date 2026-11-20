@@ -49,6 +49,17 @@ POLICY blastbox_deny {
     mount,
     umount,
     pivot_root,
+    chroot,
+
+    // The new mount API (Linux 5.2+): builds and attaches mounts without mount(2)
+    fsopen,
+    fsconfig,
+    fsmount,
+    fspick,
+    move_mount,
+    open_tree,
+    open_tree_attr,
+    mount_setattr,
 
     // Kernel exec / reboot
     kexec_load,
