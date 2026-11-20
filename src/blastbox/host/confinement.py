@@ -165,6 +165,9 @@ class HostLsm:
     jailer: str | None = None           # resolved path (unjailed only)
     fc_jail: str | None = None          # FC_JAIL_STATES; None = not probed (dispatcher's own view)
     fc_jail_detail: str | None = None   # the helper's socket and, when not answered, why
+    #: The jail configuration fc_jail was judged for (_jail_key): "off", the helper socket, or
+    #: "invalid" -- so a Detection judged under another configuration is not reused.
+    fc_jail_for: str | None = None
 
     def would_use(self, kind: str, mode: str = "auto") -> str:
         """The LSM ``kind``'s host processes would be confined with: selinux | apparmor |
@@ -238,6 +241,7 @@ class HostLsm:
             "jailer": self.jailer,
             "fc_jail": self.fc_jail,
             "fc_jail_detail": self.fc_jail_detail,
+            "fc_jail_for": self.fc_jail_for,
             "flags": self.flags,
         }
 
@@ -428,6 +432,17 @@ def _firecracker(host: HostReader, env: Mapping[str, str]) -> tuple[str | None, 
     return fc, jailer
 
 
+def _jail_key(env: Mapping[str, str]) -> str:
+    """Which jail configuration ``env`` selects: "off", the helper socket, or "invalid"."""
+    from blastbox.host.runtime.fc_jail import JailSettings  # noqa: PLC0415
+
+    try:
+        settings = JailSettings.from_env(dict(env))
+    except ValueError:
+        return "invalid"
+    return settings.socket_path if settings.enabled else "off"
+
+
 def _fc_jail(host: HostReader, env: Mapping[str, str]) -> tuple[str, str | None]:
     """``(state, detail)`` for HostLsm.fc_jail. Asks the helper (one ``hello`` over its socket;
     nothing is spawned) only when jailing is on."""
@@ -472,6 +487,7 @@ def probe(host: HostReader, *, env: Mapping[str, str] | None = None,
         extra["runsc"], extra["runsc_split_sentry"] = _runsc(host, env)
     if "firecracker" in kinds:
         extra["fc_jail"], extra["fc_jail_detail"] = _fc_jail(host, env)
+        extra["fc_jail_for"] = _jail_key(env)
         if extra["fc_jail"] == "off":
             extra["firecracker"], extra["jailer"] = _firecracker(host, env)
     return replace(state, **extra)  # type: ignore[arg-type]
@@ -538,13 +554,16 @@ def jail_code(exc: BaseException) -> str:
 def complete_for(det: "Detection", kinds: Collection[str], *, env: Mapping[str, str] | None = None,
                  host: HostReader | None = None) -> "Detection":
     """``det`` with the jail helper's answer filled in when ``kinds`` holds firecracker and it
-    was built without it (``detect()`` without kinds: an embedder's Detection). Returned
-    unchanged otherwise -- the helper is asked at most once."""
-    if "firecracker" not in kinds or det.state.fc_jail is not None:
-        return det
+    was built without it (``detect()`` without kinds: an embedder's Detection), or judged for
+    another jail configuration than ``env`` selects now (jailing on/off, another socket).
+    Returned unchanged otherwise -- the helper is not asked again."""
     env = os.environ if env is None else env
+    if "firecracker" not in kinds or (det.state.fc_jail is not None
+                                      and det.state.fc_jail_for == _jail_key(env)):
+        return det
     state, detail = _fc_jail(_SysReader() if host is None else host, env)
-    return replace(det, state=replace(det.state, fc_jail=state, fc_jail_detail=detail))
+    return replace(det, state=replace(det.state, fc_jail=state, fc_jail_detail=detail,
+                                      fc_jail_for=_jail_key(env)))
 
 
 class _SysReader:
@@ -607,4 +626,5 @@ def detect(env: Mapping[str, str] | None = None, *, host: HostReader | None = No
     extra: dict[str, object] = {"cold_blocker": _cold_blocker(env, reader)}
     if "firecracker" in kinds:
         extra["fc_jail"], extra["fc_jail_detail"] = _fc_jail(reader, env)
+        extra["fc_jail_for"] = _jail_key(env)
     return Detection(mode=mode, state=replace(state, **extra))  # type: ignore[arg-type]

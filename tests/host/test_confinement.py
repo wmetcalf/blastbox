@@ -1225,7 +1225,7 @@ def test_embedded_dispatcher_completes_a_passed_detection(tmp_path, monkeypatch)
                engines={"e": EngineSpec(name="e", image="i", worker_argv=["w"])},
                limits=_limits(), job_root=tmp_path, runtime_selector=_fake_runtime,
                attest_key=None, confinement=det)
-    assert "kinds" in seen
+    assert "cold" in seen["kinds"]          # the reachable kinds, not an empty list
 
 
 def test_a_garbled_hello_reply_is_undecided_like_the_runtime():
@@ -1236,3 +1236,34 @@ def test_a_garbled_hello_reply_is_undecided_like_the_runtime():
     assert cf.jail_code(JailError("busy")) == "busy"
     assert _jailed(UBUNTU, (None, "protocol-transient", "truncated")).fc_jail == "unknown"
     assert _jailed(UBUNTU, _HELLO_SKEW).fc_jail == "unusable"
+
+
+
+def test_jailed_firecracker_blocker_is_reported_once():
+    c = _pf_jail(UBUNTU, _HELLO_DOWN)
+    assert c.detail.count("jail helper unreachable") == 1, c.detail
+
+
+def test_missing_apparmor_parser_is_noted_only_for_kinds_the_dispatcher_confines_itself():
+    jailed = _pf_jail(UBUNTU, _HELLO_AA)                       # healthy fake has no parser
+    assert "apparmor_parser not found" not in jailed.detail
+    off = _pf_jail(UBUNTU, _HELLO_AA, env=_JAIL_OFF)
+    assert "apparmor_parser not found" in off.detail
+
+
+
+def test_a_detection_judged_for_another_jail_configuration_is_re_judged():
+    """detect() with jailing off (or another socket), then a dispatcher whose env jails: the old
+    answer describes another launch path, so the helper is asked."""
+    off = cf.detect(_JAIL_OFF, host=_host(UBUNTU), landlock=0, kinds=["firecracker"])
+    assert off.state.fc_jail == "off" and off.state.would_use("firecracker") == "apparmor"
+    host = _host(UBUNTU)
+    host.jail = _HELLO_NO_AA
+    now = cf.complete_for(off, ["firecracker"], env={}, host=host)
+    assert now.state.fc_jail == "no-apparmor"
+    other = cf.complete_for(now, ["firecracker"], env={"BLASTBOX_FC_JAIL_SOCKET": "/run/o.sock"},
+                            host=host)
+    assert host.jail_asked == "/run/o.sock" and other.state.fc_jail_for == "/run/o.sock"
+    same = _host(UBUNTU)
+    assert cf.complete_for(now, ["firecracker"], env={}, host=same) is now
+    assert not hasattr(same, "jail_asked")

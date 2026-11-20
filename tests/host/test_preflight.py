@@ -1876,3 +1876,22 @@ def test_every_firecracker_vmm_counts_but_firecracker_containerd_does_not():
     for comm in ("firecracker-xyz", "firecracker-con"):   # "con": a jail id, or containerd
         host = _with_procs({"/proc/78/cmdline": "", "/proc/78/comm": comm + "\n"})
         assert [p.role for p in pf._sandbox_processes(host)] == ["firecracker"], comm
+
+
+
+def test_jailed_vmm_problems_get_jailer_aware_advice():
+    p = _proc(300, ["/firecracker-a", "--id", "a", "--start-time-us", "1"], uid=10001,
+              aa="unconfined\n")
+    c = _by_name(pf.run_preflight(_with_procs(p), ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.WARN
+    assert "already under the jailer" in c.detail
+    assert "run firecracker under the jailer" not in c.detail
+
+
+def test_another_jailer_users_vmm_in_its_own_profile_is_not_off_profile():
+    """A VMM another launcher put under the jailer (exec file not firecracker-<jail id>, e.g.
+    firecracker-containerd's /usr/bin/firecracker) keeps its own profile."""
+    p = _proc(300, ["/usr/bin/firecracker", "--id", "vm1", "--start-time-us", "1"], uid=10001,
+              aa="containerd-fc (enforce)\n")
+    c = _by_name(pf.run_preflight(_with_procs(p), ["firecracker"]))["sandbox-confinement"]
+    assert c.status is Status.PASS, c.detail
