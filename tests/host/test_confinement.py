@@ -837,14 +837,16 @@ def test_blank_home_is_used_verbatim_like_the_cli():
 
 
 def test_cold_only_refusal_omits_the_caller_context_blockers():
-    st = cf.probe(_host(CONTAINER_UNDER_DOCKER_DEFAULT),
-                  env={"DOCKER_HOST": "tcp://builder:2376"}, landlock=0)
+    confined = {**UBUNTU, "/proc/self/attr/apparmor/current": "docker-default (enforce)\n"}
+    st = cf.probe(_host(confined), env={"DOCKER_HOST": "tcp://builder:2376"}, landlock=0)
+    assert "docker-default" in (st.apparmor_blocker or "")      # the blocker exists...
     with pytest.raises(cf.ConfinementUnavailable) as exc:
         cf.check_required(st, "require", ["cold"])
     assert "docker-default" not in str(exc.value) and "DOCKER_HOST" in str(exc.value)
-    c = _pf(CONTAINER_UNDER_DOCKER_DEFAULT, env={"BLASTBOX_CONFINEMENT": "require"},
-            tiers=("docker",))
-    assert "docker-default" not in c.detail
+    c = _pf(confined, env={"BLASTBOX_CONFINEMENT": "require"}, tiers=("docker",))
+    assert "docker-default" not in c.detail                     # ...but not for cold
+    c = _pf(confined, env={"BLASTBOX_CONFINEMENT": "require"}, tiers=("gvisor",))
+    assert "docker-default" in c.detail
 
 
 def test_startup_log_reports_the_enforced_mode(tmp_path, monkeypatch, caplog):
@@ -860,3 +862,21 @@ def test_startup_log_reports_the_enforced_mode(tmp_path, monkeypatch, caplog):
                    attest_key=None, confinement=det)
     line = next(r.getMessage() for r in caplog.records if "confinement (" in r.getMessage())
     assert "mode=require" in line and "cold=selinux" in line
+
+
+@pytest.mark.parametrize("make", ["enotdir", "eloop", "dangling"])
+def test_symlinked_config_errors_match_the_cli(tmp_path, make):
+    """Only ENOENT (a dangling link) is no config; ENOTDIR / ELOOP through a link are unknown,
+    as the CLI warns on them. Real files, the production reader."""
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    if make == "enotdir":
+        (cfg / "afile").write_text("x")
+        (cfg / "config.json").symlink_to("afile/config.json")
+    elif make == "eloop":
+        (cfg / "loop").symlink_to("loop")
+        (cfg / "config.json").symlink_to("loop/config.json")
+    else:
+        (cfg / "config.json").symlink_to(tmp_path / "missing.json")
+    blocker = cf._cold_blocker({"DOCKER_CONFIG": str(cfg)}, cf._SysReader())
+    assert (blocker is None) is (make == "dangling")

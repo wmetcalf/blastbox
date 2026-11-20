@@ -154,6 +154,12 @@ class RealHost(HostView):
 
         return landlock_abi()
 
+    def absent(self, path: str) -> bool:
+        """ENOENT through symlinks, as open() would see it (other errors: not absent)."""
+        from blastbox.host.confinement import _stat_absent  # noqa: PLC0415
+
+        return _stat_absent(path)
+
     def read(self, path: str) -> str | None:
         # Chunked: a /proc/sys handler fails ONE large read() with ENOMEM (a 4 MiB read of
         # max_user_namespaces does), which would make every sysctl look absent.

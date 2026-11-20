@@ -277,6 +277,24 @@ def _docker_config_dir(env: Mapping[str, str]) -> str:
     return os.path.join(home, ".docker")
 
 
+def _stat_absent(path: str) -> bool:
+    """True only when stat() -- which follows links as open() does -- says ENOENT."""
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _absent(host: HostReader, path: str) -> bool:
+    probe = getattr(host, "absent", None)
+    if callable(probe):
+        return bool(probe(path))
+    return not host.exists(host.realpath(path))
+
+
 class _Pairs(list):  # type: ignore[type-arg]
     """A decoded JSON object as its (key, value) pairs, duplicates kept."""
 
@@ -294,8 +312,9 @@ def _resolve_cold_blocker(env: Mapping[str, str], host: HostReader) -> str | Non
         return f"DOCKER_CONTEXT={context!r}: cold runsc may run on another daemon's host"
     path = os.path.join(_docker_config_dir(env), "config.json")
     raw = host.read(path)
-    # Follow a symlink first: a dangling one is no config to the CLI (ENOENT, no warning).
-    if raw is None and host.exists(host.realpath(path)):
+    # Only ENOENT is "no config" to the CLI (silently); EACCES, ENOTDIR, ELOOP ... it warns on,
+    # so they are unknown -- whether or not config.json is a symlink.
+    if raw is None and not _absent(host, path):
         return "docker config.json exists but is not readable: current context unknown"
     if raw is not None and len(raw) >= _READ_CAP:
         return "docker config.json too large to read whole: current context unknown"
@@ -442,6 +461,9 @@ class _SysReader:
 
     def exists(self, path: str) -> bool:
         return os.path.lexists(path)
+
+    def absent(self, path: str) -> bool:
+        return _stat_absent(path)
 
     def which(self, name: str) -> str | None:
         return None
