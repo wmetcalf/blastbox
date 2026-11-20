@@ -78,7 +78,15 @@ profile blastbox-sandbox flags=(attach_disconnected,mediate_deleted) {
   # ---- capabilities and operations a detonation never needs ------------------------------
   audit deny ptrace,
   audit deny mount,
-  audit deny umount,
+  # The next two lines spell the detach deny WITH A PATH, never bare (nor `*`/`**`): a
+  # detach deny that can match the empty mountpoint clears the mount class's mediation
+  # marker, and the compiled policy then does not mediate the class at all -- every mount,
+  # detach and pivot_root is allowed, whatever these rules say. With the bare form this
+  # profile was in that state on apparmor_parser 4.0.1; only the `capability sys_admin` deny
+  # below stopped a mount. tests/deploy/test_apparmor_profiles.py checks the COMPILED policy,
+  # and holds the keyword to exactly these two lines anywhere in the file (comments too).
+  audit deny umount /,
+  audit deny umount /**,
   audit deny pivot_root,
   audit deny capability sys_admin,
   audit deny capability sys_module,

@@ -216,6 +216,169 @@ def test_every_network_allow_in_the_profile_actually_survives_compilation(
     )
 
 
+_MOUNT_CLASS = 0x7    # AA_CLASS_MOUNT: the policy DFA's first byte for mount/umount/pivot_root
+
+
+def _policy_start_classes(text: str) -> list[set[int]]:
+    """Per compiled POLICY DFA in `--dump=dfa-states` (one per profile, hat or child), the
+    class bytes its start state has a transition for. The kernel mediates a class only if that
+    transition exists (RULE_MEDIATES): without it, every operation of the class is allowed,
+    whatever the rules say. File and xmatch DFAs are told apart by their start state: it
+    transitions on path bytes ('/'), a policy DFA's on class bytes."""
+    res = subprocess.run(
+        ["apparmor_parser", "-Q", "-K", "--skip-cache", "--dump=dfa-states", "-S"],
+        input=text.encode(), capture_output=True, timeout=120,
+    )
+    assert res.returncode == 0, res.stderr.decode()
+    lines = res.stderr.decode().splitlines()
+    starts = [i for i, ln in enumerate(lines) if "<== " in ln] + [len(lines)]
+    policies: list[set[int]] = []
+    for lo, hi in zip(starts, starts[1:]):
+        section = lines[lo:hi]
+        first = next((i for i, ln in enumerate(section) if ln.startswith("{1} perms")), None)
+        if first is None:
+            continue
+        classes: set[int] = set()
+        for ln in section[first + 1:]:
+            if ln.startswith("{"):
+                break
+            m = re.search(r"\b0x([0-9a-fA-F]+) ->", ln)
+            if m:
+                classes.add(int(m.group(1), 16))
+        if 0x2F not in classes:                  # not a file / xmatch DFA
+            policies.append(classes)
+    assert policies, "no policy DFA in the dump"
+    return policies
+
+
+def _mediates_mount(text: str) -> bool:
+    return all(_MOUNT_CLASS in classes for classes in _policy_start_classes(text))
+
+
+_PARSER = pytest.mark.skipif(shutil.which("apparmor_parser") is None,
+                             reason="apparmor_parser not installed on this host")
+
+
+@_PARSER
+def test_the_child_profile_mediates_the_mount_class() -> None:
+    """A non-quiet umount deny that can match the EMPTY mountpoint -- bare `audit deny umount,`,
+    or `umount *,` / `umount **,` -- clears the mount class's mediation marker, and the compiled
+    policy then has no mount class at all: the kernel allows every mount, umount and
+    pivot_root. The shipped profile was in that state on apparmor_parser 4.0.1; only its
+    `audit deny capability sys_admin,` stood between a workload and mount. Measured live
+    (kernel 7.0): with that capability deny replaced by an allow plus `mount, umount,` allows,
+    the old profile let a confined process mount and umount; this one denies both (EACCES).
+    The check is on the compiled DFA, so it catches every spelling."""
+    text = (_PROFILE_DIR / "blastbox-sandbox").read_text()
+    assert _mediates_mount(text), (
+        "the compiled child profile does not mediate the mount class: a umount deny is matching "
+        "the empty mountpoint -- spell it with a path (`audit deny umount /,` and "
+        "`audit deny umount /**,`)"
+    )
+
+
+def _parser_has_the_marker_bug() -> bool:
+    """apparmor_parser <= 4.0.x adds the class mediation markers as ordinary allows, so a deny
+    matching the empty mountpoint wipes the mount one; >= 4.1 adds them at an internal priority
+    above any rule ("a deny rule wiping these out could result in the dfa allowing stuff as
+    unmediated"), so that spelling is harmless there."""
+    probe = "abi <abi/3.0>,\nprofile bb-probe {\n  /tmp/bb-probe r,\n  audit deny umount,\n}\n"
+    return not _mediates_mount(probe)
+
+
+@_PARSER
+@pytest.mark.parametrize("extra,mediated", [
+    ("", True),
+    ("  audit deny umount,", False),          # the old spelling
+    ("  audit deny umount **,", False),       # matches the empty mountpoint too
+    ("  umount,", True),                      # an ALLOW keeps the class mediated
+])
+def test_the_mediation_check_tells_the_spellings_apart(extra: str, mediated: bool) -> None:
+    """The oracle above, pinned against the spellings it must distinguish. The unmediated cases
+    are a property of the parser (<= 4.0.x), so they are checked only where it has the bug."""
+    if not mediated and not _parser_has_the_marker_bug():
+        pytest.skip("this apparmor_parser compiles mediation markers above any deny (>= 4.1)")
+    text = (_PROFILE_DIR / "blastbox-sandbox").read_text().replace(
+        "  network netlink raw,", "  network netlink raw,\n" + extra if extra else
+        "  network netlink raw,")
+    assert _mediates_mount(text) is mediated
+
+
+_CANONICAL_UMOUNT = ("audit deny umount /,", "audit deny umount /**,")
+
+
+def _umount_rules_ok(text: str) -> bool:
+    """A strict allowlist that does not try to tell comments from rules (the parser's lexer is
+    stateful: `#` is a comment only at some token boundaries, and a list, escape, quote or
+    open statement can carry it into a rule). Anywhere in the file, comments included, the
+    keyword `umount` (or its synonym `unmount`) may appear ONLY in the two canonical denies,
+    each alone on its line. Any other umount rule -- or prose naming the keyword -- must first
+    be checked against the compiled DFA on a parser <= 4.0.x and then allowed here."""
+    lines = [ln.strip() for ln in text.split("\n")]
+    # `deny all` implies a bare umount deny without naming the keyword (rule lines only, so
+    # prose such as "would deny all SOCK_RAW" in a comment does not trip it).
+    if any(re.search(r"\bdeny\s+all\b", ln, re.ASCII) for ln in lines
+           if not ln.startswith("#")):
+        return False
+    # Every line naming the keyword must be exactly a canonical deny (a hat or child profile
+    # may repeat them), each line naming it once; both canonical denies must be present.
+    named = [ln for ln in lines if re.search(r"\b(?:umount|unmount)\b", ln, re.ASCII)]
+    mentions = re.findall(r"\b(?:umount|unmount)\b", text, re.ASCII)
+    return (all(ln in _CANONICAL_UMOUNT for ln in named) and len(mentions) == len(named)
+            and all(rule in named for rule in _CANONICAL_UMOUNT))
+
+
+def test_umount_denies_are_spelled_with_a_path() -> None:
+    """The text-level tripwire, for hosts without apparmor_parser AND for parsers >= 4.1, where
+    the compiled check cannot see the bug. It catches the ways a maintainer would plausibly
+    reintroduce it; the AUTHORITY is the compiled check, which CI's sandbox job runs on Ubuntu
+    24.04 (apparmor_parser 4.0.x, which has the bug). The bug: a umount deny that can match
+    the empty mountpoint unmediates the mount class on apparmor_parser <= 4.0.x."""
+    assert _umount_rules_ok((_PROFILE_DIR / "blastbox-sandbox").read_text()), (
+        f"blastbox-sandbox may name the umount keyword only on lines that are exactly one of "
+        f"{_CANONICAL_UMOUNT} (comments count too), and may not hold a `deny all,` rule: check "
+        "any other umount rule against the compiled DFA (test_the_child_profile_mediates_the_mount_class on a "
+        "<= 4.0.x parser) and extend _CANONICAL_UMOUNT deliberately"
+    )
+
+
+@pytest.mark.parametrize("extra", [
+    "  audit deny umount,",
+    "  audit deny unmount,",
+    "  audit deny umount {/a,**},",
+    "  audit deny umount fstype= /x,",
+    '  "/tmp/#x" r, audit deny umount,',
+    '  "/mnt/x(y" r,\n  audit deny umount,',
+    "  audit deny pivot_root, audit deny umount /,",
+    "  audit deny\n    umount,",
+    "  umount,",
+    "  /tmp/#x r, audit deny umount,",
+    '  "/tmp/a\\"#" r, audit deny umount,',
+    '  "/tmp/a\n#" r, audit deny umount,',
+    "  /tmp/a\x0c# r, audit deny umount,",
+    "  change_profile ->\n#x, audit deny umount,",
+    "  change_profile ->\n\x0c#x, audit deny umount,",
+    "  #include if exists <local/blastbox-sandbox> audit deny umount,",
+    "  #include <abstractions/base>audit deny umount,",
+    "  audit deny mount fstype=(proc,\n  # sysfs), audit deny umount,",
+    "  audit deny mount fstype=a\\,\n  # -> /m/, audit deny umount,",
+    "  profile helper {\n    deny all,\n  }",
+    "  audit deny mount, audit deny all,",
+    "  deny all, # everything",
+    "  audit deny umount\u00b2,",
+])
+def test_the_text_guard_rejects_any_other_umount_rule(extra: str) -> None:
+    text = (_PROFILE_DIR / "blastbox-sandbox").read_text().replace(
+        "  network netlink raw,", "  network netlink raw,\n" + extra)
+    assert not _umount_rules_ok(text)
+
+
+def test_the_text_guard_counts_comments_too() -> None:
+    """A '#' line is not always a comment to the parser, so the guard does not exempt any."""
+    text = (_PROFILE_DIR / "blastbox-sandbox").read_text() + "\n# audit deny umount,\n"
+    assert not _umount_rules_ok(text)
+
+
 def test_the_child_profile_loads_on_the_oldest_supported_apparmor() -> None:
     """The child profile must compile on an AppArmor 3.x parser, and only it.
 
@@ -267,3 +430,42 @@ def test_the_snake_case_rule_is_actually_enforced() -> None:
 
     ignored = cfg["tool"]["ruff"]["lint"]["per-file-ignores"]["tests/**"]
     assert "N802" in ignored, "the deliberate emphasis in test names lost its exemption"
+
+
+@_PARSER
+def test_the_oracle_reads_the_policy_dfa_of_a_profile_with_an_attachment() -> None:
+    """An attachment adds an xmatch DFA in front of the file DFA; the policy DFA is still last."""
+    text = (_PROFILE_DIR / "blastbox-sandbox").read_text().replace(
+        "profile blastbox-sandbox flags=", "profile blastbox-sandbox /opt/detonate/run flags=")
+    assert _mediates_mount(text)
+
+
+@_PARSER
+def test_the_oracle_checks_every_profile_in_the_file() -> None:
+    """A child, hat or second profile adds its own policy DFA; the parent's must still count."""
+    bare = (_PROFILE_DIR / "blastbox-sandbox").read_text().replace(
+        "  audit deny umount /,\n  audit deny umount /**,", "  audit deny umount,")
+    if not _parser_has_the_marker_bug():
+        pytest.skip("this apparmor_parser compiles mediation markers above any deny (>= 4.1)")
+    child = bare.rstrip().rstrip("}") + "  profile helper {\n    /usr/bin/true rix,\n  }\n}\n"
+    assert not _mediates_mount(bare) and not _mediates_mount(child)
+    # and the converse: a clean parent with a bad child is not mediated either
+    shipped = (_PROFILE_DIR / "blastbox-sandbox").read_text()
+    bad_child = shipped.rstrip().rstrip("}") + (
+        "  profile helper {\n    /usr/bin/true rix,\n    audit deny umount,\n  }\n}\n")
+    assert _mediates_mount(shipped) and not _mediates_mount(bad_child)
+
+
+
+def test_the_text_guard_allows_a_hat_repeating_the_canonical_denies() -> None:
+    shipped = (_PROFILE_DIR / "blastbox-sandbox").read_text()
+    hat = shipped.rstrip().rstrip("}") + (
+        "  ^detonate {\n    /** rwlkmix,\n    audit deny mount,\n    audit deny umount /,\n"
+        "    audit deny umount /**,\n  }\n}\n")
+    assert _umount_rules_ok(hat)
+
+
+def test_the_text_guard_ignores_deny_all_in_prose() -> None:
+    text = (_PROFILE_DIR / "blastbox-sandbox").read_text().replace(
+        "denies SOCK_RAW in EVERY family", "would deny all SOCK_RAW, in EVERY family")
+    assert _umount_rules_ok(text)
