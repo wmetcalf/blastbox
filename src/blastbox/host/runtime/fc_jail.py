@@ -183,7 +183,12 @@ class JailClient:
             else:
                 sock.send(msg)
             _arm()
-            data, got, flags, _ = socket.recv_fds(sock, MAX_MSG + 1, 4)
+            try:
+                data, got, flags, _ = socket.recv_fds(sock, MAX_MSG + 1, 4)
+            except ConnectionResetError:
+                # The kernel reports a close-with-our-request-unread BEFORE a reply queued
+                # ahead of it: take that reply if there is one (a refusal is DECIDED).
+                data, got, flags, _ = socket.recv_fds(sock, MAX_MSG + 1, 4, socket.MSG_DONTWAIT)
         except TimeoutError as exc:
             raise JailError("timeout", op) from exc
         except (ConnectionError, OSError) as exc:

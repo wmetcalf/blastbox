@@ -1736,7 +1736,9 @@ class Helper:
         # REFUSED instead when anyone but us could replace the socket in it: whoever can would
         # answer every dispatcher in the helper's place.
         _check_owned_dir(parent, os.geteuid())
-        if os.lstat(parent).st_mode & 0o022:
+        # (os.stat: a symlinked directory is judged by what it points at -- its chain was
+        # verified node by node just above; a link's own mode is always 0777.)
+        if os.stat(parent).st_mode & 0o022:
             # Sticky does not help HERE: in a sticky world-writable directory anyone can take
             # the socket's name while the helper is down (a restart) and answer dispatchers.
             raise RuntimeError(f"{parent} must not be group/other-writable (sticky or not)")
@@ -1744,15 +1746,26 @@ class Helper:
         # path: a dispatcher probing during a restart sees the old socket or the new one, never
         # a root:root (EACCES -- decided, for good) or not-yet-listening one. (Nobody else can
         # write the directory -- checked above -- so the by-path chmod cannot be redirected.)
-        tmp = parent / f".{cfg.socket_path.name}.{os.getpid()}"
-        with contextlib.suppress(FileNotFoundError):
-            tmp.unlink()
+        prefix = f".{cfg.socket_path.name}."
+        for name in os.listdir(parent):
+            # Earlier instances' private names (a start that failed before its rename): only
+            # this helper can write here, so every such name is ours to sweep.
+            if name.startswith(prefix) and name[len(prefix):].isdigit():
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(parent / name)
+        tmp = parent / f"{prefix}{os.getpid()}"
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        srv.bind(str(tmp))
-        self._lchown(tmp, 0, cfg.socket_gid)
-        os.chmod(tmp, 0o660)
-        srv.listen(_LISTEN_BACKLOG)
-        os.rename(tmp, cfg.socket_path)
+        try:
+            srv.bind(str(tmp))
+            self._lchown(tmp, 0, cfg.socket_gid)
+            os.chmod(tmp, 0o660)
+            srv.listen(_LISTEN_BACKLOG)
+            os.rename(tmp, cfg.socket_path)
+        except BaseException:
+            srv.close()
+            with contextlib.suppress(FileNotFoundError):
+                tmp.unlink()
+            raise
         srv.settimeout(1.0)
         threading.Thread(target=self._monitor_loop, daemon=True, name="fcj-monitor").start()
         slots = threading.BoundedSemaphore(self.cfg.max_conns)
@@ -1847,9 +1860,11 @@ class Helper:
                 # startup gate retries a misconfiguration forever. Its request is TAKEN first
                 # (never parsed or acted on; its descriptors go to the sink below): closing
                 # with it still queued is an ECONNRESET the client reads INSTEAD of the reply.
+                # Waits (briefly) for a request not sent yet: this is the connection's own
+                # thread, and the client sends right after connecting.
                 with contextlib.suppress(OSError):
-                    _, fds, _, _ = socket.recv_fds(conn, MAX_MSG + 1, SCM_MAX_FD,
-                                                   socket.MSG_DONTWAIT)
+                    conn.settimeout(1.0)
+                    _, fds, _, _ = socket.recv_fds(conn, MAX_MSG + 1, SCM_MAX_FD)
                 with contextlib.suppress(OSError):
                     self._reply(conn, {"ok": False, "error": "forbidden",
                                        "detail": f"uid {uid} is not allowed (--allow-uid)"}, [])

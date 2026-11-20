@@ -536,6 +536,7 @@ def test_the_ready_signal_adopts_a_helper_bound_listener(tmp_path):
 
 
 @pytest.mark.parametrize("code,host_io", [("unreachable", True), ("refused", True),
+                                          ("forbidden", True),
                                           ("no_socket", False), ("exited", False)])
 def test_a_jailed_vsock_connect_failure_is_attributed(tmp_path, code, host_io):
     from blastbox.host.runtime.firecracker import VsockHostWarmControl
@@ -1155,3 +1156,105 @@ def test_the_socket_appears_only_once_it_is_owned_and_listening(tmp_path):
     finally:
         helper._stop.set()
         t.join(5)
+
+
+def test_a_refused_uid_that_sends_late_still_reads_forbidden(tmp_path):
+    # The helper may get to the refusal before the client has sent anything: it must still
+    # take the request (or the close is an ECONNRESET the client reads instead of the reply).
+    helper = _helper_for(tmp_path)
+    object.__setattr__(helper.cfg, "allowed_uids", frozenset({os.getuid() + 1}))
+
+    class _CloseNow:                              # the final close, synchronously
+        @staticmethod
+        def release(fds):
+            for fd in fds:
+                os.close(fd)
+    helper._sink = _CloseNow()
+    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        t = threading.Thread(target=helper.serve_conn, args=(b,), daemon=True)
+        t.start()
+        time.sleep(0.3)
+        a.send(h.encode({"op": "hello"}))
+        t.join(5)
+        assert h.decode(a.recv(h.MAX_MSG))["error"] == "forbidden"
+    finally:
+        a.close()
+
+
+def test_the_client_reads_a_reply_queued_behind_a_reset(monkeypatch, tmp_path):
+    # A helper that closes with the request unread: the kernel reports the reset BEFORE the
+    # reply it queued. That reply still decides the call (forbidden), not "refused".
+    real = socket.recv_fds
+    calls = []
+
+    def _reset_first(sock, *a, **k):
+        calls.append(a)
+        if len(calls) == 1:
+            raise ConnectionResetError(104, "Connection reset by peer")
+        return real(sock, *a, **k)
+
+    with _serving(tmp_path, allowed_uids=frozenset({os.getuid() + 1})) as (_, path):
+        monkeypatch.setattr(fc_jail.socket, "recv_fds", _reset_first)
+        with pytest.raises(JailError) as exc:
+            JailClient(path)._call_once("hello")
+    assert exc.value.code == "forbidden" and exc.value.decided
+
+
+def _serve_raises(tmp_path):
+    helper = _helper_for(tmp_path)
+    ready, raised = threading.Event(), []
+
+    def _serve():
+        try:
+            helper.serve(ready=ready.set)
+        except (RuntimeError, OSError) as exc:
+            raised.append(exc)
+    t = threading.Thread(target=_serve, daemon=True)
+    t.start()
+    t.join(5)
+    helper._stop.set()
+    t.join(5)
+    return ready.is_set(), raised
+
+
+def test_the_helper_refuses_a_socket_directory_under_an_ancestor_others_can_write(tmp_path):
+    (tmp_path / "open").mkdir()
+    os.chmod(tmp_path / "open", 0o757)
+    (tmp_path / "open" / "run").mkdir(mode=0o750)
+    nested = tmp_path / "open"
+    ready, raised = _serve_raises(nested)
+    assert not ready and raised and "group/other-writable" in str(raised[0])
+
+
+def test_a_symlinked_socket_directory_is_judged_by_what_it_points_at(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir(mode=0o750)
+    (tmp_path / "run").symlink_to(real)
+    with _serving(tmp_path) as (_, path):
+        JailClient(path).hello()
+
+
+def test_a_failed_publish_leaves_no_private_socket_and_old_ones_are_swept(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir(mode=0o750)
+    stale = run / ".h.sock.999999"
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    s.bind(str(stale))
+    s.close()
+    (run / "h.sock").mkdir()                  # the rename over it fails
+    ready, raised = _serve_raises(tmp_path)
+    assert not ready and raised
+    assert sorted(os.listdir(run)) == ["h.sock"]
+
+
+def test_a_refused_peer_that_sends_nothing_frees_its_slot_quickly(tmp_path):
+    helper = _helper_for(tmp_path)
+    object.__setattr__(helper.cfg, "allowed_uids", frozenset({os.getuid() + 1}))
+    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        t0 = time.monotonic()
+        helper.serve_conn(b)
+        assert time.monotonic() - t0 < 2.0     # not the 10 s connection timeout
+    finally:
+        a.close()

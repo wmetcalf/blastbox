@@ -15,8 +15,9 @@
 
 [Unit]
 Description=blastbox Firecracker jail helper (root launcher for jailed microVMs)
-# Before docker: dispatcher containers bind-mount the socket directory, and a missing bind
-# source is created by dockerd (not root-owned under userns-remap: the helper refuses it).
+# Before docker, with the socket directory made by ExecStartPre (which completes before the
+# unit counts as started): dispatcher containers bind-mount it, and a missing bind source is
+# created by dockerd -- not root-owned under userns-remap, which the helper refuses.
 After=local-fs.target apparmor.service
 Before=docker.service
 Wants=apparmor.service
@@ -26,6 +27,8 @@ Type=simple
 # --socket-group / --allow-uid: the dispatcher container's gid / uid (10001 in the shipped images).
 # The chroot base must be root-owned, on a filesystem with room for every live slot's output disk
 # plus each warm generation's memory file; put it on tmpfs to keep snapshots in RAM.
+# The gid here and --socket-group below must match.
+ExecStartPre=/usr/bin/install -d -o root -g 10001 -m 0750 /run/blastbox-fc-jail
 ExecStart=/usr/bin/python3 -I /usr/local/libexec/blastbox/fc_jail_helper.py \
     --socket /run/blastbox-fc-jail/helper.sock \
     --socket-group 10001 --allow-uid 10001 \
