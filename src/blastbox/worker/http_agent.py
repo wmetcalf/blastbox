@@ -37,6 +37,7 @@ import logging
 import os
 import stat
 import signal
+import ssl
 import tarfile
 import tempfile
 import threading
@@ -208,6 +209,10 @@ def _install_shutdown_handlers() -> None:
         signal.signal(sig, _on_shutdown_signal)
 
 
+# Longest a peer may take over its TLS handshake. A LAN handshake takes milliseconds.
+_HANDSHAKE_TIMEOUT_S = 30.0
+
+
 class _Handler(BaseHTTPRequestHandler):
     engine: Engine = None  # type: ignore[assignment]  # set on the server
     token: str | None = None
@@ -236,6 +241,25 @@ class _Handler(BaseHTTPRequestHandler):
     # would otherwise hold the single-flight _JOB_LOCK forever and wedge the whole worker. Overridable
     # via BLASTBOX_WORKER_AGENT_TIMEOUT_S; must exceed the largest legitimate upload's transfer time.
     timeout = 300.0   # ClassVar (matches StreamRequestHandler.timeout); no annotation -> no override clash
+
+    # The TLS handshake runs here, in this connection's own thread (serve() wraps the listening
+    # socket with do_handshake_on_connect=False). Run in accept() instead, it was on the one serving
+    # thread with no timeout: a peer that stalled mid-handshake (a dispatcher container replaced
+    # mid-probe, a port scan) blocked every later connection until the agent was restarted.
+    def setup(self) -> None:
+        self._tls_failed = False
+        if isinstance(self.request, ssl.SSLSocket):
+            self.request.settimeout(min(self.timeout, _HANDSHAKE_TIMEOUT_S))
+            try:
+                self.request.do_handshake()
+            except OSError as exc:  # ssl.SSLError and socket timeouts are OSErrors
+                _log.debug("http_agent: TLS handshake with %s failed: %s", self.client_address, exc)
+                self._tls_failed = True
+        super().setup()
+
+    def handle(self) -> None:
+        if not self._tls_failed:
+            super().handle()
 
     # quieter logging (per-request lines go to our logger at debug)
     def log_message(self, fmt: str, *args: object) -> None:
@@ -796,7 +820,8 @@ def serve(engine: Engine, *, bind: str = "0.0.0.0", port: int = 8765,
                 f"client_ca={client_ca!r}): {exc}. The files must exist and be READABLE by the agent "
                 f"uid ({os.getuid()}) -- a 0600 key owned by root is unreadable when the image runs as "
                 f"a non-root USER; chown the key to the agent uid or loosen its mode.") from exc
-        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        # The handshake is the handler thread's (_Handler.setup), bounded by a timeout.
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True, do_handshake_on_connect=False)
     _log.info("http_agent: serving engine=%s on %s:%d (tls=%s mtls=%s allowlist=%s egress=%s)",
               engine.name, bind, port, bool(tls_cert), bool(client_ca), bool(allow_cidrs),
               bool(egress_capable))

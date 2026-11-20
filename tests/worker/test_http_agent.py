@@ -576,6 +576,42 @@ def test_mtls_end_to_end_and_rejects_uncertified_caller(tmp_path):
         httpd.server_close()
 
 
+def test_a_stalled_tls_handshake_does_not_block_other_callers(tmp_path, monkeypatch):
+    # a peer that connects and never finishes its handshake (a dispatcher container replaced
+    # mid-probe) used to block accept() -- and so every later connection -- indefinitely
+    import socket
+    import time
+
+    import blastbox.worker.http_agent as hag
+    from blastbox.host.pki import ensure_ca
+    from blastbox.tls import client_ssl_context
+
+    monkeypatch.setattr(hag, "_HANDSHAKE_TIMEOUT_S", 1.0)
+    ca = ensure_ca(tmp_path / "pki")
+    scrt, skey = ca.issue_server(["127.0.0.1"]).write(tmp_path, "server")
+    (tmp_path / "ca.crt").write_bytes(ca.cert_pem)
+    ccrt, ckey = ca.issue_client("dispatcher").write(tmp_path, "client")
+    httpd = serve(_NoopEngine(), bind="127.0.0.1", port=0,
+                  tls_cert=str(scrt), tls_key=str(skey), client_ca=str(tmp_path / "ca.crt"))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+    stalled = [socket.create_connection(("127.0.0.1", port), timeout=10) for _ in range(3)]
+    stalled[0].sendall(b"\x16\x03\x01\x02\x00\x01\x00")   # the start of a ClientHello, then nothing
+    try:
+        cctx = client_ssl_context(str(tmp_path / "ca.crt"), cert_file=str(ccrt), key_file=str(ckey))
+        t0 = time.monotonic()
+        with urllib.request.urlopen(f"https://127.0.0.1:{port}/healthz", timeout=5, context=cctx) as r:
+            assert r.status == 200
+        assert time.monotonic() - t0 < 1.0       # served at once, not after the stalled handshakes
+        for s in stalled:                         # and the stalled peers are cut off at the timeout
+            assert s.recv(1) == b""
+    finally:
+        for s in stalled:
+            s.close()
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_hard_deadline_kills_and_sweeps_runs_in_flight_before_exiting(monkeypatch):
     # os._exit skips every backend's `finally`: the macOS backends' runs (in their own sessions,
     # out of reach of launchd's process-group cleanup) are killed and swept first
