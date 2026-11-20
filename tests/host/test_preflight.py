@@ -1749,3 +1749,16 @@ def test_an_unjailed_dispatcher_still_checks_local_kvm_and_firecracker():
     by = _by_name(pf.run_preflight(_unjailed(), ["firecracker"]))
     assert by["kvm"].status is Status.PASS and by["firecracker"].status is Status.PASS
     assert by["fc-jailer"].status is Status.WARN
+
+
+@pytest.mark.parametrize("knob", [{"BLASTBOX_SNAPSHOT_MEM_TMPFS": "1"},
+                                  {"BLASTBOX_SNAPSHOT_MEM_DIR": "/dev/shm/bb"}])
+def test_a_jailed_warm_tier_with_a_snapshot_mem_dir_fails_as_the_runtime_refuses(knob):
+    env = {"BLASTBOX_POOL_WARM_SNAPSHOT": "1", **knob}
+    _, c = _jail_check(env=env)
+    assert c.status is Status.FAIL and "chroot-base" in c.detail
+    _, c = _jail_check(env={**knob})                  # no warm snapshots: the knob is unused
+    assert c.status is Status.PASS
+    _, c = _jail_check(env={"BLASTBOX_POOL_WARM_SNAPSHOT": "1",
+                            "BLASTBOX_SNAPSHOT_MEM_TMPFS": "0"})   # off: not refused
+    assert c.status is Status.PASS

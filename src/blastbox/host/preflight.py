@@ -819,6 +819,16 @@ def _check_fc_jailer(host: HostView) -> Check:
                      f"{ENV_JAILER}=off: firecracker runs UNJAILED as the dispatcher uid, sharing "
                      "its filesystem view, cgroup and network namespace with every other slot",
                      doc)
+    # As resolve_mem_dir() reads them (a path; a truthy toggle).
+    mem_knobs = ([k for k in ("BLASTBOX_SNAPSHOT_MEM_DIR",) if host.env.get(k, "").strip()]
+                 + [k for k in ("BLASTBOX_SNAPSHOT_MEM_TMPFS",) if host.env.get(k, "").strip()
+                    .lower() not in ("", "0", "false", "no")])
+    if mem_knobs and _warm_snapshot(host.env):
+        # As the snapshot runtime refuses it at startup: jailed snapshots are the helper's.
+        return Check("fc-jailer", Status.FAIL,
+                     f"{' / '.join(mem_knobs)} cannot apply under the jailer: jailed snapshots "
+                     "live in the jail helper's --chroot-base (put THAT on tmpfs to preload "
+                     f"them); the warm snapshot tier refuses to start. {opt_out_hint()}", doc)
     info, code, detail = host.jail_hello(settings.socket_path)
     if info is None:
         # The helper never allows uid 0: it says "forbidden" (an older helper just closed the

@@ -427,10 +427,12 @@ as none, without resolving where it points: `DOCKER_HOST`, `DOCKER_TLS_VERIFY`/`
 **With the Firecracker jail helper (the default)** firecracker is not started by the dispatcher:
 the root helper confines each jailed VMM with its own per-jail AppArmor profile on the host
 (see "Firecracker jail helper"). The `firecracker` column above describes only what the
-dispatcher itself could apply (the unjailed path); it does not yet account for the helper's
-profile, so under `require` a containerised jailed dispatcher can be refused for `firecracker`
-although its VMMs are AppArmor-confined. Run the helper with `--apparmor require` for that
-guarantee until detection learns about the helper.
+dispatcher itself could apply (the unjailed path; jailed, no Landlock shim runs either) and does
+not yet account for the helper, in EITHER direction: under `require` a containerised jailed
+dispatcher can be refused for `firecracker` although its VMMs are AppArmor-confined, and
+`require` can pass (e.g. on Landlock) while a helper running without AppArmor leaves them with
+no LSM at all (preflight's `fc-jailer` WARNs then). Run the helper with `--apparmor require` for
+the guarantee until detection learns about the helper.
 
 `BLASTBOX_CONFINEMENT=auto|require|off` (default `auto`). `require` makes `blastbox dispatch`
 refuse to start, and preflight FAIL, when a sandbox kind the dispatcher can run (including
