@@ -1802,8 +1802,8 @@ def test_every_firecracker_vmm_counts_but_firecracker_containerd_does_not():
                            "--config-file", "/tmp/fc.json"], True),
                          (["/firecracker-abc"], True),                  # flagless, renamed
                          (["/firecracker-abc", "--log-path", "/x"], True),
-                         (["/usr/bin/firecracker-containerd", "--config", "/etc/x"], False),
-                         (["/usr/bin/firecracker-containerd-shim", "-namespace", "x"], False)):
+                         (["/firecracker-containerd-vmm1", *vmm], True),   # a jail id
+                         (["/usr/bin/firecracker-containerd", "--config", "/etc/x"], False)):
         host = _with_procs(_proc(77, argv))
         roles = [p.role for p in pf._sandbox_processes(host)]
         assert (roles == ["firecracker"]) is is_vmm, (argv, roles)
