@@ -1750,13 +1750,17 @@ class Helper:
         for name in os.listdir(parent):
             # Earlier instances' private names (a start that failed before its rename). Only
             # SOCKETS are ours: anything else under such a name is left alone, never fatal.
-            if name.startswith(prefix) and name[len(prefix):].isdigit():
+            if name.startswith(prefix) and re.fullmatch(r"\d+(-\d+)?", name[len(prefix):]):
                 with contextlib.suppress(OSError):
                     if stat.S_ISSOCK(os.lstat(parent / name).st_mode):
                         os.unlink(parent / name)
         # A free private name (a stray non-socket entry may sit at the obvious one).
-        tmp = next(p for p in (parent / f"{prefix}{os.getpid()}{n or ''}" for n in range(1000))
-                   if not os.path.lexists(p))
+        # ("<pid>-<n>": a fallback can never read as another pid's own name.)
+        tmp = next((p for p in (parent / f"{prefix}{os.getpid()}{f'-{n}' if n else ''}"
+                                for n in range(1000))
+                    if not os.path.lexists(p)), None)
+        if tmp is None:
+            raise RuntimeError(f"{parent}: no free private socket name (stray {prefix}* entries)")
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         try:
             srv.bind(str(tmp))

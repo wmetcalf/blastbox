@@ -1286,3 +1286,28 @@ def test_a_failed_publish_reports_its_own_error(tmp_path):
     ready, raised = _serve_raises(tmp_path)
     assert not ready and isinstance(raised[0], IsADirectoryError)
     assert "h.sock" in str(raised[0]) and not raised[0].__context__
+
+
+def test_no_free_private_name_is_a_clear_refusal(tmp_path, monkeypatch):
+    run = tmp_path / "run"
+    run.mkdir(mode=0o750)
+    monkeypatch.setattr(h.os.path, "lexists", lambda p: True)
+    ready, raised = _serve_raises(tmp_path)
+    assert not ready and isinstance(raised[0], RuntimeError) and str(run) in str(raised[0])
+
+
+def test_a_fallback_private_name_never_reads_as_another_pid(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir(mode=0o750)
+    (run / f".h.sock.{os.getpid()}").mkdir()
+    names = []
+    real_bind = socket.socket.bind
+
+    def _bind(self, addr):
+        names.append(os.path.basename(addr))
+        return real_bind(self, addr)
+    import unittest.mock as _m
+    with _m.patch.object(socket.socket, "bind", _bind):
+        with _serving(tmp_path) as (_, path):
+            JailClient(path).hello()
+    assert f".h.sock.{os.getpid()}-1" in names
