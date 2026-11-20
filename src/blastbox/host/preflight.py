@@ -229,6 +229,10 @@ class RealHost(HostView):
         except OSError:
             return None
 
+    def begin_run(self) -> None:
+        """A new preflight run: forget the previous run's helper answers."""
+        self.__dict__.pop("_jail_hellos", None)
+
     def jail_hello(self, socket_path: str) -> "tuple[dict[str, object] | None, str, str]":
         # Asked once per socket per run: fc-jailer, sandbox-confinement and confinement all
         # judge the SAME answer (and a stalled helper costs its timeout once, not three times).
@@ -245,7 +249,9 @@ class RealHost(HostView):
         try:
             return JailClient(socket_path, timeout_s=5.0).hello(), "", ""
         except JailError as exc:
-            return None, exc.code, exc.detail
+            from blastbox.host.confinement import jail_code  # noqa: PLC0415
+
+            return None, jail_code(exc), exc.detail
         except Exception as exc:  # noqa: BLE001 -- never raise on host state
             return None, "error", str(exc)
 
@@ -1520,9 +1526,17 @@ def _check_confinement(host: HostView, tiers: Collection[str],
         # require refuses to start, so it stays a FAIL.
         hard = [k for k in missing
                 if not {t for t in reach if cf.kinds_for_tiers({t}) == [k]} <= set(skipped)]
+        # A root preflight cannot ask the helper (it never answers uid 0): the dispatcher's own
+        # answer is unknown from here, so that miss is a WARN to re-run as its uid, not a FAIL.
+        unverified = [k for k in hard if k == "firecracker" and st.fc_jail == "unverified"]
+        hard = [k for k in hard if k not in unverified]
         msg = "; ".join(parts) + f"; require unmet for {', '.join(missing)}"
         if hard:
             return Check("confinement", Status.FAIL, msg, doc, facts)
+        if unverified:
+            return Check("confinement", Status.WARN,
+                         msg + " -- firecracker not verifiable as root: re-run preflight as the "
+                         "dispatcher uid (e.g. inside its container) to judge require", doc, facts)
         return Check("confinement", Status.WARN,
                      msg + " -- only via tiers this dispatcher will not run (not selected, or "
                      "cascade overflow tiers unavailable at startup)", doc, facts)
@@ -1638,6 +1652,9 @@ def _downgrade_unselected(checks: list[Check], env: Mapping[str, str]) -> list[C
 
 def run_preflight(host: HostView, tiers: Sequence[str], *, explicit: bool = True) -> list[Check]:
     """Run every check relevant to ``tiers``. Pure reads; never raises on host state."""
+    begin = getattr(host, "begin_run", None)
+    if callable(begin):
+        begin()
     t = set(tiers)
     out: list[Check] = []
     if "docker" in t:

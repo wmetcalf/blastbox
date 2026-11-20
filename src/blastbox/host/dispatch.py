@@ -747,6 +747,9 @@ class Dispatcher:
         if self._confinement is None and env_mode == "require":
             self._confinement = _confinement.detect(kinds=kinds)
         if self._confinement is not None:
+            # A passed Detection built without the reachable kinds has not asked the jail helper:
+            # judge a jailed firecracker by its answer, not the dispatcher's own context.
+            self._confinement = _confinement.complete_for(self._confinement, kinds)
             # The env's require binds too, whatever mode the passed detection was built with --
             # and the log reports the mode actually applied.
             if env_mode == "require" and self._confinement.mode != "require":

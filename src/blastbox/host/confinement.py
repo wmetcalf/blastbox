@@ -82,9 +82,15 @@ class HostReader(Protocol):
 #:   off          BLASTBOX_FC_JAILER=off: the dispatcher execs firecracker itself
 #:   apparmor     jailed; the helper answered and loads a per-jail AppArmor profile
 #:   no-apparmor  jailed; the helper answered and loads none (AppArmor off there, --apparmor off)
-#:   unknown      jailed; the helper could not be asked (down, restarting, not this uid's to ask)
-#:   unusable     jailed; the helper refused for good (protocol skew), or a BLASTBOX_FC_JAILER typo
-FC_JAIL_STATES = ("off", "apparmor", "no-apparmor", "unknown", "unusable")
+#:   unknown      jailed; the helper could not be asked (down, restarting, busy, timing out)
+#:   unverified   jailed; asked as root (preflight), which the helper never answers -- it says
+#:                nothing about the dispatcher uid's view
+#:   unusable     jailed; the helper refused for good (this uid not allowed, protocol skew), or
+#:                a BLASTBOX_FC_JAILER typo -- the runtime drops the tier
+FC_JAIL_STATES = ("off", "apparmor", "no-apparmor", "unknown", "unverified", "unusable")
+#: hello failures the runtime treats as DECIDED (fc_jail.JailError.decided: FCUnavailable, the
+#: tier is dropped); every other failure is undecided (FCHelperNoVerdict, the tier is deferred).
+_JAIL_DECIDED = frozenset({"forbidden", "protocol"})
 
 
 class ConfinementUnavailable(RuntimeError):
@@ -192,6 +198,8 @@ class HostLsm:
                            "where it runs, or --apparmor off)" + where,
             "unknown": "jail helper unreachable: a jailed firecracker's confinement is unknown "
                        "until it answers" + where,
+            "unverified": "jail helper answers only the dispatcher uid(s) it allows, not root: "
+                          "run preflight as the dispatcher uid to verify its AppArmor" + where,
             "unusable": "jail helper not usable: the firecracker tier does not run" + where,
         }.get(self.fc_jail or "")
 
@@ -441,9 +449,12 @@ def _fc_jail(host: HostReader, env: Mapping[str, str]) -> tuple[str, str | None]
     if info is not None:
         return ("apparmor" if info.get("apparmor") else "no-apparmor"), settings.socket_path
     why = f"{settings.socket_path}: {code}" + (f": {detail}" if detail else "")
-    # A protocol/READY-port skew is DECIDED (the runtime drops the tier); everything else --
-    # down, timing out, busy, or a uid it does not answer (root preflight) -- is not known.
-    return ("unusable" if code == "protocol" else "unknown"), why
+    if code in ("forbidden", "refused") and getattr(host, "euid", None) == 0:
+        # A ROOT preflight: the helper never answers uid 0, so this is not the dispatcher's view.
+        return "unverified", why
+    # As the runtime judges it: forbidden / a hello protocol skew drop the tier; anything else
+    # -- down, timing out, busy, reset -- defers it.
+    return ("unusable" if code in _JAIL_DECIDED else "unknown"), why
 
 
 def probe(host: HostReader, *, env: Mapping[str, str] | None = None,
@@ -516,6 +527,26 @@ class Detection:
         return ", ".join(parts)
 
 
+def jail_code(exc: BaseException) -> str:
+    """A hello JailError's code, keeping what the ``(info, code, detail)`` tuple would lose: a
+    ``protocol`` error is DECIDED only for a hello skew (``decided``); a garbled or truncated
+    reply is not -- the runtime defers the tier on it -- so it is ``protocol-transient``."""
+    code = str(getattr(exc, "code", "error"))
+    return code if code != "protocol" or getattr(exc, "decided", False) else "protocol-transient"
+
+
+def complete_for(det: "Detection", kinds: Collection[str], *, env: Mapping[str, str] | None = None,
+                 host: HostReader | None = None) -> "Detection":
+    """``det`` with the jail helper's answer filled in when ``kinds`` holds firecracker and it
+    was built without it (``detect()`` without kinds: an embedder's Detection). Returned
+    unchanged otherwise -- the helper is asked at most once."""
+    if "firecracker" not in kinds or det.state.fc_jail is not None:
+        return det
+    env = os.environ if env is None else env
+    state, detail = _fc_jail(_SysReader() if host is None else host, env)
+    return replace(det, state=replace(det.state, fc_jail=state, fc_jail_detail=detail))
+
+
 class _SysReader:
     def read(self, path: str) -> str | None:
         # Chunked: /proc/sys handlers refuse ONE large read() with ENOMEM.
@@ -555,7 +586,7 @@ class _SysReader:
         try:
             return JailClient(socket_path, timeout_s=_JAIL_HELLO_S).hello(), "", ""
         except JailError as exc:
-            return None, exc.code, exc.detail
+            return None, jail_code(exc), exc.detail
         except Exception as exc:  # noqa: BLE001 -- never raise on host state
             return None, "error", str(exc)
 

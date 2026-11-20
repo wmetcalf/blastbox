@@ -436,10 +436,12 @@ host, and `off` only means "do not gate on it":
 |---|---|
 | answers, per-jail AppArmor on | apparmor (also from a containerised dispatcher under `docker-default`) |
 | answers, AppArmor off where it runs or `--apparmor off` | none (Landlock is never offered: the dispatcher does not launch the VMM) |
-| unreachable (down, restarting, or not this uid's to ask) | none -- unknown until it answers; `require` fails closed |
-| refuses for good (protocol skew), or a `BLASTBOX_FC_JAILER` typo | none |
+| unreachable (down, restarting, busy, timing out, a garbled reply) | none -- unknown until it answers; `require` fails closed (the runtime would defer the tier, then admit it unchecked) |
+| refuses for good (this uid not allowed, protocol skew), or a `BLASTBOX_FC_JAILER` typo | none -- the runtime drops the tier |
+| asked as root by preflight (it never answers uid 0) | none, unverified: `confinement` WARNs to re-run as the dispatcher uid instead of failing `require` |
 
-The dispatcher asks the helper once at startup, and only when a firecracker tier is reachable.
+The dispatcher asks the helper once at startup, and only when a firecracker tier is reachable
+(also for a Detection an embedder passed in without asking it).
 Preflight's `sandbox-confinement` check also flags a jailed VMM outside its
 `blastbox-fc-jail-<id>` profile when the helper says it loads one; jailed VMMs live in the
 host's pid namespace, so from a dispatcher container none are visible -- run it on the host.

@@ -1158,3 +1158,81 @@ def test_embedded_require_detection_is_told_the_kinds(tmp_path, monkeypatch):
                limits=_limits(), job_root=tmp_path, runtime_selector=_fake_runtime,
                attest_key=None)
     assert "kinds" in seen and "cold" in list(seen["kinds"])
+
+
+# --- round 1: the helper's refusal classes mirror the runtime; a passed Detection is completed --
+
+def test_forbidden_is_decided_for_the_dispatcher_like_the_runtime():
+    """_jail_client treats `forbidden` as DECIDED (FCUnavailable: the tier is dropped), and
+    `refused` as undecided (FCHelperNoVerdict: deferred) -- detection says the same."""
+    assert _jailed(UBUNTU, (None, "forbidden", "uid 1000 not allowed")).fc_jail == "unusable"
+    assert _jailed(UBUNTU, (None, "refused", "reset")).fc_jail == "unknown"
+
+
+def test_root_preflight_cannot_verify_and_does_not_fail_require():
+    """The helper never answers uid 0: a root preflight learns nothing about the dispatcher's
+    view, so `confinement` must not claim the dispatcher refuses to start (fc-jailer WARNs)."""
+    for code in ("forbidden", "refused"):
+        host = _healthy(files=UBUNTU, euid=0,
+                        env={"BLASTBOX_CONFINEMENT": "require", "BLASTBOX_DISPATCH_WARM_ONLY": "1"})
+        host.jail = (None, code, "uid 0 is not allowed")
+        c = next(c for c in pf.run_preflight(host, ["firecracker"]) if c.name == "confinement")
+        assert c.status is Status.WARN, c.detail
+        assert "as the dispatcher uid" in c.detail
+        assert c.facts["host"]["fc_jail"] == "unverified"  # type: ignore[index]
+    # ...while the same refusal to a non-root caller is the dispatcher's own (decided) answer.
+    host = _healthy(files=UBUNTU, euid=1000,
+                    env={"BLASTBOX_CONFINEMENT": "require", "BLASTBOX_DISPATCH_WARM_ONLY": "1"})
+    host.jail = (None, "forbidden", "uid 1000 is not allowed")
+    c = next(c for c in pf.run_preflight(host, ["firecracker"]) if c.name == "confinement")
+    assert c.status is Status.FAIL
+
+
+def test_dispatcher_completes_a_passed_detection_that_never_asked_the_helper(monkeypatch):
+    """An embedder's detect() without kinds has fc_jail=None (the dispatcher's own view); with a
+    firecracker tier reachable the dispatcher asks the helper itself before judging require."""
+    st = cf._probe_lsm(_host(UBUNTU), 6)
+    det = cf.Detection(mode="require", state=st)
+    assert det.state.would_use("firecracker") == "apparmor"          # the stale own-context view
+    host = _host(UBUNTU)
+    host.jail = _HELLO_NO_AA
+    done = cf.complete_for(det, ["firecracker"], env={}, host=host)
+    assert done.state.fc_jail == "no-apparmor"
+    with pytest.raises(cf.ConfinementUnavailable):
+        cf.check_required(done.state, done.mode, ["firecracker"])
+    # Already probed, or no firecracker kind: returned unchanged, the helper not asked again.
+    host2 = _host(UBUNTU)
+    assert cf.complete_for(done, ["firecracker"], env={}, host=host2) is done
+    assert cf.complete_for(det, ["cold"], env={}, host=host2) is det
+    assert not hasattr(host2, "jail_asked")
+
+
+def test_embedded_dispatcher_completes_a_passed_detection(tmp_path, monkeypatch):
+    from blastbox.host.dispatch import Dispatcher, EngineSpec
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    from tests.host.test_dispatch import _fake_runtime, _limits
+
+    seen = {}
+    real = cf.complete_for
+
+    def spy(det, kinds, **kw):
+        seen["kinds"] = list(kinds)
+        return real(det, kinds, **kw)
+
+    monkeypatch.setattr(cf, "complete_for", spy)
+    det = cf.detect({}, host=_host(ROCKY), landlock=0)
+    Dispatcher(job_store=InMemoryJobStore(),
+               engines={"e": EngineSpec(name="e", image="i", worker_argv=["w"])},
+               limits=_limits(), job_root=tmp_path, runtime_selector=_fake_runtime,
+               attest_key=None, confinement=det)
+    assert "kinds" in seen
+
+
+def test_a_garbled_hello_reply_is_undecided_like_the_runtime():
+    from blastbox.host.runtime.fc_jail import JailError
+
+    assert cf.jail_code(JailError("protocol", "skew", decided=True)) == "protocol"
+    assert cf.jail_code(JailError("protocol", "truncated reply")) == "protocol-transient"
+    assert cf.jail_code(JailError("busy")) == "busy"
+    assert _jailed(UBUNTU, (None, "protocol-transient", "truncated")).fc_jail == "unknown"
+    assert _jailed(UBUNTU, _HELLO_SKEW).fc_jail == "unusable"

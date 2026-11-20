@@ -684,6 +684,11 @@ def test_real_host_asks_the_jail_helper_once_per_socket(monkeypatch):
     host.jail_hello("/run/a.sock")
     host.jail_hello("/run/b.sock")
     assert calls == ["/run/a.sock", "/run/b.sock"]
+    # ...per RUN: a RealHost reused for a second preflight asks again (the helper may have
+    # restarted with other settings in between).
+    host.env = {"BLASTBOX_POOL_RUNTIME": "firecracker", "BLASTBOX_FC_JAIL_SOCKET": "/run/a.sock"}
+    pf.run_preflight(host, ["firecracker"])
+    assert calls.count("/run/a.sock") == 2
 
 
 def test_a_chrooted_or_containerised_firecracker_is_not_taken_for_jailed():
