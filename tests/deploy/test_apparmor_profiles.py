@@ -314,13 +314,17 @@ def _umount_rules_ok(text: str) -> bool:
     keyword `umount` (or its synonym `unmount`) may appear ONLY in the two canonical denies,
     each alone on its line. Any other umount rule -- or prose naming the keyword -- must first
     be checked against the compiled DFA on a parser <= 4.0.x and then allowed here."""
-    mentions = re.findall(r"\b(?:umount|unmount)\b", text, re.ASCII)
     lines = [ln.strip() for ln in text.split("\n")]
-    # `deny all,` implies a bare (non-quiet) umount deny too, without naming the keyword.
-    if re.search(r"\bdeny\s+all\b", text, re.ASCII):
+    # `deny all,` implies a bare umount deny without naming the keyword (rule-shaped only, so
+    # prose such as "would deny all SOCK_RAW" in a comment does not trip it).
+    if any(re.fullmatch(r"(audit\s+|quiet\s+)*deny\s+all\s*,", ln) for ln in lines):
         return False
-    return len(mentions) == len(_CANONICAL_UMOUNT) and all(
-        lines.count(rule) == 1 for rule in _CANONICAL_UMOUNT)
+    # Every line naming the keyword must be exactly a canonical deny (a hat or child profile
+    # may repeat them), each line naming it once; both canonical denies must be present.
+    named = [ln for ln in lines if re.search(r"\b(?:umount|unmount)\b", ln, re.ASCII)]
+    mentions = re.findall(r"\b(?:umount|unmount)\b", text, re.ASCII)
+    return (all(ln in _CANONICAL_UMOUNT for ln in named) and len(mentions) == len(named)
+            and all(rule in named for rule in _CANONICAL_UMOUNT))
 
 
 def test_umount_denies_are_spelled_with_a_path() -> None:
@@ -330,8 +334,9 @@ def test_umount_denies_are_spelled_with_a_path() -> None:
     24.04 (apparmor_parser 4.0.x, which has the bug). The bug: a umount deny that can match
     the empty mountpoint unmediates the mount class on apparmor_parser <= 4.0.x."""
     assert _umount_rules_ok((_PROFILE_DIR / "blastbox-sandbox").read_text()), (
-        f"blastbox-sandbox may name the umount keyword only in {_CANONICAL_UMOUNT} (comments "
-        "count too): check any other umount rule against the compiled DFA (test_the_child_profile_mediates_the_mount_class on a "
+        f"blastbox-sandbox may name the umount keyword only on lines that are exactly one of "
+        f"{_CANONICAL_UMOUNT} (comments count too), and may not hold a `deny all,` rule: check "
+        "any other umount rule against the compiled DFA (test_the_child_profile_mediates_the_mount_class on a "
         "<= 4.0.x parser) and extend _CANONICAL_UMOUNT deliberately"
     )
 
@@ -447,3 +452,17 @@ def test_the_oracle_checks_every_profile_in_the_file() -> None:
         "  profile helper {\n    /usr/bin/true rix,\n    audit deny umount,\n  }\n}\n")
     assert _mediates_mount(shipped) and not _mediates_mount(bad_child)
 
+
+
+def test_the_text_guard_allows_a_hat_repeating_the_canonical_denies() -> None:
+    shipped = (_PROFILE_DIR / "blastbox-sandbox").read_text()
+    hat = shipped.rstrip().rstrip("}") + (
+        "  ^detonate {\n    /** rwlkmix,\n    audit deny mount,\n    audit deny umount /,\n"
+        "    audit deny umount /**,\n  }\n}\n")
+    assert _umount_rules_ok(hat)
+
+
+def test_the_text_guard_ignores_deny_all_in_prose() -> None:
+    text = (_PROFILE_DIR / "blastbox-sandbox").read_text().replace(
+        "denies SOCK_RAW in EVERY family", "would deny all SOCK_RAW, in EVERY family")
+    assert _umount_rules_ok(text)
