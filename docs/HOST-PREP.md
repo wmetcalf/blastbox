@@ -36,10 +36,15 @@ checks, `static` / `aws-*` members map to `remote`). The cold docker tier is add
 no cold path. A cascade takes its primary member's style, so a remote overflow member (which the
 dispatcher must skip at startup to boot a local primary; a selectable one is a refused mix) does
 not drop the cold docker checks. The `pool-runtime` check FAILs a pool name or cascade spec the dispatcher refuses
-(unknown or set-but-empty name, unknown cascade primary, missing/zero capacity, a mix of local and
-remote tiers, worker-mTLS and public-TLS tiers mixed under `BLASTBOX_DISPATCH_TLS_CA`,
-`BLASTBOX_DISPATCH_WARM_ONLY` without a pool) and WARNs on an unknown overflow member,
-which the dispatcher skips at startup.
+(unknown or set-but-empty name, unknown cascade primary, a `static` pool or cascade primary
+the static selector refuses before probing, missing/zero capacity, a mix of local and remote tiers,
+worker-mTLS and public-TLS tiers mixed under `BLASTBOX_DISPATCH_TLS_CA`,
+`BLASTBOX_DISPATCH_WARM_ONLY` without a pool) and WARNs on an overflow member the dispatcher
+skips at startup: an unknown name, a local tier whose startup checks FAIL, or a `static` member
+the selector refuses before probing (no `BLASTBOX_STATIC_WORKERS`, or a partial dispatcher TLS
+config or missing TLS file; file contents are not validated). Mixes are judged on the tiers left after those skips; a `static` or
+`aws-*` overflow member that is configured is assumed admitted, because only a live probe at boot
+can show it is down.
 
 `blastbox preflight` checks the **host**; `blastbox doctor` checks what is **running** on it
 (container and rootfs versions). Run both after an upgrade.

@@ -399,30 +399,59 @@ def _check_runsc_binary(host: HostView) -> Check:
     if path is None:
         return Check("runsc", Status.FAIL, f"runsc binary {name!r} not found/executable", doc)
     proc = host.run([path, "--version"])
-    if proc is None:
-        return Check("runsc", Status.FAIL, f"{path} --version did not run (spawn failure or "
-                     "timeout)", doc)
-    if proc.returncode != 0:
-        why = _first_line(proc.stderr) or _first_line(proc.stdout) or f"rc={proc.returncode}"
-        return Check("runsc", Status.FAIL, f"{path} --version failed: {why}", doc)
-    ver = _first_line(proc.stdout) or "version unknown"
     # The warm tier's own capability probe (gvisor_snapshot._default_cr_capable): `runsc help`
-    # must list both checkpoint and restore, else the tier is refused.
+    # must list both checkpoint and restore, else the tier is refused. Run it whatever --version
+    # says: it is the probe the dispatcher selects on, and --version is not.
     helped = host.run([path, "help"])
     text = (helped.stdout + helped.stderr) if helped is not None else ""
+    ver = "version unknown"
+    if proc is not None and proc.returncode == 0:
+        ver = _first_line(proc.stdout) or ver
     if "checkpoint" not in text or "restore" not in text:
         return Check("runsc", Status.FAIL,
                      f"{path} ({ver}) does not list checkpoint/restore in `runsc help`; the "
                      "gVisor warm tier needs both and refuses this build", doc)
+    # From here the selector admits the tier, so these FAILs are not startup gates.
+    admitted = {"admitted": True}
+    if proc is None:
+        return Check("runsc", Status.FAIL, f"{path} --version did not run (spawn failure or "
+                     "timeout)", doc, admitted)
+    if proc.returncode != 0:
+        why = _first_line(proc.stderr) or _first_line(proc.stdout) or f"rc={proc.returncode}"
+        return Check("runsc", Status.FAIL, f"{path} --version failed: {why}", doc, admitted)
     return Check("runsc", Status.PASS, f"{path}: {ver} (checkpoint/restore available)")
 
 
 _KNOWN_POOL_RUNTIMES = {"none", "firecracker", "gvisor", "cascade", *_REMOTE_POOL_RUNTIMES}
 
 
-def _check_pool_runtime(host: HostView) -> Check | None:
+def _static_refusal(host: HostView) -> str:
+    """Why select_static_pool_runtime refuses before probing any worker, else "": a knob
+    StaticPoolConfig.from_env cannot parse, no BLASTBOX_STATIC_WORKERS, or a dispatcher TLS config
+    dispatch_ssl_context_from_env raises on (partial, or a named file that is not there). Past this
+    the verdict needs the CA/key contents and a live /healthz probe, which preflight does not make."""
+    from blastbox.host.runtime.static_pool import StaticPoolConfig  # noqa: PLC0415
+
+    env = host.env
+    try:
+        cfg = StaticPoolConfig.from_env(env.get)
+    except Exception as exc:  # noqa: BLE001 -- the selector raises on it; report, never raise
+        return f"BLASTBOX_STATIC_* does not parse: {exc}"
+    if not cfg.workers:
+        return "BLASTBOX_STATIC_WORKERS is empty"
+    ca, cert, key = (env.get(f"BLASTBOX_DISPATCH_TLS_{k}") or "" for k in ("CA", "CERT", "KEY"))
+    if not ca:
+        return "BLASTBOX_DISPATCH_TLS_CERT/KEY set without _CA" if cert or key else ""
+    if bool(cert) != bool(key):
+        return "BLASTBOX_DISPATCH_TLS_CERT and _KEY are not set together"
+    missing = [p for p in (ca, cert, key) if p and not host.is_file(p)]
+    return f"dispatcher TLS file(s) {', '.join(missing)} not found" if missing else ""
+
+
+def _check_pool_runtime(host: HostView, skipped: Collection[str] = ()) -> Check | None:
     """An unknown BLASTBOX_POOL_RUNTIME (or cascade member) is refused by the dispatcher; the
-    tier preflight would have checked for it is unknowable, so say so instead of passing."""
+    tier preflight would have checked for it is unknowable, so say so instead of passing.
+    ``skipped``: local overflow tiers the cascade drops at startup (_skipped_overflow_tiers)."""
     doc = f"{DOC}#what-each-tier-needs"
     if "BLASTBOX_POOL_RUNTIME" in host.env and not host.env["BLASTBOX_POOL_RUNTIME"].strip():
         # PoolConfig.from_env defaults only an ABSENT variable to "none"; a set-but-empty one
@@ -462,8 +491,17 @@ def _check_pool_runtime(host: HostView) -> Check | None:
             return Check("pool-runtime", Status.FAIL,
                          f"BLASTBOX_POOL_TIERS primary {members[0]!r} is unknown/invalid; the "
                          "dispatcher refuses the cascade", doc)
+        static_why = _static_refusal(host) if "static" in members else ""
+        if members[0] == "static" and static_why:
+            return Check("pool-runtime", Status.FAIL,
+                         f"BLASTBOX_POOL_TIERS primary 'static' is unavailable ({static_why}); the "
+                         "dispatcher refuses the cascade", doc)
         dropped = [m for m in members[1:] if _bad(m)]
-        members = [m for m in members if not _bad(m)]
+        # build_cascade_runtime skips an overflow tier its selector refuses at startup, so the
+        # style/TLS mix is judged on the tiers it admits, as CascadingRuntime does.
+        gone = set(skipped) | ({"static"} if static_why else set())
+        unused = list(dict.fromkeys(m for m in members[1:] if m in gone and m != members[0]))
+        members = [m for m in members if not _bad(m) and m not in unused]
         local = {m for m in members if m in ("firecracker", "gvisor")}
         if local and len(local) != len(set(members)):
             return Check("pool-runtime", Status.FAIL,
@@ -479,13 +517,20 @@ def _check_pool_runtime(host: HostView) -> Check | None:
                          f"with BLASTBOX_DISPATCH_TLS_CA set, {', '.join(sorted(mtls))} use worker "
                          f"mTLS but {', '.join(sorted(public))} public TLS: the dispatcher refuses "
                          "the mixed cascade (use separate pools)", doc)
-        if dropped:
+        if dropped or unused:
             # build_cascade_runtime skips an unavailable overflow tier at startup and boots
             # on the rest -- a typo there silently shrinks the pool.
+            why = [f"{', '.join(dropped)} unknown"] if dropped else []
+            why += [f"{', '.join(unused)} unavailable at startup"] if unused else []
             return Check("pool-runtime", Status.WARN,
-                         f"BLASTBOX_POOL_TIERS overflow member(s) {', '.join(dropped)} are unknown; "
-                         f"the dispatcher skips them and runs on {', '.join(members)}", doc)
+                         f"BLASTBOX_POOL_TIERS overflow member(s) {'; '.join(why)}: the dispatcher "
+                         f"skips them and runs on {', '.join(dict.fromkeys(members))}", doc)
         return Check("pool-runtime", Status.PASS, f"cascade of {', '.join(members)}")
+    if pool == "static" and (refusal := _static_refusal(host)):
+        # build_warm_pool selects a non-cascade pool with require_available, like a primary.
+        return Check("pool-runtime", Status.FAIL,
+                     f"BLASTBOX_POOL_RUNTIME=static is unavailable ({refusal}); the dispatcher "
+                     "refuses to start", doc)
     return Check("pool-runtime", Status.PASS, f"BLASTBOX_POOL_RUNTIME={pool}")
 
 
@@ -1380,6 +1425,10 @@ def _is_startup_gate(c: Check) -> bool:
     admitted and every spawn fails; a missing gVisor rootfs is booted anyway."""
     if c.name == "kvm":
         return c.detail.startswith(_KVM_MISSING)
+    if c.name == "runsc":
+        # GvisorSnapshotBackend.available() asks only for the binary and `runsc help` listing
+        # checkpoint/restore; a failing `runsc --version` alone does not keep the tier out.
+        return not (c.facts or {}).get("admitted")
     return c.name != "gvisor-rootfs"
 
 
@@ -1402,6 +1451,11 @@ def _downgrade_overflow(checks: list[Check], env: Mapping[str, str]) -> list[Che
             c = Check(c.name, Status.WARN,
                       f"{c.detail} -- {tier} is an overflow tier of this cascade, so the "
                       "dispatcher skips it at startup and runs without it", c.doc)
+        elif tier in overflow and c.status is Status.FAIL and (c.facts or {}).get("admitted"):
+            c = Check(c.name, Status.WARN,
+                      f"{c.detail} -- {tier} is an overflow tier of this cascade, and its "
+                      "selector does not run this probe, so the dispatcher still admits it",
+                      c.doc, c.facts)
         elif tier in warm and c.status is Status.FAIL:
             # Admitted, but its warm base never builds: the cascade never spawns there and
             # serves on the other tiers.
@@ -1450,9 +1504,6 @@ def run_preflight(host: HostView, tiers: Sequence[str], *, explicit: bool = True
     """Run every check relevant to ``tiers``. Pure reads; never raises on host state."""
     t = set(tiers)
     out: list[Check] = []
-    pool = _check_pool_runtime(host)
-    if pool is not None:
-        out.append(pool)
     if "docker" in t:
         # The warm gVisor tier drives runsc directly against an exported rootfs; docker is
         # needed only for the cold docker tier.
@@ -1490,6 +1541,10 @@ def run_preflight(host: HostView, tiers: Sequence[str], *, explicit: bool = True
         out.append(_check_bwrap_stock_profile(host, t))
         out.append(_check_userns(host, t))
     skipped = _skipped_overflow_tiers(out, host.env)
+    # Judged after the tier checks: a cascade's mix depends on which overflow tiers it skips.
+    pool = _check_pool_runtime(host, skipped)
+    if pool is not None:
+        out.insert(0, pool)
     if not explicit and host.env.get("BLASTBOX_POOL_RUNTIME", "").strip().lower() in ("", "none"):
         skipped |= {"gvisor", "firecracker"}     # preview: the dispatcher runs cold only
     # remote-only too: dispatch validates the mode

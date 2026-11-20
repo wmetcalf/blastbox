@@ -742,7 +742,8 @@ def test_unknown_pool_runtime_fails():
         c = _by_name(pf.run_preflight(_healthy(env=env), ["docker"]))["pool-runtime"]
         assert c.status is Status.FAIL, env
     assert "pool-runtime" not in _by_name(pf.run_preflight(_healthy(), ["docker"]))
-    ok = _healthy(env={"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "static:4,aws-ec2:8"})
+    ok = _healthy(env={"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "static:4,aws-ec2:8",
+                       "BLASTBOX_STATIC_WORKERS": "10.0.0.5"})   # a static primary needs a fleet
     assert _by_name(pf.run_preflight(ok, ["remote"]))["pool-runtime"].status is Status.PASS
 
 
@@ -1286,9 +1287,10 @@ def test_sandbox_knob_under_runsc_needs_no_host_userns():
 
 def test_cascade_mixing_mtls_and_public_tls_tiers_fails():
     env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "static:4,aws-lambda-microvm:16",
-           "BLASTBOX_DISPATCH_TLS_CA": "/etc/blastbox/ca.pem"}
-    assert _by_name(pf.run_preflight(_healthy(env=env), ["remote"]))["pool-runtime"].status \
-        is Status.FAIL
+           "BLASTBOX_DISPATCH_TLS_CA": "/etc/blastbox/ca.pem", "BLASTBOX_STATIC_WORKERS": "10.0.0.5"}
+    c = _by_name(pf.run_preflight(_healthy(env=env, paths={"/etc/blastbox/ca.pem"}),
+                                  ["remote"]))["pool-runtime"]
+    assert c.status is Status.FAIL and "mTLS" in c.detail, c.detail
     del env["BLASTBOX_DISPATCH_TLS_CA"]
     assert _by_name(pf.run_preflight(_healthy(env=env), ["remote"]))["pool-runtime"].status \
         is Status.PASS
@@ -1550,3 +1552,106 @@ def test_gvisor_userns_real_account_owner_reported_alongside_other_warnings():
     host.stats = {"/var/lib/blastbox": (0o40755, 0, 0, True)}      # an undecidable ACL warning
     c = _by_name(pf.run_preflight(host, ["gvisor"]))["gvisor-userns"]
     assert c.status is Status.WARN and "ACL" in c.detail and "real account" in c.detail
+
+
+# --- a mixed-style cascade is judged on the tiers the dispatcher actually admits ------------
+
+_WORKERS = {"BLASTBOX_STATIC_WORKERS": "10.0.0.5:8765"}
+
+
+def _pool_runtime(env, **over):
+    host = _healthy(env=env, **over)
+    host.env.update(env)
+    checks = pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False)
+    return _by_name(checks)["pool-runtime"], checks
+
+
+def test_unconfigured_static_overflow_is_skipped_so_the_mix_only_warns():
+    """build_cascade_runtime skips an overflow tier whose selector refuses at startup, and
+    select_static_pool_runtime refuses an empty BLASTBOX_STATIC_WORKERS before probing: the
+    dispatcher boots on firecracker alone, so the style mix is never formed."""
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "firecracker:2,static:4"}
+    c, checks = _pool_runtime(env)
+    assert c.status is Status.WARN, c.detail
+    assert "static" in c.detail and "skips" in c.detail
+    assert pf.exit_code(checks) == 0
+    # A configured static fleet is admitted (or deferred while unprobeable), and the dispatcher
+    # refuses the mix.
+    assert _pool_runtime({**env, **_WORKERS})[0].status is Status.FAIL
+    # So is an unparseable one, which select_static_pool_runtime raises on: skipped.
+    assert _pool_runtime({**env, "BLASTBOX_STATIC_WORKERS": "10.0.0.5:x"})[0].status \
+        is Status.WARN
+
+
+def test_unavailable_local_overflow_under_a_static_primary_only_warns():
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "static:4,firecracker:2",
+           **_WORKERS}
+    host_over = {"executables": {"timedatectl": "/usr/bin/timedatectl", "docker": "/usr/bin/docker",
+                                 "runsc": "/usr/bin/runsc"}}       # no firecracker binary: a gate
+    c, _ = _pool_runtime(env, **host_over)
+    assert c.status is Status.WARN, c.detail
+    assert _pool_runtime(env)[0].status is Status.FAIL        # firecracker admitted: refused
+
+
+def test_a_static_primary_with_no_workers_still_fails_the_cascade():
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "static:4,firecracker:2"}
+    host_over = {"executables": {"timedatectl": "/usr/bin/timedatectl", "docker": "/usr/bin/docker",
+                                 "runsc": "/usr/bin/runsc"}}
+    c, _ = _pool_runtime(env, **host_over)
+    assert c.status is Status.FAIL and "primary" in c.detail, c.detail
+
+
+def test_a_static_tls_config_the_selector_refuses_skips_the_static_overflow():
+    """select_static_pool_runtime builds the dispatcher TLS context before probing; a partial
+    config or a missing file raises there, so an overflow static tier is skipped and a static
+    primary refuses the cascade."""
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "firecracker:2,static:4",
+           **_WORKERS}
+    for tls in ({"BLASTBOX_DISPATCH_TLS_CA": "/etc/blastbox/ca.pem"},
+                {"BLASTBOX_DISPATCH_TLS_CERT": "/etc/blastbox/c.pem"},
+                {"BLASTBOX_DISPATCH_TLS_CA": "/etc/blastbox/ca.pem",
+                 "BLASTBOX_DISPATCH_TLS_CERT": "/etc/blastbox/c.pem"}):
+        assert _pool_runtime({**env, **tls})[0].status is Status.WARN, tls
+    present = _pool_runtime({**env, "BLASTBOX_DISPATCH_TLS_CA": "/etc/blastbox/ca.pem"},
+                            files={"/etc/blastbox/ca.pem": "pem"})[0]
+    assert present.status is Status.FAIL, present.detail      # admitted: refused mix
+    primary = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "static:4,aws-ec2:8",
+               **_WORKERS, "BLASTBOX_DISPATCH_TLS_CERT": "/etc/blastbox/c.pem"}
+    c = _by_name(pf.run_preflight(_healthy(env=primary), ["remote"]))["pool-runtime"]
+    assert c.status is Status.FAIL and "primary" in c.detail, c.detail
+
+
+def test_a_runsc_version_failure_alone_does_not_skip_a_gvisor_overflow():
+    """The gVisor selector admits runsc on `runsc help` listing checkpoint/restore; it never runs
+    `--version`, so a failing --version leaves the tier in and the mix is refused."""
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "static:4,gvisor:2", **_WORKERS}
+    host = _healthy(env=env)
+    host.commands[("/usr/bin/runsc", "--version")] = (1, "", "config not found\n")
+    checks = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False))
+    assert checks["runsc"].status is not Status.PASS
+    assert checks["pool-runtime"].status is Status.FAIL, checks["pool-runtime"].detail
+    host.commands[("/usr/bin/runsc", "help")] = (127, "", "lib missing\n")   # help fails too
+    checks = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False))
+    assert checks["pool-runtime"].status is Status.WARN, checks["pool-runtime"].detail
+    host.executables.pop("runsc")                       # no binary: selector refuses, skipped
+    checks = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False))
+    assert checks["pool-runtime"].status is Status.WARN, checks["pool-runtime"].detail
+
+
+def test_a_plain_static_pool_the_selector_refuses_fails():
+    """build_warm_pool selects BLASTBOX_POOL_RUNTIME=static with require_available, so the same
+    pre-probe refusal that fails a static cascade primary fails the plain pool."""
+    env = {"BLASTBOX_POOL_RUNTIME": "static"}
+    c = _by_name(pf.run_preflight(_healthy(env=env), ["remote"]))["pool-runtime"]
+    assert c.status is Status.FAIL and "BLASTBOX_STATIC_WORKERS" in c.detail, c.detail
+    c = _by_name(pf.run_preflight(_healthy(env={**env, **_WORKERS}), ["remote"]))["pool-runtime"]
+    assert c.status is Status.PASS, c.detail
+
+
+def test_an_admitted_runsc_overflow_fail_is_not_reported_as_never_ready():
+    env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "firecracker:2,gvisor:2"}
+    host = _healthy(env=env)
+    host.commands[("/usr/bin/runsc", "--version")] = (1, "", "boom\n")
+    c = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False))["runsc"]
+    assert c.status is Status.WARN and "still admits" in c.detail, c.detail
+    assert "never becomes ready" not in c.detail
