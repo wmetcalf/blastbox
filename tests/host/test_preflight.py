@@ -1626,10 +1626,13 @@ def test_a_runsc_version_failure_alone_does_not_skip_a_gvisor_overflow():
     `--version`, so a failing --version leaves the tier in and the mix is refused."""
     env = {"BLASTBOX_POOL_RUNTIME": "cascade", "BLASTBOX_POOL_TIERS": "static:4,gvisor:2", **_WORKERS}
     host = _healthy(env=env)
-    host.commands[("/usr/bin/runsc", "--version")] = (1, "", "boom\n")
+    host.commands[("/usr/bin/runsc", "--version")] = (1, "", "config not found\n")
     checks = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False))
     assert checks["runsc"].status is not Status.PASS
     assert checks["pool-runtime"].status is Status.FAIL, checks["pool-runtime"].detail
+    host.commands[("/usr/bin/runsc", "help")] = (127, "", "lib missing\n")   # help fails too
+    checks = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False))
+    assert checks["pool-runtime"].status is Status.WARN, checks["pool-runtime"].detail
     host.executables.pop("runsc")                       # no binary: selector refuses, skipped
     checks = _by_name(pf.run_preflight(host, pf.resolve_tiers([], host.env), explicit=False))
     assert checks["pool-runtime"].status is Status.WARN, checks["pool-runtime"].detail

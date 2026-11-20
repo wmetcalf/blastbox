@@ -399,21 +399,26 @@ def _check_runsc_binary(host: HostView) -> Check:
     if path is None:
         return Check("runsc", Status.FAIL, f"runsc binary {name!r} not found/executable", doc)
     proc = host.run([path, "--version"])
-    if proc is None:
-        return Check("runsc", Status.FAIL, f"{path} --version did not run (spawn failure or "
-                     "timeout)", doc)
-    if proc.returncode != 0:
-        why = _first_line(proc.stderr) or _first_line(proc.stdout) or f"rc={proc.returncode}"
-        return Check("runsc", Status.FAIL, f"{path} --version failed: {why}", doc)
-    ver = _first_line(proc.stdout) or "version unknown"
     # The warm tier's own capability probe (gvisor_snapshot._default_cr_capable): `runsc help`
-    # must list both checkpoint and restore, else the tier is refused.
+    # must list both checkpoint and restore, else the tier is refused. Run it whatever --version
+    # says: it is the probe the dispatcher selects on, and --version is not.
     helped = host.run([path, "help"])
     text = (helped.stdout + helped.stderr) if helped is not None else ""
+    ver = "version unknown"
+    if proc is not None and proc.returncode == 0:
+        ver = _first_line(proc.stdout) or ver
     if "checkpoint" not in text or "restore" not in text:
         return Check("runsc", Status.FAIL,
                      f"{path} ({ver}) does not list checkpoint/restore in `runsc help`; the "
                      "gVisor warm tier needs both and refuses this build", doc)
+    # From here the selector admits the tier, so these FAILs are not startup gates.
+    admitted = {"admitted": True}
+    if proc is None:
+        return Check("runsc", Status.FAIL, f"{path} --version did not run (spawn failure or "
+                     "timeout)", doc, admitted)
+    if proc.returncode != 0:
+        why = _first_line(proc.stderr) or _first_line(proc.stdout) or f"rc={proc.returncode}"
+        return Check("runsc", Status.FAIL, f"{path} --version failed: {why}", doc, admitted)
     return Check("runsc", Status.PASS, f"{path}: {ver} (checkpoint/restore available)")
 
 
@@ -1418,7 +1423,7 @@ def _is_startup_gate(c: Check) -> bool:
     if c.name == "runsc":
         # GvisorSnapshotBackend.available() asks only for the binary and `runsc help` listing
         # checkpoint/restore; a failing `runsc --version` alone does not keep the tier out.
-        return "not found" in c.detail or "checkpoint/restore" in c.detail
+        return not (c.facts or {}).get("admitted")
     return c.name != "gvisor-rootfs"
 
 
