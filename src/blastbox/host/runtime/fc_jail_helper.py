@@ -1762,7 +1762,11 @@ class Helper:
         if tmp is None:
             raise RuntimeError(f"{parent}: no free private socket name (stray {prefix}* entries)")
         dir_fd = os.open(parent, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
-        srv = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        try:
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        except BaseException:
+            os.close(dir_fd)
+            raise
         try:
             # Through the directory's fd, under a short fixed-length name: only the configured
             # path has to fit sun_path (the clients connect by it), however long its parts.

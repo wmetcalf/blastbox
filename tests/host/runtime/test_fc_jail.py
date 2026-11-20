@@ -1357,3 +1357,17 @@ def _long_name_publishes(tmp_path):
     finally:
         helper._stop.set()
         t.join(5)
+
+
+def test_a_socket_that_cannot_be_created_leaks_no_directory_fd(tmp_path, monkeypatch):
+    (tmp_path / "run").mkdir(mode=0o750)
+    helper = _helper_for(tmp_path)
+
+    def _no_socket(*a, **k):
+        raise OSError(24, "Too many open files")
+    before = len(os.listdir("/proc/self/fd"))
+    monkeypatch.setattr(h.socket, "socket", _no_socket)
+    with pytest.raises(OSError, match="Too many"):
+        helper.serve()
+    monkeypatch.undo()
+    assert len(os.listdir("/proc/self/fd")) == before
