@@ -315,7 +315,8 @@ def _resolve_cold_blocker(env: Mapping[str, str], host: HostReader) -> str | Non
     # Only ENOENT is "no config" to the CLI (silently); EACCES, ENOTDIR, ELOOP ... it warns on,
     # so they are unknown -- whether or not config.json is a symlink.
     if raw is None and not _absent(host, path):
-        return "docker config.json exists but is not readable: current context unknown"
+        return f"docker config {path!r} could not be read (and is not simply absent): current " \
+               "context unknown"
     if raw is not None and len(raw) >= _READ_CAP:
         return "docker config.json too large to read whole: current context unknown"
     if raw is None or not raw.strip():

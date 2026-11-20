@@ -809,7 +809,7 @@ def test_existing_but_unreadable_docker_config_is_unknown():
     path = f"{_CFG}/config.json"
     host = FakeHost(files=UBUNTU, paths={path})          # exists, read() -> None
     st = cf.probe(host, env={"DOCKER_CONFIG": _CFG})
-    assert st.would_use("cold") == "none" and "not readable" in (st.cold_blocker or "")
+    assert st.would_use("cold") == "none" and "could not be read" in (st.cold_blocker or "")
 
 
 def test_dispatcher_honours_env_require_over_a_passed_auto_detection(tmp_path, monkeypatch):
@@ -864,8 +864,9 @@ def test_startup_log_reports_the_enforced_mode(tmp_path, monkeypatch, caplog):
     assert "mode=require" in line and "cold=selinux" in line
 
 
+@pytest.mark.parametrize("reader", ["dispatcher", "preflight"])
 @pytest.mark.parametrize("make", ["enotdir", "eloop", "dangling"])
-def test_symlinked_config_errors_match_the_cli(tmp_path, make):
+def test_symlinked_config_errors_match_the_cli(tmp_path, make, reader):
     """Only ENOENT (a dangling link) is no config; ENOTDIR / ELOOP through a link are unknown,
     as the CLI warns on them. Real files, the production reader."""
     cfg = tmp_path / "cfg"
@@ -878,5 +879,8 @@ def test_symlinked_config_errors_match_the_cli(tmp_path, make):
         (cfg / "config.json").symlink_to("loop/config.json")
     else:
         (cfg / "config.json").symlink_to(tmp_path / "missing.json")
-    blocker = cf._cold_blocker({"DOCKER_CONFIG": str(cfg)}, cf._SysReader())
+    host = cf._SysReader() if reader == "dispatcher" else pf.RealHost()
+    blocker = cf._cold_blocker({"DOCKER_CONFIG": str(cfg)}, host)
     assert (blocker is None) is (make == "dangling")
+    if blocker:
+        assert str(cfg / "config.json") in blocker and "exists" not in blocker
