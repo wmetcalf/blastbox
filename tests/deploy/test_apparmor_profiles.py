@@ -307,31 +307,20 @@ def test_the_mediation_check_tells_the_spellings_apart(extra: str, mediated: boo
 _CANONICAL_UMOUNT = ("audit deny umount /,", "audit deny umount /**,")
 
 
-def _strip_comments(text: str) -> str:
-    """The profile without comments: `#` starts one only outside a quoted string."""
-    out = []
-    for line in text.splitlines():
-        quoted, cut = False, len(line)
-        for i, ch in enumerate(line):
-            if ch == '"':
-                quoted = not quoted
-            elif ch == "#" and not quoted:
-                cut = i
-                break
-        out.append(line[:cut])
-    return "\n".join(out)
-
-
 def _umount_rules_ok(text: str) -> bool:
-    """A strict allowlist rather than a re-implementation of the parser: outside comments,
-    `umount` (and its synonym `unmount`) may appear ONLY in the two canonical denies, each
-    alone on its line. Any other umount rule -- however spelled -- must first be checked
-    against the compiled DFA on a parser <= 4.0.x and then added here deliberately."""
-    body = _strip_comments(text)
-    mentions = re.findall(r"\b(?:umount|unmount)\b", body)
-    lines = [ln.strip() for ln in body.splitlines()]
+    """A strict allowlist rather than a re-implementation of the parser's lexer. Only whole-line
+    comments are allowed (a rule line holds no `#` and no quote, so nothing can hide behind an
+    inline comment, inside a quoted string, or across lines), and outside them `umount` (or its
+    synonym `unmount`) may appear ONLY in the two canonical denies, each alone on its line. Any
+    other umount rule -- however spelled -- must first be checked against the compiled DFA on a
+    parser <= 4.0.x and then added here deliberately."""
+    rules = [ln for ln in text.split("\n") if not ln.lstrip().startswith("#")]
+    if any("#" in ln or '"' in ln for ln in rules):
+        return False
+    mentions = re.findall(r"\b(?:umount|unmount)\b", "\n".join(rules))
+    stripped = [ln.strip() for ln in rules]
     return len(mentions) == len(_CANONICAL_UMOUNT) and all(
-        lines.count(rule) == 1 for rule in _CANONICAL_UMOUNT)
+        stripped.count(rule) == 1 for rule in _CANONICAL_UMOUNT)
 
 
 def test_umount_denies_are_spelled_with_a_path() -> None:
@@ -339,8 +328,9 @@ def test_umount_denies_are_spelled_with_a_path() -> None:
     the compiled check cannot see the bug (a umount deny that can match the empty mountpoint
     unmediates the mount class on apparmor_parser <= 4.0.x)."""
     assert _umount_rules_ok((_PROFILE_DIR / "blastbox-sandbox").read_text()), (
-        f"blastbox-sandbox may contain no umount rule but {_CANONICAL_UMOUNT}: check any "
-        "other against the compiled DFA (test_the_child_profile_mediates_the_mount_class on a "
+        f"blastbox-sandbox may contain no umount rule but {_CANONICAL_UMOUNT}, and no inline "
+        "comment or quoted string on a rule line: check any other umount rule against the "
+        "compiled DFA (test_the_child_profile_mediates_the_mount_class on a "
         "<= 4.0.x parser) and extend _CANONICAL_UMOUNT deliberately"
     )
 
@@ -355,6 +345,10 @@ def test_umount_denies_are_spelled_with_a_path() -> None:
     "  audit deny pivot_root, audit deny umount /,",
     "  audit deny\n    umount,",
     "  umount,",
+    "  /tmp/#x r, audit deny umount,",
+    '  "/tmp/a\\"#" r, audit deny umount,',
+    '  "/tmp/a\n#" r, audit deny umount,',
+    "  /tmp/a\x0c# r, audit deny umount,",
 ])
 def test_the_text_guard_rejects_any_other_umount_rule(extra: str) -> None:
     text = (_PROFILE_DIR / "blastbox-sandbox").read_text().replace(
