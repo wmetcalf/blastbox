@@ -1,0 +1,55 @@
+schema = "blastbox-engine-contract/1"
+
+[engine]
+name = "rea-agent"
+formats = ["*"]
+network = ["httpproxy"]
+statuses = ["ok", "rejected"]
+
+[[artifacts]]
+id = "transcript"
+path = "transcript.jsonl"
+kind = "report"
+required = true
+role = "model_transcript"
+description = "Model/tool-call transcript for the pass (warning transcript_truncated when capped)."
+
+[[artifacts]]
+id = "continuation"
+path = "*"
+kind = "rea_continuation"
+role = "continuation"
+description = "Ghidra project bundle for the next pass; absent on a final pass or when over the artifact budget."
+
+[payload]
+root = "record"
+node_types = ["record"]
+schema_field = "schema"
+schema_version = "rea.pass/1"
+required_root_fields = ["pass_no", "model", "model_status", "steps", "refused_calls", "tool_calls", "functions", "iocs", "summary", "done", "more_pending"]
+
+[[detections]]
+code = "rea.analysis"
+severity = "info"
+source = "payload.fields.analysis_report (rea.analysis/1 JSON text, present when model_status is ok)"
+description = "Model-written report; findings are evidence-linked claims, not verdicts until verified."
+
+[[detections]]
+code = "rea.ioc"
+severity = "info"
+source = "payload.fields.iocs (parallel columns type/value/source/verified/reason)"
+description = "Model-proposed IOCs; only verified=true ones were found in the sample."
+
+[[gaps]]
+id = "egress-model-only"
+description = "Egress is the rea_model netpolicy (httpproxy driver) to the model gateway only; a mis-spelled policy name resolves to none and the pass ends model_unavailable."
+
+[[gaps]]
+id = "rejected-payload"
+description = "A rejected job seals a Record with schema and error only; the pass fields are absent."
+
+[[consumers]]
+name = "loadout"
+engine = "rea-agent"
+mapper = "backend/loadout/engines.py"
+emits = ["detection"]

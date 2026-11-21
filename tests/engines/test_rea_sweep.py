@@ -927,3 +927,11 @@ def test_signatures_scan_extracted_members(tmp_path):
     scan = FakeSignatures()
     _run(_zip(tmp_path / "a.zip"), tmp_path, runner=factory(extract_fn=extract), signatures=scan)
     assert scan.calls[0]["labels"] == ["sample", "member:member-0", "member:member-1", "member:member-2"]
+
+
+def test_sweep_result_conforms_to_its_engine_contract(tmp_path: Path, _workdir: Path) -> None:
+    from blastbox.contract.engine_contract import check_result, load_contract
+    c = load_contract(Path(__file__).resolve().parents[2] / "src" / "blastbox" / "engines"
+                      / "contracts" / "rea.toml")
+    res, _out, _g = _run(FIXTURES / "sample.exe", tmp_path)
+    assert check_result(c, res) == []

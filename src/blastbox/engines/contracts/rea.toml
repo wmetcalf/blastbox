@@ -1,0 +1,66 @@
+schema = "blastbox-engine-contract/1"
+
+[engine]
+name = "rea"
+formats = ["*"]
+network = ["none"]
+
+[[artifacts]]
+id = "report"
+path = "report.json"
+kind = "report"
+required = true
+role = "sweep_report"
+description = "Full rea.report/1 JSON (inspect, IOCs, capabilities, hidden payloads, emulation, signatures)."
+
+[[artifacts]]
+id = "member-*"
+path = "members/*"
+kind = "extracted"
+max_count = 0
+role = "extracted_member"
+description = "Files unwrapped from installers, UPX, emulated stages or hidden .NET payloads (warning members_capped / member_dropped when over budget)."
+
+[[artifacts]]
+id = "icon-*"
+path = "*"
+kind = "icon"
+max_count = 8
+role = "icon"
+description = "Extracted PE/app icons (MAX_ICONS)."
+
+[[artifacts]]
+id = "continuation"
+path = "*"
+kind = "rea_continuation"
+role = "continuation"
+description = "Ghidra project bundle for the rea-agent passes; absent when no model pass can follow (chain_stop) or it exceeded the artifact budget."
+
+[payload]
+root = "record"
+node_types = ["record"]
+schema_field = "schema"
+schema_version = "rea.report/1"
+required_root_fields = ["kind", "inspect", "ghidra_status", "members", "icons", "more_pending", "iocs_total", "iocs"]
+
+[[detections]]
+code = "rea.ioc"
+severity = "info"
+source = "payload.fields.iocs (parallel columns type/value/source; iocs_total is the true count, warning iocs_capped)"
+description = "Indicators extracted from strings, emulation and unwrapped layers."
+
+[[detections]]
+code = "rea.capability"
+severity = "info"
+source = "payload.fields.capabilities (parallel columns rule/namespace/attack; present when capa ran)"
+description = "capa rule matches with ATT&CK mapping."
+
+[[gaps]]
+id = "label-not-verdict"
+description = "detected is a magic-byte classification with confidence 0.0, not a verdict; the verdict comes from the rea-agent report."
+
+[[consumers]]
+name = "loadout"
+engine = "rea"
+mapper = "backend/loadout/engines.py"
+emits = ["detection", "artifact"]
