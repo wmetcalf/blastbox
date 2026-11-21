@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>LoadoutFixture</AssemblyName>
+    <Deterministic>true</Deterministic>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+</Project>

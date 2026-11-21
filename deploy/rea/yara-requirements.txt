@@ -1,0 +1,9 @@
+# YARA-X (VirusTotal's Rust rewrite of YARA) for the sweep's signature step (signatures.py /
+# signatures_runner.py), wheel only, pinned by sha256. The REA cold-worker image installs it with
+# pip --require-hashes --no-deps --only-binary :all: into its own venv (/opt/yara) on the image's
+# python3 (3.14). One abi3 manylinux_2_28 x86_64 wheel, no runtime dependencies.
+# yara-x, not yara-python: yara-python 4.5.4 (2025-05) has no CPython 3.14 or abi3 wheel. 1.22.1
+# (2026-10-26) is the newest release at least two weeks old.
+# Regenerate in the base image: pip download --only-binary :all: --no-deps -d w yara-x==<ver>
+yara-x==1.22.1 \
+    --hash=sha256:5dcb9db77784f0ad62460506923031673e0aadc525c1a5d25e53965a7f91587f

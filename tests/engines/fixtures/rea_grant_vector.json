@@ -1,0 +1,16 @@
+{
+  "note": "Synthetic cross-repo test vector; all key material is fake.",
+  "gateway_private_key_b64url": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "gateway_public_key_b64url": "j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF8",
+  "ephemeral_private_key_b64url": "ZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1-f4CBgoM",
+  "nonce_hex": "c8c9cacbcccdcecfd0d1d2d3",
+  "claims": {
+    "v": 1,
+    "job": "job-vector-0001",
+    "provider": "openrouter",
+    "model": "vendor/synthetic-model",
+    "key": "sk-or-v1-SYNTHETIC-TEST-VECTOR-NOT-A-REAL-KEY",
+    "exp": 1893456000
+  },
+  "token": "g1.fZwkMWU5glwYluV_KBl3Rnk85gy-461H2p0HuF-lXirIycrLzM3Oz9DR0tO4k2dIIpa_1R7kQ5AAvQDxtyHWiaezppshXSXbuKn8J0A3GtTRSEl2BjYu0_Iv1w1rJ2R6bbLxm-eESDwMWFOAaRpQj5l2B3o1cFZF_uHsNGX7-ubGUqZi53CdzU89I1mrG9NegRXeoaBWRAxZqqwwptHlWh919UppvjMN3WF6xL5P7OGSXnagNPZDeod8cMu1goChTOCH8kqzy6qmHYd1KRnJIeqjjvGOfOd-i4MZ"
+}

@@ -74,6 +74,12 @@ clamav = [
 magika = [
     "magika>=1.0.0",
 ]
+# The REA (reverse-engineering) engine's in-worker helpers: PE resource/icon parsing and
+# icon decoding. Worker-image only (deploy/docker/Dockerfile.rea-cold-worker).
+rea = [
+    "pefile==2024.8.26",
+    "Pillow==13.0.0",
+]
 dev = [
     "blastbox[host]",              # the http/ingress tests need the host stack (fastapi, etc.)
     "blastbox[clamav]",
@@ -82,6 +88,10 @@ dev = [
     # singleton, the identify() wrapper, onnxruntime version handling — is never
     # executed by anything, and the asymmetry is invisible in "N passed / M skipped".
     "blastbox[magika]",
+    "blastbox[rea]",               # tests/engines/test_rea_icons.py needs pefile+Pillow; must not skip in CI
+    # tests/engines/test_rea_dotnet_resources.py runs the resource scanner in-process. In the worker
+    # image dnfile comes from the capa venv (deploy/rea/capa-requirements.txt, same version).
+    "dnfile==0.18.0",
     "pytest>=8.0.0",
     "mypy>=1.9.0",
     # 0.16 expanded ruff's default rule set -> 244 pre-existing violations across the
@@ -106,7 +116,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 # PEP 561: ship the typing marker so consumers (e.g. ClippyShot) get types.
-blastbox = ["py.typed", "engines/contracts/*.toml"]
+blastbox = ["py.typed", "engines/contracts/*.toml", "engines/rea/data/*.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

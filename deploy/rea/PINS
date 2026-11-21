@@ -1,0 +1,129 @@
+# Pins for deploy/docker/Dockerfile.rea-cold-worker. The Dockerfile ARG defaults
+# are the source of truth; this file records them, and why, in one place.
+# Keep both in sync. Evidence for each pin is in SPIKE.md.
+
+# REA, built from source. Will chose a source build because the newest npm
+# release (rea-agents 6.8.0) lacks the existing-project reuse mode
+# (REA_GHIDRA_PROJECT_PATH / REA_GHIDRA_PROGRAM_NAME). The build self-reports
+# "6.8.0", so it is identified by commit, tarball digest and catalog digest.
+REA_COMMIT=d74549e495c58eb4a560279fd9f05508401ea0a0
+REA_TARBALL_URL=https://codeload.github.com/morluto/rea/tar.gz/d74549e495c58eb4a560279fd9f05508401ea0a0
+REA_TARBALL_SHA256=325bd045b0f065ef8d78477a8570f3c180e74f640ca9d91fc8b6df6573798cd9
+REA_TOOLS_SHA256=b3054fab57a222a4690d93cdba88805d7cbd2e6c0279dd596eecf213030c3797
+
+# Node: REA requires ^22.23.4 || ^24.22.1 || >=26.12.1.
+NODE_VERSION=v22.23.4
+NODE_TARBALL_SHA256=1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce
+
+# Ghidra 12.1.4 PUBLIC 20260921
+GHIDRA_URL=https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1.4_build/ghidra_12.1.4_PUBLIC_20260921.zip
+GHIDRA_SHA256=ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db
+
+# JDK 21 (Temurin 21.0.13+9, Ubuntu 26.04.1, linux/amd64). A full JDK, not a JRE:
+# Ghidra compiles Java GhidraScripts (REA's bridge and our ghidra_scripts) at run
+# time with the in-process javax.tools compiler, which a JRE lacks.
+JDK_IMAGE=eclipse-temurin:21-jdk@sha256:ebfbb18d11ff163ee83b21258acf12248af48d22a0fdfdc68fa1a1516c05976a
+
+# upx-ucl from the base image's Ubuntu archive (the sweep upx -d-s UPX-marked samples).
+UPX_VERSION=4.2.4-1.1build1
+
+# Installer unwrapping (installer.py). The base image's archive is Ubuntu 26.04 "resolute"
+# (not noble): versions read with `apt-cache policy` inside JDK_IMAGE on 2026-11-09.
+# 7-Zip's NSIS handler extracts files only (no [NSIS].nsi since 15.05); the sweep decodes the
+# script's string table itself, and carves the archive itself when its signature was altered so
+# that 7-Zip lists nothing (installer.nsis_carve).
+SEVENZIP_VERSION=26.00+dfsg-1
+# Inno Setup: Binary Refinery's xtinno parser in its own venv (/opt/refinery, the Dockerfile's
+# refinery stage), run by inno_unwrap.py. It replaced innoextract 1.9 (the latest release), which
+# rejects current Inno Setup and returned nothing for a live 6.7.0 installer; xtinno reads through 7.x
+# and also disassembles the compiled [Code] script. 0.11.3 (2026-10-26) is sdist-only on PyPI; its
+# setup.py imports the package and every optional dependency, so nothing is built: the
+# sha256-checked sdist's pure-Python refinery/ tree is unpacked into the venv (the Cython
+# accelerators are optional and left out). Only what xtinno imports is installed, hash-locked in
+# refinery-requirements.txt: defusedxml 0.7.1, pure-magic-rs 0.5.1 and pycryptodomex 3.24.1 (the
+# releases before the current 0.6.0 / 3.24.2, which were days old on 2026-11-10). The rest of
+# Refinery's declared dependencies (lief, msgpack, colorama, toml...) serve units the sweep never
+# loads and are absent on purpose, so the stage has no `pip check`.
+# There is NO benign Inno Setup fixture (the compiler is Windows-only): the build smoke proves the
+# parser imports and that a non-Inno file is refused; extraction was verified in the sandboxed lab
+# on a live Inno 6.7.0 installer, and the tests feed inno_unwrap synthetic member lists.
+REFINERY_VERSION=0.11.3
+REFINERY_SDIST_URL=https://files.pythonhosted.org/packages/3d/4a/0bd600f4f86f33bdf7bdc60d332a5cc33a2f9b8411a0eedec26ce8203164/binary_refinery-0.11.3.tar.gz
+REFINERY_SDIST_SHA256=8b5bf2113939cb1e2b8ca234ba40bef07aff87a33685dfcbdc7105d59675a520
+# Fixture regeneration only (rea-fixtures stage builds deploy/rea/fixtures/installer.exe).
+NSIS_VERSION=3.10-2ubuntu2
+
+# capa 10.0.0 (flare-capa wheel + deps, hash-locked in capa-requirements.txt), with the
+# same release's rules (capa-rules tag) and FLIRT signatures (capa tag, sigs/ only).
+CAPA_VERSION=10.0.0
+# The .NET resource scan (dotnet_resources.py) runs under /opt/capa/bin/python and uses the
+# capa venv's hash-locked dnfile==0.18.0 (capa-requirements.txt); nothing new is installed.
+# Its fixture deploy/rea/fixtures/dotnet.dll is built by fixtures/dotnet/build.sh in
+# mcr.microsoft.com/dotnet/sdk@sha256:341aa6e8bbaceb1194732328ca27c15bfa9c531687db83a66af3c0c1833f5534
+CAPA_RULES_URL=https://codeload.github.com/mandiant/capa-rules/tar.gz/refs/tags/v10.0.0
+CAPA_RULES_SHA256=3d14dbdaf5b71731e42395ed5fa4d287418e6a2e5d6b0a348c7fd9fbe1699611
+CAPA_SRC_URL=https://codeload.github.com/mandiant/capa/tar.gz/refs/tags/v10.0.0
+CAPA_SRC_SHA256=d3f6006ad61e6591896f524566c191eca89c6220611969e1bd485bd9a1098180
+
+# Emulated unpacking (emulate.py / emulate_runner.py): Speakeasy in its own hash-locked venv
+# (/opt/speakeasy, the Dockerfile's speakeasy stage). Wheels + sha256 in speakeasy-requirements.txt.
+# 2.0.0b9 (2026-10-11) is a pre-release: the last stable 1.5.11 (2022) pins unicorn==1.0.2 and does
+# not support Python 3.14 (the base image's python). Its unicorn pin is >=2.1.4; 2.1.4 is used.
+# pycryptodome 3.24.1 (mature 3.x line; 4.x was weeks old). pydantic/rich/pefile and their
+# dependencies are the same versions and hashes as capa-requirements.txt.
+SPEAKEASY_VERSION=2.0.0b9
+SPEAKEASY_WHEEL_SHA256=cfec1403da9537922eeaea09d912bb5f8bda5b4bdc9cf7a4d53ee440b2a1dccf
+UNICORN_VERSION=2.1.4
+UNICORN_WHEEL_SHA256=9d6e6dea140560de4ebd8446661f7ef84a357d428c14a3ef09dacd306ec8c239
+CAPSTONE_VERSION=5.0.9
+PYCRYPTODOME_VERSION=3.24.1
+# lznt1 (Speakeasy dependency, pure Python, sdist only on PyPI): built into a wheel in the speakeasy
+# stage from this sdist with the hash-locked setuptools in speakeasy-build-requirements.txt
+# (setuptools 84.2.1, build stage only).
+LZNT1_SDIST_URL=https://files.pythonhosted.org/packages/72/c2/087cd4845836f0eddd17cb4e99f92f4ef2087074de6e0ca8253f47e83524/lznt1-0.2.tar.gz
+LZNT1_SDIST_SHA256=fdc59b57d462003038d572b17e165aa3c8f91a33df68948a344969a2896bc2ea
+SETUPTOOLS_BUILD_VERSION=84.2.1
+# Fixtures (rea-fixtures stage, gcc-mingw-w64-x86-64 as before): unpack.exe / unpack.dll (decrypt the
+# benign sample.exe into VirtualAlloc'd memory, map it, make it RX, run 54 bytes of shellcode, call
+# WinINet with run-time-decrypted strings) and peb.exe (no imports; PEB walk + ror13 hashes).
+
+# Signatures (signatures.py / signatures_runner.py): YARA-X in its own hash-locked venv (/opt/yara,
+# the Dockerfile's yara stage). Wheel + sha256 in yara-requirements.txt (one abi3 manylinux_2_28
+# x86_64 wheel, no runtime dependencies). yara-x, not yara-python: yara-python's newest release
+# (4.5.4, 2025-05) has no CPython 3.14 or abi3 wheel. 1.22.1 (2026-10-26) is the newest yara-x
+# release at least two weeks old (1.23.0 was 5 days old when chosen).
+YARA_X_VERSION=1.22.1
+YARA_X_WHEEL_SHA256=5dcb9db77784f0ad62460506923031673e0aadc525c1a5d25e53965a7f91587f
+# Rules: CAPEv2's family rules, data/yara/CAPE (114 files, 143 rules at this commit), fetched at
+# image build from the codeload tarball of this commit (the newest commit touching data/yara/CAPE,
+# 2026-09-22, "Defendnot yara") and sha256-checked; NOT vendored in this repository. Licence:
+# CAPEv2 is GPL-3.0 (its LICENSE file, kept in the image as /opt/yara/CAPE-LICENSE); the rules are
+# used unmodified, compiled at build into /opt/yara/cape.yarx (YARA-X serialized rules, loaded per
+# job; tied to the YARA-X version that wrote them). Each file is compiled alone first and skipped
+# if it fails; the build fails under CAPE_RULES_MIN rules. At this commit all 114 files / 143
+# rules compile under YARA-X 1.22.1 (relaxed_re_syntax); /opt/yara/cape-compile.json records it.
+CAPE_COMMIT=5ee1155a30c46e50c0f1cb6272c724979a1d61bf
+CAPE_TARBALL_SHA256=680ecbf561c4d5326082a52159d054e5aeec5917833f357e3beadbe5b7631219
+CAPE_RULES_MIN=135
+
+# .NET decompile (dotnet_decompile.py): ILSpy's command-line front end on the .NET runtime, in the
+# Dockerfile's ilspy stage, copied to /opt/dotnet and /opt/ilspycmd. Run as
+# `/opt/dotnet/dotnet /opt/ilspycmd/ilspycmd.dll` (no SDK, no `dotnet tool install`, no network at run
+# time; ilspycmd's own update check is turned off with --disable-updatecheck on every call).
+# ilspycmd 11.1.0.9782 (nuget.org, published 2026-09-23; ICSharpCode.Decompiler 11.1.0.9782): the
+# release before 11.2.0.10050, which was 14 days old on 2026-11-10. Targets net10.0. The .nupkg is a
+# zip; its tools/net10.0/any tree is unpacked as-is (XML API docs, .pdb and Windows-only runtimes/win
+# dropped). ILSPYCMD_SHA512 is nuget.org's packageHash for the package (catalog entry
+# 2026.09.23.06.00.50), checked with sha512sum.
+ILSPYCMD_VERSION=11.1.0.9782
+ILSPYCMD_URL=https://api.nuget.org/v3-flatcontainer/ilspycmd/11.1.0.9782/ilspycmd.11.1.0.9782.nupkg
+ILSPYCMD_SHA512=17b0a5bbfad858fb7d7c29432f3660597234376fd1b78e2de6d3ae90e61466dd6d23c930653098f3311956022bede4e425086e645256e9127c1f34429709c842
+# .NET runtime 10.0.14 (Microsoft.NETCore.App only, linux-x64; 2026-10-25, a security release, 16 days
+# old on 2026-11-10). DOTNET_RUNTIME_SHA512 is the hash Microsoft publishes for the file in
+# https://dotnetcli.blob.core.windows.net/dotnet/release-metadata/10.0/releases.json. Needs only libc,
+# libstdc++, libgcc_s and zlib (all in the base image); no ICU (invariant globalization).
+DOTNET_RUNTIME_VERSION=10.0.14
+DOTNET_RUNTIME_URL=https://builds.dotnet.microsoft.com/dotnet/Runtime/10.0.14/dotnet-runtime-10.0.14-linux-x64.tar.gz
+DOTNET_RUNTIME_SHA512=634326028645f38731c8c4e71a68356e4ca0d6b6607139a234ab760687f742063edaf33a1f20dda615742d2dc8300ca2ff857619d51fbb38090383b71334af89
+# Image size added: /opt/dotnet 80 MB + /opt/ilspycmd 9.1 MB (lab image blastbox-rea:lab-il vs
+# blastbox-rea:dev-f5ee252: 3.54 GB vs 3.41 GB on disk as reported by `docker images`).

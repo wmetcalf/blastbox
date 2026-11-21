@@ -1,0 +1,52 @@
+# rea-bb api + dispatcher image (`blastbox-rea-host:<tag>`): `blastbox serve` (ingress) or
+# `blastbox dispatch` (claims queued rea / rea-agent jobs and starts one cold worker container
+# per job through docker-socket-proxy). Pure-Python host: no JVM, Ghidra or REA here; those live
+# only in the worker image (deploy/docker/Dockerfile.rea-cold-worker).
+#
+# Built from the LOCAL source tree so the host carries the httpproxy `bridge=` key
+# (feat/netpolicy-httpproxy-bridge) that the rea_model personality needs. On toolz2 the tree is
+# the local merge branch deploy/rea-toolz2 (feat/rea-engine + the bridge branch); see README.md.
+#
+# Build context = blastbox repo root:
+#   docker build -f deploy/rea/Dockerfile.host -t blastbox-rea-host:<tag> .
+ARG BASE_IMAGE=python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Docker CLI only: the dispatcher shells out to `docker run/kill/info/network inspect` and
+# reaches the daemon solely through docker-socket-proxy over TCP (DOCKER_HOST). No socket bind.
+RUN apt-get update -qq \
+    && apt-get install -y --no-install-recommends curl ca-certificates gnupg tini \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+    && gpg --show-keys --with-colons /etc/apt/keyrings/docker.gpg | grep -q '9DC858229FC7DD38854AE2D88D81803C0EBFCD88' \
+        || { echo 'FATAL: docker apt signing key fingerprint mismatch' >&2; exit 1; } \
+    && chmod a+r /etc/apt/keyrings/docker.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list \
+    && apt-get update -qq \
+    && apt-get install -y --no-install-recommends docker-ce-cli \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 blastbox \
+    && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin blastbox
+
+WORKDIR /build
+COPY pyproject.toml README.md /build/
+COPY src /build/src
+RUN python3 -m venv /opt/blastbox \
+    && /opt/blastbox/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/blastbox/bin/pip install --no-cache-dir "/build[host]" \
+    && rm -rf /build \
+    && /opt/blastbox/bin/python -c "import blastbox.host.ingress.app, blastbox.host.dispatch; \
+from blastbox.host.netapply import BRIDGE_NAME_RE; assert BRIDGE_NAME_RE.fullmatch('bb-rea-model'); \
+print('rea host ok')"
+
+ENV PATH=/opt/blastbox/bin:$PATH \
+    BLASTBOX_ALLOWED_ENGINES=rea,rea-agent
+USER 10001:10001
+WORKDIR /var/lib/blastbox
+ENTRYPOINT ["/usr/bin/tini", "--", "blastbox"]
+CMD ["serve", "--host", "0.0.0.0", "--port", "8000"]
+LABEL org.opencontainers.image.title="blastbox-rea-host" \
+      org.opencontainers.image.description="blastbox ingress/dispatcher for the REA engines (rea, rea-agent)"

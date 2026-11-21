@@ -1,0 +1,9 @@
+# Hash-locked wheels for the model-gateway image (model-gw/Dockerfile): `cryptography` and its
+# two runtime dependencies, nothing else. Linux x86_64, CPython 3.13. Installed with
+# pip --require-hashes --no-deps --only-binary :all:.
+cryptography==50.0.2 \
+    --hash=sha256:4061c0079120205fb760c58acab6443e217307dcf05e3702cf970e0689972856
+cffi==2.1.1 \
+    --hash=sha256:a931079504ecc49efed7744c476a5c343a92fabf66dec2db95edb1b2fdc770e2
+pycparser==3.12 \
+    --hash=sha256:a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e
