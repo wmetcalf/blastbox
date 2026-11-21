@@ -2120,6 +2120,36 @@ def test_net_egress_env_reflects_personality(tmp_path, monkeypatch):
     assert run_with("none") == "0"     # sealed → isolate
 
 
+def test_cold_worker_gets_the_hosts_output_caps(tmp_path):
+    """The cold worker's harness builds Limits.from_env(): forward the host-owned output caps so an
+    engine sizes its payload/artifacts to the cap the host trust gate will enforce. A job param
+    can't set them: the BLASTBOX_ prefix is reserved and dropped by _sanitize_params."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    job.params = {"BLASTBOX_MAX_METADATA": "1"}
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    launched: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        launched.append(list(argv))
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    limits = Limits(max_metadata_bytes=123_456_789, max_artifact_bytes=2_000_000,
+                    max_total_artifact_bytes=3_000_000, max_artifacts=77)
+    d = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    d._limits = limits
+    d.dispatch_once()
+    argv = next(a for a in launched if a[:2] == ["docker", "run"])
+    env = dict(t.split("=", 1) for t in argv if t.startswith("BLASTBOX_MAX_"))
+    assert env == {"BLASTBOX_MAX_METADATA": "123456789", "BLASTBOX_MAX_ARTIFACT": "2000000",
+                   "BLASTBOX_MAX_TOTAL_ARTIFACTS": "3000000", "BLASTBOX_MAX_ARTIFACTS": "77"}
+
+
 def test_socks_personality_labels_worker_for_wiring_and_uses_bb_socks(tmp_path, monkeypatch):
     """A socks personality → worker on bb-socks (internal) + labeled blastbox.net.wire=socks."""
     monkeypatch.setenv(
