@@ -12,6 +12,7 @@ import copy
 import json
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -1163,6 +1164,205 @@ def test_requeue_grace_window(tmp_path):
     assert store.get(fresh.job_id).status == JobStatus.RUNNING
 
 
+def test_requeue_skips_cold_job_this_dispatcher_is_still_finishing(tmp_path):
+    """The maintenance sweep must not requeue a cold job one of THIS dispatcher's own threads is
+    still working on.
+
+    `docker ps` lists RUNNING containers only, so from the moment a worker exits until its owner
+    thread writes the terminal status -- container auto-removal, output size cap, trust
+    validation, sealing, upload -- the job is RUNNING in the store and absent from `docker ps`.
+    Past the grace window the sweep called that "worker container disappeared" and requeued it out
+    from under its live owner: the re-claim wipes output/ and either collides on the container
+    name (job FAILED on a missing metadata.json) or runs the same untrusted sample a second time.
+    Seen on a live stack as 3 of ~45 jobs, each requeued 94-142 s after launch.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    swept: list[int] = []
+    holder: dict[str, Dispatcher] = {}
+
+    def fake_runner(argv, **kw):
+        if "ps" in argv:
+            # The worker has exited: no running container carries this job's label.
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if "run" in argv:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+            # A long-running worker: the grace window is well behind us when it exits...
+            store.update(job.job_id, started_at=time.time() - 600)
+            # ...and the maintenance tick lands before the owner thread has finished the job.
+            swept.append(holder["d"].requeue_orphaned_jobs())
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    holder["d"] = dispatcher
+    assert dispatcher.dispatch_once() is True
+
+    assert swept == [0], "the sweep must have run mid-dispatch and requeued nothing"
+    final_job = store.get(job.job_id)
+    assert final_job is not None
+    assert final_job.status == JobStatus.DONE
+    assert "requeued: worker container disappeared" not in final_job.security_warnings
+
+
+def test_requeue_still_recovers_a_cold_job_once_its_dispatch_has_returned(tmp_path):
+    """The in-flight exclusion ends with the dispatch: a job left RUNNING after its owner thread
+    has returned (or by a dispatcher that is gone) is still an orphan and is still requeued."""
+    store = InMemoryJobStore()
+    done = _make_job()
+    done.input_sha256 = _INPUT_SHA
+    store.create(done)
+    _setup_job_dirs(tmp_path, done)
+    output_dir = tmp_path / done.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        if "run" in argv:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    assert dispatcher.dispatch_once() is True
+    assert store.get(done.job_id).status == JobStatus.DONE
+
+    # Same job id, RUNNING again with no live owner: nothing may remember it as in flight.
+    store.update(done.job_id, status=JobStatus.RUNNING, started_at=time.time() - 600)
+    assert dispatcher.requeue_orphaned_jobs() == 1
+    assert store.get(done.job_id).status == JobStatus.QUEUED
+
+
+def test_requeue_keeps_a_reclaimed_job_in_flight_after_its_stale_holder_returns(tmp_path):
+    """In flight is per CLAIM, not per job id. Two threads of one dispatcher can hold the same
+    job: A on a claim that has since been requeued, B on the re-claim. A returning must not
+    unregister B's claim, or this process's own sweep requeues the job B is still finishing."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    a_exited, a_go = threading.Event(), threading.Event()
+    b_exited, b_go = threading.Event(), threading.Event()
+
+    def fake_runner(argv, **kw):
+        if "run" in argv:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+            if threading.current_thread().name == "A":
+                a_exited.set()
+                assert a_go.wait(10)
+            else:
+                store.update(job.job_id, started_at=time.time() - 600)  # a long-running worker
+                b_exited.set()
+                assert b_go.wait(10)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    ta = threading.Thread(target=dispatcher.dispatch_once, name="A")
+    ta.start()
+    assert a_exited.wait(10)
+    # A's claim is requeued from under it (a peer's sweep, or A's own warm-requeue backoff)...
+    first_claim = store.get(job.job_id).claim_id
+    assert store.update_if_status(
+        job.job_id, JobStatus.RUNNING, expect_claim_id=first_claim, status=JobStatus.QUEUED,
+        claim_id=None, started_at=None, worker_runtime=None, worker_tier=None)
+    # ...and another thread of this dispatcher claims the job again.
+    tb = threading.Thread(target=dispatcher.dispatch_once, name="B")
+    tb.start()
+    assert b_exited.wait(10)
+    second_claim = store.get(job.job_id).claim_id
+    assert second_claim not in (None, first_claim)
+    a_go.set()
+    ta.join(10)
+    assert not ta.is_alive()  # the stale holder has returned; B still holds the job
+
+    assert dispatcher.requeue_orphaned_jobs() == 0
+    held = store.get(job.job_id)
+    assert held.status == JobStatus.RUNNING and held.claim_id == second_claim
+
+    b_go.set()
+    tb.join(10)
+    assert not tb.is_alive()
+    assert "requeued: worker container disappeared" not in store.get(job.job_id).security_warnings
+
+
+def test_requeue_recovers_a_cold_job_whose_owner_thread_is_stuck(tmp_path):
+    """The in-flight exemption is bounded in time, like the warm deadline. An owner thread wedged
+    before launch (a `docker info` that never returns) holds its job with no container; past
+    `worker_timeout_s + requeue_grace_s` without progress the sweep takes the job back."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    entered, release = threading.Event(), threading.Event()
+
+    def stuck_selector():
+        entered.set()
+        release.wait(30)
+        return _fake_runtime()
+
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, runtime_selector=stuck_selector, worker_timeout_s=30,
+        subprocess_runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
+    owner = threading.Thread(target=dispatcher.dispatch_once, daemon=True)
+    owner.start()
+    try:
+        assert entered.wait(10)
+        store.update(job.job_id, started_at=time.time() - 3600)
+        # Held, and inside the bound: still the owner's.
+        assert dispatcher.requeue_orphaned_jobs() == 0
+        assert store.get(job.job_id).status == JobStatus.RUNNING
+        # No progress for longer than a worker may run plus the grace window: an orphan.
+        with dispatcher._inflight_lock:
+            for key in dispatcher._inflight:
+                dispatcher._inflight[key] -= 30 + dispatcher._requeue_grace_s + 1
+        assert dispatcher.requeue_orphaned_jobs() == 1
+        assert store.get(job.job_id).status == JobStatus.QUEUED
+    finally:
+        release.set()
+        owner.join(10)
+
+
+def test_cold_in_flight_bound_restarts_when_the_worker_exits(tmp_path):
+    """A worker may use its whole timeout, so the bound is measured from the last progress: the
+    worker's exit restarts it, and the owner gets a full window to validate, seal and upload."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    swept: list[int] = []
+    holder: dict[str, Dispatcher] = {}
+
+    def fake_runner(argv, **kw):
+        if "run" in argv:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+            store.update(job.job_id, started_at=time.time() - 600)
+            d = holder["d"]
+            with d._inflight_lock:  # the worker ran for all of its timeout, and then some
+                for key in d._inflight:
+                    d._inflight[key] -= 30 + d._requeue_grace_s + 1
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner, worker_timeout_s=30)
+    holder["d"] = dispatcher
+    size_cap = dispatcher._enforce_output_size_cap
+
+    def sweep_then_cap(path):
+        swept.append(dispatcher.requeue_orphaned_jobs())  # the tick lands while the owner seals
+        return size_cap(path)
+
+    dispatcher._enforce_output_size_cap = sweep_then_cap
+    assert dispatcher.dispatch_once() is True
+    assert swept == [0]
+    assert store.get(job.job_id).status == JobStatus.DONE
+
+
 def test_cold_enrichment_claim_fenced_aborts_on_reclaim(tmp_path):
     """If a peer requeues+reclaims a cold job while _runtime_selector blocks (e.g. on `docker
     info`), the claim-fenced enrichment write aborts THIS stale owner before it launches a worker,
@@ -1983,6 +2183,451 @@ def test_routed_personality_without_gateway_fails_fast(tmp_path, monkeypatch):
     assert "gateway=" in (final.error or "")
 
 
+def test_bridge_on_non_httpproxy_fails_job(tmp_path, monkeypatch):
+    """bridge= only means something for httpproxy; on any other driver the dispatcher fails the job."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_DIRBR", "exit=direct,bridge=bb-x")
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="dirbr")
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng})
+    assert dispatcher.dispatch_once() is True
+    final = store.get(job.job_id)
+    assert final.status == JobStatus.FAILED
+    assert "bridge=" in (final.error or "") and "httpproxy" in (final.error or "")
+
+
+_NET_ID = "a" * 64
+
+
+def _net(driver="bridge", scope="local", internal="true", name="<no value>", gw4="isolated",
+         v6="false", gw6="<no value>"):
+    """A ``docker network inspect`` answer in the dispatcher's ``|``-separated template."""
+    return "|".join([_NET_ID, driver, scope, internal, name, gw4, v6, gw6])
+
+
+_INTERNAL_BRIDGE = _net()
+
+
+def _run_bridge_job(tmp_path, monkeypatch, decl, inspect=_INTERNAL_BRIDGE, *, dispatches=1,
+                    extra_jobs=0):
+    """Dispatch one bridge= job. ``inspect`` is what ``docker network inspect`` answers: a
+    stdout string (rc 0), a ``(rc, stdout, stderr)`` tuple, or an exception to raise. The fake
+    answers ONLY for the bridge the personality names, so a gate that inspects any other network
+    (e.g. bb-socks) gets an error rather than a free pass."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_BRX", decl)
+    named = decl.rsplit("bridge=", 1)[-1]
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    jobs = [job]
+    for _ in range(extra_jobs):
+        extra = _make_job()
+        extra.input_sha256 = _INPUT_SHA
+        store.create(extra)
+        _setup_job_dirs(tmp_path, extra)
+        jobs.append(extra)
+    launched: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        launched.append(list(argv))
+        if argv[:2] == ["docker", "run"]:
+            for j in jobs:
+                if any(j.job_id in a for a in argv):
+                    _make_valid_output_dir(tmp_path / j.job_id / "output",
+                                           input_sha256=_INPUT_SHA)
+        if argv[:3] == ["docker", "network", "inspect"]:
+            if argv[-1] not in (named, _NET_ID):
+                return subprocess.CompletedProcess(argv, 1, "", f"network {argv[-1]} not found")
+            answer = inspect() if callable(inspect) else inspect
+            if isinstance(answer, BaseException):
+                raise answer
+            if isinstance(answer, tuple):
+                return subprocess.CompletedProcess(argv, *answer)
+            return subprocess.CompletedProcess(argv, 0, answer + "\n", "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="brx")
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
+                                  subprocess_runner=fake_runner)
+    for _ in range(dispatches):
+        assert dispatcher.dispatch_once() is True
+    return store.get(job.job_id), launched
+
+
+_BRX = "exit=httpproxy,proxy=http://172.30.0.30:8888,bridge="
+
+
+def _ran(launched):
+    return [a for a in launched if a[:2] == ["docker", "run"]]
+
+
+@pytest.mark.parametrize("bad", ["BB-X", "host", "bb-", "../x"])
+def test_httpproxy_invalid_bridge_name_fails_job(tmp_path, monkeypatch, bad):
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + bad)
+    assert final.status == JobStatus.FAILED and "bridge=" in (final.error or "")
+    assert not _ran(launched)
+
+
+@pytest.mark.parametrize("reserved", ["bb-net0", "bb-fakenet", "bb-socks", "bb-vpn", "bb-inspect"])
+def test_httpproxy_reserved_bridge_fails_job(tmp_path, monkeypatch, reserved):
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + reserved)
+    assert final.status == JobStatus.FAILED and "bridge=" in (final.error or "")
+    assert not _ran(launched)
+
+
+@pytest.mark.parametrize("answer", [
+    _net(internal="false"),               # created without --internal
+    _net(driver="overlay", scope="swarm"),  # internal, but an attachable swarm overlay
+    _net(driver="macvlan"),               # internal flag on a non-bridge driver
+    "garbage",                            # unparseable answer is not verified
+])
+def test_httpproxy_unverified_bridge_fails_job(tmp_path, monkeypatch, answer):
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + "bb-rea-model", answer)
+    assert final.status == JobStatus.FAILED
+    assert "--internal" in (final.error or "")
+    assert not _ran(launched)
+
+
+def test_httpproxy_missing_bridge_fails_job(tmp_path, monkeypatch):
+    final, launched = _run_bridge_job(
+        tmp_path, monkeypatch, _BRX + "bb-rea-model",
+        (1, "", "Error response from daemon: network bb-rea-model not found"))
+    assert final.status == JobStatus.FAILED and "bb-rea-model" in (final.error or "")
+    assert not _ran(launched)
+
+
+@pytest.mark.parametrize("glitch", [
+    subprocess.TimeoutExpired(["docker"], 10),
+    OSError("docker socket unavailable"),
+    (1, "", "Cannot connect to the Docker daemon"),
+    (1, "", 'context "prod": context not found'),
+    (1, "", "Error response from daemon: 404 page not found"),
+])
+def test_httpproxy_bridge_inspect_glitch_defers_not_fails(tmp_path, monkeypatch, glitch):
+    """A docker hiccup is about the node, not the job: release it to the fleet, don't fail it."""
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + "bb-rea-model", glitch)
+    assert final.status == JobStatus.QUEUED
+    assert final.claimable_after is not None
+    assert not _ran(launched)
+
+
+@pytest.mark.parametrize("answer", [
+    _net(name="br0"),                                 # reuses a pre-existing host bridge
+    _net(name="virbr0"),
+])
+def test_httpproxy_bridge_on_preexisting_linux_bridge_fails_job(tmp_path, monkeypatch, answer):
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + "bb-rea-model", answer)
+    assert final.status == JobStatus.FAILED and "explicit Linux bridge" in (final.error or "")
+    assert not _ran(launched)
+
+
+@pytest.mark.parametrize("answer", [
+    _net(),                                           # option unset (docker's template output)
+    _net(name=""),                                    # ...or rendered empty
+    _net(name=f"br-{_NET_ID[:12]}"),                  # docker's own per-network bridge
+    _net(v6="true", gw6="isolated"),                  # IPv6 too, also isolated
+])
+def test_httpproxy_bridge_default_linux_bridge_runs(tmp_path, monkeypatch, answer):
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + "bb-rea-model", answer)
+    assert len(_ran(launched)) == 1
+
+
+@pytest.mark.parametrize("answer", [
+    _net(gw4="<no value>"),                 # default gateway mode: the host owns an address
+    _net(gw4="nat"),
+    _net(gw4="routed"),
+    _net(gw4="nat-unprotected"),
+    _net(v6="true", gw6="<no value>"),      # IPv4 isolated, but the host has an IPv6 gateway
+    _net(v6="true", gw6="nat"),
+])
+def test_httpproxy_bridge_with_a_host_gateway_fails_job(tmp_path, monkeypatch, answer):
+    """A worker on an internal bridge whose gateway mode is not ``isolated`` can reach every
+    host service listening on the bridge's gateway address (sshd, published ports): refuse it."""
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + "bb-rea-model", answer)
+    assert final.status == JobStatus.FAILED
+    assert "gateway_mode_ipv" in (final.error or "")
+    assert not _ran(launched)
+
+
+def test_httpproxy_ambiguous_bridge_name_fails_job(tmp_path, monkeypatch):
+    final, launched = _run_bridge_job(
+        tmp_path, monkeypatch, _BRX + "bb-rea-model",
+        (1, "", "Error response from daemon: network bb-rea-model is ambiguous (2 matches found "
+                "based on name)"))
+    assert final.status == JobStatus.FAILED and "ambiguous" in (final.error or "")
+    assert not _ran(launched)
+
+
+def test_httpproxy_bridge_inspect_errors_back_off_loudly_never_fail(tmp_path, monkeypatch, caplog):
+    """A docker error on THIS node must not fail a job a peer could run, nor spin silently: the
+    store gets a short constant defer, this node's own cooldown escalates, it skips re-inspecting
+    while cooling down, and it WARNs on every power-of-two attempt."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_BRX", _BRX + "bb-rea-model")
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    inspects = []
+
+    def fake_runner(argv, **kw):
+        if argv[:3] == ["docker", "network", "inspect"]:
+            inspects.append(argv)
+            raise FileNotFoundError("docker")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="brx")
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
+                                  subprocess_runner=fake_runner)
+    shared, local = [], []
+    with caplog.at_level("WARNING"):
+        for _ in range(8):
+            assert dispatcher.dispatch_once() is True
+            j = store.get(job.job_id)
+            assert j.status == JobStatus.QUEUED
+            shared.append(round(j.claimable_after - time.time()))
+            local.append(dispatcher._bridge_cooldown[job.job_id] - time.time())
+            store.update(job.job_id, claimable_after=None)
+            # Still cooling down locally: excluded at claim time, so NOT re-claimed or re-inspected.
+            n_before = len(inspects)
+            assert dispatcher.dispatch_once() is False
+            assert len(inspects) == n_before
+            dispatcher._bridge_cooldown[job.job_id] = 0.0      # end the local cooldown
+    assert len(inspects) == 8
+    # The store never hears the escalation: its defer stays at the short shared cap.
+    assert max(shared) <= round(dispatcher._egress_shared_defer_s)
+    assert local == sorted(local) and local[-1] > local[0]     # escalating local cooldown
+    warns = [r for r in caplog.records if "could not inspect bridge" in r.getMessage()]
+    assert len(warns) == 4                                     # attempts 1, 2, 4, 8
+    assert store.get(job.job_id).status == JobStatus.QUEUED
+
+
+def test_httpproxy_bridge_inspect_map_overflow_floor_and_lapsed_pruning(tmp_path, monkeypatch):
+    """Over the cap, entries whose cooldown lapsed long ago are pruned without raising the floor;
+    only evicting a LIVE count raises it, and a later success with an empty map resets it."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_BRX", _BRX + "bb-rea-model")
+    store = InMemoryJobStore()
+    jobs = []
+    for _ in range(3):
+        j = _make_job()
+        j.input_sha256 = _INPUT_SHA
+        store.create(j)
+        _setup_job_dirs(tmp_path, j)
+        jobs.append(j)
+    ok = {"on": False}
+
+    def fake_runner(argv, **kw):
+        if argv[:3] == ["docker", "network", "inspect"]:
+            if ok["on"]:
+                return subprocess.CompletedProcess(argv, 0, _INTERNAL_BRIDGE + "\n", "")
+            raise OSError("blip")
+        if argv[:2] == ["docker", "run"]:
+            for j in jobs:
+                if any(j.job_id in a for a in argv):
+                    _make_valid_output_dir(tmp_path / j.job_id / "output", input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="brx")
+    d = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
+                         subprocess_runner=fake_runner)
+    monkeypatch.setattr(d, "EGRESS_DEFER_MAX", 1)
+    # Job 0 errors twice; its cooldown then lapses long ago (a peer ran it elsewhere).
+    for _ in range(2):
+        assert d.dispatch_once() is True
+        store.update(jobs[0].job_id, claimable_after=None)
+        d._bridge_cooldown[jobs[0].job_id] = 0.0
+    store.update(jobs[0].job_id, status=JobStatus.DONE)
+    d._bridge_cooldown[jobs[0].job_id] = time.time() - 10 * d._egress_defer_cap_s
+    assert d.dispatch_once() is True                 # job 1 errors: job 0 pruned, floor untouched
+    assert jobs[0].job_id not in d._bridge_inspect_errors and d._bridge_inspect_floor == 0
+    store.update(jobs[1].job_id, claimable_after=None)
+    d._bridge_cooldown[jobs[1].job_id] = time.time() + 999   # job 1 stays LIVE
+    store.update(jobs[1].job_id, status=JobStatus.DONE)      # (keep it out of the claim order)
+    assert d.dispatch_once() is True                 # job 2 errors: live job 1 evicted
+    assert d._bridge_inspect_floor == 1
+    assert list(d._bridge_inspect_errors) == [jobs[2].job_id]
+    store.update(jobs[2].job_id, claimable_after=None)
+    d._bridge_cooldown[jobs[2].job_id] = 0.0
+    ok["on"] = True
+    assert d.dispatch_once() is True                 # success empties the map
+    assert d._bridge_inspect_errors == {} and d._bridge_inspect_floor == 0
+
+
+def test_httpproxy_bridge_cooldown_jobs_do_not_starve_newer_work(tmp_path, monkeypatch):
+    """Several bridge= jobs whose inspect keeps failing must not monopolise a single-thread node:
+    while this node cools down from them they are excluded at claim time, so a newer job runs."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_BRX", _BRX + "bb-rea-model")
+    store = InMemoryJobStore()
+    stuck = []
+    for _ in range(8):
+        j = _make_job()
+        j.input_sha256 = _INPUT_SHA
+        store.create(j)
+        _setup_job_dirs(tmp_path, j)
+        stuck.append(j)
+    other_eng = EngineSpec(name="plain", image=_ENGINE_IMAGE, worker_argv=["worker", "run"])
+    newer = _make_job(engine="plain")
+    newer.input_sha256 = _INPUT_SHA
+    store.create(newer)
+    _setup_job_dirs(tmp_path, newer)
+
+    def fake_runner(argv, **kw):
+        if argv[:3] == ["docker", "network", "inspect"]:
+            raise subprocess.TimeoutExpired(argv, 10)
+        if argv[:2] == ["docker", "run"] and any(newer.job_id in a for a in argv):
+            _make_valid_output_dir(tmp_path / newer.job_id / "output", engine="plain",
+                                   input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="brx")
+    d = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng, "plain": other_eng},
+                         subprocess_runner=fake_runner)
+    d._warm_requeue_backoff_s = 0.0
+    for _ in range(len(stuck) + 1):
+        d.dispatch_once()
+        for j in stuck:                               # ignore the store-side shared defer
+            if store.get(j.job_id).status == JobStatus.QUEUED:
+                store.update(j.job_id, claimable_after=None)
+    assert store.get(newer.job_id).status != JobStatus.QUEUED
+    assert all(store.get(j.job_id).status == JobStatus.QUEUED for j in stuck)
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+def test_httpproxy_bridge_cooldown_backstop_without_store_exclude(tmp_path, monkeypatch, legacy):
+    """A store whose claim_next lacks ``exclude`` (legacy shape) must never get it, and one that
+    accepts-and-drops it (a store that ignores it) must still not re-inspect a job this node is cooling down
+    from: the gate bounces it back with only the short shared defer."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_BRX", _BRX + "bb-rea-model")
+    store = InMemoryJobStore()
+    real_claim = store.claim_next
+    if legacy:
+        def claim_next(*, claimant_tier=None):
+            return real_claim(claimant_tier=claimant_tier)
+    else:
+        def claim_next(*, claimant_tier=None, exclude=()):
+            return real_claim(claimant_tier=claimant_tier)      # accepted, dropped
+    store.claim_next = claim_next
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    inspects = []
+
+    def fake_runner(argv, **kw):
+        if argv[:3] == ["docker", "network", "inspect"]:
+            inspects.append(argv)
+            raise OSError("blip")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="brx")
+    d = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
+                         subprocess_runner=fake_runner)
+    d._warm_requeue_backoff_s = 0.0
+    assert d.dispatch_once() is True                  # error: cooldown starts
+    store.update(job.job_id, claimable_after=None)
+    assert d.dispatch_once() is True                  # re-claimed (no exclude) ...
+    assert len(inspects) == 1                         # ... but bounced, not re-inspected
+    bounced = store.get(job.job_id).claimable_after - time.time()
+    assert store.get(job.job_id).status == JobStatus.QUEUED
+    assert 0 < bounced <= d._egress_shared_defer_s + 1
+
+
+def test_httpproxy_bridge_claim_exclude_is_ordered_oldest_cooldown_first(tmp_path):
+    """Stores that must trim an exclusion keep its FRONT (sql_store, http_store). A frozenset
+    gave them an arbitrary front, so the trim could drop the head of the cooling wall -- the
+    job oldest-first claim_next offers next. The dispatcher passes cooldowns in the order they
+    started, and only the live ones."""
+    store = InMemoryJobStore()
+    seen = []
+
+    def claim_next(*, claimant_tier=None, exclude=()):
+        seen.append(exclude)
+        return None
+    store.claim_next = claim_next
+    d = _make_dispatcher(store, job_root=tmp_path, engines={})
+    now = time.time()
+    d._bridge_cooldown = {"first": now + 100, "lapsed": now - 1, "second": now + 100,
+                          "third": now + 100}
+    d.dispatch_once()
+    assert seen == [("first", "second", "third")]
+
+
+def test_httpproxy_static_bridge_checks_precede_egress_health_defer(tmp_path, monkeypatch):
+    """bridge= on a gateway-routed driver must fail at once, not sit deferred behind an
+    unhealthy-egress gate that would otherwise release it to the fleet forever."""
+    from types import SimpleNamespace
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_VX",
+                       "exit=openvpn,gateway=172.31.0.2,bridge=bb-rea-model")
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="vx")
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng})
+    dispatcher._node_egress_health = lambda: SimpleNamespace(healthy=False, reason="down")
+    assert dispatcher.dispatch_once() is True
+    final = store.get(job.job_id)
+    assert final.status == JobStatus.FAILED and "bridge=" in (final.error or "")
+
+
+def test_httpproxy_bridge_args_mismatch_refuses_unpinned_run(tmp_path, monkeypatch):
+    """If docker_network_args ever disagrees with the verified bridge, refuse -- never fall back
+    to attaching by name."""
+    import blastbox.host.netapply as netapply
+    monkeypatch.setattr(netapply, "docker_network_args",
+                        lambda p: ["--network", "bb-rea-model", "--network-alias", "x"])
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + "bb-rea-model")
+    assert final.status == JobStatus.FAILED and "unpinned" in (final.error or "")
+    assert not _ran(launched)
+
+
+def test_httpproxy_bridge_verdict_is_not_cached_across_jobs(tmp_path, monkeypatch):
+    """Each dispatch re-inspects: a glitch on job 1 must not stick to job 2 on the same node."""
+    answers = [OSError("blip"), _INTERNAL_BRIDGE]
+    final, launched = _run_bridge_job(
+        tmp_path, monkeypatch, _BRX + "bb-rea-model", lambda: answers.pop(0),
+        extra_jobs=1, dispatches=2)
+    assert final.status == JobStatus.QUEUED          # job 1: deferred on the glitch
+    assert len(_ran(launched)) == 1                  # job 2: re-inspected, verified, ran
+    assert answers == []
+
+
+def test_httpproxy_internal_bridge_runs_pinned_to_inspected_network_id(tmp_path, monkeypatch):
+    """docker run attaches by the ID that was verified, not the name, so a bridge recreated
+    without --internal between the check and the run can't be picked up by name."""
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + "bb-rea-model")
+    argv = _ran(launched)[0]
+    i = argv.index("--network")
+    assert argv[i + 1] == _NET_ID
+    assert "blastbox.net.leakguard=strict" in argv
+    inspected = [a for a in launched if a[:3] == ["docker", "network", "inspect"]]
+    assert inspected and inspected[0][-1] == "bb-rea-model"
+    # The template must ask for every field the gate judges, incl. the Linux bridge name option.
+    template = inspected[0][inspected[0].index("-f") + 1]
+    for field in (".Id", ".Driver", ".Scope", ".Internal", "com.docker.network.bridge.name"):
+        assert field in template
+
+
+def test_httpproxy_bridge_with_inspect_fails_with_clear_reason(tmp_path, monkeypatch):
+    final, launched = _run_bridge_job(
+        tmp_path, monkeypatch, "exit=httpproxy,proxy=http://172.30.0.30:8888,inspect=1,bridge=bb-rea-model")
+    assert final.status == JobStatus.FAILED and "inspect is not supported" in (final.error or "")
+    assert not _ran(launched)
+
+
 def test_decrypt_seals_decrypted_and_mixed_when_keylog_present(tmp_path, monkeypatch):
     """With BLASTBOX_NET_DECRYPT + a keylog in the capture dir, the dispatcher runs GoGoRoboCap
     and seals decrypted+mixed pcaps as trusted artifacts."""
@@ -2118,6 +2763,36 @@ def test_net_egress_env_reflects_personality(tmp_path, monkeypatch):
 
     assert run_with("direct") == "1"   # has an exit → net-share allowed
     assert run_with("none") == "0"     # sealed → isolate
+
+
+def test_cold_worker_gets_the_hosts_output_caps(tmp_path):
+    """The cold worker's harness builds Limits.from_env(): forward the host-owned output caps so an
+    engine sizes its payload/artifacts to the cap the host trust gate will enforce. A job param
+    can't set them: the BLASTBOX_ prefix is reserved and dropped by _sanitize_params."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    job.params = {"BLASTBOX_MAX_METADATA": "1"}
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    launched: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        launched.append(list(argv))
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    limits = Limits(max_metadata_bytes=123_456_789, max_artifact_bytes=2_000_000,
+                    max_total_artifact_bytes=3_000_000, max_artifacts=77)
+    d = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    d._limits = limits
+    d.dispatch_once()
+    argv = next(a for a in launched if a[:2] == ["docker", "run"])
+    env = dict(t.split("=", 1) for t in argv if t.startswith("BLASTBOX_MAX_"))
+    assert env == {"BLASTBOX_MAX_METADATA": "123456789", "BLASTBOX_MAX_ARTIFACT": "2000000",
+                   "BLASTBOX_MAX_TOTAL_ARTIFACTS": "3000000", "BLASTBOX_MAX_ARTIFACTS": "77"}
 
 
 def test_socks_personality_labels_worker_for_wiring_and_uses_bb_socks(tmp_path, monkeypatch):

@@ -339,6 +339,19 @@ def _nono_launch_wrap(
     ]
 
 
+def validate_readonly_mounts(mounts: Iterable[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
+    """Reject mount-option injection or malformed operator paths before launching."""
+    items = tuple(mounts)
+    if len(items) > 32:
+        raise ValueError("too many operator mounts")
+    for source, destination in items:
+        for path in (source, destination):
+            if (not isinstance(path, str) or not path.startswith("/")
+                    or any(c in path for c in (",", ":", "\x00", "\r", "\n"))):
+                raise ValueError("operator mount must use absolute paths without mount options")
+    return items
+
+
 def build_worker_docker_run_argv(
     *,
     image: str,
@@ -356,6 +369,7 @@ def build_worker_docker_run_argv(
     workdir: str = _DEFAULT_WORKDIR,
     labels: Mapping[str, str] | None = None,
     extra_env: Mapping[str, str] | None = None,
+    extra_mounts: Iterable[tuple[str, str]] = (),
 ) -> list[str]:
     """Build a narrow, hardened ``docker run`` argv for a single worker job.
 
@@ -425,11 +439,14 @@ def build_worker_docker_run_argv(
     # ------------------------------------------------------------------
     # Core hardened argv — every flag is unconditional.
     # ------------------------------------------------------------------
+    mounts = validate_readonly_mounts(extra_mounts)
     argv: list[str] = [
         "docker",
         "run",
         "--rm",
         f"--runtime={runtime.runtime}",
+        *(token for src, dst in mounts for token in
+          ("--mount", f"type=bind,src={src},dst={dst},readonly")),
         "--user",
         f"{worker_uid}:{worker_gid}",
         *(network_args if network_args is not None else ["--network=none"]),
