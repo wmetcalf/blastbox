@@ -12,6 +12,7 @@ import copy
 import json
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -1161,6 +1162,205 @@ def test_requeue_grace_window(tmp_path):
     )
     assert d.requeue_orphaned_jobs() == 0
     assert store.get(fresh.job_id).status == JobStatus.RUNNING
+
+
+def test_requeue_skips_cold_job_this_dispatcher_is_still_finishing(tmp_path):
+    """The maintenance sweep must not requeue a cold job one of THIS dispatcher's own threads is
+    still working on.
+
+    `docker ps` lists RUNNING containers only, so from the moment a worker exits until its owner
+    thread writes the terminal status -- container auto-removal, output size cap, trust
+    validation, sealing, upload -- the job is RUNNING in the store and absent from `docker ps`.
+    Past the grace window the sweep called that "worker container disappeared" and requeued it out
+    from under its live owner: the re-claim wipes output/ and either collides on the container
+    name (job FAILED on a missing metadata.json) or runs the same untrusted sample a second time.
+    Seen on a live stack as 3 of ~45 jobs, each requeued 94-142 s after launch.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    swept: list[int] = []
+    holder: dict[str, Dispatcher] = {}
+
+    def fake_runner(argv, **kw):
+        if "ps" in argv:
+            # The worker has exited: no running container carries this job's label.
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if "run" in argv:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+            # A long-running worker: the grace window is well behind us when it exits...
+            store.update(job.job_id, started_at=time.time() - 600)
+            # ...and the maintenance tick lands before the owner thread has finished the job.
+            swept.append(holder["d"].requeue_orphaned_jobs())
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    holder["d"] = dispatcher
+    assert dispatcher.dispatch_once() is True
+
+    assert swept == [0], "the sweep must have run mid-dispatch and requeued nothing"
+    final_job = store.get(job.job_id)
+    assert final_job is not None
+    assert final_job.status == JobStatus.DONE
+    assert "requeued: worker container disappeared" not in final_job.security_warnings
+
+
+def test_requeue_still_recovers_a_cold_job_once_its_dispatch_has_returned(tmp_path):
+    """The in-flight exclusion ends with the dispatch: a job left RUNNING after its owner thread
+    has returned (or by a dispatcher that is gone) is still an orphan and is still requeued."""
+    store = InMemoryJobStore()
+    done = _make_job()
+    done.input_sha256 = _INPUT_SHA
+    store.create(done)
+    _setup_job_dirs(tmp_path, done)
+    output_dir = tmp_path / done.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        if "run" in argv:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    assert dispatcher.dispatch_once() is True
+    assert store.get(done.job_id).status == JobStatus.DONE
+
+    # Same job id, RUNNING again with no live owner: nothing may remember it as in flight.
+    store.update(done.job_id, status=JobStatus.RUNNING, started_at=time.time() - 600)
+    assert dispatcher.requeue_orphaned_jobs() == 1
+    assert store.get(done.job_id).status == JobStatus.QUEUED
+
+
+def test_requeue_keeps_a_reclaimed_job_in_flight_after_its_stale_holder_returns(tmp_path):
+    """In flight is per CLAIM, not per job id. Two threads of one dispatcher can hold the same
+    job: A on a claim that has since been requeued, B on the re-claim. A returning must not
+    unregister B's claim, or this process's own sweep requeues the job B is still finishing."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    a_exited, a_go = threading.Event(), threading.Event()
+    b_exited, b_go = threading.Event(), threading.Event()
+
+    def fake_runner(argv, **kw):
+        if "run" in argv:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+            if threading.current_thread().name == "A":
+                a_exited.set()
+                assert a_go.wait(10)
+            else:
+                store.update(job.job_id, started_at=time.time() - 600)  # a long-running worker
+                b_exited.set()
+                assert b_go.wait(10)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    ta = threading.Thread(target=dispatcher.dispatch_once, name="A")
+    ta.start()
+    assert a_exited.wait(10)
+    # A's claim is requeued from under it (a peer's sweep, or A's own warm-requeue backoff)...
+    first_claim = store.get(job.job_id).claim_id
+    assert store.update_if_status(
+        job.job_id, JobStatus.RUNNING, expect_claim_id=first_claim, status=JobStatus.QUEUED,
+        claim_id=None, started_at=None, worker_runtime=None, worker_tier=None)
+    # ...and another thread of this dispatcher claims the job again.
+    tb = threading.Thread(target=dispatcher.dispatch_once, name="B")
+    tb.start()
+    assert b_exited.wait(10)
+    second_claim = store.get(job.job_id).claim_id
+    assert second_claim not in (None, first_claim)
+    a_go.set()
+    ta.join(10)
+    assert not ta.is_alive()  # the stale holder has returned; B still holds the job
+
+    assert dispatcher.requeue_orphaned_jobs() == 0
+    held = store.get(job.job_id)
+    assert held.status == JobStatus.RUNNING and held.claim_id == second_claim
+
+    b_go.set()
+    tb.join(10)
+    assert not tb.is_alive()
+    assert "requeued: worker container disappeared" not in store.get(job.job_id).security_warnings
+
+
+def test_requeue_recovers_a_cold_job_whose_owner_thread_is_stuck(tmp_path):
+    """The in-flight exemption is bounded in time, like the warm deadline. An owner thread wedged
+    before launch (a `docker info` that never returns) holds its job with no container; past
+    `worker_timeout_s + requeue_grace_s` without progress the sweep takes the job back."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    entered, release = threading.Event(), threading.Event()
+
+    def stuck_selector():
+        entered.set()
+        release.wait(30)
+        return _fake_runtime()
+
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, runtime_selector=stuck_selector, worker_timeout_s=30,
+        subprocess_runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
+    owner = threading.Thread(target=dispatcher.dispatch_once, daemon=True)
+    owner.start()
+    try:
+        assert entered.wait(10)
+        store.update(job.job_id, started_at=time.time() - 3600)
+        # Held, and inside the bound: still the owner's.
+        assert dispatcher.requeue_orphaned_jobs() == 0
+        assert store.get(job.job_id).status == JobStatus.RUNNING
+        # No progress for longer than a worker may run plus the grace window: an orphan.
+        with dispatcher._inflight_lock:
+            for key in dispatcher._inflight:
+                dispatcher._inflight[key] -= 30 + dispatcher._requeue_grace_s + 1
+        assert dispatcher.requeue_orphaned_jobs() == 1
+        assert store.get(job.job_id).status == JobStatus.QUEUED
+    finally:
+        release.set()
+        owner.join(10)
+
+
+def test_cold_in_flight_bound_restarts_when_the_worker_exits(tmp_path):
+    """A worker may use its whole timeout, so the bound is measured from the last progress: the
+    worker's exit restarts it, and the owner gets a full window to validate, seal and upload."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    swept: list[int] = []
+    holder: dict[str, Dispatcher] = {}
+
+    def fake_runner(argv, **kw):
+        if "run" in argv:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+            store.update(job.job_id, started_at=time.time() - 600)
+            d = holder["d"]
+            with d._inflight_lock:  # the worker ran for all of its timeout, and then some
+                for key in d._inflight:
+                    d._inflight[key] -= 30 + d._requeue_grace_s + 1
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner, worker_timeout_s=30)
+    holder["d"] = dispatcher
+    size_cap = dispatcher._enforce_output_size_cap
+
+    def sweep_then_cap(path):
+        swept.append(dispatcher.requeue_orphaned_jobs())  # the tick lands while the owner seals
+        return size_cap(path)
+
+    dispatcher._enforce_output_size_cap = sweep_then_cap
+    assert dispatcher.dispatch_once() is True
+    assert swept == [0]
+    assert store.get(job.job_id).status == JobStatus.DONE
 
 
 def test_cold_enrichment_claim_fenced_aborts_on_reclaim(tmp_path):

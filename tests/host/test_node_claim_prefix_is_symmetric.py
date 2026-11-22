@@ -11,6 +11,7 @@ Round five found it enforced on one side only, in both directions:
 from __future__ import annotations
 
 import base64
+import threading
 import time
 
 import pytest
@@ -112,6 +113,8 @@ class TestADispatcherSharingTheQueueLeavesNodeClaimsAlone:
         d._worker_timeout_s = 300.0
         d._job_retention_seconds = 0
         d._list_active_worker_job_ids = lambda: set()      # nothing of ours is running
+        d._inflight_lock = threading.Lock()
+        d._inflight = {}                                    # and no thread of ours holds a job
         d._delete_input = lambda p: None
         return d
 
