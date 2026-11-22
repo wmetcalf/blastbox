@@ -379,6 +379,8 @@ class EngineSpec:
     # (see netpolicy.resolve_net_policy). Runtime-configurable like default_params: flip the
     # env + restart the dispatcher, no rebuild. This task only carries it; applying it is later.
     net_policy: str = "none"
+    # Operator-owned, read-only feed/assets binds. Never sourced from job params.
+    mounts: tuple[tuple[str, str], ...] = ()
     # Operator allowlist of dispatcher TIERS this engine may run on (BLASTBOX_ENGINE_<NAME>_ALLOWED_RUNTIMES),
     # matched against the canonical tier vocabulary (jobs.base.VALID_TIERS: "cold" + the warm tiers
     # firecracker/gvisor/libvirt-vm/aws-*/static/cascade). None (default) ⇒ no restriction (any tier).
@@ -428,6 +430,11 @@ def enforce_allowed_runtimes(engines: Mapping[str, "EngineSpec"], reachable: Col
     restriction, so this is a no-op for the default config."""
     reachable = frozenset(reachable)
     for name, spec in engines.items():
+        if getattr(spec, "mounts", ()) and reachable - {"cold"}:
+            raise ValueError(
+                f"engine {name!r}: operator mounts are supported only on the cold tier; "
+                "bake feed assets into warm images and omit mounts there"
+            )
         # getattr default: a real EngineSpec always has the field; a duck-typed spec (embedder/tests)
         # without it just imposes no restriction (same as None).
         allowed = getattr(spec, "allowed_runtimes", None)
@@ -2815,6 +2822,7 @@ class Dispatcher:
 
         container_name = f"blastbox-worker-{job.job_id[:12]}"
         argv = build_worker_docker_run_argv(
+            extra_mounts=engine.mounts,
             image=engine.image,          # NEVER job.engine / job.filename / job.params
             input_path=input_path,
             input_mount_path=f"/input/{input_path.name}",
