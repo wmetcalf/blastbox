@@ -1292,6 +1292,17 @@ class Dispatcher:
     # Internal dispatch flow
     # ------------------------------------------------------------------
 
+    def _output_cap_env(self) -> dict[str, str]:
+        """BLASTBOX_MAX_* for the worker from the dispatcher's own Limits (dispatcher-owned:
+        merged last, so a job param can't set them)."""
+        lim = self._limits
+        return {
+            "BLASTBOX_MAX_METADATA": str(lim.max_metadata_bytes),
+            "BLASTBOX_MAX_ARTIFACT": str(lim.max_artifact_bytes),
+            "BLASTBOX_MAX_TOTAL_ARTIFACTS": str(lim.max_total_artifact_bytes),
+            "BLASTBOX_MAX_ARTIFACTS": str(lim.max_artifacts),
+        }
+
     @staticmethod
     def _httpproxy_env(personality) -> dict[str, str]:
         """The HTTP(S)_PROXY env to inject for an httpproxy personality, or {} if the driver isn't
@@ -2808,6 +2819,12 @@ class Dispatcher:
                 # env → the worker fails closed (internal bridge, no egress) rather than racing some
                 # client's direct-fallback behaviour.
                 **self._httpproxy_env(personality),
+                # The HOST-owned output caps (parity with the remote tier, vm_dispatch): the
+                # worker harness builds Limits.from_env(), and engines size their payload and
+                # artifacts from it (detonate/urlgrab read max_artifact_bytes). Unforwarded, a cap
+                # raised only on the dispatcher leaves the worker on the defaults -- truncating
+                # output, or (metadata) sealing a result the trust gate then sizes differently.
+                **self._output_cap_env(),
             },
         )
 
