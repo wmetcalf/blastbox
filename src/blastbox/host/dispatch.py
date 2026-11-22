@@ -700,6 +700,11 @@ class Dispatcher:
         self._egress_shared_defer_s = max(
             1.0, float(os.environ.get("BLASTBOX_EGRESS_SHARED_DEFER_S", "5") or 5))
         self._egress_cooldown: dict[str, float] = {}
+        # Consecutive bridge= inspect errors per job on THIS node, and this node's local cooldown
+        # for each such job (bounded by EGRESS_DEFER_MAX, like the egress-health maps).
+        self._bridge_inspect_errors: dict[str, int] = {}
+        self._bridge_cooldown: dict[str, float] = {}
+        self._bridge_inspect_floor = 0
         # ONE implementation, shared with VmJobDispatcher. Two dispatch classes with two
         # copies of "may I run this" is how one of them ends up with no copy at all —
         # which is exactly what happened before this was extracted.
@@ -907,6 +912,19 @@ class Dispatcher:
             claim_kw["engine"] = frozenset(self._engines)
         if self._claim_untargeted_after_s:
             claim_kw["untargeted_min_age_s"] = self._claim_untargeted_after_s
+        # Jobs this node is cooling down from after a bridge= inspect error are skipped at CLAIM
+        # time, so they can't monopolise this node's threads bouncing in and out while newer work
+        # waits (the gate's own cooldown bounce remains the backstop for stores that lack
+        # exclude, and for ids past a store's cap). Passed only when non-empty AND the store's claim_next accepts it, so a
+        # legacy claim_next(*, claimant_tier=) never sees an unexpected kwarg.
+        now_t = time.time()
+        with self._egress_defer_lock:
+            cooling = [k for k, until in self._bridge_cooldown.items() if until > now_t]
+        if cooling and _accepts_kwarg(self._job_store.claim_next, "exclude"):
+            # A tuple in cooldown order, not a set: a store that must trim keeps the FRONT
+            # (sql_store, http_store), and the front is the oldest cooldown -- the head of the
+            # wall oldest-first claim_next would offer next.
+            claim_kw["exclude"] = tuple(cooling)
         try:
             job = self._job_store.claim_next(**claim_kw)
         except BaseException:
@@ -2577,6 +2595,8 @@ class Dispatcher:
         # unknown driver falls back to --network=none in docker_network_args.
         from blastbox.host.netpolicy import resolve_net_policy
         from blastbox.host.netapply import (
+            BRIDGE_NAME_RE,
+            RESERVED_BRIDGES,
             docker_network_args,
             inspect_routes_via_gateway,
             worker_resolv_conf,
@@ -2616,6 +2636,35 @@ class Dispatcher:
                 f"(direct / inetsim / httpproxy).",
             )
             return
+        # Static bridge= checks run before any gate that can DEFER the job (egress health), so an
+        # invalid declaration fails at once instead of sitting queued through an outage.
+        named_bridge: str | None = None
+        if "bridge" in personality.config:
+            if personality.exit_driver != "httpproxy":
+                self._fail_job(
+                    job,
+                    f"netpolicy {personality.name!r} (exit={personality.exit_driver}) declares "
+                    f"bridge=, which is only valid for exit=httpproxy (it names the internal bridge "
+                    f"the proxy sidecar shares). Remove bridge= or use httpproxy.",
+                )
+                return
+            if personality.inspect:
+                self._fail_job(
+                    job,
+                    f"netpolicy {personality.name!r}: inspect is not supported with httpproxy "
+                    f"bridge= (an app-level proxy hop cannot be route-inspected). Drop inspect= "
+                    f"or bridge=.",
+                )
+                return
+            named_bridge = personality.config["bridge"]
+            if not BRIDGE_NAME_RE.fullmatch(named_bridge) or named_bridge in RESERVED_BRIDGES:
+                self._fail_job(
+                    job,
+                    f"netpolicy {personality.name!r}: bridge={named_bridge[:80]!r} is not a valid "
+                    f"bridge name (must match {BRIDGE_NAME_RE.pattern} and not be a blastbox-managed "
+                    f"bridge: {', '.join(sorted(RESERVED_BRIDGES))}).",
+                )
+                return
         # A gateway-routed tier cannot work at all if this node's own exit is down — the
         # worker would sit waiting for a route into a sidecar that is gone, and fail closed
         # on its gateway barrier. That is the right outcome for the SAMPLE but the wrong one
@@ -2714,6 +2763,74 @@ class Dispatcher:
                 f"egress would race netd. Add gateway=<netd gateway IP> to the personality.",
             )
             return
+        named_bridge_id: str | None = None
+        if named_bridge is not None:
+            # Inside this node's own cooldown for this job after an inspect error: hand it straight
+            # back with the short shared defer, without re-inspecting (a peer may run it now).
+            if (until := self._bridge_cooldown.get(job.job_id)) and time.time() < until:
+                self._requeue_claimed(
+                    job, defer=True, defer_s=self._egress_shared_defer_s,
+                    reason=f"this node is in a bridge-inspect cooldown for another "
+                           f"{until - time.time():.0f}s; releasing to the fleet",
+                )
+                return
+            verdict, detail = self._inspect_named_bridge(named_bridge)
+            if verdict == "error":
+                # A docker problem on THIS node says nothing about the job, and a peer whose
+                # docker answers may run it: never fail it here. Same shape as the egress-health
+                # gate -- a short constant defer in the shared store, an escalating LOCAL cooldown
+                # so this node stops re-claiming it, and a WARNING on every power-of-two attempt
+                # so a persistent problem is loud. Expiry stays with max_queued_age.
+                with self._egress_defer_lock:
+                    n = max(self._bridge_inspect_errors.get(job.job_id, 0),
+                            self._bridge_inspect_floor) + 1
+                    self._bridge_inspect_errors[job.job_id] = n
+                    if len(self._bridge_inspect_errors) > self.EGRESS_DEFER_MAX:
+                        # Jobs a peer ran (or that were cancelled) never come back to clear their
+                        # entry: drop those whose cooldown lapsed long ago first, WITHOUT touching
+                        # the floor -- they are not live, so forgetting them resets nothing.
+                        lapsed = time.time() - self._egress_defer_cap_s
+                        for k in [k for k, until in self._bridge_cooldown.items()
+                                  if until < lapsed and k != job.job_id]:
+                            self._bridge_cooldown.pop(k, None)
+                            self._bridge_inspect_errors.pop(k, None)
+                    if len(self._bridge_inspect_errors) > self.EGRESS_DEFER_MAX:
+                        # Evicting a live count must not reset backoff (and re-arm the attempt-1
+                        # WARNING) for everyone: raise the floor to what was forgotten, as the
+                        # egress-health map does.
+                        stale = next(iter(self._bridge_inspect_errors))
+                        stale_n = self._bridge_inspect_errors.pop(stale, 0)
+                        self._bridge_cooldown.pop(stale, None)
+                        self._bridge_inspect_floor = max(self._bridge_inspect_floor, stale_n)
+                    shared_defer, delay = self._egress_defer_plan(n)
+                    self._bridge_cooldown[job.job_id] = time.time() + delay
+                if n & (n - 1) == 0:
+                    _log.warning(
+                        "could not inspect bridge %r for netpolicy %r (%s): job %s attempt %d on "
+                        "this node; releasing it to the fleet, this node backs off %.0fs. Check "
+                        "`docker network inspect %s` on this node.", named_bridge,
+                        personality.name, detail, job.job_id, n, delay, named_bridge)
+                self._requeue_claimed(
+                    job, defer=True, defer_s=shared_defer,
+                    reason=f"could not inspect bridge {named_bridge!r} ({detail}); releasing "
+                           f"netpolicy {personality.name!r} to the fleet",
+                )
+                return
+            with self._egress_defer_lock:
+                self._bridge_inspect_errors.pop(job.job_id, None)
+                self._bridge_cooldown.pop(job.job_id, None)
+                if not self._bridge_inspect_errors:
+                    self._bridge_inspect_floor = 0
+            if verdict != "ok":
+                self._fail_job(
+                    job,
+                    f"netpolicy {personality.name!r}: bridge={named_bridge!r} is not verified "
+                    f"as a local --internal bridge ({detail}); create it with "
+                    f"`docker network create --internal -o "
+                    f"com.docker.network.bridge.gateway_mode_ipv4=isolated {named_bridge}`.",
+                )
+                return
+            named_bridge_id = detail
         # Egress-hardening knobs (egress_ports / block_internal) are only enforceable on the
         # gateway-routed, netd-gated tiers (tor/openvpn/wireguard): there the worker's OWN netns OUTPUT
         # carries the real destination IP:port (so a port/destination filter is meaningful) AND egress
@@ -2744,6 +2861,18 @@ class Dispatcher:
             )
             return
         network_args = docker_network_args(personality)
+        if named_bridge_id is not None:
+            # Attach by the network ID just verified, never by name: a bridge recreated without
+            # --internal after the check cannot be picked up by name at `docker run`. Any other
+            # shape means the args and the verification disagree -- refuse rather than run.
+            if network_args != ["--network", named_bridge]:
+                self._fail_job(
+                    job,
+                    f"netpolicy {personality.name!r}: network args {network_args!r} do not match "
+                    f"the verified bridge={named_bridge!r}; refusing to run unpinned.",
+                )
+                return
+            network_args = ["--network", named_bridge_id]
 
         # Optional resolv.conf injection for an egress personality (per-personality ``dns=``).
         # On a docker user-defined bridge the worker's only nameserver is docker's embedded
@@ -3261,6 +3390,73 @@ class Dispatcher:
             verdict = False
         cache[network] = (verdict, now)
         return verdict
+
+    def _inspect_named_bridge(self, network: str) -> tuple[str, str]:
+        """Verify an operator-named ``bridge=`` right now (uncached) for this dispatch.
+
+        Returns ``("ok", <network id>)`` only when docker reports a local-scope ``bridge`` driver
+        network with Internal=true and an ``isolated`` gateway (no host address on the bridge,
+        for IPv4 and, when enabled, IPv6) on docker's own per-network Linux bridge;
+        ``("reject", why)`` when docker answered and the network is missing, ambiguous,
+        external, a different driver/scope, gives the host a gateway address, rides a
+        pre-existing host bridge, or the answer is unparseable; and
+        ``("error", why)`` when docker itself could not answer (timeout, socket error, daemon
+        error), which is a node problem, not a job problem. A verified ID is seeded into the
+        receipt cache: an ID names one immutable network, so its verdict cannot go stale."""
+        try:
+            proc = self._subprocess_runner(
+                ["docker", "network", "inspect", "-f",
+                 "{{.Id}}|{{.Driver}}|{{.Scope}}|{{.Internal}}|"
+                 '{{index .Options "com.docker.network.bridge.name"}}|'
+                 '{{index .Options "com.docker.network.bridge.gateway_mode_ipv4"}}|'
+                 "{{.EnableIPv6}}|"
+                 '{{index .Options "com.docker.network.bridge.gateway_mode_ipv6"}}', network],
+                capture_output=True, text=True, check=False, timeout=10)
+        except Exception as exc:  # noqa: BLE001 - docker unreachable: defer, don't fail
+            return "error", f"docker network inspect failed: {type(exc).__name__}"
+        rc = getattr(proc, "returncode", 1)
+        if rc != 0:
+            err = str(getattr(proc, "stderr", "") or "").strip()
+            low = err.lower()
+            # Only a "no such network" answer about THIS network is a verdict on the job; a bare
+            # "not found" can be docker's own problem (missing context, daemon 404) -> error.
+            if (f"network {network.lower()} not found" in low or "no such network" in low
+                    or "network not found" in low):
+                return "reject", "docker reports no such network"
+            if "ambiguous" in low or "matches found" in low:
+                return "reject", "docker reports the name is ambiguous (duplicate networks)"
+            return "error", f"docker network inspect rc={rc}: {err[:120]}"
+        # An unset Options key renders as "<no value>": normalise it away.
+        fields = [f.strip() for f in str(getattr(proc, "stdout", "") or "").strip()
+                  .replace("<no value>", "").split("|")]
+        if len(fields) != 8 or not re.fullmatch(r"[0-9a-f]{64}", fields[0]):
+            return "reject", "unparseable docker network inspect answer"
+        net_id, driver, scope, internal, linux_bridge, gw4, ipv6, gw6 = fields
+        if driver != "bridge" or scope != "local" or internal.lower() != "true":
+            return "reject", f"driver={driver} scope={scope} internal={internal}"
+        # --internal stops forwarding off the bridge, but docker still gives the HOST an address
+        # on it (the gateway), so the worker reaches every host service bound to 0.0.0.0. The
+        # `isolated` gateway mode leaves the bridge address-less: only the proxy sidecar on the
+        # same L2 segment is reachable, with no host firewall rule involved.
+        if gw4 != "isolated":
+            return "reject", (f"gateway_mode_ipv4={gw4 or 'unset'} gives the host an address on "
+                              f"the bridge; recreate it with "
+                              f"-o com.docker.network.bridge.gateway_mode_ipv4=isolated")
+        if ipv6.lower() == "true" and gw6 != "isolated":
+            return "reject", (f"gateway_mode_ipv6={gw6 or 'unset'} gives the host an IPv6 "
+                              f"address on the bridge; recreate it with "
+                              f"-o com.docker.network.bridge.gateway_mode_ipv6=isolated")
+        # `-o com.docker.network.bridge.name=br0` makes docker REUSE an existing host bridge, which
+        # may carry other hosts/VMs on its L2 segment. Docker's answer can't tell a reused bridge
+        # from one it created under that name, so any explicit name is refused: only docker's own
+        # per-network br-<id12> is OK.
+        if linux_bridge not in ("", f"br-{net_id[:12]}"):
+            return "reject", (f"network names an explicit Linux bridge {linux_bridge[:32]!r} "
+                              f"(com.docker.network.bridge.name), which may be a pre-existing "
+                              f"shared host bridge; recreate it without that option")
+        cache = self.__dict__.setdefault("_bridge_internal_cache", {})
+        cache[net_id] = (True, time.monotonic())
+        return "ok", net_id
 
     def _verified_net_claim(self, personality, network_args: list[str],
                             gateway_health) -> dict:
