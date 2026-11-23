@@ -1,0 +1,220 @@
+# rea-bb: the REA reverse-engineering engines (`rea` sweep, `rea-agent` model pass) on a
+# blastbox host. Ingress + cold-only dispatcher + postgres + docker-socket-proxy (the same shape
+# as the other *-bb stacks on toolz2) + rea-model-proxy, the only route to the model endpoint.
+#
+#   # once, as the operator (see README.md "Network"): the INTERNAL bridge the agent slots ride
+#   docker network create --internal -o com.docker.network.bridge.gateway_mode_ipv4=isolated --subnet 10.231.200.0/24 bb-rea-model
+#   install -m 600 env.example .env       # fill in every REPLACE_ME
+#   docker compose -p rea-bb -f compose.yml up -d
+#
+# Images (README.md "Build"): blastbox-rea-host (deploy/rea/Dockerfile.host, built from the
+# local merge branch deploy/rea-toolz2), blastbox-rea-sweep / blastbox-rea-agent
+# (deploy/rea/Dockerfile.stack-worker over blastbox-rea:dev).
+name: rea-bb
+
+x-host-env: &host-env
+  BLASTBOX_DATABASE_URL: postgresql://rea:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/rea
+  BLASTBOX_JOB_ROOT: ${REA_DATA_DIR:?set REA_DATA_DIR in .env}/jobs
+  BLASTBOX_ALLOWED_ENGINES: rea,rea-agent
+  BLASTBOX_ENGINES: rea=${REA_SWEEP_IMAGE:?set REA_SWEEP_IMAGE},rea-agent=${REA_AGENT_IMAGE:?set REA_AGENT_IMAGE}
+  # Host-side re-seal caps; keep identical on ingress and dispatcher (CONFIGURATION.md).
+  BLASTBOX_MAX_INPUT: "1073741824"
+  BLASTBOX_MAX_ARTIFACT: "1073741824"
+  BLASTBOX_MAX_TOTAL_ARTIFACTS: "2147483648"
+  BLASTBOX_JOB_RETENTION_SECONDS: "0"
+  # Network posture is an ENGINE property: `rea` never has network; `rea-agent` always gets the
+  # rea_model personality. No per-job override (BLASTBOX_ALLOW_NETPOLICY_OVERRIDE unset).
+  BLASTBOX_NETPOLICY_REA_MODEL: exit=httpproxy,proxy=http://${REA_MODEL_PROXY_IP:-10.231.200.2}:8888,bridge=bb-rea-model
+  BLASTBOX_ENGINE_REA_NETPOLICY: none
+  # The registry key is the env suffix LOWER-CASED: BLASTBOX_NETPOLICY_REA_MODEL -> "rea_model".
+  # "rea-model" (hyphen) is an UNKNOWN name and resolves fail-closed to none (seen live).
+  BLASTBOX_ENGINE_REA_AGENT_NETPOLICY: rea_model
+  BLASTBOX_ENGINE_REA_ALLOWED_RUNTIMES: cold
+  BLASTBOX_ENGINE_REA_AGENT_ALLOWED_RUNTIMES: cold
+  # No client param reaches either worker (empty allowlist = block all, defaults included), and
+  # every REA_* knob is reserved besides. Operator values are baked into the worker images
+  # (Dockerfile.stack-worker explains why DEFAULT_PARAMS cannot hold them).
+  BLASTBOX_ENGINE_REA_PARAM_KEYS: ""
+  # rea-agent takes exactly three params: the sealed per-job grant (opaque to the agent; Loadout
+  # seals it to the gateway's key) and the model id + dialect the grant was issued for.
+  BLASTBOX_ENGINE_REA_AGENT_PARAM_KEYS: REA_MODEL_GRANT,REA_MODEL_ID,REA_MODEL_DIALECT
+  BLASTBOX_ENGINE_REA_RESERVED_KEYS: &rea-reserved REA_MODEL_URL,REA_MODEL_GRANT_URL,REA_MODEL_PROVIDERS,REA_MODEL_REQUIRE_PARAMETERS,REA_BIN,REA_GHIDRA_SCRIPTS,REA_ANALYSIS_PROVIDER,REA_GHIDRA_PROJECT_PATH,REA_GHIDRA_PROGRAM_NAME,REA_GHIDRA_SWEEP_S,REA_INSPECT_TIMEOUT_S,REA_CAPA_TIMEOUT_S,REA_EMULATE_TIMEOUT_S,REA_EMULATE_MAX_API,REA_EMULATE_MAX_INSTRUCTIONS,REA_PASS_WALL_S,REA_MAX_STEPS,REA_MAX_PASSES,REA_MAX_COMPLETION_TOKENS,REA_TURN_MAX_TOKENS,REA_MODEL_TOKENS_PER_S,REA_FINAL_THINKING,REA_RETAIN_REASONING,REA_COMMIT,REA_TOOLS_SHA256,REA_REPORT_MAX_TOKENS,REA_REPORT_TEMPERATURE,REA_RESERVE_TOKENS,REA_MODEL_TIMEOUT_S,REA_TOOL_TIMEOUT_S,REA_MAX_UNPACK_BYTES,GHIDRA_INSTALL_DIR,JAVA_TOOL_OPTIONS,_JAVA_OPTIONS,JDK_JAVA_OPTIONS,HTTP_PROXY,HTTPS_PROXY,http_proxy,https_proxy,NO_PROXY,no_proxy,HOME,TMPDIR,NODE_OPTIONS,REA_GW_LISTEN,REA_GW_PRIVATE_KEY_FILE,REA_GW_OPERATOR_KEY_FILE_OPENROUTER,REA_GW_OPERATOR_KEY_FILE_ANTHROPIC,REA_GW_REQUIRE_GRANT
+  BLASTBOX_ENGINE_REA_AGENT_RESERVED_KEYS: *rea-reserved
+
+services:
+  postgres:
+    image: postgres:16-alpine@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: rea
+      POSTGRES_USER: rea
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rea -d rea"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [backend]
+
+  docker-socket-proxy:
+    image: ghcr.io/tecnativa/docker-socket-proxy@sha256:9e4b9e7517a6b660f2cc903a19b257b1852d5b3344794e3ea334ff00ae677ac2
+    restart: unless-stopped
+    # Same grants as mail-bb's proxy (the other stack with an egress tier): containers + images
+    # + info/version/events/ping, POST for run/kill, and NETWORKS so the dispatcher can run
+    # `docker network inspect bb-rea-model` (the bridge= gate refuses a bridge it cannot
+    # verify as --internal).
+    environment:
+      CONTAINERS: "1"
+      IMAGES: "1"
+      INFO: "1"
+      VERSION: "1"
+      PING: "1"
+      EVENTS: "1"
+      POST: "1"
+      NETWORKS: "1"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/run"]
+    volumes:
+      # The entrypoint renders haproxy.cfg at start; read_only needs this one writable dir.
+      - proxy-haproxy-cfg:/usr/local/etc/haproxy
+      # Longer client/server timeouts than the image's 10m (see the file's header).
+      - ./docker-socket-proxy/haproxy.cfg.template:/usr/local/etc/haproxy/haproxy.cfg.template:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [backend]
+
+  api:
+    image: ${REA_HOST_IMAGE:?set REA_HOST_IMAGE in .env}
+    restart: unless-stopped
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      <<: *host-env
+      # Same scheme as williamtells-bb: every route except /v1/healthz and /v1/version needs
+      # `Authorization: Bearer <key>`, and the listener is https only.
+      BLASTBOX_API_KEY: ${BLASTBOX_API_KEY:?set BLASTBOX_API_KEY in .env}
+      BLASTBOX_TLS_CERT: /tls/ingress.crt
+      BLASTBOX_TLS_KEY: /tls/ingress.key
+    command: ["serve", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${REA_BIND_ADDR:-0.0.0.0}:${REA_PORT:-8006}:8000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,nosuid,size=2g"]
+    volumes:
+      - ${REA_DATA_DIR}:${REA_DATA_DIR}
+      - ${REA_TLS_DIR:?set REA_TLS_DIR in .env}:/tls:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import ssl,urllib.request,sys; c=ssl.create_default_context(cafile='/tls/ca.crt'); c.check_hostname=False; sys.exit(0 if urllib.request.urlopen('https://localhost:8000/v1/healthz', timeout=5, context=c).status==200 else 1)"]
+      interval: 30s
+      timeout: 15s
+      start_period: 20s
+      retries: 3
+    networks: [backend, frontend]
+
+  dispatcher:
+    image: ${REA_HOST_IMAGE}
+    restart: unless-stopped
+    depends_on:
+      postgres: {condition: service_healthy}
+      docker-socket-proxy: {condition: service_started}
+    environment:
+      <<: *host-env
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+      BLASTBOX_ATTEST_KEY: /keys/attest.key
+      # Cold path only (no warm pool): every job is one disposable gVisor container.
+      BLASTBOX_POOL_RUNTIME: none
+      BLASTBOX_WORKER_RUNTIME: runsc
+      BLASTBOX_REQUIRE_SECURE_RUNTIME: "1"
+      BLASTBOX_ALLOW_RUNC: "0"
+      BLASTBOX_DISPATCH_CONCURRENCY: "${REA_CONCURRENCY:-2}"
+      BLASTBOX_WORKER_MEMORY: 6g
+      BLASTBOX_WORKER_CPUS: "4"
+      BLASTBOX_WORKER_PIDS_LIMIT: "1024"
+      BLASTBOX_WORKER_NOFILE: "4096"
+      # In-slot BLASTBOX_TIMEOUT is 840 (baked into the worker images); the dispatcher kills at 900.
+      BLASTBOX_WORKER_TIMEOUT_S: "900"
+      BLASTBOX_MAX_QUEUED_AGE_S: "3600"
+      BLASTBOX_SECCOMP_JSON_HOST: ""
+      BLASTBOX_APPARMOR_PROFILES: ""
+    command: ["dispatch"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,nosuid,size=64m"]
+    volumes:
+      - ${REA_DATA_DIR}:${REA_DATA_DIR}
+      # Signing key in a dir ONLY the dispatcher mounts (the api shares the data dir).
+      - ${REA_KEY_DIR:?set REA_KEY_DIR in .env}:/keys
+    networks: [backend]
+
+  rea-model-proxy:
+    # tinyproxy 1.11.3, non-root (uid 57981). Config + filter: README.md "Network".
+    image: kalaksi/tinyproxy@sha256:fafafc7079ca29c6704564de1353f61d038f2166f09b01d4e460e8e499bf6b57
+    container_name: rea-model-proxy
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,nosuid,noexec,size=16m", "/run:rw,nosuid,noexec,size=1m"]
+    volumes:
+      - ./tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
+      - ./tinyproxy.filter:/etc/tinyproxy/filter:ro
+    networks:
+      bb-rea-model:
+        ipv4_address: ${REA_MODEL_PROXY_IP:-10.231.200.2}
+      model-egress: {}
+      model-gw:
+        ipv4_address: 10.231.201.2
+
+  rea-model-gw:
+    # Python model gateway (blastbox.engines.rea.model_gateway; README.md "Hosted model"): opens the
+    # per-job grant in X-Rea-Grant, forces OpenRouter ZDR, injects the provider key and forwards
+    # over verified TLS. Keys are 0400 files in ./model-gw/secret (uid 1000). Reached only via
+    # rea-model-proxy on model-gw. REA_GW_REQUIRE_GRANT is deliberately NOT set here (rollout
+    # compatibility: no grant -> the operator key); see README.md before turning it on.
+    build:
+      context: ../..
+      dockerfile: deploy/rea/model-gw/Dockerfile
+    image: blastbox-rea-model-gw:dev
+    container_name: rea-model-gw
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,nosuid,noexec,size=64m"]
+    environment:
+      REA_GW_LISTEN: 0.0.0.0:8080
+      REA_GW_PRIVATE_KEY_FILE: /run/model-gw/gateway.key
+      REA_GW_OPERATOR_KEY_FILE_OPENROUTER: /run/model-gw/openrouter.key
+      # Uncomment once model-gw/secret/anthropic.key exists: a set path that cannot be read stops
+      # the gateway at start (fail closed), so this is off until the file is there.
+      # REA_GW_OPERATOR_KEY_FILE_ANTHROPIC: /run/model-gw/anthropic.key
+    volumes:
+      - ./model-gw/secret:/run/model-gw:ro
+    networks:
+      model-gw:
+        ipv4_address: 10.231.201.3
+      model-egress: {}
+
+networks:
+  backend: {internal: true}
+  frontend: {}
+  # The proxy's way out (a normal NATed bridge). Nothing else joins it.
+  model-egress: {}
+  # tinyproxy <-> rea-model-gw only.
+  model-gw:
+    internal: true
+    ipam: {config: [{subnet: 10.231.201.0/29}]}
+  # Operator-created, --internal (the dispatcher's bridge= gate verifies it with docker inspect).
+  bb-rea-model:
+    external: true
+
+volumes:
+  postgres-data: {}
+  proxy-haproxy-cfg: {}
