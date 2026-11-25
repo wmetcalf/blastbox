@@ -99,6 +99,7 @@ dev = [
     # codebase; pin below it until a deliberate lint-modernization pass.
     "ruff>=0.3.0,<0.16",
     "fakeredis>=2.21",
+    "redis<8.2",  # fakeredis 2.40 breaks on redis 8.2 (FakeRedis() reads a C method's __closure__); lift once fakeredis supports it
     "httpx>=0.27",
     "moto[s3]>=5.0",             # in-process S3 for the blob-store contract tests
 ]

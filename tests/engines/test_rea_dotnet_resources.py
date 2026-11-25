@@ -252,6 +252,15 @@ def _columns(stream, w, h, channels):
     return bytes(out)
 
 
+@pytest.fixture
+def unhurried(monkeypatch):
+    """The scan budgets are wall-clock (40 s of image decoding): a stalled CI runner trips them
+    and the scan skips the image it was asked about. A test about what a scan finds must not
+    depend on how fast the machine is, so it runs with budgets that cannot expire."""
+    monkeypatch.setattr(dr, "IMAGE_BUDGET_S", 1e9)
+    monkeypatch.setattr(dr, "SCAN_BUDGET_S", 1e9)
+
+
 def _noise(n, seed=b"n"):
     out = bytearray()
     while len(out) < n:
@@ -380,6 +389,7 @@ def test_png_filters_are_undone():
     assert image is not None and (image.r, image.g, image.b, image.a) == (px[0::4], px[1::4], px[2::4], px[3::4])
 
 
+@pytest.mark.usefixtures("unhurried")
 def test_a_recovered_stage_is_described_and_its_own_resources_scanned(tmp_path):
     state = dr._Scan(tmp_path)
     carrier = _serialized(_stage2_png(DLL.read_bytes()))
@@ -395,6 +405,7 @@ def test_a_recovered_stage_is_described_and_its_own_resources_scanned(tmp_path):
     assert len(state.hidden) <= dr.MAX_HIDDEN
 
 
+@pytest.mark.usefixtures("unhurried")
 def test_stages_are_not_followed_past_the_depth_cap(tmp_path, monkeypatch):
     monkeypatch.setattr(dr, "MAX_DEPTH", 0)
     state = dr._Scan(tmp_path)
@@ -403,6 +414,7 @@ def test_stages_are_not_followed_past_the_depth_cap(tmp_path, monkeypatch):
     assert len(state.hidden) == 1 and state.hidden[0]["stage"]["dotnet"] is True
 
 
+@pytest.mark.usefixtures("unhurried")
 def test_a_native_stage_is_described_as_not_dotnet(tmp_path):
     state = dr._Scan(tmp_path)
     carrier = _serialized(_stage1_bmp())
@@ -410,6 +422,7 @@ def test_a_native_stage_is_described_as_not_dotnet(tmp_path):
     assert [h.get("stage") for h in state.hidden] == [{"dotnet": False}]
 
 
+@pytest.mark.usefixtures("unhurried")
 def test_a_noise_image_is_a_hidden_payload_and_a_picture_is_not(tmp_path):
     state = dr._Scan(tmp_path)
     noisy = _png(200, 160, b"".join(_noise(96000)[i:i + 3] + b"\xff" for i in range(0, 96000, 3)))
@@ -418,6 +431,22 @@ def test_a_noise_image_is_a_hidden_payload_and_a_picture_is_not(tmp_path):
     flat = _png(200, 160, bytes(200 * 160 * 4))
     state.consider(flat, dr.entropy(flat), "r", "flat", 0)
     assert len(state.hidden) == 1
+
+
+@pytest.mark.parametrize("hurried", [True, False])
+def test_a_stalled_clock_costs_a_noise_image_only_when_the_budgets_are_real(tmp_path, monkeypatch, hurried):
+    """The 2026-11 CI flake: a runner stall past IMAGE_BUDGET_S between building the scan and
+    reading the image made the scan skip it (counted in items_unread), leaving ``hidden`` empty."""
+    if not hurried:
+        monkeypatch.setattr(dr, "IMAGE_BUDGET_S", 1e9)
+        monkeypatch.setattr(dr, "SCAN_BUDGET_S", 1e9)
+    state = dr._Scan(tmp_path)
+    real = dr.time.monotonic
+    monkeypatch.setattr(dr.time, "monotonic", lambda: real() + 1000.0)  # the runner stalled
+    n = _noise(96000)
+    state.consider(_png(200, 160, b"".join(n[i:i + 3] + b"\xff" for i in range(0, 96000, 3))), None, "r", "pic", 0)
+    assert bool(state.hidden) is (not hurried)
+    assert (state.items_unread >= 1) is hurried
 
 
 def _png_header(w, h, *, depth=8, colour=6, interlace=0):
@@ -432,6 +461,7 @@ def _bmp_header(w, h):
     return b"BM" + struct.pack("<IHHI", 54, 0, 0, 54) + struct.pack("<IiiHHIIiiII", 40, w, h, 1, 24, 0, 0, 0, 0, 0, 0)
 
 
+@pytest.mark.usefixtures("unhurried")
 def test_images_over_the_pixel_limit_are_counted_not_read(tmp_path):
     """A readable kind of image too large to decode may carry anything: it is unread, like one past
     the time budget, so a benign verdict cannot rest on the scan."""
@@ -444,6 +474,7 @@ def test_images_over_the_pixel_limit_are_counted_not_read(tmp_path):
     assert state.hidden == [] and state.items_unread == 4
 
 
+@pytest.mark.usefixtures("unhurried")
 def test_one_item_is_counted_unread_once(tmp_path, monkeypatch):
     """An oversize image is counted where it is met; a parser that then breaks on the same item
     must not count it a second time."""
@@ -458,6 +489,7 @@ def test_one_item_is_counted_unread_once(tmp_path, monkeypatch):
     assert state.hidden == [] and state.items_unread == 1
 
 
+@pytest.mark.usefixtures("unhurried")
 def test_images_of_an_unreadable_kind_or_broken_are_not_counted(tmp_path):
     """Only size is counted: a palette or interlaced PNG, a truncated one and a picture that was
     read leave the count alone, so an ordinary program's icons do not hold its verdict."""
@@ -542,6 +574,7 @@ def _found(state):
     return {(h["resource"], h.get("entry")): str(h.get("decoded", ""))[:6] for h in state.hidden}
 
 
+@pytest.mark.usefixtures("unhurried")
 def test_a_carrier_past_the_listing_caps_is_still_found(tmp_path):
     """The caps bound what the scan lists, not what it reads: a payload behind 64 dull resources,
     or behind 64 dull entries of one container, was never looked at."""
@@ -576,6 +609,7 @@ def test_items_the_scan_did_not_reach_are_counted_unread(tmp_path, monkeypatch):
     assert state.hidden == [] and state.items_unread == 3
 
 
+@pytest.mark.usefixtures("unhurried")
 def test_an_item_that_breaks_the_scanner_costs_that_item_not_the_scan(tmp_path, monkeypatch):
     real = dr.decode
 
@@ -595,6 +629,7 @@ def test_an_item_that_breaks_the_scanner_costs_that_item_not_the_scan(tmp_path, 
     assert _found(state) == {("App.resources", "late"): "image:"} and state.items_unread == 1
 
 
+@pytest.mark.usefixtures("unhurried")
 def test_a_resource_the_parser_cannot_give_costs_that_resource_not_the_scan(tmp_path):
     """dnfile reads lazily: asking for one resource's data can raise on a crafted table."""
 
@@ -628,6 +663,7 @@ def test_bytes_of_a_container_that_no_entry_covers_are_read(tmp_path):
         assert [e["size"] for e in doc["resources"][0]["entries"]] == sizes, tag
 
 
+@pytest.mark.usefixtures("unhurried")
 def test_an_entry_whose_name_cannot_be_read_is_counted_and_its_bytes_still_read(tmp_path):
     raw = _container([("a", b"text"), ("lost", _stage1_bmp()), ("c", b"more")], lost={1})
     state, doc = dr._Scan(tmp_path), {"resources": []}
@@ -639,6 +675,7 @@ def test_an_entry_whose_name_cannot_be_read_is_counted_and_its_bytes_still_read(
     assert key[1].startswith("(bytes outside entries at 0x") and how == "image:"
 
 
+@pytest.mark.usefixtures("unhurried")
 def test_a_container_that_does_not_parse_is_counted_and_read_as_one_blob(tmp_path):
     raw = dr._RES_MAGIC + struct.pack("<II", 2, 0x7FFFFF00) + _noise(70 * 1024)
     state, doc = dr._Scan(tmp_path), {"resources": []}
@@ -872,6 +909,7 @@ def test_a_bitmap_cut_short_by_another_entrys_offset_is_read_whole(tmp_path, mon
     assert late.hidden == [] and late.items_unread == 1
 
 
+@pytest.mark.usefixtures("unhurried")
 def test_the_first_image_header_that_holds_decides(tmp_path):
     """A small picture planted inside a carrier's header must not be the one that is read: not a
     16x16 bitmap in the gap an oversize bitmap leaves before its pixels, and not a PNG there."""
@@ -920,6 +958,7 @@ def _woff(body):
 _MEDIA_FILES = {"png": _palette_png, "jpeg": _jpeg, "gif": _gif, "ico": _ico, "riff": _riff, "woff": _woff}
 
 
+@pytest.mark.usefixtures("unhurried")
 def test_whole_media_files_are_not_payloads(tmp_path):
     """Compressed media is high-entropy by nature: a file whose framing holds to its end is not
     reported, alone, inside a serialized object or with a few bytes after it."""
@@ -952,6 +991,7 @@ def test_a_media_magic_does_not_excuse_a_payload(tmp_path):
         assert state.hidden[0]["size"] >= dr.HIDDEN_MIN_BYTES and state.items_unread == 0, tag
 
 
+@pytest.mark.usefixtures("unhurried")
 def test_bytes_between_a_bitmaps_header_and_its_pixels_are_read(tmp_path):
     clean = _bmp(40, 40, bytes(40 * 40 * 3))
     blob = clean[:10] + struct.pack("<I", 54 + len(SAMPLE)) + clean[14:54] + SAMPLE + clean[54:]
@@ -961,6 +1001,7 @@ def test_bytes_between_a_bitmaps_header_and_its_pixels_are_read(tmp_path):
     assert _found(state) == {("r", "pic"): "plain"} and state.items_unread == 0
 
 
+@pytest.mark.usefixtures("unhurried")
 def test_an_item_of_too_many_parts_is_counted(tmp_path):
     small = _png(16, 16, bytes(16 * 16 * 4))
     for count, unread in ((dr.MAX_PARTS, 0), (dr.MAX_PARTS + 1, 1)):
@@ -1045,6 +1086,7 @@ def test_an_empty_resource_is_not_a_resource_left_unread(tmp_path):
     assert "error" not in doc and "items_unread" not in doc and doc["resources_total"] == 5
 
 
+@pytest.mark.usefixtures("unhurried")
 def test_stretches_outside_entries_past_the_cap_are_counted_unread(tmp_path, monkeypatch):
     """A container cut into more uncovered stretches than the scan reads has bytes nobody read."""
     raw = _container([("a", b"text")], tail=_stage1_bmp())
