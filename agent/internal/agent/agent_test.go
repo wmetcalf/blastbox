@@ -68,7 +68,7 @@ func TestSemver(t *testing.T) {
 		a, b string
 		less bool
 	}{{"dev", "0.0.1", true}, {"1.0.0", "9.0.0", true}, {"1.2.3", "1.2.3", false}, {"v1.10.0", "1.9.9", false},
-		{"2.0.0-rc1", "2.0.0", false}, {"dev", "dev", false}, {"1.0.0", "", false}} {
+		{"2.0.0-rc1", "2.0.0", true}, {"dev", "dev", false}, {"1.0.0", "", false}} {
 		if got := semverLess(c.a, c.b); got != c.less {
 			t.Errorf("%q < %q = %v", c.a, c.b, got)
 		}
@@ -994,6 +994,25 @@ func TestRenewProofSignedByCurrentKeyAcrossSwaps(t *testing.T) {
 		}
 		if np, _, _ := certPub(newCert); np.Equal(curPub) {
 			t.Fatalf("round %d: key not rotated", round)
+		}
+	}
+}
+
+// A prerelease of the minimum version is below it (semver 2.0 §11): 1.2.3-rc1 < 1.2.3.
+func TestPrereleaseIsBelowItsRelease(t *testing.T) {
+	for _, c := range []struct {
+		a, b string
+		less bool
+	}{
+		{"1.2.3-rc1", "1.2.3", true},
+		{"1.2.3", "1.2.3-rc1", false},
+		{"1.2.3-rc1", "1.2.3-rc1", false},
+		{"1.2.3+build5", "1.2.3", false},
+		{"1.2.4-rc1", "1.2.3", false},
+		{"1.2.2", "1.2.3", true},
+	} {
+		if got := semverLess(c.a, c.b); got != c.less {
+			t.Errorf("semverLess(%q, %q) = %v, want %v", c.a, c.b, got, c.less)
 		}
 	}
 }

@@ -46,7 +46,8 @@ func classify(err error) (d time.Duration, lvl slog.Level, ok bool) {
 	return 0, slog.LevelWarn, false
 }
 
-// semver compares dotted numeric versions; "dev", empty or unparseable parts count as 0.
+// semver compares dotted numeric versions; "dev", empty or unparseable parts count as 0, and a
+// prerelease (1.2.3-rc1) is below its release.
 func semverLess(a, b string) bool { return semverCmp(a, b) < 0 }
 
 func semverCmp(a, b string) int {
@@ -59,7 +60,27 @@ func semverCmp(a, b string) int {
 			return 1
 		}
 	}
+	// Equal numbers: a prerelease is below its release (semver 2.0 §11); build metadata after
+	// "+" does not count. Two prereleases of one version compare equal here (fail-open only
+	// between prereleases, never past the release itself).
+	if pa, pb := prerelease(a), prerelease(b); pa != pb && (pa == "" || pb == "") {
+		if pa != "" {
+			return -1
+		}
+		return 1
+	}
 	return 0
+}
+
+func prerelease(v string) string {
+	v = strings.TrimSpace(v)
+	if i := strings.IndexByte(v, '+'); i >= 0 {
+		v = v[:i]
+	}
+	if i := strings.IndexByte(v, '-'); i >= 0 {
+		return v[i+1:]
+	}
+	return ""
 }
 
 func semverParts(v string) [3]int {
