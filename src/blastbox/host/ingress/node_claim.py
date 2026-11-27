@@ -412,7 +412,9 @@ TERMINAL_WRITES_DIRECT = "direct"
 #: Under finalizer-only, the union of the two write shapes a node may send (spec 6.5):
 #: release {status: queued, claim_id: null}; fail {status: failed, error, finished_at,
 #: expires_at}.
-_FINALIZER_ONLY_FIELDS = frozenset({"status", "claim_id", "error", "finished_at", "expires_at"})
+_RELEASE_FIELDS = frozenset({"status", "claim_id"})
+_FAIL_FIELDS = frozenset({"status", "error", "finished_at", "expires_at"})
+_FINALIZER_ONLY_FIELDS = _RELEASE_FIELDS | _FAIL_FIELDS
 
 
 def terminal_writes_mode(env: "dict[str, str] | None" = None) -> str:
@@ -1548,6 +1550,13 @@ def register_node_claim_routes(
                 why = f"status={getattr(fields['status'], 'value', fields['status'])}"
             elif extra:
                 why = f"fields {', '.join(extra)}"
+            elif fields["status"] == JobStatus.QUEUED and set(req.fields) - _RELEASE_FIELDS:
+                why = f"release with {', '.join(sorted(set(req.fields) - _RELEASE_FIELDS))}"
+            elif fields["status"] == JobStatus.FAILED and set(req.fields) != _FAIL_FIELDS \
+                    and set(req.fields) != _FAIL_FIELDS - {"error"}:
+                # finished_at and expires_at are required: without expires_at the FAILED row
+                # (and anything stored for it) is never retention-purged
+                why = f"fail write with {', '.join(sorted(req.fields))}"
             elif req.expect_status is not None and req.expect_status != JobStatus.RUNNING.value:
                 why = f"expect_status={req.expect_status}"
             if why is not None:
@@ -1555,6 +1564,16 @@ def register_node_claim_routes(
                              node_id, job_id, why, TERMINAL_WRITES_ENV, terminal_mode)
                 raise HTTPException(status_code=403, detail=_REFUSED)
         if terminal_mode == TERMINAL_WRITES_FINALIZER_ONLY:
+            if fields.get("status") == JobStatus.FAILED:
+                from blastbox.errors import sanitize_public_error
+
+                # the same scrub the dispatcher's own _fail_job applies before storage
+                if fields.get("error") is not None:
+                    fields["error"] = sanitize_public_error(str(fields["error"]))
+                started = current.started_at
+                if fields.get("finished_at") is not None and started is not None \
+                        and fields["finished_at"] < started:
+                    fields["finished_at"] = started
             # The RUNNING check above read a snapshot; the finalizer may make the job DONE
             # before this write lands. The CAS is on RUNNING, whatever the caller expected.
             if not job_store.update_if_status(job_id, JobStatus.RUNNING,

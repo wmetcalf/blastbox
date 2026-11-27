@@ -56,7 +56,11 @@ def test_finalizer_only_refuses_any_status_but_release_or_fail(tmp_path, pki_dir
 def test_finalizer_only_allows_fail(tmp_path, pki_dir, monkeypatch):  # noqa: F811
     monkeypatch.setenv(ENV, "finalizer-only")
     store, c, hdr = _setup(tmp_path, pki_dir)
-    r = _post(c, hdr, {"status": "failed", "error": "sandbox would not start"}, expect="running")
+    import time as _t
+
+    now = _t.time()
+    r = _post(c, hdr, {"status": "failed", "error": "sandbox would not start", "finished_at": now,
+                       "expires_at": now + 60}, expect="running")
     assert r.status_code == 200, r.text
     assert store.get("job-1").status == JobStatus.FAILED
 
@@ -225,3 +229,34 @@ def test_finalizer_only_result_summary_is_the_finalizers(tmp_path, pki_dir, monk
     store, c, hdr = _setup(tmp_path, pki_dir)
     assert _post(c, hdr, {"result_summary": {"forged": 1}}).status_code == 403
     assert store.get("job-1").result_summary in (None, {})
+
+
+@pytest.mark.parametrize("fields", [
+    {"status": "queued", "claim_id": None, "error": "x"},
+    {"status": "queued", "claim_id": None, "finished_at": 1.0},
+    {"status": "queued", "claim_id": None, "expires_at": __import__("time").time() + 60},
+    {"status": "failed"},                                     # no retention clock: never purged
+    {"status": "failed", "error": "x", "finished_at": 1.0},   # no expires_at
+])
+def test_finalizer_only_each_shape_is_checked_on_its_own(tmp_path, pki_dir, monkeypatch,  # noqa: F811
+                                                         fields):
+    monkeypatch.setenv(ENV, "finalizer-only")
+    store, c, hdr = _setup(tmp_path, pki_dir)
+    before = store.get("job-1")
+    assert _post(c, hdr, fields, expect="running").status_code == 403
+    assert store.get("job-1") == before
+
+
+def test_finalizer_only_fail_error_is_sanitised_and_finish_not_before_start(tmp_path, pki_dir,  # noqa: F811
+                                                                            monkeypatch):
+    import time as _t
+
+    monkeypatch.setenv(ENV, "finalizer-only")
+    store, c, hdr = _setup(tmp_path, pki_dir)
+    started = store.get("job-1").started_at
+    r = _post(c, hdr, {"status": "failed", "error": "boom /var/lib/blastbox/jobs/x postgres://u:pw@h/db",
+                       "finished_at": 1.0, "expires_at": _t.time() + 60}, expect="running")
+    assert r.status_code == 200, r.text
+    j = store.get("job-1")
+    assert "/var/lib" not in j.error and "pw@" not in j.error
+    assert j.finished_at is not None and started is not None and j.finished_at >= started
