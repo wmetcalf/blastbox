@@ -721,3 +721,32 @@ def test_revoke_proceeds_past_a_dir_whose_lock_is_held(tmp_path, monkeypatch):
     for d in (ca_dir, i1, i2):                      # revoked everywhere regardless
         assert node_renew.current_cert(d, "n1") is None
     assert exc.value.unlocked == [i2]
+
+
+def test_same_second_certs_with_different_wg_keys_defer_not_guess(tmp_path, monkeypatch):
+    d = tmp_path / "pki"
+    ca = pki.ensure_ca(d)
+    now = pki._now()
+    monkeypatch.setattr(pki, "_now", lambda: now)
+    wg2 = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8="
+    (d / "a-old.crt").write_bytes(ca.issue_node("n1", wg_pubkey=WG, grants=GRANTS).cert_pem)
+    (d / "z-new.crt").write_bytes(ca.issue_node("n1", wg_pubkey=wg2, grants=GRANTS).cert_pem)
+    monkeypatch.undo()
+    before = {p.name: p.read_bytes() for p in d.glob("*.crt")}
+    queue_csr(d, "n1", make_csr("n1")[0])
+    [(nid, outcome)] = sign_pending(ca, d)
+    assert outcome.startswith("deferred") and "WireGuard" in outcome
+    assert {p.name: p.read_bytes() for p in d.glob("*.crt")} == before
+    assert pending(d) == ["n1"]
+
+
+def test_revoke_removes_a_symlink_to_the_nodes_cert_but_not_its_target(tmp_path):
+    ca, ca_dir, i1, _i2 = _split(tmp_path)
+    outside = tmp_path / "outside.crt"
+    os.replace(i1 / "node-n1.crt", outside)
+    (i1 / "node-n1.crt").symlink_to(outside)        # the ingress follows it
+    assert set(fleet_grants(i1)) == {"n1"}
+    node_renew.revoke(ca_dir, "n1", node_dirs=[i1])
+    assert not (i1 / "node-n1.crt").is_symlink()
+    assert outside.exists()
+    assert "n1" not in fleet_grants(i1)

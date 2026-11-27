@@ -111,14 +111,15 @@ class _Unreadable(ValueError):
         self.regular = regular
 
 
-def _read_capped(path: Path, limit: int) -> bytes:
+def _read_capped(path: Path, limit: int, *, follow: bool = False) -> bytes:
     """Read a small REGULAR file without following a link or blocking on a FIFO.
 
     A node dir is the ingress's to write, so the CA host checks what it opened (fstat on
     the same descriptor, no check-then-open window) and never reads more than ``limit``.
     """
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        flags = os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | (0 if follow else os.O_NOFOLLOW)
+        fd = os.open(path, flags)
     except OSError as exc:
         if exc.errno == errno.ELOOP:
             raise _Unreadable(f"{path.name} is a symlink") from None
@@ -159,7 +160,7 @@ class _Current:
     pem: bytes
     ident: NodeIdentity
     grants: NodeGrants                  #: INTERSECTION over every verifying cert
-    newest: NodeIdentity                #: the most recently ISSUED (latest not_before)
+    idents: list[NodeIdentity]          #: every verifying cert's identity
     others: list[tuple[Path, bytes]]    #: the rest, superseded by a renewal
 
 
@@ -212,7 +213,7 @@ def _find_current(pki_dir: Path, node_id: str,
         grants = _intersect(grants, f[2].grants)
     assert grants is not None
     return _Current(path=best[0], pem=best[1], ident=best[2], grants=grants,
-                    newest=max(found, key=lambda f: f[2].not_before)[2],
+                    idents=[f[2] for f in found],
                     others=[(f[0], f[1]) for f in found if f is not best])
 
 
@@ -388,10 +389,17 @@ def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
     for cur in states.values():
         grants = _intersect(grants, cur.grants)
     assert grants is not None
-    newest = max((cur.newest for cur in states.values()), key=lambda i: i.not_before)
+    idents = [i for cur in states.values() for i in cur.idents]
+    latest = max(i.not_before for i in idents)
+    keys = {i.wg_pubkey for i in idents if i.not_before == latest}
+    if len(keys) != 1:
+        # Issued in the same second (X.509 has one-second resolution) with different
+        # keys: which is newer is unknowable, and guessing could restore the old key.
+        return ("deferred: certificates issued in the same second disagree about the "
+                "WireGuard key; remove the stale one"), True
     try:
         new = ca.sign_node_csr(csr_pem, node_id=node_id, grants=grants, days=days,
-                               wg_pubkey=newest.wg_pubkey)
+                               wg_pubkey=next(iter(keys)))
     except ValueError as exc:
         return f"refused: {exc}", False
     try:
@@ -468,13 +476,13 @@ def revoke(pki_dir: Path, node_id: str, *, node_dirs: list[Path] | None = None) 
 def _revoke_in(anchor: TrustAnchor, d: Path, node_id: str) -> list[Path]:
     removed: list[Path] = []
     for crt in sorted(d.glob("*.crt")):
-        if crt.is_symlink():
-            continue
+        # A symlinked cert is FOLLOWED here (the ingress follows it too, so it authorises
+        # the node), and only the link is removed, never its target.
         try:
-            pem = _read_capped(crt, MAX_CERT_BYTES)
+            pem = _read_capped(crt, MAX_CERT_BYTES, follow=True)
             if node_identity(anchor, pem, allow_expired=True).node_id != node_id:
                 continue
-        except ValueError:                  # _Unreadable included: not a cert
+        except (ValueError, FileNotFoundError):   # not a cert / a dangling link
             continue
         crt.unlink()
         removed.append(crt)
