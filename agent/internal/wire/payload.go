@@ -7,7 +7,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
+	"strconv"
 )
 
 // sigDomain is the domain-separation prefix (node_auth._SIG_DOMAIN).
@@ -48,4 +50,21 @@ func Verify(pub *ecdsa.PublicKey, payload []byte, sigB64 string) bool {
 	}
 	h := sha256.Sum256(payload)
 	return ecdsa.VerifyASN1(pub, h[:], der)
+}
+
+// renewDomain is the domain-separation prefix of the renewal proof of possession.
+const renewDomain = "blastbox/node-renew/v1"
+
+// RenewPayload returns what the CURRENT node key signs to renew: domain, node id, lowercase
+// hex SHA-256 of the exact csr_pem bytes sent, and decimal issued_at, joined by NUL bytes.
+func RenewPayload(nodeID, csrPEM string, issuedAt int64) []byte {
+	sum := sha256.Sum256([]byte(csrPEM))
+	out := []byte(renewDomain)
+	out = append(out, 0)
+	out = append(out, nodeID...)
+	out = append(out, 0)
+	out = append(out, hex.EncodeToString(sum[:])...)
+	out = append(out, 0)
+	out = strconv.AppendInt(out, issuedAt, 10)
+	return out
 }

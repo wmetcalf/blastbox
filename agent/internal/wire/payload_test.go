@@ -5,12 +5,14 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"flag"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/wmetcalf/blastbox/agent/internal/conformance"
@@ -142,5 +144,50 @@ func TestSignRefusesNonP256(t *testing.T) {
 	}
 	if _, err := wire.Sign(nil, []byte("x")); err == nil {
 		t.Fatal("nil key accepted")
+	}
+}
+
+func TestRenewPayloadBytes(t *testing.T) {
+	csr := "-----BEGIN CERTIFICATE REQUEST-----\nabc\n-----END CERTIFICATE REQUEST-----\n"
+	sum := sha256.Sum256([]byte(csr))
+	want := "blastbox/node-renew/v1\x00node-a\x00" + hex.EncodeToString(sum[:]) + "\x001700000123"
+	if got := string(wire.RenewPayload("node-a", csr, 1700000123)); got != want {
+		t.Fatalf("payload %q, want %q", got, want)
+	}
+	// hex is lowercase and 64 chars.
+	if h := hex.EncodeToString(sum[:]); len(h) != 64 || h != strings.ToLower(h) {
+		t.Fatal(h)
+	}
+}
+
+// renew_proof.json is supplied by the Python side; shape follows ecdsa_cross.json and is
+// provisional, so unknown fields are ignored.
+func TestRenewProofVectors(t *testing.T) {
+	if _, err := os.Stat(conformance.Path("renew_proof.json")); err != nil {
+		t.Skip("renew_proof.json not present yet")
+	}
+	var f struct {
+		Cases []struct {
+			NodeID     string `json:"node_id"`
+			CSRPEM     string `json:"csr_pem"`
+			IssuedAt   int64  `json:"issued_at"`
+			PayloadHex string `json:"payload_hex"`
+		} `json:"cases"`
+		PythonSigned []conformance.SignedEntry `json:"python_signed"`
+	}
+	if err := conformance.ReadJSON("renew_proof.json", &f); err != nil {
+		t.Fatal(err)
+	}
+	for i, c := range f.Cases {
+		if got := hex.EncodeToString(wire.RenewPayload(c.NodeID, c.CSRPEM, c.IssuedAt)); got != c.PayloadHex {
+			t.Errorf("cases[%d]: payload %s, want %s", i, got, c.PayloadHex)
+		}
+	}
+	for i, e := range f.PythonSigned {
+		payload, _ := hex.DecodeString(e.PayloadHex)
+		want := e.Valid == nil || *e.Valid
+		if got := wire.Verify(parsePub(t, e.PublicKeyPEM), payload, e.SignatureB64); got != want {
+			t.Errorf("python_signed[%d]: verify=%v, want %v", i, got, want)
+		}
 	}
 }

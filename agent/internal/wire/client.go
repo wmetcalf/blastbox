@@ -820,9 +820,20 @@ func (c *Client) Heartbeat(ctx context.Context, hb Heartbeat) (HeartbeatResp, er
 	return out, nil
 }
 
-// Renew queues a CSR for certificate renewal.
+// Renew queues a CSR for certificate renewal. The request carries a proof of possession of
+// the CURRENT node key (not the key in the CSR) over the CSR bytes and a server-relative time.
 func (c *Client) Renew(ctx context.Context, csrPEM []byte) error {
-	body, err := jsonBody(map[string]string{"csr_pem": string(csrPEM)})
+	issuedAt := c.ServerNow().Unix()
+	sig, err := Sign(c.key, RenewPayload(c.nodeID, string(csrPEM), issuedAt))
+	if err != nil {
+		return err
+	}
+	body, err := jsonBody(map[string]any{
+		"csr_pem":   string(csrPEM),
+		"cert_pem":  c.cert,
+		"issued_at": issuedAt,
+		"signature": sig,
+	})
 	if err != nil {
 		return err
 	}

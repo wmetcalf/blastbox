@@ -95,17 +95,18 @@ type ingress struct {
 	srv *httptest.Server
 	ca  *pki
 
-	mu         sync.Mutex
-	claims     int
-	hbs        []wire.Heartbeat
-	sessions   []string
-	updates    map[string]map[string]any // job id -> posted body
-	csrs       [][]byte
-	issued     []byte
-	dateOffset time.Duration
-	hbResp     map[string]any
-	onClaim    func(n int) (code int, body string)
-	jobStatus  map[string]int // job id -> status code override for updates
+	mu          sync.Mutex
+	claims      int
+	hbs         []wire.Heartbeat
+	sessions    []string
+	updates     map[string]map[string]any // job id -> posted body
+	csrs        [][]byte
+	renewBodies []map[string]any
+	issued      []byte
+	dateOffset  time.Duration
+	hbResp      map[string]any
+	onClaim     func(n int) (code int, body string)
+	jobStatus   map[string]int // job id -> status code override for updates
 }
 
 func newIngress(t *testing.T, ca *pki) *ingress {
@@ -166,16 +167,46 @@ func (in *ingress) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(code)
 		io.WriteString(w, b)
 	case p == "/v1/nodes/renew":
-		var m map[string]string
-		json.Unmarshal(body, &m)
-		blk, _ := pem.Decode([]byte(m["csr_pem"]))
+		var m struct {
+			CSR       string  `json:"csr_pem"`
+			Cert      string  `json:"cert_pem"`
+			IssuedAt  float64 `json:"issued_at"`
+			Signature string  `json:"signature"`
+		}
+		if json.Unmarshal(body, &m) != nil {
+			w.WriteHeader(400)
+			return
+		}
+		blk, _ := pem.Decode([]byte(m.CSR))
+		if blk == nil {
+			w.WriteHeader(400)
+			return
+		}
 		csr, err := x509.ParseCertificateRequest(blk.Bytes)
 		if err != nil || csr.CheckSignature() != nil {
 			w.WriteHeader(400)
 			return
 		}
+		cblk, _ := pem.Decode([]byte(m.Cert))
+		if cblk == nil {
+			w.WriteHeader(400)
+			return
+		}
+		ccert, err := x509.ParseCertificate(cblk.Bytes)
+		if err != nil {
+			w.WriteHeader(400)
+			return
+		}
+		cpub, _ := ccert.PublicKey.(*ecdsa.PublicKey)
+		if cpub == nil || ccert.Subject.CommonName != csr.Subject.CommonName ||
+			m.IssuedAt != float64(int64(m.IssuedAt)) ||
+			!wire.Verify(cpub, wire.RenewPayload(ccert.Subject.CommonName, m.CSR, int64(m.IssuedAt)), m.Signature) {
+			w.WriteHeader(403)
+			return
+		}
 		in.mu.Lock()
-		in.csrs = append(in.csrs, []byte(m["csr_pem"]))
+		in.renewBodies = append(in.renewBodies, map[string]any{"cert_pem": m.Cert, "csr_pem": m.CSR, "issued_at": m.IssuedAt})
+		in.csrs = append(in.csrs, []byte(m.CSR))
 		in.issued = in.ca.issueNode(in.t, csr.Subject.CommonName, csr.PublicKey.(*ecdsa.PublicKey),
 			time.Now().Add(-time.Minute), time.Now().Add(7*24*time.Hour))
 		in.mu.Unlock()

@@ -562,3 +562,40 @@ func TestEnrolRefusesExistingKeyAndFixesDirMode(t *testing.T) {
 		t.Fatal(st.Mode())
 	}
 }
+
+// The renew proof is verified by the fake control plane against the CURRENT cert's key; a
+// second renewal after the swap must verify against the NEW current key and cert.
+func TestRenewProofSignedByCurrentKeyAcrossSwaps(t *testing.T) {
+	e := newEnv(t, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	for round := 0; round < 2; round++ {
+		curCert, _ := os.ReadFile(e.cfg.CertFile)
+		curPub, _, err := certPub(curCert)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out safeBuf
+		if err := RenewNow(context.Background(), e.cfg, time.Now, &out); err != nil {
+			t.Fatalf("round %d: %v\n%s", round, err, out.String())
+		}
+		e.in.mu.Lock()
+		got := e.in.renewBodies
+		e.in.mu.Unlock()
+		if len(got) != round+1 {
+			t.Fatalf("round %d: %d renew bodies", round, len(got))
+		}
+		b := got[round]
+		if b["cert_pem"] != string(curCert) {
+			t.Fatalf("round %d: cert_pem is not the current cert", round)
+		}
+		if at := int64(b["issued_at"].(float64)); at < time.Now().Unix()-30 || at > time.Now().Unix()+30 {
+			t.Fatalf("round %d: issued_at %d", round, at)
+		}
+		newCert, _ := os.ReadFile(e.cfg.CertFile)
+		if string(newCert) == string(curCert) {
+			t.Fatalf("round %d: cert not swapped", round)
+		}
+		if np, _, _ := certPub(newCert); np.Equal(curPub) {
+			t.Fatalf("round %d: key not rotated", round)
+		}
+	}
+}
