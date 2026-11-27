@@ -562,16 +562,21 @@ func TestLostClaimOnPutNoRetryAndWiped(t *testing.T) {
 // Params the dispatcher would drop are dropped here too, not fatal: a lowercase or oversized
 // key, and the loader/interpreter/shell keys a submitter must never set.
 func TestUnusableParamsAreDropped(t *testing.T) {
-	const show = `env | grep -E '^(FOO|PYTHON|IFS|LD_|DYLD_|lower|BIG)' | sort | tr '\n' ' ' > "$1/env.txt"; echo '{}' > "$1/metadata.json"`
+	const show = `env | grep -E '^(FOO|PYTHON|IFS|LD_|DYLD_|lower|NUL)' | sort | tr '\n' ' ' > "$1/env.txt"; printf %s "$BIG" > "$1/big.txt"; echo '{}' > "$1/metadata.json"`
 	f := setup(t, show)
 	f.claim.Run.Params = map[string]any{"FOO": "bar", "lower-case": "x", "password": "infected",
-		"BIG": strings.Repeat("v", 8193), "PYTHONPATH": "/x", "PYTHONSTARTUP": "/x", "IFS": "x",
+		"BIG": strings.Repeat("é", 5000), "NUL": "a\x00b", "PYTHONPATH": "/x", "PYTHONSTARTUP": "/x", "IFS": "x",
 		"LD_PRELOAD": "/x", "DYLD_INSERT_LIBRARIES": "/x"}
 	if res := f.run(); res.Outcome != "done" {
 		t.Fatalf("%+v", res)
 	}
-	if got := f.in.tarFiles()["env.txt"]; got != "FOO=bar " {
+	files := f.in.tarFiles()
+	if got := files["env.txt"]; got != "FOO=bar " {
 		t.Fatalf("env %q", got)
+	}
+	// Like the dispatcher (_MAX_ENV_VALUE_LEN), an over-long value is cut to 4096 characters.
+	if got := files["big.txt"]; got != strings.Repeat("é", 4096) {
+		t.Fatalf("BIG has %d runes, want 4096", len([]rune(got)))
 	}
 }
 

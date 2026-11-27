@@ -67,7 +67,7 @@ const (
 	defMaxTotalArtifacts = 500 << 20
 	defMaxArtifacts      = 1000
 	maxDirs              = 4096
-	maxParamValue        = 8 << 10
+	maxParamValue        = 4096 // characters, as dispatch._MAX_ENV_VALUE_LEN
 	metadataName         = "metadata.json"
 )
 
@@ -378,7 +378,8 @@ func reservedParam(eng config.Engine, k string) bool {
 // paramEnv turns run.params into extra child env, filtered as the dispatcher's
 // _sanitize_params filters them: a key must match ^[A-Z][A-Z0-9_]{0,63}$, must not be reserved
 // (the floor above, or the engine's reserved_param_keys) and, when the engine sets param_keys,
-// must be in it; a value must be <= 8 KiB. Anything else is dropped (and logged), not fatal:
+// must be in it; a value is cut to 4096 characters and one holding NUL is dropped. Anything
+// else is dropped (and logged), not fatal:
 // the push path runs such a job without the key, and so does this one. Nothing is forwarded
 // unless the engine opts in (default true).
 func (r *Runner) paramEnv(jobID string, eng config.Engine, params map[string]any) (map[string]string, error) {
@@ -429,9 +430,13 @@ func (r *Runner) paramEnv(jobID string, eng config.Engine, params map[string]any
 			}
 			v = string(b)
 		}
-		if len(v) > maxParamValue || strings.ContainsRune(v, 0) {
-			r.logf("job %s: dropping param %+q: value over 8 KiB or holding NUL", jobID, k)
+		if strings.ContainsRune(v, 0) {
+			r.logf("job %s: dropping param %+q: value holds NUL", jobID, k)
 			continue
+		}
+		if rs := []rune(v); len(rs) > maxParamValue {
+			r.logf("job %s: truncating param %+q to %d characters", jobID, k, maxParamValue)
+			v = string(rs[:maxParamValue])
 		}
 		env[k] = v
 	}
