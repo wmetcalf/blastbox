@@ -89,3 +89,13 @@ def test_an_unparseable_peer_line_is_an_error_not_an_ok():
     code, lines = wla.check_handshakes("wg-test", 180, now=NOW, run=_runner(out))
     assert code == 1
     assert PSK not in "\n".join(lines) and PRIV not in "\n".join(lines)
+
+
+def test_a_handshake_far_in_the_future_is_stale():
+    """After a backward clock step a dead peer's last handshake sits ahead of now."""
+    code, _ = wla.check_handshakes(
+        "wg-test", 180, now=NOW, run=_runner(_dump(("AAAAAAAAAAAA=", int(NOW) + 3600))))
+    assert code == 2
+    code, _ = wla.check_handshakes(
+        "wg-test", 180, now=NOW, run=_runner(_dump(("AAAAAAAAAAAA=", int(NOW) + 5))))
+    assert code == 0

@@ -1219,7 +1219,9 @@ def check_handshakes(iface: str, max_age: float = 180.0, *, now: float | None = 
     for p in peers:
         if not p.ever_connected:
             bad.append(f"  {p.public_key[:8]}: never handshaked")
-        elif at - p.latest_handshake > max_age:
+        elif abs(at - p.latest_handshake) > max_age:
+            # abs(): after a backward clock step a dead peer's last handshake sits in the
+            # future, and a negative age would pass any limit until the clock caught up.
             bad.append(f"  {p.public_key[:8]}: last handshake {at - p.latest_handshake:.0f}s ago "
                        f"(limit {max_age:.0f}s)")
     if bad:
