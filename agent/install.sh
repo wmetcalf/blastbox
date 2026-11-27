@@ -9,6 +9,9 @@
 # Order: pinned sha256 -> cosign verify-blob of SHA256SUMS -> binary's line in
 # SHA256SUMS -> install -> atomic flip of <prefix>/current.
 set -eu
+# Installed dirs and files must be readable by a non-root service user even when the
+# caller runs with a restrictive umask (077 is common for root).
+umask 022
 
 REPO="wmetcalf/blastbox"
 OIDC_ISSUER="https://token.actions.githubusercontent.com"
@@ -63,6 +66,9 @@ esac
 # would move INTO the directory current points at, so use the no-dereference
 # flag: -T on GNU/Linux, -h on BSD/macOS.
 flip_current() {
+  if [ -e "$prefix/current" ] && [ ! -L "$prefix/current" ]; then
+    die "$prefix/current exists and is not a symlink; move it aside"
+  fi
   tmp=$prefix/.current.tmp.$$
   rm -f "$tmp"
   ln -s "$1" "$tmp"
@@ -88,16 +94,30 @@ valid_version() {
   [ "$(printf '%s' "$1" | tr -cd '.' | wc -c | tr -d ' ')" = 2 ]
 }
 
+# Record $1 (the version current points at now) in <prefix>/.previous, BEFORE the flip,
+# so a failed write never leaves current moved with a stale .previous. Written to a
+# temp file and renamed. A target that is not a plain version (an absolute or
+# hand-made link) is not recorded, since rollback could not use it.
+record_previous() {
+  valid_version "$1" || return 0
+  if [ -e "$prefix/.previous" ] || [ -L "$prefix/.previous" ]; then
+    [ -f "$prefix/.previous" ] && [ ! -L "$prefix/.previous" ] \
+      || die "$prefix/.previous is not a regular file"
+  fi
+  ptmp=$prefix/.previous.tmp.$$
+  rm -f "$ptmp"
+  printf '%s\n' "$1" > "$ptmp"
+  mv -f "$ptmp" "$prefix/.previous"
+}
+
 if [ "$rollback" = 1 ]; then
   [ -f "$prefix/.previous" ] || die "no previous version recorded in $prefix/.previous"
   prev=$(cat "$prefix/.previous")
   valid_version "$prev" || die "corrupt $prefix/.previous"
   [ -x "$prefix/$prev/blastbox-agent" ] || die "previous version $prev is not installed"
   cur=$(current_target || true)
+  if [ -n "$cur" ] && [ "$cur" != "$prev" ]; then record_previous "$cur"; fi
   flip_current "$prev"
-  if [ -n "$cur" ] && [ "$cur" != "$prev" ]; then
-    printf '%s\n' "$cur" > "$prefix/.previous"
-  fi
   say "rolled back to $prev (was ${cur:-none})"
   exit 0
 fi
@@ -128,6 +148,9 @@ bin="blastbox-agent-$goos-$goarch"
 tag="agent-v$version"
 base="https://github.com/$REPO/releases/download/$tag"
 
+if [ -e "$prefix/current" ] && [ ! -L "$prefix/current" ]; then
+  die "$prefix/current exists and is not a symlink; move it aside"
+fi
 mkdir -p "$prefix"
 stage=$(mktemp -d "$prefix/.stage.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
@@ -173,8 +196,6 @@ mv -f "$dest/blastbox-agent.new" "$dest/blastbox-agent"
 
 # 5. flip current atomically; remember what it pointed at
 cur=$(current_target || true)
+if [ -n "$cur" ] && [ "$cur" != "$version" ]; then record_previous "$cur"; fi
 flip_current "$version"
-if [ -n "$cur" ] && [ "$cur" != "$version" ]; then
-  printf '%s\n' "$cur" > "$prefix/.previous"
-fi
 say "installed $version to $dest (current -> $version)"

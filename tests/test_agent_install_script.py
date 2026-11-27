@@ -88,7 +88,8 @@ def test_good_install_and_rollback(tmp_path):
     assert p.returncode == 0, p.stderr
     assert os.readlink(pfx / "current") == "2.0.0"
     # current is a symlink to a dir: the flip must not have nested a link inside it
-    assert not (pfx / "1.0.0" / ".current.tmp").exists()
+    assert not list(pfx.glob("*/.current.tmp*")) and not list(pfx.glob("*/current"))
+    assert not list(pfx.glob("*/1.0.0")) and not list(pfx.glob("*/2.0.0"))
     assert (pfx / ".previous").read_text().strip() == "1.0.0"
 
     p = run(["--rollback", "--prefix", str(pfx)])
@@ -182,6 +183,76 @@ def test_static_no_curl_pipe_sh():
     assert "| sh" not in text and "|sh" not in text and "| bash" not in text
     assert "--proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL" in text
     assert text.startswith("#!/bin/sh") and "set -eu" in text
+
+
+def _two_versions(tmp_path):
+    pfx = tmp_path / "pfx"
+    for v in ("1.0.0", "2.0.0"):
+        rel, sha = make_release(tmp_path, f"bin {v}".encode())
+        assert install(rel, sha, pfx, v, "--no-cosign").returncode == 0
+        shutil.rmtree(rel)
+    return pfx
+
+
+def test_previous_unwritable_does_not_flip(tmp_path):
+    # .previous must be recorded before current moves, or a failed write leaves them inconsistent
+    pfx = _two_versions(tmp_path)
+    (pfx / ".previous").unlink()
+    (pfx / ".previous").mkdir()
+    rel, sha = make_release(tmp_path, b"bin 3.0.0")
+    p = install(rel, sha, pfx, "3.0.0", "--no-cosign")
+    assert p.returncode != 0
+    assert os.readlink(pfx / "current") == "2.0.0"
+    assert not list(pfx.glob(".previous/*"))
+
+
+def test_current_real_directory_refused(tmp_path):
+    pfx = tmp_path / "pfx"
+    (pfx / "current").mkdir(parents=True)
+    rel, sha = make_release(tmp_path)
+    p = install(rel, sha, pfx, "1.0.0", "--no-cosign")
+    assert p.returncode != 0 and "not a symlink" in p.stderr
+    assert not list((pfx / "current").iterdir())
+
+
+def test_non_version_current_target_not_recorded(tmp_path):
+    pfx = tmp_path / "pfx"
+    rel, sha = make_release(tmp_path, b"bin 1")
+    assert install(rel, sha, pfx, "1.0.0", "--no-cosign").returncode == 0
+    shutil.rmtree(rel)
+    (pfx / "current").unlink()
+    (pfx / "current").symlink_to(pfx / "1.0.0")  # absolute, hand-made
+    rel, sha = make_release(tmp_path, b"bin 2")
+    assert install(rel, sha, pfx, "2.0.0", "--no-cosign").returncode == 0
+    prev = pfx / ".previous"
+    assert not prev.exists() or prev.read_text().strip() == "1.0.0"
+
+
+def test_dirs_readable_under_restrictive_umask(tmp_path):
+    rel, sha = make_release(tmp_path)
+    pfx = tmp_path / "pfx"
+    p = subprocess.run(
+        ["sh", "-c", 'umask 077; exec sh "$@"', "sh", str(INSTALL), "--version", "1.0.0",
+         "--sha256", sha, "--from", str(rel), "--prefix", str(pfx), "--no-cosign"],
+        capture_output=True, text=True, env={"PATH": os.environ["PATH"], "HOME": "/nonexistent"},
+    )
+    assert p.returncode == 0, p.stderr
+    for d in (pfx, pfx / "1.0.0"):
+        assert stat.S_IMODE(d.stat().st_mode) == 0o755, d
+
+
+@pytest.mark.parametrize("break_it", ["sha", "sums", "missing"])
+def test_failed_install_leaves_no_stage(tmp_path, break_it):
+    rel, sha = make_release(tmp_path)
+    pfx = tmp_path / "pfx"
+    if break_it == "sha":
+        sha = "0" * 64
+    elif break_it == "sums":
+        (rel / "SHA256SUMS").write_text("")
+    else:
+        (rel / "SHA256SUMS").unlink()
+    assert install(rel, sha, pfx, "1.0.0", "--no-cosign").returncode != 0
+    assert not list(pfx.glob(".stage.*")) and not list(pfx.glob(".current.tmp.*"))
 
 
 @pytest.mark.skipif(shutil.which("shellcheck") is None, reason="shellcheck not installed")
