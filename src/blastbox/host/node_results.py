@@ -43,6 +43,10 @@ def results_root(job_root: Path | str) -> Path:
     env = os.environ.get(RESULTS_ENV)
     root = Path(env) if env else Path(job_root) / ".node-results"
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        root.chmod(0o700)           # mkdir leaves a pre-existing root as it was
+    except OSError:
+        pass
     return root
 
 
@@ -133,10 +137,11 @@ def vet_tar(fileobj: Any, *, max_members: int, max_total_bytes: int) -> None:
     root ``metadata.json``, no duplicate names, and bounded member count / declared bytes.
     """
     seen: set[str] = set()
+    meta_regular = False
     count = 0
     total = 0
     try:
-        with tarfile.open(fileobj=fileobj, mode="r") as tf:
+        with tarfile.open(fileobj=fileobj, mode="r:") as tf:   # "r:" refuses gz/bz2/xz
             for m in tf:
                 count += 1
                 if count > max_members:
@@ -155,14 +160,16 @@ def vet_tar(fileobj: Any, *, max_members: int, max_total_bytes: int) -> None:
                 if norm in seen:
                     raise TarRejected(f"duplicate member: {norm!r}")
                 seen.add(norm)
+                if norm == "metadata.json" and m.isfile():
+                    meta_regular = True
                 if m.isfile():
                     total += m.size
                     if total > max_total_bytes:
                         raise TarRejected("declared size exceeds the byte cap")
     except tarfile.TarError as exc:
         raise TarRejected(f"unreadable tar: {exc}") from exc
-    if "metadata.json" not in seen:
-        raise TarRejected("metadata.json missing at the root")
+    if not meta_regular:
+        raise TarRejected("metadata.json missing at the root, or not a regular file")
     fileobj.seek(0)
 
 

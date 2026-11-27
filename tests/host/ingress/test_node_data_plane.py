@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import json
 import tarfile
 import time
 
@@ -19,6 +18,7 @@ from blastbox.host.jobs.memory import InMemoryJobStore
 from .test_node_claim import _claim, auth, pki_dir, token_for  # noqa: F401  (fixture)
 
 DATA = b"sample-bytes"
+WG = "A" * 42 + "B="
 
 
 @pytest.fixture(autouse=True)
@@ -273,9 +273,146 @@ def test_stream_cap_413(tmp_path, pki_dir, monkeypatch):  # noqa: F811
 
 
 def test_node_cert_sha256_picks_latest(tmp_path, pki_dir):  # noqa: F811
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+
+    from blastbox.host import pki
+
     assert node_results.node_cert_sha256(pki_dir, "nobody") is None
-    assert len(node_results.node_cert_sha256(pki_dir, "alpha") or "") == 64
-    assert json.dumps({}) == "{}"
+    ca = pki.load_ca(pki_dir)
+    grants = pki.NodeGrants(engines=("clamav",))
+    ca.issue_node("delta", wg_pubkey=WG, grants=grants, days=2).write(pki_dir, "node-delta-old")
+    ca.issue_node("delta", wg_pubkey=WG, grants=grants, days=6).write(pki_dir, "node-delta-new")
+
+    def sha(name):
+        pem = (pki_dir / f"{name}.crt").read_bytes()
+        der = x509.load_pem_x509_certificate(pem).public_bytes(serialization.Encoding.DER)
+        return hashlib.sha256(der).hexdigest()
+
+    assert sha("node-delta-old") != sha("node-delta-new")
+    assert node_results.node_cert_sha256(pki_dir, "delta") == sha("node-delta-new")
+    (pki_dir / "node-delta-new.crt").unlink()
+    assert node_results.node_cert_sha256(pki_dir, "delta") == sha("node-delta-old")
+
+
+def test_replay_returns_stored_outcome_after_job_done(tmp_path, pki_dir):  # noqa: F811
+    store, c, hdr = _setup(tmp_path, pki_dir)
+    assert put(c, hdr, make_tar([])).status_code == 202
+    (d,) = spool_dirs(tmp_path)
+    node_results.write_outcome(d, "done", None)
+    store.update_if_status("job-1", JobStatus.RUNNING, expect_claim_id=hdr["x-blastbox-claim-id"],
+                           status=JobStatus.DONE)
+    r = put(c, hdr, b"ignored")
+    assert r.status_code == 200 and r.json() == {"status": "done"}
+    # a stranger still gets nothing, whatever the job state
+    other = {**hdr, **auth(token_for(c, pki_dir, "gamma"))}
+    assert put(c, other, b"x").status_code == 403
+
+
+def test_replay_pending_and_failed_in_any_state(tmp_path, pki_dir):  # noqa: F811
+    store, c, hdr = _setup(tmp_path, pki_dir)
+    assert put(c, hdr, make_tar([])).status_code == 202
+    store.update_if_status("job-1", JobStatus.RUNNING, expect_claim_id=hdr["x-blastbox-claim-id"],
+                           status=JobStatus.FAILED)
+    assert put(c, hdr, b"x").status_code == 202
+    (d,) = spool_dirs(tmp_path)
+    node_results.write_outcome(d, "failed", "nope")
+    r = put(c, hdr, b"x")
+    assert r.status_code == 422 and r.json()["reason"] == "nope"
+
+
+def test_reclaim_mid_upload_refused_no_marker(tmp_path, pki_dir, monkeypatch):  # noqa: F811
+    store, c, hdr = _setup(tmp_path, pki_dir)
+    import blastbox.host.runtime.remote_http as rh
+    real = rh._safe_extract_tar
+
+    def reclaiming(*a, **k):
+        out = real(*a, **k)
+        store.update_if_status("job-1", JobStatus.RUNNING,
+                               expect_claim_id=hdr["x-blastbox-claim-id"],
+                               status=JobStatus.QUEUED, claim_id=None)
+        return out
+
+    monkeypatch.setattr(rh, "_safe_extract_tar", reclaiming)
+    assert put(c, hdr, make_tar([])).status_code == 403
+    assert spool_dirs(tmp_path) == []
+    assert [p for p in (tmp_path / "results").rglob("*") if "partial" in p.name] == []
+
+
+@pytest.mark.parametrize("h", ["x-blastbox-started-at-ms", "x-blastbox-finished-at-ms"])
+@pytest.mark.parametrize("bad", ["abc", "-5", "1.5"])
+def test_bad_timestamp_headers_400(tmp_path, pki_dir, h, bad):  # noqa: F811
+    _, c, hdr = _setup(tmp_path, pki_dir)
+    assert put(c, hdr, make_tar([]), **{h: bad}).status_code == 400
+    assert spool_dirs(tmp_path) == []
+
+
+def test_compressed_tar_refused(tmp_path, pki_dir):  # noqa: F811
+    import gzip
+    _, c, hdr = _setup(tmp_path, pki_dir)
+    assert put(c, hdr, gzip.compress(make_tar([]))).status_code == 422
+    assert spool_dirs(tmp_path) == []
+
+
+def test_metadata_must_be_a_regular_file(tmp_path, pki_dir):  # noqa: F811
+    _, c, hdr = _setup(tmp_path, pki_dir)
+    d = tarfile.TarInfo("metadata.json")
+    d.type = tarfile.DIRTYPE
+    assert put(c, hdr, make_tar([("m", d)], metadata=False)).status_code == 422
+
+
+def test_concurrent_identical_puts_extract_once(tmp_path, pki_dir, monkeypatch):  # noqa: F811
+    from concurrent.futures import ThreadPoolExecutor
+
+    _, c, hdr = _setup(tmp_path, pki_dir)
+    import blastbox.host.runtime.remote_http as rh
+    real = rh._safe_extract_tar
+    calls = []
+
+    def slow(*a, **k):
+        calls.append(1)
+        time.sleep(0.6)
+        return real(*a, **k)
+
+    monkeypatch.setattr(rh, "_safe_extract_tar", slow)
+    body = make_tar([("a", b"x")])
+    with ThreadPoolExecutor(3) as ex:
+        rs = list(ex.map(lambda _: put(c, hdr, body), range(3)))
+    assert [r.status_code for r in rs] == [202, 202, 202]
+    assert len(calls) == 1
+    assert len(spool_dirs(tmp_path)) == 1
+    assert list((tmp_path / "results" / "job-1").glob("*.claim")) == []
+
+
+def test_results_root_tightens_existing_mode(tmp_path):
+    root = tmp_path / "results"
+    root.mkdir(mode=0o755)
+    root.chmod(0o755)
+    node_results.results_root(tmp_path)
+    assert oct(root.stat().st_mode & 0o777) == "0o700"
+
+
+def test_real_build_app_large_result_not_413(tmp_path, pki_dir, monkeypatch):  # noqa: F811
+    from blastbox.host.ingress.app import build_app
+    from blastbox.limits import Limits
+
+    monkeypatch.setenv("BLASTBOX_PKI_DIR", str(pki_dir))
+    store = InMemoryJobStore()
+    store.create(Job(job_id="job-1", engine="clamav", filename="sample.bin",
+                     status=JobStatus.QUEUED, created_at=time.time()))
+    app = build_app(job_store=store, job_root=tmp_path / "jobs",
+                    limits=Limits(max_input_bytes=1000), blob_store=Blobs(DATA))
+    c = TestClient(app)
+    r = _claim(c, pki_dir, "alpha", engine="clamav")
+    assert r.status_code == 200, r.text
+    hdr = {**auth(token_for(c, pki_dir, "alpha")),
+           "x-blastbox-claim-id": r.json()["job"]["claim_id"],
+           "x-blastbox-receipt": r.json()["receipt"]}
+    big = make_tar([("a.bin", b"x" * 50_000)])
+    assert len(big) > 1000
+    assert put(c, hdr, big).status_code == 202
+    # while an ordinary route still honours max_input_bytes
+    assert c.post("/v1/jobs", content=b"x" * 5000).status_code == 413
 
 
 def test_middleware_ceiling_is_per_route():

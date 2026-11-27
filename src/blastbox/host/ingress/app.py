@@ -1469,7 +1469,7 @@ def build_app(
     # The API key doubles as the pepper for the store-held node signing key: every ingress
     # host already has it and a queue reader does not. See node_auth.resolve_claim_secret.
     register_node_claim_routes(app, job_store=_job_store, job_root=_job_root,
-                               blob_store=_blob_store,
+                               blob_store=_blob_store, limits=_limits,
                                pepper=_api_key.encode() if _api_key else None)
 
     return app

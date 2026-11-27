@@ -58,6 +58,7 @@ exposes no peer certificate to an ASGI app in any case.
 from __future__ import annotations
 
 import base64
+import asyncio
 import binascii
 import logging
 import math
@@ -599,7 +600,7 @@ def _job_requirements(job) -> "tuple[str | None, bool, bool]":
 def register_node_claim_routes(
     app: "FastAPI", *, job_store: "JobStore", pki_dir: "Path | str | None" = None,
     pepper: bytes | None = None, job_root: "Path | str | None" = None,
-    blob_store: "Any | None" = None,
+    blob_store: "Any | None" = None, limits: "Any | None" = None,
 ) -> bool:
     """Mount the claim routes if this deployment has a PKI. Returns whether it did."""
     resolved = resolve_pki_dir(pki_dir)
@@ -1503,12 +1504,15 @@ def register_node_claim_routes(
     # node-finalizer (a separate process) does both. See blastbox.host.node_results.
     _runtimes_ok = frozenset({"seatbelt", "nsjail"})
 
+    def _owned_any(job_id: str, node_id: str, claim_id: str | None, receipt: str | None):
+        if not claim_id or not receipt:
+            raise HTTPException(status_code=403, detail=_REFUSED)
+        return _owned_job(job_id, node_id, claim_id, receipt)
+
     def _running_owned(job_id: str, node_id: str, claim_id: str | None, receipt: str | None):
         from blastbox.host.jobs.base import JobStatus
 
-        if not claim_id or not receipt:
-            raise HTTPException(status_code=403, detail=_REFUSED)
-        job = _owned_job(job_id, node_id, claim_id, receipt)
+        job = _owned_any(job_id, node_id, claim_id, receipt)
         if job.status != JobStatus.RUNNING:
             raise HTTPException(status_code=403, detail=_REFUSED)
         return job
@@ -1533,6 +1537,7 @@ def register_node_claim_routes(
         import tempfile
 
         from fastapi.responses import StreamingResponse
+        from starlette.background import BackgroundTask
 
         node_id = _node_from_token(x_blastbox_node_session)
         job = _running_owned(job_id, node_id, x_blastbox_claim_id, x_blastbox_receipt)
@@ -1568,18 +1573,22 @@ def register_node_claim_routes(
             os.lseek(fd, 0, os.SEEK_SET)
             sha = h.hexdigest()
 
+        fh = os.fdopen(fd, "rb")
+
         def _body():
-            try:
-                with os.fdopen(fd, "rb") as f:
-                    for chunk in iter(lambda: f.read(1 << 20), b""):
-                        yield chunk
-            finally:
-                if cleanup:
-                    shutil.rmtree(cleanup, ignore_errors=True)
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                yield chunk
+
+        def _done() -> None:
+            # a BackgroundTask runs even when the client disconnects before iterating
+            fh.close()
+            if cleanup:
+                shutil.rmtree(cleanup, ignore_errors=True)
 
         return StreamingResponse(_body(), media_type="application/octet-stream",
                                  headers={"Content-Length": str(size),
-                                          "x-blastbox-input-sha256": sha})
+                                          "x-blastbox-input-sha256": sha},
+                                 background=BackgroundTask(_done))
 
     def _ms_header(name: str, raw: "str | None") -> "int | None":
         if raw is None or raw == "":
@@ -1611,7 +1620,12 @@ def register_node_claim_routes(
         from blastbox.limits import Limits
 
         node_id = _node_from_token(x_blastbox_node_session)
-        await run_in_threadpool(_running_owned, job_id, node_id,
+        from blastbox.host.jobs.base import JobStatus
+
+        # Ownership (session + claim id + receipt + grant) is proved for EVERY call; RUNNING is
+        # required only to start a NEW extraction. A replay returns the stored outcome in any
+        # job state (spec 6.4), including after the finalizer has made the job DONE.
+        job = await run_in_threadpool(_owned_any, job_id, node_id,
                                       x_blastbox_claim_id, x_blastbox_receipt)
         claim_id = x_blastbox_claim_id or ""
         runtime = x_blastbox_worker_runtime
@@ -1639,7 +1653,10 @@ def register_node_claim_routes(
         if prior is not None:
             return prior
 
-        lim = Limits.from_env()
+        if job.status != JobStatus.RUNNING:
+            raise HTTPException(status_code=403, detail=_REFUSED)
+
+        lim = limits if limits is not None else Limits.from_env()
         cap = nr.stream_cap(max_artifact_total=lim.max_total_artifact_bytes,
                             max_metadata=lim.max_metadata_bytes,
                             max_artifacts=lim.max_artifacts)
@@ -1648,69 +1665,101 @@ def register_node_claim_routes(
             raise HTTPException(status_code=403, detail=_REFUSED)
         jobdir = root / job_id
         jobdir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        partial: "Path | None" = None
-        with tempfile.NamedTemporaryFile(dir=root, prefix=".upload-", suffix=".tar") as spool:
-            os.chmod(spool.name, 0o600)
-            declared = request.headers.get("content-length")
-            if declared and declared.isdigit() and int(declared) > cap:
-                raise HTTPException(status_code=413, detail="result too large")
-            got = 0
-            async for chunk in request.stream():
-                got += len(chunk)
-                if got > cap:
+        async def _receive_and_extract():
+            partial: "Path | None" = None
+            with tempfile.NamedTemporaryFile(dir=root, prefix=".upload-", suffix=".tar") as spool:
+                os.chmod(spool.name, 0o600)
+                declared = request.headers.get("content-length")
+                if declared and declared.isdigit() and int(declared) > cap:
                     raise HTTPException(status_code=413, detail="result too large")
-                await run_in_threadpool(spool.write, chunk)
-            spool.flush()
-            spool.seek(0)
+                got = 0
+                async for chunk in request.stream():
+                    got += len(chunk)
+                    if got > cap:
+                        raise HTTPException(status_code=413, detail="result too large")
+                    await run_in_threadpool(spool.write, chunk)
+                spool.flush()
+                spool.seek(0)
 
-            def _extract() -> Path:
-                nonlocal partial
-                partial = Path(tempfile.mkdtemp(dir=jobdir, prefix=final.name + ".partial-"))
-                os.chmod(partial, 0o700)
-                max_members = lim.max_artifacts + 64
-                nr.vet_tar(spool, max_members=max_members,
-                           max_total_bytes=lim.max_total_artifact_bytes)
-                out = partial / nr.OUT
-                out.mkdir(mode=0o700)
-                _safe_extract_tar(spool, out, max_total_bytes=lim.max_total_artifact_bytes,
-                                  max_members=max_members,
-                                  max_metadata_bytes=lim.max_metadata_bytes)
-                return partial
+                def _extract() -> Path:
+                    nonlocal partial
+                    partial = Path(tempfile.mkdtemp(dir=jobdir, prefix=final.name + ".partial-"))
+                    os.chmod(partial, 0o700)
+                    max_members = lim.max_artifacts + 64
+                    nr.vet_tar(spool, max_members=max_members,
+                               max_total_bytes=lim.max_total_artifact_bytes)
+                    out = partial / nr.OUT
+                    out.mkdir(mode=0o700)
+                    _safe_extract_tar(spool, out, max_total_bytes=lim.max_total_artifact_bytes,
+                                      max_members=max_members,
+                                      max_metadata_bytes=lim.max_metadata_bytes)
+                    return partial
 
-            try:
-                await run_in_threadpool(_extract)
-                # Ownership re-check: the reclaim sweep may have taken the job while we read.
                 try:
-                    await run_in_threadpool(_running_owned, job_id, node_id,
-                                            x_blastbox_claim_id, x_blastbox_receipt)
+                    await run_in_threadpool(_extract)
+                    # Ownership re-check: the reclaim sweep may have taken the job while we read.
+                    try:
+                        await run_in_threadpool(_running_owned, job_id, node_id,
+                                                x_blastbox_claim_id, x_blastbox_receipt)
+                    except HTTPException:
+                        raise
+                    assert partial is not None
+                    nr.write_marker(partial, nr.UploadMarker(
+                        job_id=job_id, claim_id=claim_id, node_id=node_id,
+                        node_cert_sha256=cert, worker_runtime=runtime,
+                        received_at=time.time(), started_at_ms=started,
+                        finished_at_ms=finished))
+                    try:
+                        os.rename(partial, final)
+                    except OSError:
+                        # lost a race with an identical upload: it is already quarantined
+                        shutil.rmtree(partial, ignore_errors=True)
+                        return _existing() or JSONResponse({"status": "accepted"}, status_code=202)
+                    partial = None
                 except HTTPException:
                     raise
-                assert partial is not None
-                nr.write_marker(partial, nr.UploadMarker(
-                    job_id=job_id, claim_id=claim_id, node_id=node_id,
-                    node_cert_sha256=cert, worker_runtime=runtime,
-                    received_at=time.time(), started_at_ms=started,
-                    finished_at_ms=finished))
+                except Exception as exc:            # noqa: BLE001 - any extraction fault: refuse, no marker
+                    if not isinstance(exc, (nr.TarRejected, OSError, RuntimeError, ValueError)):
+                        _log.exception("node_claim: result extraction failed job=%s", job_id)
+                    else:
+                        _log.warning("node_claim: result refused job=%s: %s", job_id, exc)
+                    return JSONResponse({"status": "failed", "reason": "result rejected"},
+                                        status_code=422)
+                finally:
+                    if partial is not None:
+                        shutil.rmtree(partial, ignore_errors=True)
+            return JSONResponse({"status": "accepted"}, status_code=202)
+
+        # Exactly one extraction per (job, claim): the first PUT holds this lock dir; a
+        # concurrent identical PUT waits briefly for the winner's result, else answers 202.
+        # A lock older than the longest plausible upload is stale (crash) and is broken.
+        lock = final.with_name(final.name + ".claim")
+        for _attempt in range(2):
+            try:
+                os.mkdir(lock, 0o700)
+                break
+            except FileExistsError:
                 try:
-                    os.rename(partial, final)
+                    stale = time.time() - lock.stat().st_mtime > 900
                 except OSError:
-                    # lost a race with an identical upload: it is already quarantined
-                    shutil.rmtree(partial, ignore_errors=True)
-                    return _existing() or JSONResponse({"status": "accepted"}, status_code=202)
-                partial = None
-            except HTTPException:
-                raise
-            except Exception as exc:            # noqa: BLE001 - any extraction fault: refuse, no marker
-                if not isinstance(exc, (nr.TarRejected, OSError, RuntimeError, ValueError)):
-                    _log.exception("node_claim: result extraction failed job=%s", job_id)
-                else:
-                    _log.warning("node_claim: result refused job=%s: %s", job_id, exc)
-                return JSONResponse({"status": "failed", "reason": "result rejected"},
-                                    status_code=422)
-            finally:
-                if partial is not None:
-                    shutil.rmtree(partial, ignore_errors=True)
-        return JSONResponse({"status": "accepted"}, status_code=202)
+                    stale = True
+                if stale:
+                    shutil.rmtree(lock, ignore_errors=True)
+                    continue
+                for _ in range(50):
+                    await asyncio.sleep(0.1)
+                    prior = _existing()
+                    if prior is not None:
+                        return prior
+                    if not lock.exists():
+                        break
+                return _existing() or JSONResponse({"status": "accepted"}, status_code=202)
+        else:
+            return JSONResponse({"status": "accepted"}, status_code=202)
+        try:
+            return await _receive_and_extract()
+        finally:
+            shutil.rmtree(lock, ignore_errors=True)
 
     app.include_router(router)
     _log.info("node_claim: enforcing node grants at the hand-over (pki=%s)", resolved)
