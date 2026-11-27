@@ -597,7 +597,7 @@ def _job_requirements(job) -> "tuple[str | None, bool, bool]":
 
 def register_node_claim_routes(
     app: "FastAPI", *, job_store: "JobStore", pki_dir: "Path | str | None" = None,
-    pepper: bytes | None = None,
+    pepper: bytes | None = None, job_root: "Path | str | None" = None,
 ) -> bool:
     """Mount the claim routes if this deployment has a PKI. Returns whether it did."""
     resolved = resolve_pki_dir(pki_dir)
@@ -611,6 +611,48 @@ def register_node_claim_routes(
     from blastbox.host.pki import load_trust_anchor
 
     router = APIRouter(prefix="/v1/nodes", tags=["nodes"])
+    _jobs_dir = Path(job_root or os.environ.get("BLASTBOX_JOB_ROOT", "/var/lib/blastbox/jobs"))
+
+    def _input_bytes(job) -> "int | None":
+        """Size of the spooled input, or None when it is not on this host."""
+        try:
+            name = Path(job.filename).name
+            if not name or name != job.filename:
+                return None
+            p = _jobs_dir / job.job_id / "input" / name
+            return p.stat().st_size if p.is_file() else None
+        except (OSError, ValueError):
+            return None
+
+    def _run_block(job) -> "dict[str, Any]":
+        """The server-authored run description a credential-less agent reads and nothing else."""
+        from blastbox.limits import Limits
+
+        eng = job.engine.upper().replace("-", "_")
+        raw = (os.environ.get(f"BLASTBOX_NODE_RUN_DEADLINE_S_{eng}")
+               or os.environ.get("BLASTBOX_NODE_RUN_DEADLINE_S") or "300")
+        try:
+            deadline = int(raw)
+        except ValueError:
+            deadline = 300
+        deadline = max(10, min(3600, deadline))
+        lim = Limits.from_env()
+        tier, _creds, _tell = _job_requirements(job)
+        return {
+            "deadline_s": deadline,
+            "limits": {
+                "max_input": lim.max_input_bytes,
+                "max_metadata": lim.max_metadata_bytes,
+                "max_artifact": lim.max_artifact_bytes,
+                "max_total_artifacts": lim.max_total_artifact_bytes,
+                "max_artifacts": lim.max_artifacts,
+            },
+            "network": tier or "none",
+            "params": {k: v for k, v in (job.params or {}).items()
+                       if not str(k).upper().startswith("BLASTBOX_")},
+            "input": {"sha256": job.input_sha256, "bytes": _input_bytes(job),
+                      "filename": job.filename},
+        }
 
     def _anchor():
         """Loaded PER REQUEST, not once at startup.
@@ -936,7 +978,8 @@ def register_node_claim_routes(
         _log.info("node_claim: handed job=%s engine=%s to node=%s",
                   job.job_id, job.engine, node_id)
         return {
-            "job": job.to_dict(),
+            "job": job.to_node_dict(),
+            "run": _run_block(job),
             "node_id": node_id,
             # The receipt, not just the claim id: see node_auth.claim_receipt for why
             # knowing a claim id must not be sufficient to write to a job.

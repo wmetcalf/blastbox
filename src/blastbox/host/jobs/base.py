@@ -98,6 +98,12 @@ class Job:
         d["status"] = self.status.value
         return d
 
+    def to_node_dict(self) -> dict:
+        """``to_dict`` minus ``result_dir``: an ingress-internal path that must not reach a node."""
+        d = self.to_dict()
+        d.pop("result_dir", None)
+        return d
+
     def to_public_dict(self) -> dict:
         """Return a dict safe to expose publicly.
 
