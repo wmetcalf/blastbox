@@ -67,3 +67,34 @@ func TestNoHTMLEscape(t *testing.T) {
 		t.Fatalf("%q %v", got, err)
 	}
 }
+
+func TestEdgeCases(t *testing.T) {
+	got, err := canon.MarshalJSONText([]byte(`[-0, 0, -5]`))
+	if err != nil || string(got) != "[0,0,-5]" {
+		t.Fatalf("%q %v", got, err)
+	}
+	if got, err := canon.Marshal(json.Number("-0")); err != nil || string(got) != "0" {
+		t.Fatalf("%q %v", got, err)
+	}
+	for _, bad := range []json.Number{"", "+1", "01", "0x1", "1_0", "-", "abc"} {
+		if _, err := canon.Marshal(bad); err == nil || errors.Is(err, canon.ErrFloat) {
+			t.Errorf("%q: want non-float number error, got %v", bad, err)
+		}
+	}
+	for _, bad := range []string{`{} {}`, `1 2`, `[] x`, "{}\x00"} {
+		if _, err := canon.MarshalJSONText([]byte(bad)); err == nil {
+			t.Errorf("trailing data accepted: %q", bad)
+		}
+	}
+	if _, err := canon.MarshalJSONText([]byte(" {} \n")); err != nil {
+		t.Errorf("trailing whitespace refused: %v", err)
+	}
+	for _, bad := range []any{"a\xffb", map[string]any{"k\xff": 1}} {
+		if _, err := canon.Marshal(bad); !errors.Is(err, canon.ErrUTF8) {
+			t.Errorf("%q: want ErrUTF8, got %v", bad, err)
+		}
+	}
+	if _, err := canon.MarshalJSONText([]byte("\"a\xffb\"")); !errors.Is(err, canon.ErrUTF8) {
+		t.Errorf("raw invalid UTF-8 text: %v", err)
+	}
+}

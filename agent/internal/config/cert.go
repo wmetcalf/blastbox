@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"regexp"
 	"time"
 )
 
@@ -16,6 +17,8 @@ var (
 	oidNodeInfo = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 1, 1}
 	oidNodeAuth = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 1, 2}
 	oidEKU      = asn1.ObjectIdentifier{2, 5, 29, 37}
+	oidCN       = asn1.ObjectIdentifier{2, 5, 4, 3}
+	nodeIDRE    = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
 )
 
 // CheckNodeCert is the agent's pre-flight check of its own certificate, mirroring the
@@ -85,8 +88,18 @@ func CheckNodeCert(certPEM, caPEM []byte, now time.Time) (nodeID string, notAfte
 	if info.V != 1 && info.V != 2 {
 		return "", time.Time{}, fmt.Errorf("unsupported node-info version %d", info.V)
 	}
-	if info.NodeID == "" || cert.Subject.CommonName != info.NodeID {
-		return "", time.Time{}, errors.New("subject CN does not match node-info node_id")
+	if !nodeIDRE.MatchString(info.NodeID) {
+		return "", time.Time{}, fmt.Errorf("node-info node_id %q is not a valid node id", info.NodeID)
+	}
+	var cns []string
+	for _, atv := range cert.Subject.Names {
+		if atv.Type.Equal(oidCN) {
+			s, _ := atv.Value.(string)
+			cns = append(cns, s)
+		}
+	}
+	if len(cns) != 1 || cns[0] != info.NodeID {
+		return "", time.Time{}, errors.New("subject must carry exactly one CN, equal to node-info node_id")
 	}
 	return info.NodeID, cert.NotAfter, nil
 }

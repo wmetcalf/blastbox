@@ -4,13 +4,13 @@ package config
 
 import (
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
-	"syscall"
 
 	"github.com/BurntSushi/toml"
 )
@@ -111,13 +111,17 @@ func (c *Config) validate(goos string) error {
 	if err != nil || u.Scheme != "https" || u.Host == "" {
 		return fmt.Errorf("ingress must be an https:// URL, got %q", c.Ingress)
 	}
+	if u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery ||
+		u.Fragment != "" || strings.Contains(c.Ingress, "#") {
+		return fmt.Errorf("ingress must be a bare https://host[:port] (no userinfo, path, query or fragment), got %q", c.Ingress)
+	}
 	for name, f := range map[string]string{"ca_file": c.CAFile, "cert_file": c.CertFile} {
 		st, err := os.Stat(f)
 		if err != nil || !st.Mode().IsRegular() {
 			return fmt.Errorf("%s %q is missing or not a regular file", name, f)
 		}
 	}
-	if err := checkKeyFile(c.KeyFile); err != nil {
+	if err := checkKeyFile(c.KeyFile, fileOwner, os.Getuid()); err != nil {
 		return err
 	}
 	if c.StateDir == "" || !filepath.IsAbs(c.StateDir) {
@@ -224,9 +228,9 @@ func absArgv(name string, argv []string, required bool) error {
 	return nil
 }
 
-// checkKeyFile refuses a key that is a symlink, not a regular file, not owned by the
-// current uid, or accessible to group/other.
-func checkKeyFile(path string) error {
+// checkKeyFile refuses a key that is a symlink, not a regular file, owned by someone other
+// than wantUID (as reported by owner), or accessible to group/other.
+func checkKeyFile(path string, owner func(fs.FileInfo) (int, error), wantUID int) error {
 	st, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("key_file %q: %w", path, err)
@@ -238,10 +242,14 @@ func checkKeyFile(path string) error {
 		return fmt.Errorf("key_file %q is not a regular file", path)
 	}
 	if st.Mode().Perm()&0o077 != 0 {
-		return fmt.Errorf("key_file %q has mode %04o; must be 0600", path, st.Mode().Perm())
+		return fmt.Errorf("key_file %q has mode %04o; it must have no group/other access", path, st.Mode().Perm())
 	}
-	if sys, ok := st.Sys().(*syscall.Stat_t); ok && int(sys.Uid) != os.Getuid() {
-		return fmt.Errorf("key_file %q is owned by uid %d, not %d", path, sys.Uid, os.Getuid())
+	uid, err := owner(st)
+	if err != nil {
+		return fmt.Errorf("key_file %q: %w", path, err)
+	}
+	if uid != wantUID {
+		return fmt.Errorf("key_file %q is owned by uid %d, not %d", path, uid, wantUID)
 	}
 	return nil
 }

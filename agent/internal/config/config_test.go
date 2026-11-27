@@ -1,7 +1,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -16,9 +18,13 @@ func newFixture(t *testing.T) fixture {
 	d := t.TempDir()
 	f := fixture{dir: d, ca: filepath.Join(d, "ca.crt"), crt: filepath.Join(d, "node.crt"), key: filepath.Join(d, "node.key")}
 	for _, p := range []string{f.ca, f.crt} {
-		os.WriteFile(p, []byte("x"), 0o644)
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	os.WriteFile(f.key, []byte("x"), 0o600)
+	if err := os.WriteFile(f.key, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	return f
 }
 
@@ -42,7 +48,6 @@ output = "stdout-envelope"
 ` + extra
 }
 
-// nativeSandbox is the sandbox valid on the running OS (load takes goos explicitly in tests).
 func write(t *testing.T, f fixture, body string) string {
 	p := filepath.Join(f.dir, "agent.toml")
 	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
@@ -89,14 +94,35 @@ func TestLoadRefusals(t *testing.T) {
 		{"http ingress", "linux", func(f fixture) string {
 			return strings.Replace(f.toml(eng(good), nsj), "https://", "http://", 1)
 		}, "https"},
-		{"missing ca", "linux", func(f fixture) string { os.Remove(f.ca); return f.toml(eng(good), nsj) }, "ca_file"},
-		{"missing cert", "linux", func(f fixture) string { os.Remove(f.crt); return f.toml(eng(good), nsj) }, "cert_file"},
-		{"missing key", "linux", func(f fixture) string { os.Remove(f.key); return f.toml(eng(good), nsj) }, "key_file"},
-		{"key 0640", "linux", func(f fixture) string { os.Chmod(f.key, 0o640); return f.toml(eng(good), nsj) }, "0600"},
+		{"ingress path", "linux", func(f fixture) string {
+			return strings.Replace(f.toml(eng(good), nsj), "8005\"", "8005/api\"", 1)
+		}, "bare https"},
+		{"ingress userinfo", "linux", func(f fixture) string {
+			return strings.Replace(f.toml(eng(good), nsj), "https://", "https://u:p@", 1)
+		}, "bare https"},
+		{"ingress query", "linux", func(f fixture) string {
+			return strings.Replace(f.toml(eng(good), nsj), "8005\"", "8005?x=1\"", 1)
+		}, "bare https"},
+		{"ingress fragment", "linux", func(f fixture) string {
+			return strings.Replace(f.toml(eng(good), nsj), "8005\"", "8005#f\"", 1)
+		}, "bare https"},
+		{"missing ca", "linux", func(f fixture) string { _ = os.Remove(f.ca); return f.toml(eng(good), nsj) }, "ca_file"},
+		{"missing cert", "linux", func(f fixture) string { _ = os.Remove(f.crt); return f.toml(eng(good), nsj) }, "cert_file"},
+		{"missing key", "linux", func(f fixture) string { _ = os.Remove(f.key); return f.toml(eng(good), nsj) }, "key_file"},
+		{"key 0640", "linux", func(f fixture) string {
+			if err := os.Chmod(f.key, 0o640); err != nil {
+				t.Fatal(err)
+			}
+			return f.toml(eng(good), nsj)
+		}, "no group/other"},
 		{"key symlink", "linux", func(f fixture) string {
 			real := f.key + ".real"
-			os.Rename(f.key, real)
-			os.Symlink(real, f.key)
+			if err := os.Rename(f.key, real); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(real, f.key); err != nil {
+				t.Fatal(err)
+			}
 			return f.toml(eng(good), nsj)
 		}, "symlink"},
 		{"relative state_dir", "linux", func(f fixture) string {
@@ -154,5 +180,39 @@ func TestLoadUsesRuntimeGOOS(t *testing.T) {
 	}
 	if _, err := Load(write(t, f, f.toml(eng(`sandbox = "`+wrong+`"`+"\n"), ""))); err == nil {
 		t.Fatal("wrong-OS sandbox accepted")
+	}
+}
+
+func TestKeyFileChecks(t *testing.T) {
+	f := newFixture(t)
+	me := os.Getuid()
+	for _, mode := range []os.FileMode{0o400, 0o600, 0o700} {
+		if err := os.Chmod(f.key, mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := checkKeyFile(f.key, fileOwner, me); err != nil {
+			t.Errorf("mode %04o refused: %v", mode, err)
+		}
+	}
+	if err := os.Chmod(f.key, 0o604); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkKeyFile(f.key, fileOwner, me); err == nil || !strings.Contains(err.Error(), "no group/other") {
+		t.Errorf("other-readable key: %v", err)
+	}
+	if err := os.Chmod(f.key, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Wrong owner: expect a different uid than the file's.
+	if err := checkKeyFile(f.key, fileOwner, me+1); err == nil || !strings.Contains(err.Error(), "owned by uid") {
+		t.Errorf("wrong owner accepted: %v", err)
+	}
+	fake := func(fs.FileInfo) (int, error) { return me + 7, nil }
+	if err := checkKeyFile(f.key, fake, me); err == nil || !strings.Contains(err.Error(), "owned by uid") {
+		t.Errorf("injected foreign owner accepted: %v", err)
+	}
+	fail := func(fs.FileInfo) (int, error) { return 0, errors.New("no owner info") }
+	if err := checkKeyFile(f.key, fail, me); err == nil {
+		t.Error("owner lookup failure accepted")
 	}
 }

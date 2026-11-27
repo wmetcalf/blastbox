@@ -7,10 +7,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"regexp"
 	"sort"
-	"strings"
 	"unicode/utf16"
+	"unicode/utf8"
 )
+
+var intRE = regexp.MustCompile(`^-?(0|[1-9][0-9]*)$`)
+
+// ErrUTF8 is returned for a string that is not valid UTF-8.
+var ErrUTF8 = errors.New("canon: invalid UTF-8")
 
 // ErrFloat is returned for any non-integer number.
 var ErrFloat = errors.New("canon: floats are not allowed")
@@ -27,11 +34,17 @@ func Marshal(v any) ([]byte, error) {
 
 // MarshalJSONText canonicalises a JSON document (numbers kept exact via UseNumber).
 func MarshalJSONText(text []byte) ([]byte, error) {
+	if !utf8.Valid(text) {
+		return nil, ErrUTF8
+	}
 	d := json.NewDecoder(bytes.NewReader(text))
 	d.UseNumber()
 	var v any
 	if err := d.Decode(&v); err != nil {
 		return nil, err
+	}
+	if _, err := d.Token(); err != io.EOF {
+		return nil, errors.New("canon: trailing data after JSON value")
 	}
 	return Marshal(v)
 }
@@ -47,12 +60,22 @@ func enc(b *bytes.Buffer, v any) error {
 			b.WriteString("false")
 		}
 	case string:
-		encString(b, x)
+		return encString(b, x)
 	case json.Number:
-		if strings.ContainsAny(string(x), ".eE") {
-			return ErrFloat
+		if !intRE.MatchString(string(x)) {
+			// A number with . e E is a float; anything else is not a JSON integer literal.
+			for _, c := range string(x) {
+				if c == '.' || c == 'e' || c == 'E' {
+					return ErrFloat
+				}
+			}
+			return fmt.Errorf("canon: invalid number %q", string(x))
 		}
-		b.WriteString(string(x))
+		if string(x) == "-0" {
+			b.WriteString("0")
+		} else {
+			b.WriteString(string(x))
+		}
 	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
 		fmt.Fprintf(b, "%d", x)
 	case float32, float64:
@@ -80,7 +103,9 @@ func enc(b *bytes.Buffer, v any) error {
 			if i > 0 {
 				b.WriteByte(',')
 			}
-			encString(b, k)
+			if err := encString(b, k); err != nil {
+				return err
+			}
 			b.WriteByte(':')
 			if err := enc(b, x[k]); err != nil {
 				return err
@@ -93,7 +118,10 @@ func enc(b *bytes.Buffer, v any) error {
 	return nil
 }
 
-func encString(b *bytes.Buffer, s string) {
+func encString(b *bytes.Buffer, s string) error {
+	if !utf8.ValidString(s) {
+		return ErrUTF8
+	}
 	const hex = "0123456789abcdef"
 	u := func(r rune) {
 		b.WriteString(`\u`)
@@ -132,4 +160,5 @@ func encString(b *bytes.Buffer, s string) {
 		}
 	}
 	b.WriteByte('"')
+	return nil
 }

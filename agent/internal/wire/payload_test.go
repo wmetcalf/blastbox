@@ -133,3 +133,13 @@ func TestUpdateGoSigned(t *testing.T) {
 	}
 	t.Log("wrote go_signed; refresh SHA256SUMS with: python3 scripts/gen_conformance.py")
 }
+
+func TestSignRefusesNonP256(t *testing.T) {
+	k, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if _, err := wire.Sign(k, []byte("x")); err == nil {
+		t.Fatal("P-384 key accepted")
+	}
+	if _, err := wire.Sign(nil, []byte("x")); err == nil {
+		t.Fatal("nil key accepted")
+	}
+}

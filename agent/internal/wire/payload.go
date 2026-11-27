@@ -3,9 +3,11 @@ package wire
 
 import (
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 )
 
 // sigDomain is the domain-separation prefix (node_auth._SIG_DOMAIN).
@@ -27,6 +29,9 @@ func SigningPayload(challenge, scope, nodeID string) []byte {
 
 // Sign returns the ECDSA P-256/SHA-256 DER signature of payload, standard base64.
 func Sign(key *ecdsa.PrivateKey, payload []byte) (string, error) {
+	if key == nil || key.Curve != elliptic.P256() {
+		return "", errors.New("wire: signing key must be ECDSA P-256")
+	}
 	h := sha256.Sum256(payload)
 	der, err := ecdsa.SignASN1(rand.Reader, key, h[:])
 	if err != nil {
