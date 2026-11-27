@@ -386,15 +386,25 @@ def test_a_claim_for_one_engine_does_not_serve_another():
     assert run(T0, e, {"n": _claimed(T0, {"": T0 - 2})}, q) == []     # unscoped: every grant
 
 
-def test_a_node_that_claims_but_never_heartbeats_is_alive_and_serves():
-    """A Python pull node (HttpJobStore) has no heartbeat client: its claims are its liveness."""
+def test_a_node_that_claims_but_never_heartbeats_is_still_silent():
+    """§10: node_silent is "no heartbeat". Claims never stand in for one: a node whose
+    heartbeats are blocked (a proxy allowlist) or that has no heartbeat client must surface,
+    and a busy claim-only node goes quiet on /claim for a whole job anyway."""
+    e = {"n": ident(("clamav",))}
+    claim_only = NodeLiveness("n", None, T0 - 2, None, None, {"": T0 - 2})
+    assert kinds(run(T0, e, {"n": claim_only})) == [("node_silent", "n")]
+
+
+def test_the_claim_window_does_not_stretch_with_a_long_heartbeat_interval():
+    """Agents poll /claim every ~2 s whatever heartbeat_s is: a node that stopped claiming
+    10 minutes ago does not serve just because silence is judged over 15 minutes."""
+    cfg = LivenessConfig(silent_after_s=900.0)
     e = {"n": ident(("clamav",))}
     q = {"clamav": T0 - 400}
-    claim_only = NodeLiveness("n", None, T0 - 2, None, None, {"": T0 - 2})
-    assert run(T0, e, {"n": claim_only}, q) == []
-    stale = NodeLiveness("n", None, T0 - 200, None, None, {"": T0 - 200})
-    assert kinds(run(T0, e, {"n": stale}, q)) == [("engine_orphaned", "clamav"),
-                                                   ("node_silent", "n")]
+    stopped = _claimed(T0 - 100, {"clamav": T0 - 600}, engines=(("clamav", True),))
+    assert kinds(run(T0, e, {"n": stopped}, q, cfg)) == [("engine_orphaned", "clamav")]
+    polling = _claimed(T0 - 100, {"clamav": T0 - 3}, engines=(("clamav", True),))
+    assert run(T0, e, {"n": polling}, q, cfg) == []
 
 
 def test_queue_fallback_sees_every_engine_not_a_10k_prefix():

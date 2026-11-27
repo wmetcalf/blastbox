@@ -736,9 +736,9 @@ GET  /v1/nodes/cert                  → this node's current cert    }
 GET  /v1/fleet/liveness              → operator fleet view (API key, not a node session)
 ```
 
-Blocking `/v1/nodes/heartbeat` makes every Go-agent node read `node_silent`. A node with no
-heartbeat client (the Python `HttpJobStore` node) is judged by its claims instead. The alert
-thresholds are in CONFIGURATION.md under "Node liveness alerts".
+Blocking `/v1/nodes/heartbeat` makes every node read `node_silent`. Claims never stand in for a
+heartbeat, so a node with no heartbeat client (today's Python `HttpJobStore` node) also reads
+`node_silent`. The alert thresholds are in CONFIGURATION.md under "Node liveness alerts".
 
 `/backlog` and `/disposition` are not optional extras. Without `/backlog` a node's sizer has no
 demand signal at all and sits at its floors however deep the queue is; without `/disposition` the

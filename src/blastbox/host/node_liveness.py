@@ -333,33 +333,27 @@ def _fresh(live: "NodeLiveness | None", now: float, cfg: LivenessConfig) -> bool
     return live is not None and _within(live.last_heartbeat_at, now, cfg)
 
 
-def _claim_only(live: "NodeLiveness | None") -> bool:
-    """A node with no heartbeat client (the Python ``HttpJobStore`` pull node): it has never
-    heartbeated, so its claims are the only liveness it has."""
-    return live is not None and live.last_heartbeat_at is None
-
-
-def _alive(live: "NodeLiveness | None", now: float, cfg: LivenessConfig) -> bool:
-    if _fresh(live, now, cfg):
-        return True
-    return _claim_only(live) and _within(live.last_claim_at if live else None, now, cfg)
+#: How recent a claim attempt must be to count as "polling". Agents poll /claim every ~2 s
+#: (30 s at most under back-off) WHATEVER the heartbeat interval is, so this does not stretch
+#: with ``silent_after_s``: a node that stopped claiming must not keep serving for 3 x 300 s.
+CLAIM_FRESH_S = 90.0
 
 
 def _claimed(live: NodeLiveness, eng: str, now: float, cfg: LivenessConfig) -> bool:
-    return _within(live.claims.get(eng), now, cfg) or _within(live.claims.get(""), now, cfg)
+    w = min(cfg.silent_after_s, CLAIM_FRESH_S)
+
+    def ok(ts: float | None) -> bool:
+        return ts is not None and abs(now - ts) <= w
+    return ok(live.claims.get(eng)) or ok(live.claims.get(""))
 
 
 def _serves(live: "NodeLiveness | None", eng: str, now: float, cfg: LivenessConfig) -> bool:
-    """Evidence of taking ``eng``'s work: a claim attempt FOR IT (or an unscoped one) within the
-    silence window, or a busy slot on it -- plus, for a heartbeating node, a fresh heartbeat
-    with a passing selftest for it. A shadow agent (claim=false) heartbeats a passing selftest
-    and never claims, so it must not hide orphaned work; a node polling one engine says nothing
-    about another."""
-    if live is None:
-        return False
-    if _claim_only(live):
-        return _claimed(live, eng, now, cfg)
-    if not _fresh(live, now, cfg):
+    """A fresh heartbeat with a passing selftest for ``eng``, AND evidence of taking its work: a
+    claim attempt FOR IT (or an unscoped one) within :data:`CLAIM_FRESH_S`, or a busy slot on it.
+    A shadow agent (claim=false) heartbeats a passing selftest and never claims, so it must not
+    hide orphaned work; a node polling one engine says nothing about another. Claims never stand
+    in for a heartbeat (§10: a node with no heartbeat is silent, so it serves nothing)."""
+    if live is None or not _fresh(live, now, cfg):
         return False
     mine = [e for e in _engines_of(live) if e.get("name") == eng and e.get("selftest_ok")]
     if not mine:
@@ -385,9 +379,7 @@ def evaluate(*, now: float, enrolled: "Mapping[str, NodeIdentity]", live: dict[s
             alerts.append(Alert("cert_expired", node_id, not_after,
                                 f"certificate expired {now - not_after:.0f}s ago"))
             continue
-        if lv is not None and _claim_only(lv) and _alive(lv, now, cfg):
-            pass                                # claiming, no heartbeat client: alive
-        elif lv is not None and _fresh(lv, now, cfg):
+        if lv is not None and _fresh(lv, now, cfg):
             engines = _engines_of(lv)
             bad = sorted(str(e.get("name", "")) for e in engines if not e.get("selftest_ok"))
             if not engines:
@@ -398,14 +390,9 @@ def evaluate(*, now: float, enrolled: "Mapping[str, NodeIdentity]", live: dict[s
                                     "selftest failing for: " + ", ".join(bad)))
         else:
             hb = lv.last_heartbeat_at if lv else None
-            cl = lv.last_claim_at if lv else None
-            seen = hb if hb is not None else cl
-            since = seen if seen is not None else ident.not_before.timestamp()
-            detail = ("never heartbeated or claimed" if seen is None
-                      else f"no heartbeat for {now - hb:.0f}s (limit {cfg.silent_after_s:g}s)"
-                      if hb is not None
-                      else f"no heartbeat, and no claim for {now - seen:.0f}s "
-                           f"(limit {cfg.silent_after_s:g}s)")
+            since = hb if hb is not None else ident.not_before.timestamp()
+            detail = ("never heartbeated" if hb is None
+                      else f"no heartbeat for {now - hb:.0f}s (limit {cfg.silent_after_s:g}s)")
             alerts.append(Alert("node_silent", node_id, since, detail))
         if not_after - now < cfg.cert_expiring_s:
             alerts.append(Alert("cert_expiring", node_id, not_after - cfg.cert_expiring_s,

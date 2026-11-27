@@ -124,8 +124,8 @@ when it starts, exported as `blastbox_node_alert{kind,subject}` on `/metrics`, a
 |---|---|---|
 | `BLASTBOX_NODE_HEARTBEAT_S` | `30` | Interval returned to agents as `heartbeat_s`, clamped to 10..300. |
 | `BLASTBOX_NODE_MIN_AGENT_VERSION` | `0.0.0` | Returned as `min_agent_version`; an older agent stops claiming. |
-| `BLASTBOX_NODE_SILENT_AFTER_S` | 3 × heartbeat_s | `node_silent`: an enrolled, unexpired node with no heartbeat (or, for a node that never heartbeats, no claim) for longer than this. |
-| `BLASTBOX_ENGINE_ORPHANED_AFTER_S` | `300` | `engine_orphaned`: QUEUED work older than this, and no node with evidence of serving the engine. A node serves an engine if it has a fresh heartbeat, a passing selftest for it, and either a claim for it within the silence window or a busy slot. A node with no heartbeat client serves it if it has a recent claim for it. |
+| `BLASTBOX_NODE_SILENT_AFTER_S` | 3 × heartbeat_s | `node_silent`: an enrolled, unexpired node with no heartbeat for longer than this. Claims do not count: a node with no heartbeat client (the Python `HttpJobStore` node) reads silent. |
+| `BLASTBOX_ENGINE_ORPHANED_AFTER_S` | `300` | `engine_orphaned`: QUEUED work older than this, and no node with evidence of serving the engine. A node serves an engine if it has a fresh heartbeat, a passing selftest for it, and either a claim for it (or an unscoped claim) in the last 90 s or a busy slot on it. |
 | `BLASTBOX_ENGINE_ORPHANED_ENGINES` | every engine granted to an enrolled node | Comma-separated engines to watch instead. |
 | `BLASTBOX_NODE_CERT_EXPIRING_S` | `172800` (48 h) | `cert_expiring`. A cert that lapsed within 24 h raises `cert_expired` instead of `node_silent`. |
 
