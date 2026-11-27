@@ -300,8 +300,16 @@ func TestAcceptedPollsDisposition(t *testing.T) {
 func TestRejectedResultIsFailed(t *testing.T) {
 	f := setup(t, happyEngine)
 	f.in.putStatus = 422
-	if res := f.run(); res.Outcome != "failed" || !strings.Contains(res.Reason, "bad envelope") || len(f.in.updates) != 0 {
+	// A first-time extraction refusal stores no outcome on the control plane, so the job would
+	// stay RUNNING: the agent fails it (spec 6.4: "the job is FAILED"). When the 422 replays
+	// a stored failure the Fail is merely refused.
+	res := f.run()
+	if res.Outcome != "failed" || !strings.Contains(res.Reason, "bad envelope") {
 		t.Fatalf("%+v", res)
+	}
+	if len(f.in.updates) != 1 || f.in.update(0)["status"] != "failed" ||
+		!strings.Contains(fmt.Sprint(f.in.update(0)["error"]), "bad envelope") {
+		t.Fatalf("server saw %v", f.in.updates)
 	}
 	f.wiped(t)
 }
@@ -670,8 +678,13 @@ func TestRefusesStartedJobDir(t *testing.T) {
 	os.WriteFile(filepath.Join(d, "started"), []byte("1\n"), 0o600)
 	os.WriteFile(filepath.Join(d, "evidence"), []byte("keep"), 0o600)
 	res := f.run()
-	if res.Outcome != "refused" || f.in.inputGets != 0 || len(f.in.updates) != 0 || f.in.puts != 0 {
+	if res.Outcome != "refused" || f.in.inputGets != 0 || f.in.puts != 0 {
 		t.Fatalf("%+v", res)
+	}
+	// The job reached a sandbox on this node before (under an earlier claim): the NEW claim is
+	// failed, never released and never run; the old dir is left to recovery.
+	if len(f.in.updates) != 1 || f.in.update(0)["status"] != "failed" {
+		t.Fatalf("new claim not failed: %v", f.in.updates)
 	}
 	if b, _ := os.ReadFile(filepath.Join(d, "evidence")); string(b) != "keep" {
 		t.Fatal("started job dir was touched")

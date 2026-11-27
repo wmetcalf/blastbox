@@ -144,8 +144,12 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	}
 	j.dir = filepath.Join(jobs, c.JobID)
 	if _, err := os.Lstat(filepath.Join(j.dir, "started")); err == nil {
-		// A started job's dir belongs to crash recovery: never wipe or reuse it here.
-		return Result{Outcome: "refused", Reason: "job dir already holds a started marker; left for crash recovery"}
+		// A started job's dir belongs to crash recovery: never wipe or reuse it here. The job
+		// reached a sandbox on this node (under an earlier claim), so this new claim is failed
+		// -- never released, never run -- or it would stay RUNNING until the reclaim sweep.
+		why := "job dir already holds a started marker; left for crash recovery"
+		fr := j.fail(ctx, "this node already started the job under an earlier claim")
+		return Result{Outcome: "refused", Reason: why + " (new claim: " + fr.Outcome + ")"}
 	}
 	if _, err := os.Lstat(j.dir); err == nil { // leftover of an earlier, unstarted attempt
 		wipe(j.dir)
@@ -824,7 +828,8 @@ func (j *job) upload(ctx context.Context, tarPath string, kind sandbox.Kind) Res
 	case "done":
 		return Result{Outcome: "done", Reason: ""}
 	case "failed":
-		return Result{Outcome: "failed", Reason: "control plane rejected the result: " + out.Reason}
+		// A first-time extraction refusal stores no outcome, so nothing else settles the job.
+		return j.fail(ctx, "control plane rejected the result: "+out.Reason)
 	}
 	// accepted: the finalizer is still working. Poll for a log line.
 	wait := time.Now().Add(def(j.r.DispWait, 60*time.Second))
