@@ -234,15 +234,19 @@ def test_finalizer_only_result_summary_is_the_finalizers(tmp_path, pki_dir, monk
 @pytest.mark.parametrize("fields", [
     {"status": "queued", "claim_id": None, "error": "x"},
     {"status": "queued", "claim_id": None, "finished_at": 1.0},
-    {"status": "queued", "claim_id": None, "expires_at": __import__("time").time() + 60},
+    {"status": "queued", "claim_id": None, "expires_at": "<soon>"},
     {"status": "failed"},                                     # no retention clock: never purged
     {"status": "failed", "error": "x", "finished_at": 1.0},   # no expires_at
     {"status": "failed", "finished_at": None, "expires_at": None},       # null clocks
     {"status": "failed", "finished_at": 1.0, "expires_at": None},
-    {"status": "failed", "finished_at": None, "expires_at": __import__("time").time() + 60},
+    {"status": "failed", "finished_at": None, "expires_at": "<soon>"},
 ])
 def test_finalizer_only_each_shape_is_checked_on_its_own(tmp_path, pki_dir, monkeypatch,  # noqa: F811
                                                          fields):
+    import time as _t
+
+    # "<soon>" is resolved HERE, not at collection: a long suite would otherwise make it past
+    fields = {k: (_t.time() + 600 if v == "<soon>" else v) for k, v in fields.items()}
     monkeypatch.setenv(ENV, "finalizer-only")
     store, c, hdr = _setup(tmp_path, pki_dir)
     before = store.get("job-1")
