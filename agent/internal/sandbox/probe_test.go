@@ -181,3 +181,21 @@ func TestKillRunWaitsOutAnUnidentifiableRun(t *testing.T) {
 		t.Fatalf("past its time limit: %v", err)
 	}
 }
+
+// KillRun returns only once the recorded leader is gone (a zombie counts as gone), so the
+// caller never wipes a dir under a run that is still tearing down.
+func TestKillRunWaitsForTheLeader(t *testing.T) {
+	c := exec.Command("/bin/sh", "-c", "trap '' TERM; sleep 60")
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { syscall.Kill(-c.Process.Pid, syscall.SIGKILL); c.Wait() })
+	id, _ := ProcIdentity(c.Process.Pid)
+	if err := KillRun(RunRecord{PID: c.Process.Pid, Identity: id}); err != nil {
+		t.Fatal(err)
+	}
+	if !procGone(c.Process.Pid) {
+		t.Fatal("KillRun returned while the leader was still alive")
+	}
+}

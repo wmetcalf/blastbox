@@ -54,7 +54,16 @@ func KillRun(rec RunRecord) error {
 	switch {
 	case rec.PID > 1 && rec.Identity != 0:
 		if id, alive := ProcIdentity(rec.PID); alive && id == rec.Identity {
-			syscall.Kill(-rec.PID, syscall.SIGKILL)
+			if err := syscall.Kill(-rec.PID, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+				return errorf("cannot kill the run's process group %d: %v", rec.PID, err)
+			}
+			// SIGKILL is asynchronous: return only once the leader is gone.
+			for dl := time.Now().Add(killWait); !procGone(rec.PID); {
+				if time.Now().After(dl) {
+					return errorf("process %d still alive %s after SIGKILL", rec.PID, killWait)
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
 		}
 	case rec.Canary == "" && rec.NotAfter > 0 && time.Now().Unix() < rec.NotAfter:
 		return errorf("the run is not identifiable; waiting out its time limit (until %s)",
@@ -67,5 +76,7 @@ func KillRun(rec RunRecord) error {
 	}
 	return nil
 }
+
+const killWait = 30 * time.Second
 
 func errorf(format string, a ...any) error { return fmt.Errorf("sandbox sweep: "+format, a...) }

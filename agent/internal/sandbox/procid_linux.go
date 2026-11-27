@@ -25,3 +25,14 @@ func ProcIdentity(pid int) (int64, bool) {
 	n, err := strconv.ParseInt(f[19], 10, 64)
 	return n, err == nil
 }
+
+// procGone reports whether pid no longer runs: absent, or a zombie awaiting its reaper.
+func procGone(pid int) bool {
+	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return true
+	}
+	s := string(b)
+	i := strings.LastIndexByte(s, ')')
+	return i < 0 || i+2 >= len(s) || s[i+2] == 'Z' || s[i+2] == 'X'
+}
