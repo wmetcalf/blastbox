@@ -235,6 +235,29 @@ def test_uninstalled_current_target_does_not_clobber_previous(tmp_path):
     (pfx / "current").symlink_to("9.9.9")  # dangling, version-shaped
     rel, sha = make_release(tmp_path, b"bin 3.0.0")
     assert install(rel, sha, pfx, "3.0.0", "--no-cosign").returncode == 0
+    # neither 9.9.9 (unusable) nor the stale 1.0.0 (not what was active): rollback refuses
+    assert not (pfx / ".previous").exists()
+    p = run(["--rollback", "--prefix", str(pfx)])
+    assert p.returncode != 0 and os.readlink(pfx / "current") == "3.0.0"
+
+
+def test_absolute_current_to_installed_version_is_recorded(tmp_path):
+    pfx = _two_versions(tmp_path)  # .previous = 1.0.0, current -> 2.0.0
+    (pfx / "current").unlink()
+    (pfx / "current").symlink_to(pfx / "2.0.0")  # absolute link to the active version
+    rel, sha = make_release(tmp_path, b"bin 3.0.0")
+    assert install(rel, sha, pfx, "3.0.0", "--no-cosign").returncode == 0
+    assert (pfx / ".previous").read_text().strip() == "2.0.0"
+    assert run(["--rollback", "--prefix", str(pfx)]).returncode == 0
+    assert os.readlink(pfx / "current") == "2.0.0"
+
+
+def test_reinstall_same_version_via_absolute_link_keeps_previous(tmp_path):
+    pfx = _two_versions(tmp_path)
+    (pfx / "current").unlink()
+    (pfx / "current").symlink_to(pfx / "2.0.0")
+    rel, sha = make_release(tmp_path, b"bin 2.0.0")
+    assert install(rel, sha, pfx, "2.0.0", "--no-cosign").returncode == 0
     assert (pfx / ".previous").read_text().strip() == "1.0.0"
 
 

@@ -101,20 +101,27 @@ valid_version() {
   [ "$(printf '%s' "$1" | tr -cd '.' | wc -c | tr -d ' ')" = 2 ]
 }
 
-# Record $1 (the version current points at now) in <prefix>/.previous, BEFORE the flip,
-# so a failed write never leaves current moved with a stale .previous. Written to a
-# temp file and renamed. A target that is not a plain version (an absolute or
-# hand-made link) or a version that is not installed is not recorded, since rollback
-# could not use it and it would overwrite a good .previous.
+# Record what current points at now ($1) as <prefix>/.previous, unless it is the version
+# $2 we are about to point it at. This runs BEFORE the flip, so a failed write never
+# leaves current moved with a stale .previous; it writes a temp file and renames it.
+# An absolute link into <prefix> is reduced to its version. Any other target (a link
+# outside <prefix>, a non-version name, a version that is not installed) cannot be
+# rolled back to, so .previous is removed rather than left naming an older version that
+# was not the one active.
 record_previous() {
-  valid_version "$1" || return 0
-  [ -x "$prefix/$1/blastbox-agent" ] || return 0
+  rp=$1
+  case "$rp" in "$prefix"/*) rp=${rp#"$prefix"/}; rp=${rp%/} ;; esac
+  [ "$rp" != "$2" ] || return 0
   if [ -e "$prefix/.previous" ] || [ -L "$prefix/.previous" ]; then
     [ -f "$prefix/.previous" ] && [ ! -L "$prefix/.previous" ] \
       || die "$prefix/.previous is not a regular file"
   fi
+  if ! valid_version "$rp" || [ ! -x "$prefix/$rp/blastbox-agent" ]; then
+    rm -f "$prefix/.previous"
+    return 0
+  fi
   rm -f "$ptmp"
-  printf '%s\n' "$1" > "$ptmp"
+  printf '%s\n' "$rp" > "$ptmp"
   mv -f "$ptmp" "$prefix/.previous"
 }
 
@@ -124,7 +131,7 @@ if [ "$rollback" = 1 ]; then
   valid_version "$prev" || die "corrupt $prefix/.previous"
   [ -x "$prefix/$prev/blastbox-agent" ] || die "previous version $prev is not installed"
   cur=$(current_target || true)
-  if [ -n "$cur" ] && [ "$cur" != "$prev" ]; then record_previous "$cur"; fi
+  if [ -n "$cur" ]; then record_previous "$cur" "$prev"; fi
   flip_current "$prev"
   say "rolled back to $prev (was ${cur:-none})"
   exit 0
@@ -201,6 +208,6 @@ mv -f "$dest/blastbox-agent.new" "$dest/blastbox-agent"
 
 # 5. flip current atomically; remember what it pointed at
 cur=$(current_target || true)
-if [ -n "$cur" ] && [ "$cur" != "$version" ]; then record_previous "$cur"; fi
+if [ -n "$cur" ]; then record_previous "$cur" "$version"; fi
 flip_current "$version"
 say "installed $version to $dest (current -> $version)"
