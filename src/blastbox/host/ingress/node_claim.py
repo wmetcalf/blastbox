@@ -1757,10 +1757,12 @@ def register_node_claim_routes(
                     if not lock.exists():
                         break
                 # the winner failed (lock gone, nothing stored) or is still busy: nothing has
-                # been accepted, so say "retry" rather than a 202 that would be a lie
-                return _existing() or JSONResponse({"status": "retry"}, status_code=409)
+                # been accepted, so say "retry" rather than a 202 that would be a lie (503, never 409: 409 means claim lost)
+                return _existing() or JSONResponse({"status": "retry"}, status_code=503,
+                                             headers={"Retry-After": "2"})
         else:
-            return JSONResponse({"status": "retry"}, status_code=409)
+            return JSONResponse({"status": "retry"}, status_code=503,
+                                             headers={"Retry-After": "2"})
         try:
             return await _receive_and_extract()
         finally:

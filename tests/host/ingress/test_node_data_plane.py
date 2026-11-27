@@ -470,7 +470,7 @@ def test_input_generator_cleans_up_when_closed_early(tmp_path, pki_dir, monkeypa
     assert list(tmp_root.iterdir()) == []
 
 
-def test_lock_loser_with_no_outcome_gets_409_not_202(tmp_path, pki_dir, monkeypatch):  # noqa: F811
+def test_lock_loser_with_no_outcome_gets_503_retry_not_202(tmp_path, pki_dir, monkeypatch):  # noqa: F811
     _, c, hdr = _setup(tmp_path, pki_dir)
     root = tmp_path / "results"
     final = node_results.spool_dir(root, "job-1", hdr["x-blastbox-claim-id"])
@@ -480,6 +480,7 @@ def test_lock_loser_with_no_outcome_gets_409_not_202(tmp_path, pki_dir, monkeypa
     import threading
     threading.Timer(0.3, lock.rmdir).start()              # ...then died and released the lock
     r = put(c, hdr, make_tar([]))
-    assert r.status_code == 409 and r.json() == {"status": "retry"}
+    assert r.status_code == 503 and r.json() == {"status": "retry"}
+    assert r.headers["retry-after"] == "2"
     assert spool_dirs(tmp_path) == []
     assert put(c, hdr, make_tar([])).status_code == 202   # a retry succeeds
