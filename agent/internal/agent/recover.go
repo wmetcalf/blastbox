@@ -151,6 +151,8 @@ func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool)
 			action = "replay upload"
 			out, err := a.client().PutResult(rctx, cl, tar, meta)
 			switch {
+			case err != nil && runner.Permanent(err):
+				action, reason = "fail", "result upload refused: "+err.Error()
 			case err != nil:
 				cerr = err
 			case out.Status == "failed":
@@ -170,6 +172,9 @@ func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool)
 		a.Log.Info("recovery: job settled", "job", name, "action", action)
 	case errors.Is(cerr, wire.ErrClaimLost), errors.Is(cerr, wire.ErrRefused):
 		a.Log.Info("recovery: claim no longer ours; wiping", "job", name, "action", action, "err", cerr.Error())
+	case runner.Permanent(cerr):
+		// The control plane will never accept this report (no such job, or refused outright).
+		a.Log.Warn("recovery: report permanently refused; wiping", "job", name, "action", action, "err", cerr.Error())
 	default:
 		a.Log.Warn("recovery: will retry", "job", name, "action", action, "err", cerr.Error())
 		return false

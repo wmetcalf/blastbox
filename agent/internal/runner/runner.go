@@ -783,6 +783,12 @@ func retryable(err error) bool {
 	return errors.Is(err, wire.ErrServer) || errors.Is(err, wire.ErrTLS)
 }
 
+// Permanent reports whether the control plane refused a report for good (a 4xx other than
+// 403/409/408/429, or a 404: no such job). Retrying it from a kept dir could never succeed.
+func Permanent(err error) bool {
+	return errors.Is(err, wire.ErrRejected) || errors.Is(err, wire.ErrNotFound)
+}
+
 func (r *Runner) retry(ctx context.Context, f func() error) error {
 	tries := r.RetryTries
 	if tries <= 0 {
@@ -832,7 +838,7 @@ func (j *job) releaseOrLost2(_ context.Context, why string, err error) Result {
 		return Result{Outcome: "released", Reason: why}
 	case errors.Is(err, wire.ErrClaimLost):
 		return Result{Outcome: "lost", Reason: why + "; release: " + err.Error()}
-	case errors.Is(err, wire.ErrRefused):
+	case errors.Is(err, wire.ErrRefused), Permanent(err):
 		return Result{Outcome: "failed", Reason: why + "; release refused: " + err.Error()}
 	}
 	return Result{Outcome: "failed", Reason: why + "; release not delivered: " + err.Error(), Keep: true}
@@ -864,7 +870,7 @@ func (j *job) fail(ctx context.Context, why string) Result {
 		return Result{Outcome: "failed", Reason: why}
 	case errors.Is(err, wire.ErrClaimLost):
 		return Result{Outcome: "lost", Reason: why + "; fail: " + err.Error()}
-	case errors.Is(err, wire.ErrRefused):
+	case errors.Is(err, wire.ErrRefused), Permanent(err):
 		return Result{Outcome: "failed", Reason: why + "; fail refused: " + err.Error()}
 	}
 	return Result{Outcome: "failed", Reason: why + "; fail not delivered: " + err.Error(), Keep: true}
@@ -885,7 +891,7 @@ func (j *job) upload(ctx context.Context, tarPath string, kind sandbox.Kind) Res
 	if errors.Is(err, wire.ErrClaimLost) {
 		return Result{Outcome: "lost", Reason: "result upload: " + err.Error()}
 	}
-	if err != nil && retryable(err) {
+	if err != nil && !Permanent(err) && !errors.Is(err, wire.ErrRefused) {
 		return Result{Outcome: "failed", Reason: "result upload not delivered: " + err.Error(), Keep: true}
 	}
 	if err != nil {

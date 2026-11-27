@@ -344,6 +344,19 @@ func TestUndeliveredFailIsKeptForRecovery(t *testing.T) {
 	}
 }
 
+// A report the control plane answered with a permanent refusal (a 4xx, a 404) will never be
+// accepted: keeping the dir would only make recovery repeat it forever.
+func TestRejectedReportIsNotKept(t *testing.T) {
+	for _, code := range []int{400, 404} {
+		f := setup(t, `echo '{}' > "$1/metadata.json"; exit 3`)
+		f.in.updStatus = code
+		if res := f.run(); res.Keep {
+			t.Fatalf("HTTP %d: %+v kept", code, res)
+		}
+		f.wiped(t)
+	}
+}
+
 func TestUndeliveredUploadIsKeptForRecovery(t *testing.T) {
 	f := setup(t, happyEngine)
 	f.in.putStatus = 503

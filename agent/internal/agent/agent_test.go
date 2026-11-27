@@ -210,6 +210,37 @@ func TestKeptJobGoesToRecovery(t *testing.T) {
 	}
 }
 
+// Recovery settles a job the control plane will never accept a report for (deleted: 404;
+// refused outright: 4xx) instead of re-sending it every pass, and fails a job whose replayed
+// upload is refused outright.
+func TestRecoveryGivesUpOnPermanentRefusals(t *testing.T) {
+	e := fresh(t)
+	e.cfg.Claim = false
+	gone := jobDir(e, "jg", true, true)
+	bad := jobDir(e, "jb", true, true)
+	big := jobDir(e, "jt", true, true)
+	os.WriteFile(filepath.Join(big, runner.ResultTarName), make([]byte, 1024), 0o600)
+	os.WriteFile(filepath.Join(big, runner.ResultMetaName), []byte(`{"worker_runtime":"seatbelt"}`), 0o600)
+	e.in.jobStatus["jg"], e.in.jobStatus["jb"] = 404, 400
+	e.in.putStatus["jt"] = 413
+	h := newHarness(e)
+	h.start(t)
+	eventually(t, "all three settled and wiped", func() bool {
+		for _, d := range []string{gone, bad, big} {
+			if _, err := os.Stat(d); !os.IsNotExist(err) {
+				return false
+			}
+		}
+		return true
+	})
+	if u := e.in.update("jt"); u == nil || u["fields"].(map[string]any)["status"] != "failed" {
+		t.Fatalf("a refused replay was not failed: %v", u)
+	}
+	if n := e.in.putCount("jt"); n != 1 {
+		t.Fatalf("replayed %d times", n)
+	}
+}
+
 func TestRestartWithOnlyClaimJSONReleases(t *testing.T) {
 	e := fresh(t)
 	e.cfg.Claim = false
