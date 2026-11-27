@@ -1,0 +1,6 @@
+{
+  "http_status": 422,
+  "reason": "parent reference in a member path",
+  "server_verdict": "rejected",
+  "tar_sha256": "c4df959b56141e21dc2efaf5fceffaf3749e86151beba056231d8b68f88d452c"
+}

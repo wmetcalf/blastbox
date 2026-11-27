@@ -1,0 +1,7 @@
+{
+  "tar_bytes": 2048,
+  "tar_sha256": "713166cc5e6a5bf6edc2265ae3cf4c016f53a2923b32c1da56e5ee35cd833dac",
+  "tree": {
+    "metadata.json": "{\"a\":1}"
+  }
+}

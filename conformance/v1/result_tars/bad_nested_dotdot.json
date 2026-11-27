@@ -1,0 +1,6 @@
+{
+  "http_status": 422,
+  "reason": "parent reference inside a path",
+  "server_verdict": "rejected",
+  "tar_sha256": "68a82e1b33afe6043f5cd4e45b52203b436ffeadbf5f8c5293e0b56b55297cb1"
+}

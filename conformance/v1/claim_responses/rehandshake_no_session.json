@@ -1,0 +1,8 @@
+{
+  "body": {
+    "detail": "node session required"
+  },
+  "decision": "rehandshake",
+  "description": "no session header: 401",
+  "status": 401
+}

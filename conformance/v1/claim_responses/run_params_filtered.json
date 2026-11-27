@@ -1,0 +1,55 @@
+{
+  "body": {
+    "job": {
+      "claim_id": "<CLAIM_ID>",
+      "claimable_after": null,
+      "created_at": 1.0,
+      "engine": "clamav",
+      "error": null,
+      "expires_at": null,
+      "filename": "sample.bin",
+      "finished_at": null,
+      "input_sha256": "2acaaedc811f129ef98fad1e21ac5519b15cbe7f1f5930fedfcabfb1c2b55e27",
+      "job_id": "job-1",
+      "materialise_attempts": 0,
+      "net_policy": null,
+      "params": {
+        "BLASTBOX_SECRET": "x",
+        "depth": 3,
+        "scan": "fast"
+      },
+      "result_summary": null,
+      "security_warnings": [],
+      "started_at": "<STARTED_AT>",
+      "status": "running",
+      "target_tier": null,
+      "worker_runtime": null,
+      "worker_tier": null
+    },
+    "node_id": "alpha",
+    "receipt": "<RECEIPT>",
+    "run": {
+      "deadline_s": 300,
+      "input": {
+        "bytes": 12,
+        "filename": "sample.bin",
+        "sha256": "2acaaedc811f129ef98fad1e21ac5519b15cbe7f1f5930fedfcabfb1c2b55e27"
+      },
+      "limits": {
+        "max_artifact": 52428800,
+        "max_artifacts": 1000,
+        "max_input": 104857600,
+        "max_metadata": 4194304,
+        "max_total_artifacts": 524288000
+      },
+      "network": "none",
+      "params": {
+        "depth": 3,
+        "scan": "fast"
+      }
+    }
+  },
+  "decision": "run",
+  "description": "BLASTBOX_* params are stripped from run.params; job.params keeps them",
+  "status": 200
+}

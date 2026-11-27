@@ -1,0 +1,11 @@
+{
+  "artifacts": null,
+  "description": "attestation.json is the host's, never an artifact",
+  "engine": "clamav",
+  "input_sha256": "2acaaedc811f129ef98fad1e21ac5519b15cbe7f1f5930fedfcabfb1c2b55e27",
+  "tree": {
+    "attestation.json": "7b7d",
+    "metadata.json": "{\"artifacts\":[{\"bytes\":0,\"id\":\"a1\",\"kind\":\"binary\",\"path\":\"attestation.json\",\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}],\"detected\":{\"confidence\":0.9,\"label\":\"bin\",\"mime\":\"application/octet-stream\",\"source\":\"magika\"},\"engine\":\"clamav\",\"input_sha256\":\"2acaaedc811f129ef98fad1e21ac5519b15cbe7f1f5930fedfcabfb1c2b55e27\",\"payload\":{\"_type\":\"extracted_text\",\"char_count\":2,\"text\":\"hi\"},\"status\":\"ok\",\"warnings\":[]}"
+  },
+  "verdict": "refused"
+}

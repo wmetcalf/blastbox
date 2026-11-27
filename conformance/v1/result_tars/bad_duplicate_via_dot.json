@@ -1,0 +1,6 @@
+{
+  "http_status": 422,
+  "reason": "the same path twice, one spelled with ./",
+  "server_verdict": "rejected",
+  "tar_sha256": "8b8a78d5f80415d596b93fad3c33a997ad1979f3d630555655c9da4ac6043625"
+}

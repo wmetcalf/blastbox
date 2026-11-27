@@ -1,0 +1,6 @@
+{
+  "http_status": 202,
+  "reason": "metadata.json only",
+  "server_verdict": "accepted",
+  "tar_sha256": "4f9c837b2d7cd5ed965fb546c911ca90a48e33977bdbc2cdea06333f6cc4fd73"
+}

@@ -1,0 +1,27 @@
+{
+  "artifacts": [
+    {
+      "bytes": 2,
+      "id": "z",
+      "kind": "binary",
+      "path": "artifacts/z.bin",
+      "sha256": "4a60bf7d4bc1e485744cf7e8d0860524752fca1ce42331be7c439fd23043f151"
+    },
+    {
+      "bytes": 6,
+      "id": "a",
+      "kind": "text",
+      "path": "deep/er/a.txt",
+      "sha256": "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"
+    }
+  ],
+  "description": "ordering follows the declaration, not the tar",
+  "engine": "clamav",
+  "input_sha256": "2acaaedc811f129ef98fad1e21ac5519b15cbe7f1f5930fedfcabfb1c2b55e27",
+  "tree": {
+    "artifacts/z.bin": "7a7a",
+    "deep/er/a.txt": "68656c6c6f0a",
+    "metadata.json": "{\"artifacts\":[{\"bytes\":0,\"id\":\"z\",\"kind\":\"binary\",\"path\":\"artifacts/z.bin\",\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"},{\"bytes\":0,\"id\":\"a\",\"kind\":\"text\",\"path\":\"deep/er/a.txt\",\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}],\"detected\":{\"confidence\":0.9,\"label\":\"bin\",\"mime\":\"application/octet-stream\",\"source\":\"magika\"},\"engine\":\"clamav\",\"input_sha256\":\"2acaaedc811f129ef98fad1e21ac5519b15cbe7f1f5930fedfcabfb1c2b55e27\",\"payload\":{\"_type\":\"extracted_text\",\"char_count\":2,\"text\":\"hi\"},\"status\":\"ok\",\"warnings\":[]}"
+  },
+  "verdict": "sealed"
+}

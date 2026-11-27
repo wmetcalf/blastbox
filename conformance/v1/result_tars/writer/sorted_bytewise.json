@@ -1,0 +1,11 @@
+{
+  "tar_bytes": 5632,
+  "tar_sha256": "a1d373122651982592f1c3bf2c3a0bce951bc618df321c64e471a3641ff47b4f",
+  "tree": {
+    "B.txt": "",
+    "a.txt": "6c6f776572",
+    "art/a.txt": "68656c6c6f0a",
+    "art/z.bin": "7a7a",
+    "metadata.json": "{}"
+  }
+}

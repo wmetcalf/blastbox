@@ -1,0 +1,6 @@
+{
+  "http_status": 422,
+  "reason": "hardlink member",
+  "server_verdict": "rejected",
+  "tar_sha256": "1ed5dae108b228cc92d11e3b69c9526acab2e4ba5702a0721a7695ff62c41527"
+}

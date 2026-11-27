@@ -1,0 +1,6 @@
+{
+  "http_status": 422,
+  "reason": "backslash in a member path",
+  "server_verdict": "rejected",
+  "tar_sha256": "98f67d8b280ede80ba5d91318b6b427b3cb2a9409e8dec1536d0049cec8b1680"
+}

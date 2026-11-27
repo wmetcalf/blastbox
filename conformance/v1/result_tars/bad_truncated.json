@@ -1,0 +1,6 @@
+{
+  "http_status": 422,
+  "reason": "tar cut mid-member",
+  "server_verdict": "rejected",
+  "tar_sha256": "25e4a1819da64f5c091cfed3270c49f646efa953358debb7109539e186e28748"
+}
