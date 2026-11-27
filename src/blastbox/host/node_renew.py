@@ -13,6 +13,8 @@ No FastAPI in here, so the CA-host CLI and the ingress share one implementation.
 """
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import fcntl
 import os
 import re
@@ -27,6 +29,7 @@ from blastbox.host.pki import (
     MAX_NODE_CERT_DAYS,
     CertAuthority,
     NodeGrants,
+    NodeIdentity,
     load_trust_anchor,
     node_identity,
 )
@@ -91,11 +94,30 @@ def queue_csr(pki_dir: Path, node_id: str, csr_pem: bytes) -> None:
         Path(tmp).unlink(missing_ok=True)
 
 
-def _find_current(pki_dir: Path, node_id: str):
-    """(path, pem, identity, grants) of the node's current cert, or None.
+def _intersect(a: NodeGrants | None, b: NodeGrants) -> NodeGrants:
+    if a is None:
+        return b
+    return NodeGrants(engines=tuple(sorted(set(a.engines) & set(b.engines))),
+                      tiers=tuple(sorted(set(a.tiers) & set(b.tiers))),
+                      credentials=a.credentials and b.credentials)
 
-    The path/pem/identity are those of the verifying cert with the latest ``not_after``;
-    ``grants`` is the INTERSECTION over every verifying cert for the node, the same rule
+
+@dataclasses.dataclass
+class _Current:
+    """A node's verifying certs in one PKI dir."""
+
+    path: Path                          #: the one with the latest not_after
+    pem: bytes
+    ident: NodeIdentity
+    grants: NodeGrants                  #: INTERSECTION over every verifying cert
+    wg_keys: set[str | None]            #: every WireGuard key they carry (None = keyless)
+    others: list[tuple[Path, bytes]]    #: the rest, superseded by a renewal
+
+
+def _find_current(pki_dir: Path, node_id: str) -> _Current | None:
+    """The node's verifying certs in ``pki_dir``, or None.
+
+    ``grants`` is the intersection over every verifying cert for the node, the same rule
     :func:`blastbox.host.placement.fleet_grants` applies on the ingress, so a renewal can
     never restore a grant a narrower cert beside it is withholding.
 
@@ -110,38 +132,37 @@ def _find_current(pki_dir: Path, node_id: str):
         raise
     except Exception:                                   # noqa: BLE001 - garbled CA: verify nothing
         return None
-    best = None
-    grants: NodeGrants | None = None
+    found: list[tuple[Path, bytes, NodeIdentity]] = []
     for crt in sorted(d.glob("*.crt")):
         pem = crt.read_bytes()                          # OSError propagates (transient)
         try:
             ident = node_identity(anchor, pem)
         except Exception:                               # noqa: BLE001 - one bad file is not fatal
             continue
-        if ident.node_id != node_id:
-            continue
-        g = ident.grants
-        grants = g if grants is None else NodeGrants(
-            engines=tuple(sorted(set(grants.engines) & set(g.engines))),
-            tiers=tuple(sorted(set(grants.tiers) & set(g.tiers))),
-            credentials=grants.credentials and g.credentials)
-        if best is None or ident.not_after > best[2].not_after:
-            best = (crt, pem, ident)
-    if best is None or grants is None:
+        if ident.node_id == node_id:
+            found.append((crt, pem, ident))
+    if not found:
         return None
-    return (*best, grants)
+    best = max(found, key=lambda f: f[2].not_after)
+    grants: NodeGrants | None = None
+    for f in found:
+        grants = _intersect(grants, f[2].grants)
+    assert grants is not None
+    return _Current(path=best[0], pem=best[1], ident=best[2], grants=grants,
+                    wg_keys={f[2].wg_pubkey for f in found},
+                    others=[(f[0], f[1]) for f in found if f is not best])
 
 
 def current_cert(pki_dir: Path, node_id: str) -> bytes | None:
     """PEM of the node's verifying cert with the latest ``not_after``, or None."""
     found = _find_current(pki_dir, node_id)
-    return found[1] if found else None
+    return found.pem if found else None
 
 
 def current_cert_info(pki_dir: Path, node_id: str) -> tuple[bytes, str] | None:
     """Like :func:`current_cert`, plus its ``not_after`` as an ISO-8601 string."""
     found = _find_current(pki_dir, node_id)
-    return (found[1], found[2].not_after.isoformat()) if found else None
+    return (found.pem, found.ident.not_after.isoformat()) if found else None
 
 
 def _replace_file(path: Path, data: bytes) -> None:
@@ -159,76 +180,96 @@ def _restore(aside: Path, orig: Path) -> None:
     """Put a set-aside CSR back, unless a newer one landed on ``orig`` meanwhile.
 
     ``os.link`` fails if ``orig`` exists, so this is a no-clobber move: an exists()
-    check followed by ``os.replace`` would overwrite a CSR queued between the two.
+    check followed by ``os.replace`` would overwrite a CSR queued between the two. A
+    mount without hard links (sshfs, SMB) falls back to that check-then-replace; never
+    raise, since one stuck aside must not wedge every later run.
     """
     try:
         os.link(aside, orig)
     except FileExistsError:
         pass
+    except OSError:
+        try:
+            if not orig.exists():
+                os.replace(aside, orig)
+        except OSError:
+            return                      # left as .signing; the next run retries it
     aside.unlink(missing_ok=True)
+
+
+@contextlib.contextmanager
+def _locked(dirs: list[Path]):
+    """Hold every node dir's renewal lock (sorted, so two runs never deadlock).
+
+    ALL of them for the whole run: a renewal writes certs into every dir where the node
+    verifies, so a second run over an overlapping set must wait rather than interleave.
+    An OSError (missing or stale mount) propagates before anything is consumed.
+    """
+    with contextlib.ExitStack() as stack:
+        for d in sorted(set(dirs)):
+            # In the PKI dir itself, not renew/: creating renew/ from the CA host could
+            # leave the ingress a queue dir it does not own.
+            fh = stack.enter_context(open(Path(d) / ".renew.lock", "a+"))
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
 
 
 def sign_pending(ca: CertAuthority, pki_dir: Path, *, days: int = 7,
                  node_dirs: list[Path] | None = None) -> list[tuple[str, str]]:
     """Sign every queued CSR with its node's CURRENT grants. Returns (node_id, outcome).
 
-    ``pki_dir`` holds the CA key. ``node_dirs`` are the PKI dirs whose certs authorise
-    nodes and whose ``renew/`` queues the ingresses write -- on a split deployment, each
+    ``pki_dir`` holds the CA key. ``node_dirs`` are further PKI dirs whose certs authorise
+    nodes and whose ``renew/`` queues an ingress writes -- on a split deployment, each
     ingress host's PKI dir made reachable on the CA host (the ingress never gets the CA
-    key; the mount runs the other way). Default: ``[pki_dir]``, one host doing both.
+    key; the mount runs the other way). ``pki_dir`` is always one of them.
 
-    A CSR queued in one node dir is judged against THAT dir's certs (it is the ingress
-    that admitted the node), and the renewed cert is then published to every other node
-    dir, and ``pki_dir``, where the node currently verifies. A dir where it does not
-    verify -- revoked there -- is left alone.
+    A node's CURRENT state is taken over EVERY dir where it verifies: the new cert carries
+    the intersection of all their grants and their one WireGuard key (dirs that disagree
+    about the key are refused), and is written to every one of those dirs, so no ingress
+    is ever widened by a renewal queued through another. It must verify in the dir that
+    queued it. A dir where it does not verify -- revoked there -- is left alone. If any
+    write fails, or a cert changed or vanished meanwhile, the CSR is kept and the next
+    run redoes the whole renewal; a partly published one converges then.
 
-    Raises ValueError for an out-of-range ``days`` BEFORE touching any queue: that is an
-    operator error, and treating it per CSR would refuse and delete every queued renewal.
+    Raises ValueError for an out-of-range ``days``, and OSError when a node dir cannot be
+    locked (an unreachable mount), BEFORE touching any queue.
     """
     if not 1 <= days <= MAX_NODE_CERT_DAYS:
         raise ValueError(f"node cert lifetime must be 1..{MAX_NODE_CERT_DAYS} days, got {days}")
-    pki_dir = Path(pki_dir)
-    queues = [Path(p) for p in (node_dirs or [pki_dir])]
-    every = list(dict.fromkeys([*queues, pki_dir]))
+    every = list(dict.fromkeys([Path(pki_dir), *(Path(p) for p in node_dirs or [])]))
     results: list[tuple[str, str]] = []
-    for qdir in queues:
-        results += _drain(ca, qdir, days, [d for d in every if d != qdir])
+    with _locked(every):
+        for qdir in every:
+            results += _drain(ca, qdir, days, every)
     return results
 
 
-def _drain(ca: CertAuthority, pki_dir: Path, days: int,
-           mirrors: list[Path]) -> list[tuple[str, str]]:
-    d = _renew_dir(pki_dir)
-    if not d.is_dir():
-        return []
+def _drain(ca: CertAuthority, qdir: Path, days: int,
+           every: list[Path]) -> list[tuple[str, str]]:
+    d = _renew_dir(qdir)
     results: list[tuple[str, str]] = []
-    with open(d / ".lock", "a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        # A crash mid-sign leaves "<id>.csr.signing"; put it back unless a newer CSR landed.
-        for aside in d.glob("*.csr.signing"):
-            _restore(aside, aside.with_suffix(""))
-        for csr_path in sorted(d.glob("*.csr")):
-            node_id = csr_path.stem
-            # Rename aside under the lock, so a newer CSR can land on the original name
-            # while we sign and is never deleted by us.
-            aside = csr_path.with_name(csr_path.name + ".signing")
-            try:
-                os.replace(csr_path, aside)
-                csr_pem = aside.read_bytes()
-            except OSError:
-                continue
-            outcome, keep, new = _sign_one(ca, pki_dir, node_id, csr_pem, days)
-            if keep:
-                # Transient fault: retry next run, unless the node has queued a newer one.
-                _restore(aside, csr_path)
-            else:
-                aside.unlink(missing_ok=True)
-            if new is not None:
-                for m in mirrors:
-                    err = _publish(m, node_id, new)
-                    if err:
-                        outcome += f"; not published to {m}: {err}"
-            results.append((node_id, outcome))
+    if not d.is_dir():
+        return results
+    # A crash mid-sign leaves "<id>.csr.signing"; put it back unless a newer CSR landed.
+    for aside in d.glob("*.csr.signing"):
+        _restore(aside, aside.with_suffix(""))
+    for csr_path in sorted(d.glob("*.csr")):
+        node_id = csr_path.stem
+        # Set aside, so a newer CSR can land on the original name while we sign and is
+        # never deleted by us.
+        aside = csr_path.with_name(csr_path.name + ".signing")
+        try:
+            os.replace(csr_path, aside)
+            csr_pem = aside.read_bytes()
+        except OSError:
+            continue
+        outcome, keep = _renew_one(ca, qdir, every, node_id, csr_pem, days)
+        if keep:
+            # Transient fault: retry next run, unless the node has queued a newer one.
+            _restore(aside, csr_path)
+        else:
+            aside.unlink(missing_ok=True)
+        results.append((node_id, outcome))
     return results
 
 
@@ -244,40 +285,78 @@ def _swap_if_unchanged(path: Path, expected: bytes, new: bytes) -> str | None:
     return None
 
 
-def _publish(pki_dir: Path, node_id: str, new: bytes) -> str | None:
-    """Write a renewed cert where the node currently verifies. None, or why it was not."""
+def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
+               csr_pem: bytes, days: int) -> tuple[str, bool]:
+    """Renew one set-aside CSR across every node dir. Returns (outcome, keep the CSR)."""
+    states: dict[Path, _Current] = {}
     try:
-        found = _find_current(pki_dir, node_id)
-        if found is None:
-            return None                     # not enrolled / revoked here: leave it so
-        why = _swap_if_unchanged(found[0], found[1], new)
-        return None if why == "removed" else (f"certificate {why} meanwhile" if why else None)
+        for d in every:
+            cur = _find_current(d, node_id)
+            if cur is not None:
+                states[d] = cur
     except OSError as exc:
-        return str(exc)
-
-
-def _sign_one(ca: CertAuthority, pki_dir: Path, node_id: str, csr_pem: bytes,
-              days: int) -> tuple[str, bool, bytes | None]:
-    """Sign one set-aside CSR. Returns (outcome, keep the CSR for a retry, new cert)."""
+        return f"deferred: {exc}", True
+    if qdir not in states:
+        return "refused: no current certificate", False
+    grants: NodeGrants | None = None
+    wg_keys: set[str | None] = set()
+    for cur in states.values():
+        grants = _intersect(grants, cur.grants)
+        wg_keys |= cur.wg_keys
+    if len(wg_keys) != 1:
+        return "refused: the node's certificates disagree about its WireGuard key", False
+    assert grants is not None
     try:
-        found = _find_current(pki_dir, node_id)
-    except OSError as exc:
-        return f"deferred: {exc}", True, None
-    if found is None:
-        return "refused: no current certificate", False, None
-    path, pem, ident, grants = found
-    try:
-        new = ca.sign_node_csr(csr_pem, node_id=node_id, grants=grants,
-                               days=days, wg_pubkey=ident.wg_pubkey)
-        # Swap only if the cert is still the one we judged: an operator who deleted it
-        # (revocation) while we signed must not have it written back.
-        why = _swap_if_unchanged(path, pem, new)
-        if why == "removed":
-            return "refused: certificate removed while signing", False, None
-        if why == "changed":
-            return "deferred: certificate changed while signing", True, None
-        return "renewed", False, new
+        new = ca.sign_node_csr(csr_pem, node_id=node_id, grants=grants, days=days,
+                               wg_pubkey=next(iter(wg_keys)))
     except ValueError as exc:
-        return f"refused: {exc}", False, None
+        return f"refused: {exc}", False
+    try:
+        for d, cur in states.items():
+            # Swap only if the cert is still the one we judged: an operator who deleted it
+            # (revocation) while we signed must not have it written back.
+            why = _swap_if_unchanged(cur.path, cur.pem, new)
+            if why:
+                return f"deferred: certificate in {d} {why} while signing", True
+            # The renewed cert supersedes the node's other certs here: left in place, a
+            # longer-lived one would outlive it and be served, and would bring back its
+            # grants when the renewed one lapsed.
+            for path, pem in cur.others:
+                try:
+                    if path.read_bytes() == pem:
+                        path.unlink()
+                except FileNotFoundError:
+                    pass
     except OSError as exc:
-        return f"deferred: {exc}", True, None
+        return f"deferred: {exc}", True
+    return "renewed", False
+
+
+def revoke(pki_dir: Path, node_id: str, *, node_dirs: list[Path] | None = None) -> list[Path]:
+    """Revoke ``node_id``: delete its certs and queued CSRs in every node dir.
+
+    Under the same locks as :func:`sign_pending`, so a renewal in flight cannot write a
+    cert back after it. Returns the cert files removed.
+    """
+    every = list(dict.fromkeys([Path(pki_dir), *(Path(p) for p in node_dirs or [])]))
+    removed: list[Path] = []
+    with _locked(every):
+        for d in every:
+            try:
+                anchor = load_trust_anchor(d)
+            except Exception:                           # noqa: BLE001 - nothing verifies here
+                anchor = None
+            for crt in sorted(d.glob("*.crt")):
+                if anchor is None:
+                    break
+                try:
+                    if node_identity(anchor, crt.read_bytes(),
+                                     allow_expired=True).node_id != node_id:
+                        continue
+                except ValueError:
+                    continue
+                crt.unlink()
+                removed.append(crt)
+            for q in _renew_dir(d).glob(f"{node_id}.csr*"):
+                q.unlink(missing_ok=True)
+    return removed

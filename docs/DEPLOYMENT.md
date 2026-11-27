@@ -924,11 +924,20 @@ When the ingress is **not** the CA host, the queue and the certificates the ingr
 with live in the ingress's PKI dir, so the CA host must reach it. Make each ingress host's PKI
 dir reachable on the CA host (an sshfs or NFS mount, CA host as the client, so the ingress never
 sees `ca.key`) and add one `--node-dir <mount>` per ingress to the unit's `ExecStart`.
-`renew-pending` then drains every ingress's `renew/` queue, judges each CSR against the
-certificates of the ingress that queued it, and writes the renewed certificate to every node dir
-(and `--dir`) where the node still verifies; a dir where it was revoked is left alone. Without
+`renew-pending` then drains every queue (`--dir`'s own included) and treats the node's
+certificates in ALL of those dirs as its current state: the renewed certificate carries the
+**intersection** of their grants and their one WireGuard key (dirs that disagree about the key
+are refused), and replaces the node's certificates in every dir where it still verifies, so an
+ingress that narrowed a node is never widened by a renewal queued through another. A dir where
+it was revoked is left alone. A run that cannot lock every dir (a stale mount) renews nothing and
+exits 1; a write that fails mid-way keeps the CSR, and the next run redoes it. Without
 `--node-dir` a split deployment's renewals are never seen: the node gets 202 and its old
 certificate until it expires.
+
+**Revoke with `blastbox pki revoke-node --node-id <id> [--node-dir …]`.** It deletes the node's
+certificates and any queued renewal from every dir under the same lock `renew-pending` holds, so a
+renewal in flight cannot write a certificate back. Deleting the file by hand still revokes, but
+can race a renewal that is signing at that moment.
 
 `--name`/`--public-key` still work for nodes not yet enrolled, and say plainly that the key
 is unauthenticated. The certificate's node-info extension uses a **placeholder OID arc that

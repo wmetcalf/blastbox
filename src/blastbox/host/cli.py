@@ -1510,6 +1510,19 @@ def _pki_cmd(args: argparse.Namespace) -> int:
             f"  ca.key  (issuing key -- keep on issuing hosts only, 0600)      : {pki_dir / 'ca.key'}"
         )
         return 0
+    if args.pki_action == "revoke-node":
+        from blastbox.host.node_renew import revoke
+        try:
+            removed = revoke(pki_dir, args.node_id,
+                             node_dirs=[Path(p) for p in args.node_dir] or None)
+        except OSError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        for path in removed:
+            print(f"removed {path}")
+        if not removed:
+            print(f"no certificate for {args.node_id} found", file=sys.stderr)
+        return 0
     if args.pki_action == "renew-pending":
         from blastbox.host.node_renew import sign_pending
         from blastbox.host.pki import load_ca
@@ -1521,7 +1534,7 @@ def _pki_cmd(args: argparse.Namespace) -> int:
         try:
             outcomes = sign_pending(ca, pki_dir, days=args.days,
                                     node_dirs=[Path(p) for p in args.node_dir] or None)
-        except ValueError as exc:     # an out-of-range --days: nothing was touched
+        except (ValueError, OSError) as exc:   # bad --days / unreachable node dir: nothing touched
             print(f"error: {exc}", file=sys.stderr)
             return 1
         for node_id, outcome in outcomes:
@@ -2240,8 +2253,15 @@ def build_parser() -> argparse.ArgumentParser:
     pk_rp.add_argument(
         "--node-dir", action="append", default=[],
         help="an ingress host's PKI dir, reachable here (repeatable): drain its renew/ "
-             "queue and publish renewed certs to every node dir where the node still "
-             "verifies. Default: --dir only (CA and ingress on one host)")
+             "queue and write renewed certs to every node dir where the node still "
+             "verifies. --dir is always included")
+    pk_rv = pks.add_parser(
+        "revoke-node",
+        help="revoke a node: delete its certs and queued renewal CSRs from --dir and every "
+             "--node-dir, under the renewal lock so an in-flight renewal cannot undo it")
+    pk_rv.add_argument("--node-id", required=True)
+    pk_rv.add_argument("--node-dir", action="append", default=[],
+                       help="an ingress host's PKI dir, reachable here (repeatable)")
     pk_ns = pks.add_parser(
         "node-status",
         help="what THIS node's environment resolves to: is the grants gate armed, does "
