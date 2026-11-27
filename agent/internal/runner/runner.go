@@ -312,8 +312,19 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	if err := j.fillArtifacts(files); err != nil {
 		return j.fail(ctx, err.Error())
 	}
-	if fi, err := os.Lstat(filepath.Join(j.out, metadataName)); err != nil || fi.Size() > orDef(c.Run.Limits.MaxMetadata, defMaxMetadata) {
+	fi, err := os.Lstat(filepath.Join(j.out, metadataName))
+	if err != nil || fi.Size() > orDef(c.Run.Limits.MaxMetadata, defMaxMetadata) {
 		return j.fail(ctx, "metadata.json over max_metadata")
+	}
+	// The control plane's vet_tar counts every member, the final envelope included.
+	var total int64
+	for rel, n := range files {
+		if rel != metadataName {
+			total += n
+		}
+	}
+	if maxTotal := orDef(c.Run.Limits.MaxTotalArtifacts, defMaxTotalArtifacts); total+fi.Size() > maxTotal {
+		return j.fail(ctx, fmt.Sprintf("output total with metadata.json is over max_total_artifacts (%d)", maxTotal))
 	}
 	tarPath := filepath.Join(j.dir, ResultTarName)
 	if err := Write(j.out, tarPath); err != nil {
