@@ -149,3 +149,35 @@ func TestKillRunGuardsPidReuse(t *testing.T) {
 		t.Fatal("the recorded run survived KillRun")
 	}
 }
+
+// A recorded leader that is gone is never grounds to signal its process-group number: the number
+// may name another group by now (on Linux the jail dies with its leader; on macOS the sweep
+// finds a seatbelt run's other processes by their sandbox).
+func TestKillRunNeverSignalsAGroupWhoseLeaderIsGone(t *testing.T) {
+	c := exec.Command("/bin/sh", "-c", "sleep 60 & exit 0")
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	id, _ := ProcIdentity(c.Process.Pid)
+	c.Wait() // leader reaped; its child lives on in the group
+	t.Cleanup(func() { syscall.Kill(-c.Process.Pid, syscall.SIGKILL) })
+	if err := KillRun(RunRecord{PID: c.Process.Pid, Identity: id}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if syscall.Kill(-c.Process.Pid, 0) != nil {
+		t.Fatal("signalled a process group whose recorded leader was gone")
+	}
+}
+
+// A record that identifies no process (the agent died between starting the run and recording
+// its pid) is not "stopped" until the run's own time limit has passed.
+func TestKillRunWaitsOutAnUnidentifiableRun(t *testing.T) {
+	if err := KillRun(RunRecord{NotAfter: time.Now().Add(time.Minute).Unix()}); err == nil {
+		t.Fatal("an unidentifiable run inside its time limit was reported stopped")
+	}
+	if err := KillRun(RunRecord{NotAfter: time.Now().Add(-time.Second).Unix()}); err != nil {
+		t.Fatalf("past its time limit: %v", err)
+	}
+}

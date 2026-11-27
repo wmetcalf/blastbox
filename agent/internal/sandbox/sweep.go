@@ -38,17 +38,27 @@ type RunRecord struct {
 	Scratch      string `json:"scratch,omitempty"`
 	Canary       string `json:"canary,omitempty"`
 	StartedAfter int64  `json:"started_after_us,omitempty"`
+	// NotAfter (unix seconds) is when the run cannot be alive any more (its time limit plus a
+	// grace): until then a record that identifies no process is not a stopped run.
+	NotAfter int64 `json:"not_after,omitempty"`
 }
 
-// KillRun SIGKILLs a recorded run's process group, if its leader is still that process (or is
-// gone: the kernel does not reuse a pid while its process group lives), then sweeps a seatbelt
-// run's escapees. An error means the run could not be shown stopped.
+// KillRun SIGKILLs a recorded run's process group while its leader is still that process, then
+// sweeps a seatbelt run's escapees. A leader that is gone is never a reason to signal the group
+// number, which may name another group by now: on Linux the jail died with its leader (nsjail's
+// PID namespace), and on macOS every other process of the run carries its sandbox and is swept.
+// A record that identifies no process (the agent died between starting the run and recording
+// its pid) and has no sweep identity counts as stopped only once its time limit has passed.
+// An error means the run could not be shown stopped.
 func KillRun(rec RunRecord) error {
-	if rec.PID > 1 {
-		id, alive := ProcIdentity(rec.PID)
-		if !alive || id == rec.Identity {
+	switch {
+	case rec.PID > 1 && rec.Identity != 0:
+		if id, alive := ProcIdentity(rec.PID); alive && id == rec.Identity {
 			syscall.Kill(-rec.PID, syscall.SIGKILL)
 		}
+	case rec.Canary == "" && rec.NotAfter > 0 && time.Now().Unix() < rec.NotAfter:
+		return errorf("the run is not identifiable; waiting out its time limit (until %s)",
+			time.Unix(rec.NotAfter, 0).UTC().Format(time.RFC3339))
 	}
 	if rec.Canary != "" {
 		_, err := SweepRun(RunIdentity{Scratch: rec.Scratch, Canary: rec.Canary,

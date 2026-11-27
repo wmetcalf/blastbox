@@ -552,7 +552,8 @@ func (j *job) exec(ctx context.Context, cmd *exec.Cmd, capw *capWriter) (killed 
 	// run's sweep identity is known before it starts, so it is recorded first: a crash between
 	// Start and the pid's record still leaves a way to find the run. A run that cannot be
 	// recorded is not started (or is killed at once).
-	rec := sandbox.RunRecord{Scratch: j.ident.Scratch, Canary: j.ident.Canary}
+	rec := sandbox.RunRecord{Scratch: j.ident.Scratch, Canary: j.ident.Canary,
+		NotAfter: time.Now().Add(time.Duration(j.c.Run.DeadlineS)*time.Second + time.Minute).Unix()}
 	if j.ident.Canary != "" {
 		rec.StartedAfter = j.ident.StartedAfter.UnixMicro()
 	}
