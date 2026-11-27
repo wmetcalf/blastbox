@@ -1158,3 +1158,22 @@ def test_a_renewal_says_which_link_only_dir_it_could_not_update(tmp_path, capsys
     out = capsys.readouterr().out
     assert out.startswith("n1: renewed") and str(i2) in out and "link" in out
     assert rc == 2                                       # loud: i2 still serves the old cert
+
+
+def test_a_link_only_dir_whose_link_does_not_resolve_here_is_named_too(tmp_path, capsys):
+    from blastbox.host.cli import main
+    ca, ca_dir, i1, i2 = _split(tmp_path)
+    (i2 / "node-n1.crt").unlink()
+    (i2 / "node-n1.crt").symlink_to("/mnt/ingress2-only/n1.crt")   # resolves only there
+    queue_csr(i1, "n1", make_csr("n1")[0])
+    rc = main(["pki", "--dir", str(ca_dir), "renew-pending",
+               "--node-dir", str(i1), "--node-dir", str(i2)])
+    assert rc == 2 and str(i2) in capsys.readouterr().out
+
+
+def test_a_queue_name_cannot_fake_the_exit_code(tmp_path, capsys):
+    from blastbox.host.cli import main
+    d, _ = rig(tmp_path)
+    (d / "renew").mkdir()
+    os.mkfifo(d / "renew" / "NOT written.csr")
+    assert main(["pki", "--dir", str(d), "renew-pending"]) == 0

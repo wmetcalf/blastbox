@@ -54,6 +54,8 @@ from blastbox.host.pki import (
 )
 
 RENEW_DIR = "renew"
+#: Outcome prefix for a renewal that left some dir serving the old cert (CLI exits 2).
+RENEWED_NOT_WRITTEN = "renewed; NOT written to"
 MAX_CSR_BYTES = 8 * 1024
 #: The renewal proof's signed-message prefix (see :func:`renew_payload`).
 RENEW_PROOF_DOMAIN = b"blastbox/node-renew/v1"
@@ -676,10 +678,12 @@ def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
         return f"deferred: {exc}", True
     # A dir that serves the node only through a link out of it was not (cannot be) written:
     # that ingress still serves the old cert. Renewed, but say so (the CLI exits 2).
-    stale = [d for d in every if d not in states and _links_out_for(d, node_id, ca)]
+    # A link this host cannot read may be the node's too (resolved on that ingress only).
+    stale = [d for d in every
+             if d not in states and _links_out_for(d, node_id, ca, unknown_counts=True)]
     if stale:
-        return (f"renewed; NOT written to {', '.join(map(str, stale))}: it holds the node only "
-                "through a link out of the dir, so it still serves the old certificate"), False
+        return (f"{RENEWED_NOT_WRITTEN} {', '.join(map(str, stale))}: it may hold the node only "
+                "through a link out of the dir, so it may still serve the old certificate"), False
     return "renewed", False
 
 
