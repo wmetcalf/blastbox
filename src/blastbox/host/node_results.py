@@ -225,12 +225,12 @@ class _BoundedTarInfo(tarfile.TarInfo):
     ``size=`` override to the next member, so any independent walk can be steered onto a
     different chain than the one tarfile parses."""
 
-    def _proc_member(self, tarfile_obj):  # type: ignore[no-untyped-def]
+    def _proc_member(self, tarfile_obj: tarfile.TarFile) -> tarfile.TarInfo:
         if self.type == tarfile.GNUTYPE_SPARSE:
             raise TarRejected(f"sparse member refused: {self.name!r}")
         if self.type in _EXTENDED_TYPES and self.size > MAX_EXTENDED_HEADER:
             raise TarRejected(f"extended header record of {self.size} bytes refused")
-        return super()._proc_member(tarfile_obj)
+        return super()._proc_member(tarfile_obj)  # type: ignore[misc]  # private, stable 3.8-3.13
 
 
 def vet_tar(fileobj: Any, *, max_members: int, max_total_bytes: int,
