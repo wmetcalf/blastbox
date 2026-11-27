@@ -1550,6 +1550,15 @@ def _pki_cmd(args: argparse.Namespace) -> int:
         # A deferral repeats every run until someone fixes its cause; exit 2 so the timer
         # unit shows it, instead of staying green while the node's cert runs out.
         return 2 if any(o.startswith("deferred") for _, o in outcomes) else 0
+    if args.pki_action == "sign-node-csr":
+        # LOAD, never generate: a mistyped --dir must not mint a rogue CA and sign with it.
+        from blastbox.host.pki import load_ca
+        try:
+            load_ca(pki_dir)
+        except Exception as exc:  # noqa: BLE001 - no CA here is an operator error
+            print(f"error: cannot load the CA from {pki_dir} (this needs the CA key): {exc}",
+                  file=sys.stderr)
+            return 1
     ca = ensure_ca(pki_dir)  # generate-or-load the CA
     if args.pki_action == "init":
         crt, key = ca.issue_client("dispatcher", days=args.days).write(

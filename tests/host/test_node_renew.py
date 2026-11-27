@@ -863,3 +863,67 @@ def test_revoke_reports_a_cert_too_large_to_check(tmp_path, monkeypatch):
     with pytest.raises(node_renew.PartialRevoke) as exc:
         node_renew.revoke(ca_dir, "n1", node_dirs=[i1])
     assert any("node-n1.crt" in why for _d, why in exc.value.failed)
+
+
+def test_a_directory_in_the_queue_is_refused_not_fatal(tmp_path):
+    ca, ca_dir, i1, _i2 = _split(tmp_path)
+    (i1 / "renew").mkdir(exist_ok=True)
+    (i1 / "renew" / "evil.csr").mkdir()
+    (i1 / "renew" / "evil2.csr.signing").mkdir()
+    queue_csr(i1, "n1", make_csr("n1")[0])
+    out = dict(sign_pending(ca, ca_dir, node_dirs=[i1]))
+    assert out["n1"] == "renewed"
+    assert out["evil"].startswith("refused") and out["evil2"].startswith("refused")
+
+
+def test_revoke_never_holds_one_lock_while_waiting_for_another(tmp_path, monkeypatch):
+    ca, ca_dir, i1, i2 = _split(tmp_path)
+    monkeypatch.setattr(node_renew, "REVOKE_LOCK_WAIT_S", 0.1)
+    monkeypatch.setattr(node_renew, "LOCK_TIMEOUT_S", 0.3)
+    held: list[int] = []
+    real = node_renew._locked
+
+    @contextlib.contextmanager
+    def spy(dirs, timeout=None):
+        held.append(len(held_now))
+        with real(dirs, timeout=timeout):
+            held_now.append(1)
+            try:
+                yield
+            finally:
+                held_now.pop()
+    held_now: list[int] = []
+    monkeypatch.setattr(node_renew, "_locked", spy)
+    holder = open(i1 / ".renew.lock", "a+")
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(node_renew.PartialRevoke):
+            node_renew.revoke(ca_dir, "n1", node_dirs=[i1, i2])
+    finally:
+        holder.close()
+    assert held and max(held) == 0       # no lock held at the start of any wait
+
+
+def test_a_transient_pass_one_error_fixed_by_pass_two_is_not_reported(tmp_path, monkeypatch):
+    import threading
+    ca, ca_dir, i1, _i2 = _split(tmp_path)
+    monkeypatch.setattr(node_renew, "REVOKE_LOCK_WAIT_S", 0.1)
+    monkeypatch.setattr(node_renew, "LOCK_TIMEOUT_S", 5.0)
+    real = node_renew._read_capped
+    calls = {"n": 0}
+
+    def flaky_once(path, limit, **kw):
+        if path.name == "node-n1.crt" and path.parent == i1 and calls["n"] == 0:
+            calls["n"] += 1
+            raise OSError(5, "Input/output error")
+        return real(path, limit, **kw)
+    monkeypatch.setattr(node_renew, "_read_capped", flaky_once)
+    holder = open(i1 / ".renew.lock", "a+")
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    t = threading.Timer(0.5, holder.close)
+    t.start()
+    try:
+        node_renew.revoke(ca_dir, "n1", node_dirs=[i1])   # no PartialRevoke
+    finally:
+        t.join()
+    assert not (i1 / "node-n1.crt").exists()

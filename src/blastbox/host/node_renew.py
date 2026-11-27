@@ -19,6 +19,7 @@ import errno
 import fcntl
 import os
 import re
+import shutil
 import stat
 import tempfile
 import time
@@ -354,8 +355,8 @@ def _drain(ca: CertAuthority, qdir: Path, days: int,
             if csr_path.exists():
                 os.replace(csr_path, aside)     # newest wins over a kept older one
             csr_pem = _read_capped(aside, MAX_CSR_BYTES)
-        except _Unreadable as exc:              # FIFO, device, oversized, link: refuse it
-            aside.unlink(missing_ok=True)
+        except _Unreadable as exc:              # FIFO, device, dir, oversized, link: refuse it
+            _discard(aside)
             results.append((node_id, f"refused: {exc}"))
             continue
         except OSError as exc:                  # say it, so the run exits 2 and is seen
@@ -366,6 +367,18 @@ def _drain(ca: CertAuthority, qdir: Path, days: int,
             aside.unlink(missing_ok=True)
         results.append((node_id, outcome))
     return results
+
+
+def _discard(path: Path) -> None:
+    """Remove a refused queue entry, whatever it is; never raise (a planted directory
+    must not crash the run and starve every other queue)."""
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _swap_if_unchanged(path: Path, expected: bytes, new: bytes) -> str | None:
@@ -466,28 +479,34 @@ def revoke(pki_dir: Path, node_id: str, *, node_dirs: list[Path] | None = None) 
         out.setdefault(os.path.realpath(p), p)
     removed: list[Path] = []
     unlocked: list[Path] = []
+    errors_by_dir: dict[Path, list[str]] = {}
     failed: list[tuple[Path, str]] = []
-    with contextlib.ExitStack() as stack:
-        for d in sorted(out.values(), key=lambda p: os.path.realpath(p)):
-            if not (d / "ca.crt").is_file():
-                failed.append((d, "not a PKI dir (no ca.crt) -- unmounted?"))
-                continue
-            try:
-                stack.enter_context(_locked([d], timeout=REVOKE_LOCK_WAIT_S))
-            except OSError:
-                unlocked.append(d)
-            gone, errors = _revoke_in(anchor, d, node_id)
-            removed += gone
-            failed += [(d, why) for why in errors]
-        for d in list(unlocked):                  # second pass, under the lock
-            try:
-                stack.enter_context(_locked([d]))
-            except OSError:
-                continue
+
+    def one(d: Path, wait: float) -> bool:
+        """Revoke ``d``, under its lock if it comes within ``wait``. One lock at a time,
+        released before the next: holding one while waiting for another would break the
+        sorted order renew-pending locks in, and the two would wait on each other."""
+        try:
+            with _locked([d], timeout=wait):
+                gone, errs = _revoke_in(anchor, d, node_id)
+                got = True
+        except OSError:                       # the lock did not come: revoke anyway
+            gone, errs = _revoke_in(anchor, d, node_id)
+            got = False
+        removed.extend(g for g in gone if g not in removed)
+        errors_by_dir[d] = errs               # the latest pass is what stands
+        return got
+
+    for d in sorted(out.values(), key=lambda p: os.path.realpath(p)):
+        if not (d / "ca.crt").is_file():
+            failed.append((d, "not a PKI dir (no ca.crt) -- unmounted?"))
+            continue
+        if not one(d, REVOKE_LOCK_WAIT_S):
+            unlocked.append(d)
+    for d in list(unlocked):                  # second pass, now waiting for the lock
+        if one(d, LOCK_TIMEOUT_S):
             unlocked.remove(d)
-            gone, errors = _revoke_in(anchor, d, node_id)
-            removed += [g for g in gone if g not in removed]
-            failed += [(d, why) for why in errors if (d, why) not in failed]
+    failed += [(d, why) for d, errs in errors_by_dir.items() for why in errs]
     if unlocked or failed:
         raise PartialRevoke(removed, unlocked, failed)
     return removed

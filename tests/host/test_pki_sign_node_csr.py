@@ -174,3 +174,23 @@ def test_cli_replaces_existing_out_and_survives_stale_tmp(tmp_path, ca, capsys):
     assert f"replaced existing {out}" in capsys.readouterr().err
     assert out.read_bytes().startswith(b"-----BEGIN CERTIFICATE")
     assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
+
+
+def test_cli_sign_node_csr_never_creates_a_ca(tmp_path, capsys):
+    from cryptography import x509 as _x509
+    from cryptography.hazmat.primitives import hashes as _h
+    from cryptography.hazmat.primitives import serialization as _s
+    from cryptography.hazmat.primitives.asymmetric import ec as _ec
+    from cryptography.x509.oid import NameOID as _N
+
+    from blastbox.host.cli import main
+    key = _ec.generate_private_key(_ec.SECP256R1())
+    csr = (_x509.CertificateSigningRequestBuilder()
+           .subject_name(_x509.Name([_x509.NameAttribute(_N.COMMON_NAME, "n1")]))
+           .sign(key, _h.SHA256())).public_bytes(_s.Encoding.PEM)
+    (tmp_path / "n1.csr").write_bytes(csr)
+    empty = tmp_path / "empty"
+    assert main(["pki", "--dir", str(empty), "sign-node-csr", "--csr",
+                 str(tmp_path / "n1.csr"), "--node-id", "n1"]) == 1
+    assert "error:" in capsys.readouterr().err
+    assert not (empty / "ca.key").exists() and not (empty / "node-n1.crt").exists()
