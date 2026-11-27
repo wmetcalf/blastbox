@@ -80,8 +80,8 @@ def spool(tmp_path, job, *, env=None, claim=None, node="alpha"):
     return d
 
 
-def receipt(tmp_path):
-    return json.loads((tmp_path / "blobs" / "results" / "job-1" / attest.RECEIPT_NAME).read_bytes())
+def receipt(tmp_path, jid="job-1"):
+    return json.loads((tmp_path / "blobs" / "results" / jid / attest.RECEIPT_NAME).read_bytes())
 
 
 def test_finalizer_marks_done_and_signs_receipt_with_node_fields(tmp_path):
@@ -227,12 +227,182 @@ def _run_end_to_end(tmp_path, pki_dir):  # noqa: F811
 
 
 def test_end_to_end_claim_input_result_finalise(tmp_path, pki_dir):  # noqa: F811
-    _run_end_to_end(tmp_path, pki_dir)
-
-
-@pytest.mark.xfail(strict=True, reason=(
-    "B3 gap: put_result runs _running_owned BEFORE it consults outcome.json, so once the job "
-    "is DONE a replayed PUT is refused 403 instead of answering 200 done"))
-def test_replayed_put_after_finalise_returns_200_done(tmp_path, pki_dir):  # noqa: F811
     r = _run_end_to_end(tmp_path, pki_dir)()
     assert r.status_code == 200 and r.json() == {"status": "done"}
+
+
+# ---------------------------------------------------------------- fix round 1
+
+class FailingBlobs(LocalBlobStore):
+    fail = True
+
+    def put_output(self, job_id, output_dir):
+        if self.fail:
+            raise OSError("blob store down")
+        return super().put_output(job_id, output_dir)
+
+
+JID = "11111111-2222-3333-4444-555555555555"
+
+
+def _build_blobs(tmp_path, cls, jid="job-1"):
+    store = InMemoryJobStore()
+    store.create(Job(job_id=jid, engine="clamav", filename="s.bin", status=JobStatus.QUEUED,
+                     created_at=time.time(), input_sha256=SHA))
+    job = store.claim_next()
+    key = attest.load_or_create_key(tmp_path / "keys" / "a.key")
+    blobs = cls(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    from blastbox.host.dispatch import Dispatcher  # noqa: F401
+    fin = NodeFinalizer(job_store=store, blob_store=blobs, limits=Limits(),
+                        job_root=tmp_path / "jobs", attest_key=key)
+    fin._dispatcher._put_output_max_attempts = 1
+    fin._dispatcher._put_output_retry_backoff_s = 0.0
+    return store, job, fin, blobs
+
+
+def test_retained_tree_survives_and_the_retry_sweep_uploads_it(tmp_path):
+    store, job, fin, blobs = _build_blobs(tmp_path, FailingBlobs, jid=JID)
+    d = spool(tmp_path, job)
+    assert fin.run_once() == 1
+    out = nr.read_outcome(d)
+    assert out and out["status"] == "failed" and "retained" in out["reason"]
+    staged = tmp_path / "jobs" / JID / "output"
+    assert (staged / "metadata.json").is_file() and not (d / "out").exists()
+    assert (tmp_path / "jobs" / JID / ".pending-upload").is_file()
+    # age sweep must not destroy it
+    old = time.time() - 7200
+    os.utime(d / "outcome.json", (old, old))
+    fin.run_once()
+    assert (staged / "metadata.json").is_file()
+    blobs.fail = False
+    fin.run_once()
+    assert store.get(JID).status == JobStatus.DONE
+    assert attest.verify_body(attest.load_existing_key(tmp_path / "keys" / "a.key"),
+                              receipt(tmp_path, JID))
+
+
+def test_lost_claim_before_finalise_leaves_job_root_untouched(tmp_path):
+    store, job, fin, _ = _build_blobs(tmp_path, LocalBlobStore)
+    d = spool(tmp_path, job)
+    store.update_if_status("job-1", JobStatus.RUNNING, expect_claim_id=job.claim_id,
+                           status=JobStatus.QUEUED, claim_id=None)
+    fin.run_once()
+    assert nr.read_outcome(d) == {"status": "failed", "reason": "claim lost"}
+    assert not (tmp_path / "jobs" / "job-1" / "output").exists()
+
+
+def test_claim_lost_during_finalise_discards_nothing_on_a_live_owner(tmp_path, monkeypatch):
+    store, job, fin, _ = _build_blobs(tmp_path, LocalBlobStore)
+    d = spool(tmp_path, job)
+    real = fin._dispatcher.finalise_output
+
+    def steal(j, out, obs, **kw):
+        store.update_if_status("job-1", JobStatus.RUNNING, expect_claim_id=j.claim_id,
+                               status=JobStatus.QUEUED, claim_id=None)
+        store.claim_next()
+        return real(j, out, obs, **kw)
+
+    monkeypatch.setattr(fin._dispatcher, "finalise_output", steal)
+    fin.run_once()
+    assert nr.read_outcome(d) == {"status": "failed", "reason": "claim lost"}
+    assert store.get("job-1").status == JobStatus.RUNNING        # the new owner's row untouched
+    assert (tmp_path / "jobs" / "job-1" / "output").exists()
+
+
+def test_poison_tree_is_failed_after_five_attempts(tmp_path, monkeypatch):
+    store, job, fin, _ = build(tmp_path)
+    d = spool(tmp_path, job)
+
+    def boom(*a, **k):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(fin._dispatcher, "finalise_output", boom)
+    for _ in range(4):
+        assert fin.run_once() == 0
+        assert nr.read_outcome(d) is None
+        assert store.get("job-1").status == JobStatus.RUNNING
+    assert fin.run_once() == 1
+    assert nr.read_outcome(d) == {"status": "failed", "reason": "finalisation failed repeatedly"}
+    j = store.get("job-1")
+    assert j.status == JobStatus.FAILED and "repeatedly" in (j.error or "")
+
+
+def test_transient_error_under_the_cap_then_succeeds(tmp_path, monkeypatch):
+    store, job, fin, _ = build(tmp_path)
+    spool(tmp_path, job)
+    real = fin._dispatcher.finalise_output
+    calls = []
+
+    def flaky(*a, **k):
+        calls.append(1)
+        if len(calls) < 3:
+            raise RuntimeError("transient")
+        return real(*a, **k)
+
+    monkeypatch.setattr(fin._dispatcher, "finalise_output", flaky)
+    assert [fin.run_once() for _ in range(3)] == [0, 0, 1]
+    assert store.get("job-1").status == JobStatus.DONE
+
+
+def test_missing_input_sha_fails_the_job(tmp_path):
+    store, job, fin, _ = build(tmp_path)
+    d = spool(tmp_path, job)
+    store.update_if_status("job-1", JobStatus.RUNNING, expect_claim_id=job.claim_id,
+                           input_sha256="")
+    fin.run_once()
+    out = nr.read_outcome(d)
+    assert out and out["status"] == "failed" and "input hash" in out["reason"]
+    assert store.get("job-1").status == JobStatus.FAILED
+
+
+def test_node_reported_times_are_clamped():
+    job = Job(job_id="j", engine="e", filename="f", status=JobStatus.RUNNING,
+              created_at=0.0, input_sha256=SHA)
+    now = attest.now_ms()
+    m = nr.UploadMarker(job_id="j", claim_id="c", node_id="n", node_cert_sha256="x",
+                        worker_runtime=None, received_at=0.0,
+                        started_at_ms=now + 10**9, finished_at_ms=5)
+    o = NodeFinalizer._observation(job, m)
+    assert o.finished_at_ms >= o.started_at_ms
+    assert o.started_at_ms <= now + 301_000 and o.finished_at_ms <= now + 301_000
+
+
+def test_stale_dir_without_outcome_is_swept_and_logged(tmp_path, caplog):
+    store, job, fin, _ = build(tmp_path)
+    d = spool(tmp_path, job)
+    (d / "upload.json").unlink()                     # never becomes pending
+    old = time.time() - 30 * 3600
+    os.utime(d, (old, old))
+    with caplog.at_level("WARNING"):
+        fin.run_once()
+    assert not d.exists() and "no outcome" in caplog.text
+
+
+def test_no_receipts_path_marks_done_unsigned(tmp_path, caplog):
+    store, job, fin, _ = build(tmp_path, key=False)
+    spool(tmp_path, job)
+    assert fin.run_once() == 1
+    assert store.get("job-1").status == JobStatus.DONE
+    p = tmp_path / "blobs" / "results" / "job-1" / attest.RECEIPT_NAME
+    assert not p.exists() or "signature" not in json.loads(p.read_bytes()) \
+        or json.loads(p.read_bytes()).get("signature") is None
+
+
+def test_cli_no_receipts_logs_a_loud_warning(tmp_path, monkeypatch, caplog):
+    from blastbox.host import cli, node_finalizer
+    monkeypatch.setenv("BLASTBOX_JOB_ROOT", str(tmp_path / "jobs"))
+    monkeypatch.delenv("BLASTBOX_ATTEST_KEY", raising=False)
+
+    class Fake:
+        def __init__(self, **kw):
+            Fake.key = kw["attest_key"]
+
+        def run_once(self):
+            return 0
+
+    monkeypatch.setattr(node_finalizer, "NodeFinalizer", Fake)
+    import blastbox.host.jobs.factory as jf
+    monkeypatch.setattr(jf, "build_job_store_from_env", lambda *a, **k: InMemoryJobStore())
+    with caplog.at_level("WARNING"):
+        assert cli.main(["node-finalizer", "--once", "--no-receipts"]) == 0
+    assert Fake.key is None and "--no-receipts" in caplog.text

@@ -914,8 +914,17 @@ blastbox node-finalizer [--once] [--interval 1.0] [--no-receipts]
   a loud warning and marks node results DONE with no signed receipt.
 * **Env.** `BLASTBOX_DB` / job store and blob-store settings exactly as for `blastbox dispatch`
   (same `BLASTBOX_JOB_ROOT`), `BLASTBOX_ATTEST_KEY`, and `BLASTBOX_NODE_RESULTS_RETAIN_S`
-  (default `3600`): the extracted tree is removed right after finalisation, and a whole
-  (job, claim) directory is removed once its outcome is older than that.
+  (default `3600`): a whole (job, claim) directory is removed once its outcome is older than
+  that (a directory with no outcome at all is removed after 24 h, with a warning).
+* **A failed upload is not lost.** Before sealing, the finalizer renames the quarantined tree
+  into `$BLASTBOX_JOB_ROOT/<job>/output` (the cold dispatcher's own layout), so `job_root` and
+  the results volume must be on the same filesystem. If the blob upload then fails, the job is
+  failed with the retained marker exactly as on a dispatcher, the tree stays under `job_root`,
+  and the finalizer runs the dispatcher's pending-upload retry sweep every loop (no dispatcher
+  need run); a later successful upload repairs the row to DONE. `BLASTBOX_PENDING_UPLOAD_RETRY=0`
+  is not honoured by the finalizer.
+* **Poison trees.** A tree whose finalisation raises an unexpected error is retried; after 5
+  attempts the job is failed (`finalisation failed repeatedly`) and the outcome recorded.
 * **Set `BLASTBOX_NODE_CLAIM_RECLAIM_AFTER_S`** on the ingress. Without it a claim whose node
   never uploads is never reclaimed; the finalizer logs an ERROR at startup when it is unset.
 * Receipts it signs carry `worker_tier: node-agent`, plus `node_id` and `node_cert_sha256` of
