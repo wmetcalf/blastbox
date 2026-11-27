@@ -187,3 +187,123 @@ def test_existing_renew_dir_is_chmodded_0700(tmp_path):
     os.chmod(d / "renew", 0o755)
     queue_csr(d, "n1", make_csr("n1")[0])
     assert (d / "renew").stat().st_mode & 0o777 == 0o700
+
+
+WG = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
+
+
+def test_renewal_keeps_the_wireguard_key_of_a_v1_cert(tmp_path):
+    d = tmp_path / "pki"
+    ca = pki.ensure_ca(d)
+    (d / "node-n1.crt").write_bytes(
+        ca.issue_node("n1", wg_pubkey=WG, grants=GRANTS).cert_pem)
+    queue_csr(d, "n1", make_csr("n1")[0])
+    assert sign_pending(ca, d) == [("n1", "renewed")]
+    ident = pki.node_identity(pki.load_trust_anchor(d), (d / "node-n1.crt").read_bytes())
+    assert ident.wg_pubkey == WG and ident.info_version == 1
+
+
+def test_renewal_never_widens_past_the_ingress_grant_intersection(tmp_path):
+    d = tmp_path / "pki"
+    ca = pki.ensure_ca(d)
+    broad = pki.NodeGrants(engines=("a", "b"), tiers=("warm",), credentials=True)
+    narrow = pki.NodeGrants(engines=("a",), tiers=(), credentials=False)
+    (d / "n1-old.crt").write_bytes(ca.sign_node_csr(make_csr("n1")[0], node_id="n1",
+                                                    grants=broad, days=10))
+    (d / "node-n1.crt").write_bytes(ca.sign_node_csr(make_csr("n1")[0], node_id="n1",
+                                                     grants=narrow, days=3))
+    assert fleet_grants(d)["n1"] == narrow
+    queue_csr(d, "n1", make_csr("n1")[0])
+    assert sign_pending(ca, d) == [("n1", "renewed")]
+    anchor = pki.load_trust_anchor(d)
+    for crt in ("n1-old.crt", "node-n1.crt"):
+        assert pki.node_identity(anchor, (d / crt).read_bytes()).grants.engines in (("a",),)
+
+
+@pytest.mark.parametrize("days", [0, pki.MAX_NODE_CERT_DAYS + 1])
+def test_out_of_range_days_is_refused_before_touching_the_queue(tmp_path, days):
+    d, ca = rig(tmp_path)
+    queue_csr(d, "n1", make_csr("n1")[0])
+    with pytest.raises(ValueError):
+        sign_pending(ca, d, days=days)
+    assert [p.name for p in (d / "renew").glob("*.csr*")] == ["n1.csr"]
+
+
+def test_cli_renew_pending_bad_days_exits_1_and_keeps_queue(tmp_path, capsys):
+    from blastbox.host.cli import main
+    d, _ = rig(tmp_path)
+    queue_csr(d, "n1", make_csr("n1")[0])
+    assert main(["pki", "--dir", str(d), "renew-pending", "--days", "0"]) == 1
+    assert "error:" in capsys.readouterr().err
+    assert [p.name for p in (d / "renew").glob("*.csr*")] == ["n1.csr"]
+
+
+def test_unreadable_trust_anchor_defers_instead_of_dropping(tmp_path, monkeypatch):
+    d, ca = rig(tmp_path)
+    queue_csr(d, "n1", make_csr("n1")[0])
+
+    def boom(_d):
+        raise OSError("EIO")
+    monkeypatch.setattr(node_renew, "load_trust_anchor", boom)
+    [(nid, outcome)] = sign_pending(ca, d)
+    assert outcome.startswith("deferred:")
+    assert [p.name for p in (d / "renew").glob("*.csr*")] == ["n1.csr"]
+
+
+def test_unreadable_cert_file_defers_instead_of_dropping(tmp_path, monkeypatch):
+    d, ca = rig(tmp_path)
+    queue_csr(d, "n1", make_csr("n1")[0])
+    real = Path.read_bytes
+
+    def flaky(self):
+        if self.name == "node-n1.crt":
+            raise OSError("EIO")
+        return real(self)
+    monkeypatch.setattr(Path, "read_bytes", flaky)
+    [(nid, outcome)] = sign_pending(ca, d)
+    assert outcome.startswith("deferred:")
+    monkeypatch.undo()
+    assert [p.name for p in (d / "renew").glob("*.csr*")] == ["n1.csr"]
+
+
+def test_cert_revoked_while_signing_is_not_resurrected(tmp_path, monkeypatch):
+    d, ca = rig(tmp_path)
+    queue_csr(d, "n1", make_csr("n1")[0])
+    real = ca.sign_node_csr
+
+    def revoke_then_sign(*a, **kw):
+        (d / "node-n1.crt").unlink()          # operator revokes mid-sign
+        return real(*a, **kw)
+    monkeypatch.setattr(ca, "sign_node_csr", revoke_then_sign)
+    [(nid, outcome)] = sign_pending(ca, d)
+    assert outcome.startswith("refused")
+    assert not (d / "node-n1.crt").exists()
+
+
+def test_deferred_restore_never_clobbers_a_newer_csr(tmp_path, monkeypatch):
+    d, ca = rig(tmp_path)
+    old, _ = make_csr("n1")
+    newer, _ = make_csr("n1")
+    queue_csr(d, "n1", old)
+
+    def fail_and_race(*a):
+        queue_csr(d, "n1", newer)                   # lands between the checks
+        raise OSError("disk full")
+    monkeypatch.setattr(node_renew, "_replace_file", fail_and_race)
+    real_exists = Path.exists
+    monkeypatch.setattr(Path, "exists",
+                        lambda self, **kw: False if self.name == "n1.csr" else real_exists(self))
+    sign_pending(ca, d)
+    monkeypatch.undo()
+    assert (d / "renew" / "n1.csr").read_bytes() == newer
+    assert not list((d / "renew").glob("*.signing"))
+
+
+def test_queue_cap_is_exact(tmp_path, monkeypatch):
+    d, _ = rig(tmp_path)
+    monkeypatch.setattr(node_renew, "MAX_QUEUED", 2)
+    (d / "renew").mkdir()
+    for i in range(2):
+        (d / "renew" / f"x{i}.csr").write_bytes(b"x")
+    with pytest.raises(RenewRefused):
+        queue_csr(d, "n1", make_csr("n1")[0])

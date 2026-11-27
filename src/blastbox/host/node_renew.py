@@ -23,7 +23,13 @@ from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-from blastbox.host.pki import CertAuthority, load_trust_anchor, node_identity
+from blastbox.host.pki import (
+    MAX_NODE_CERT_DAYS,
+    CertAuthority,
+    NodeGrants,
+    load_trust_anchor,
+    node_identity,
+)
 
 RENEW_DIR = "renew"
 MAX_CSR_BYTES = 8 * 1024
@@ -73,7 +79,7 @@ def queue_csr(pki_dir: Path, node_id: str, csr_pem: bytes) -> None:
             n = sum(1 for _ in d.glob("*.csr"))
         except OSError:
             n = 0
-        if n > MAX_QUEUED:
+        if n >= MAX_QUEUED:
             raise RenewRefused("renewal queue is full")
     fd, tmp = tempfile.mkstemp(dir=d, prefix=f".{node_id}.", suffix=".tmp")
     try:
@@ -86,24 +92,44 @@ def queue_csr(pki_dir: Path, node_id: str, csr_pem: bytes) -> None:
 
 
 def _find_current(pki_dir: Path, node_id: str):
-    """(path, pem, identity) of the verifying cert with the latest not_after, or None."""
+    """(path, pem, identity, grants) of the node's current cert, or None.
+
+    The path/pem/identity are those of the verifying cert with the latest ``not_after``;
+    ``grants`` is the INTERSECTION over every verifying cert for the node, the same rule
+    :func:`blastbox.host.placement.fleet_grants` applies on the ingress, so a renewal can
+    never restore a grant a narrower cert beside it is withholding.
+
+    A cert that does not verify is skipped, but an OSError reading the anchor or a cert
+    file PROPAGATES: "could not read" is a transient fault, not "has no certificate", and
+    the caller must not turn it into a refusal that deletes the node's CSR.
+    """
     d = Path(pki_dir)
     try:
         anchor = load_trust_anchor(d)
-    except Exception:                                   # noqa: BLE001 - no CA: verify nothing
+    except OSError:
+        raise
+    except Exception:                                   # noqa: BLE001 - garbled CA: verify nothing
         return None
     best = None
+    grants: NodeGrants | None = None
     for crt in sorted(d.glob("*.crt")):
+        pem = crt.read_bytes()                          # OSError propagates (transient)
         try:
-            pem = crt.read_bytes()
             ident = node_identity(anchor, pem)
         except Exception:                               # noqa: BLE001 - one bad file is not fatal
             continue
         if ident.node_id != node_id:
             continue
+        g = ident.grants
+        grants = g if grants is None else NodeGrants(
+            engines=tuple(sorted(set(grants.engines) & set(g.engines))),
+            tiers=tuple(sorted(set(grants.tiers) & set(g.tiers))),
+            credentials=grants.credentials and g.credentials)
         if best is None or ident.not_after > best[2].not_after:
             best = (crt, pem, ident)
-    return best
+    if best is None or grants is None:
+        return None
+    return (*best, grants)
 
 
 def current_cert(pki_dir: Path, node_id: str) -> bytes | None:
@@ -129,8 +155,27 @@ def _replace_file(path: Path, data: bytes) -> None:
         Path(tmp).unlink(missing_ok=True)
 
 
+def _restore(aside: Path, orig: Path) -> None:
+    """Put a set-aside CSR back, unless a newer one landed on ``orig`` meanwhile.
+
+    ``os.link`` fails if ``orig`` exists, so this is a no-clobber move: an exists()
+    check followed by ``os.replace`` would overwrite a CSR queued between the two.
+    """
+    try:
+        os.link(aside, orig)
+    except FileExistsError:
+        pass
+    aside.unlink(missing_ok=True)
+
+
 def sign_pending(ca: CertAuthority, pki_dir: Path, *, days: int = 7) -> list[tuple[str, str]]:
-    """Sign every queued CSR with its node's CURRENT grants. Returns (node_id, outcome)."""
+    """Sign every queued CSR with its node's CURRENT grants. Returns (node_id, outcome).
+
+    Raises ValueError for an out-of-range ``days`` BEFORE touching the queue: that is an
+    operator error, and treating it per CSR would refuse and delete every queued renewal.
+    """
+    if not 1 <= days <= MAX_NODE_CERT_DAYS:
+        raise ValueError(f"node cert lifetime must be 1..{MAX_NODE_CERT_DAYS} days, got {days}")
     pki_dir = Path(pki_dir)
     d = _renew_dir(pki_dir)
     if not d.is_dir():
@@ -140,11 +185,7 @@ def sign_pending(ca: CertAuthority, pki_dir: Path, *, days: int = 7) -> list[tup
         fcntl.flock(lock, fcntl.LOCK_EX)
         # A crash mid-sign leaves "<id>.csr.signing"; put it back unless a newer CSR landed.
         for aside in d.glob("*.csr.signing"):
-            orig = aside.with_suffix("")
-            if orig.exists():
-                aside.unlink(missing_ok=True)
-            else:
-                os.replace(aside, orig)
+            _restore(aside, aside.with_suffix(""))
         for csr_path in sorted(d.glob("*.csr")):
             node_id = csr_path.stem
             # Rename aside under the lock, so a newer CSR can land on the original name
@@ -155,29 +196,40 @@ def sign_pending(ca: CertAuthority, pki_dir: Path, *, days: int = 7) -> list[tup
                 csr_pem = aside.read_bytes()
             except OSError:
                 continue
-            found = _find_current(pki_dir, node_id)
-            keep = False
-            if found is None:
-                outcome = "refused: no current certificate"
-            else:
-                path, _pem, ident = found
-                try:
-                    new = ca.sign_node_csr(csr_pem, node_id=node_id,
-                                           grants=ident.grants, days=days)
-                    _replace_file(path, new)
-                    outcome = "renewed"
-                except ValueError as exc:
-                    outcome = f"refused: {exc}"
-                except OSError as exc:
-                    outcome = f"deferred: {exc}"
-                    keep = True
+            outcome, keep = _sign_one(ca, pki_dir, node_id, csr_pem, days)
             if keep:
                 # Transient fault: retry next run, unless the node has queued a newer one.
-                if csr_path.exists():
-                    aside.unlink(missing_ok=True)
-                else:
-                    os.replace(aside, csr_path)
+                _restore(aside, csr_path)
             else:
                 aside.unlink(missing_ok=True)
             results.append((node_id, outcome))
     return results
+
+
+def _sign_one(ca: CertAuthority, pki_dir: Path, node_id: str, csr_pem: bytes,
+              days: int) -> tuple[str, bool]:
+    """Sign one set-aside CSR. Returns (outcome, keep the CSR for a retry)."""
+    try:
+        found = _find_current(pki_dir, node_id)
+    except OSError as exc:
+        return f"deferred: {exc}", True
+    if found is None:
+        return "refused: no current certificate", False
+    path, pem, ident, grants = found
+    try:
+        new = ca.sign_node_csr(csr_pem, node_id=node_id, grants=grants,
+                               days=days, wg_pubkey=ident.wg_pubkey)
+        # Re-read just before replacing: an operator who deleted the cert (revocation)
+        # while we signed must not have it written back.
+        try:
+            still = path.read_bytes()
+        except FileNotFoundError:
+            return "refused: certificate removed while signing", False
+        if still != pem:
+            return "deferred: certificate changed while signing", True
+        _replace_file(path, new)
+        return "renewed", False
+    except ValueError as exc:
+        return f"refused: {exc}", False
+    except OSError as exc:
+        return f"deferred: {exc}", True

@@ -693,7 +693,11 @@ def register_node_claim_routes(
         node_id = _node_from_token(x_blastbox_node_session)
         if _grants_now(node_id) is None:
             raise HTTPException(status_code=403, detail=_REFUSED)
-        found = node_renew.current_cert_info(resolved, node_id)
+        try:
+            found = node_renew.current_cert_info(resolved, node_id)
+        except OSError as exc:
+            _log.warning("node_claim: cert store read failed: %s", exc)
+            raise HTTPException(status_code=503, detail="certificate store unavailable") from None
         if found is None:
             raise HTTPException(status_code=404, detail="no current certificate")
         return {"cert_pem": found[0].decode(), "not_after": found[1]}

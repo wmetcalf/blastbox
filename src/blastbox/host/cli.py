@@ -1518,7 +1518,12 @@ def _pki_cmd(args: argparse.Namespace) -> int:
         except Exception as exc:  # noqa: BLE001 - no CA key here is an operator error
             print(f"error: cannot load the CA (this needs the CA key): {exc}", file=sys.stderr)
             return 1
-        for node_id, outcome in sign_pending(ca, pki_dir, days=args.days):
+        try:
+            outcomes = sign_pending(ca, pki_dir, days=args.days)
+        except ValueError as exc:     # an out-of-range --days: nothing was touched
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        for node_id, outcome in outcomes:
             print(f"{node_id}: {outcome}")
         return 0
     ca = ensure_ca(pki_dir)  # generate-or-load the CA

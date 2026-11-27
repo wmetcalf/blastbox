@@ -100,3 +100,13 @@ def test_cert_404_when_revoked_is_403(tmp_path, monkeypatch):
     (d / "node-n1.crt").unlink()
     assert c.get("/v1/nodes/cert", headers=h).status_code == 403
     assert c.post("/v1/nodes/renew", json={"csr_pem": "x"}, headers=h).status_code == 403
+
+
+def test_cert_route_store_read_fault_is_503_not_404(tmp_path, monkeypatch):
+    c, d, _, keys = _setup(tmp_path, monkeypatch)
+    h = _session(c, d, "n1", keys["n1"])
+
+    def boom(*_a):
+        raise OSError("EIO")
+    monkeypatch.setattr(node_renew, "_find_current", boom)
+    assert c.get("/v1/nodes/cert", headers=h).status_code == 503
