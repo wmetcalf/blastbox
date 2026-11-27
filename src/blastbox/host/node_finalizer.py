@@ -27,7 +27,10 @@ from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL, retry_pending_
 
 _log = logging.getLogger(__name__)
 
-LOCK_NAME = ".finalize.lock"
+# One lock PER JOB, in job_root/<job>/: every claim of a job stages into the same
+# job_root/<job>/output, so two replicas finalising different claims of one job (a stale one
+# and its successor) must exclude each other, not merely two replicas on the same claim.
+LOCK_NAME = ".node-finalize.lock"
 RETAIN_ENV = "BLASTBOX_NODE_RESULTS_RETAIN_S"
 DEFAULT_RETAIN_S = 3600.0
 NODE_TIER = "node-agent"
@@ -101,9 +104,14 @@ class NodeFinalizer:
 
     # ------------------------------------------------------------------ internals
 
+    def _lock_path(self, job_id: str) -> Path:
+        return self._job_root / job_id / LOCK_NAME
+
     def _finalise_dir(self, d: Path) -> bool:
+        lock = self._lock_path(d.parent.name)          # spool layout: <root>/<job_id>/<claim>
         try:
-            fd = os.open(d / LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         except OSError:
             return False
         try:
@@ -114,7 +122,7 @@ class NodeFinalizer:
             if nr.read_outcome(d) is not None:  # finished while we waited
                 return False
             marker = nr.read_marker(d)
-            if marker is None:
+            if marker is None or marker.job_id != d.parent.name:
                 return False
             try:
                 status, reason = self._decide(d, marker)

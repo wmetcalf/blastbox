@@ -902,8 +902,8 @@ blastbox node-finalizer [--once] [--interval 1.0] [--no-receipts]
 ```
 
 * **It holds the DB, the blob store and the attest key, and never claims work.** Run one or
-  more replicas; a per-directory `flock` (`.finalize.lock`) stops two replicas finalising the
-  same result.
+  more replicas; a per-job `flock` (`<job_root>/<job>/.node-finalize.lock`) stops two
+  replicas finalising the same job, including two different claims of it.
 * **Shared results volume.** The ingress and the finalizer must see the same spool: mount one
   volume at the same path in both and set `BLASTBOX_NODE_RESULTS_DIR` to it in both (default
   `$BLASTBOX_JOB_ROOT/.node-results`). The ingress writes it; the finalizer reads, finalises,

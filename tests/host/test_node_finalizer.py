@@ -132,7 +132,9 @@ def test_finalizer_idempotent_rerun(tmp_path):
 def test_held_lock_skips_dir(tmp_path):
     store, job, fin, _ = build(tmp_path)
     d = spool(tmp_path, job)
-    fd = os.open(d / ".finalize.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    assert d.is_dir()
+    fin._lock_path("job-1").parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(fin._lock_path("job-1"), os.O_RDWR | os.O_CREAT, 0o600)
     fcntl.flock(fd, fcntl.LOCK_EX)
     try:
         assert fin.run_once() == 0
@@ -140,6 +142,31 @@ def test_held_lock_skips_dir(tmp_path):
     finally:
         os.close(fd)
     assert fin.run_once() == 1
+
+
+def test_finalizers_exclude_each_other_per_job_not_per_claim(tmp_path):
+    """Two claims of one job stage into the SAME job_root/<job>/output: a replica working an
+    older claim of the job must keep every other replica off the job, whatever the claim."""
+    store, job, fin, _ = build(tmp_path)
+    old_claim = job.claim_id
+    store.update_if_status("job-1", JobStatus.RUNNING, expect_claim_id=old_claim,
+                           status=JobStatus.QUEUED, claim_id=None)
+    job_b = store.claim_next()
+    assert job_b is not None and job_b.claim_id != old_claim
+    d_b = spool(tmp_path, job_b)
+    lock = fin._lock_path("job-1")
+    assert lock.parent == tmp_path / "jobs" / "job-1"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)    # replica 1, on the OLD claim
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        assert fin.run_once() == 0
+        assert nr.read_outcome(d_b) is None
+        assert not (tmp_path / "jobs" / "job-1" / "output").exists()
+    finally:
+        os.close(fd)
+    assert fin.run_once() == 1
+    assert store.get("job-1").status == JobStatus.DONE
 
 
 def test_crash_after_cas_writes_outcome_without_rerunning(tmp_path):
