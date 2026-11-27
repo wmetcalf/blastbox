@@ -107,10 +107,15 @@ type ingress struct {
 	hbResp      map[string]any
 	onClaim     func(n int) (code int, body string)
 	jobStatus   map[string]int // job id -> status code override for updates
+	puts        map[string]int // job id -> result PUTs
+	putStatus   map[string]int // job id -> result PUT status (default 200 done)
+	onUpdate    func(id string, n int) int // optional: status for the n-th update of id (may block)
+	updCount    map[string]int
 }
 
 func newIngress(t *testing.T, ca *pki) *ingress {
 	in := &ingress{t: t, ca: ca, updates: map[string]map[string]any{}, jobStatus: map[string]int{},
+		puts: map[string]int{}, putStatus: map[string]int{}, updCount: map[string]int{},
 		hbResp: map[string]any{"heartbeat_s": 30}}
 	in.srv = httptest.NewUnstartedServer(http.HandlerFunc(in.serve))
 	in.srv.TLS = &tls.Config{Certificates: []tls.Certificate{ca.serverCert(t)}}
@@ -220,6 +225,22 @@ func (in *ingress) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		js(200, map[string]any{"cert_pem": string(c)})
+	case strings.HasPrefix(p, "/v1/nodes/jobs/") && strings.HasSuffix(p, "/result") && r.Method == "PUT":
+		id := strings.TrimSuffix(strings.TrimPrefix(p, "/v1/nodes/jobs/"), "/result")
+		in.mu.Lock()
+		in.puts[id]++
+		code := in.putStatus[id]
+		in.mu.Unlock()
+		switch code {
+		case 0, 200:
+			js(200, map[string]any{"status": "done"})
+		case 202:
+			js(202, map[string]any{"status": "accepted"})
+		case 422:
+			js(422, map[string]any{"status": "failed", "reason": "result rejected"})
+		default:
+			w.WriteHeader(code)
+		}
 	case strings.HasPrefix(p, "/v1/nodes/jobs/") && r.Method == "POST":
 		id := strings.TrimPrefix(p, "/v1/nodes/jobs/")
 		var m map[string]any
@@ -227,7 +248,12 @@ func (in *ingress) serve(w http.ResponseWriter, r *http.Request) {
 		in.mu.Lock()
 		in.updates[id] = m
 		code := in.jobStatus[id]
+		in.updCount[id]++
+		n, hook := in.updCount[id], in.onUpdate
 		in.mu.Unlock()
+		if hook != nil {
+			code = hook(id, n)
+		}
 		if code != 0 && code != 200 {
 			w.WriteHeader(code)
 			return
@@ -237,6 +263,8 @@ func (in *ingress) serve(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 	}
 }
+
+func (in *ingress) putCount(id string) int { in.mu.Lock(); defer in.mu.Unlock(); return in.puts[id] }
 
 func (in *ingress) claimCount() int { in.mu.Lock(); defer in.mu.Unlock(); return in.claims }
 func (in *ingress) hbCount() int    { in.mu.Lock(); defer in.mu.Unlock(); return len(in.hbs) }

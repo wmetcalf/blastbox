@@ -70,6 +70,7 @@ type Agent struct {
 	notAfter  time.Time
 	inflight  map[string]wire.HeartbeatJob
 	recSet    map[string]bool // job ids left on disk by a previous run (and runner-refused ids)
+	idLocks   map[string]*idLock
 	maxDeadln time.Time
 
 	engines []*engState
@@ -104,7 +105,7 @@ func (e *engState) claimable() bool { e.mu.Lock(); defer e.mu.Unlock(); return e
 // New builds an Agent with production defaults. It touches neither the network nor the disk.
 func New(cfg *config.Config) *Agent {
 	a := &Agent{Cfg: cfg, Version: Version, Host: sandbox.HostFromConfig(cfg), hbReady: make(chan struct{}),
-		inflight: map[string]wire.HeartbeatJob{}, recSet: map[string]bool{}}
+		inflight: map[string]wire.HeartbeatJob{}, recSet: map[string]bool{}, idLocks: map[string]*idLock{}}
 	a.Log = slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	a.ProbeFn = func(ctx context.Context, e config.Engine) sandbox.ProbeResult { return a.Host.Probe(ctx, e) }
 	a.SelfTestFn = func(ctx context.Context, e config.Engine) sandbox.ProbeResult { return a.Host.SelfTest(ctx, e) }
@@ -530,6 +531,34 @@ func (a *Agent) afterInstall(ctx context.Context) {
 	}
 }
 
+// ---- per-job-id exclusion between recovery and a live run ----
+
+type idLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lockID takes the job id's lock and returns its unlock.
+func (a *Agent) lockID(id string) func() {
+	a.mu.Lock()
+	l := a.idLocks[id]
+	if l == nil {
+		l = &idLock{}
+		a.idLocks[id] = l
+	}
+	l.refs++
+	a.mu.Unlock()
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		a.mu.Lock()
+		if l.refs--; l.refs == 0 {
+			delete(a.idLocks, id)
+		}
+		a.mu.Unlock()
+	}
+}
+
 // ---- claim loops ----
 
 func (a *Agent) slotLoop(ctx, jobsCtx context.Context, es *engState) {
@@ -592,6 +621,8 @@ func (a *Agent) runClaim(ctx, jobsCtx context.Context, es *engState, c *wire.Cla
 	es.mu.Lock()
 	es.busy++
 	es.mu.Unlock()
+	// A recovery pass already settling this job id (and about to wipe its dir) finishes first.
+	a.lockID(c.JobID)()
 
 	res := a.Runner.Run(jobsCtx, a.client(), es.eng, c, a.Cfg.StateDir)
 
@@ -603,6 +634,10 @@ func (a *Agent) runClaim(ctx, jobsCtx context.Context, es *engState, c *wire.Cla
 	a.mu.Unlock()
 	a.Log.Info("job finished", "job", c.JobID, "engine", es.eng.Name, "outcome", res.Outcome)
 	switch {
+	case res.Keep:
+		// The terminal report went unanswered: recovery retries it from the kept dir.
+		a.Log.Warn("job report not delivered; left to recovery", "job", c.JobID)
+		a.addRecovery(c.JobID)
 	case res.Outcome == "refused":
 		// A job dir already held a started marker: it now belongs to crash recovery.
 		a.Log.Warn("runner refused a claim whose job dir holds a started marker; left to recovery", "job", c.JobID)

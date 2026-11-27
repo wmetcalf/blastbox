@@ -44,11 +44,14 @@ type ingress struct {
 	srv *httptest.Server
 	mu  sync.Mutex
 
-	input       []byte
-	inputHeader string // "" = the true sha256
-	putStatus   int    // 0 = 200
-	putBody     string
-	dispStatus  string // disposition answer; "" = done
+	input        []byte
+	inputHeader  string // "" = the true sha256
+	putStatus    int    // 0 = 200
+	putBody      string
+	dispStatus   string // disposition answer; "" = done
+	updStatus    int    // status for POST /v1/nodes/jobs/<id>; 0 = 200
+	state        string // the fixture's state dir (for markers seen mid-run)
+	reportedSeen bool   // the "reported" marker existed when disposition was polled
 
 	inputGets int
 	puts      int
@@ -124,6 +127,8 @@ func (in *ingress) serve(w http.ResponseWriter, r *http.Request) {
 		in.puts++
 		in.putTar = body
 		switch in.putStatus {
+		case 503:
+			w.WriteHeader(503)
 		case 409:
 			w.WriteHeader(409)
 		case 202:
@@ -137,9 +142,16 @@ func (in *ingress) serve(w http.ResponseWriter, r *http.Request) {
 		var m map[string]any
 		json.Unmarshal(body, &m)
 		in.updates = append(in.updates, m)
+		if in.updStatus != 0 {
+			w.WriteHeader(in.updStatus)
+			return
+		}
 		js(200, map[string]any{"ok": true})
 	case r.Method == "GET" && r.URL.Path == jp+"/disposition":
 		in.disps++
+		if _, err := os.Lstat(filepath.Join(in.state, "jobs", testJob, "reported")); err == nil {
+			in.reportedSeen = true
+		}
 		st := in.dispStatus
 		if st == "" {
 			st = "done"
@@ -212,6 +224,7 @@ func setup(t *testing.T, script string) *fixture {
 	state := filepath.Join(dir, "state")
 	os.Mkdir(state, 0o700)
 	sum := sha256.Sum256(in.input)
+	in.state = state
 	f := &fixture{in: in, cl: cl, state: state,
 		eng: config.Engine{Name: "eng", Argv: []string{"/bin/sh", sp, "{out}", "{input}", "{scratch}"}, Output: "dir", Sandbox: "seatbelt"},
 		claim: &wire.Claim{JobID: testJob, ClaimID: "claim-1", Receipt: "rcpt", NodeID: "node-v2",
@@ -310,6 +323,52 @@ func TestRejectedResultIsFailed(t *testing.T) {
 	if len(f.in.updates) != 1 || f.in.update(0)["status"] != "failed" ||
 		!strings.Contains(fmt.Sprint(f.in.update(0)["error"]), "bad envelope") {
 		t.Fatalf("server saw %v", f.in.updates)
+	}
+	f.wiped(t)
+}
+
+// A terminal report the control plane never answered keeps the job dir for crash recovery,
+// which retries it, instead of wiping the only record of the claim.
+func TestUndeliveredFailIsKeptForRecovery(t *testing.T) {
+	f := setup(t, `echo '{}' > "$1/metadata.json"; exit 3`)
+	f.in.updStatus = 503
+	res := f.run()
+	if res.Outcome != "failed" || !res.Keep {
+		t.Fatalf("%+v, want failed and kept", res)
+	}
+	d := filepath.Join(f.state, "jobs", testJob)
+	for _, n := range []string{"started", "claim.json"} {
+		if _, err := os.Lstat(filepath.Join(d, n)); err != nil {
+			t.Fatalf("%s gone: %v", n, err)
+		}
+	}
+}
+
+func TestUndeliveredUploadIsKeptForRecovery(t *testing.T) {
+	f := setup(t, happyEngine)
+	f.in.putStatus = 503
+	res := f.run()
+	if !res.Keep || len(f.in.updates) != 0 {
+		t.Fatalf("%+v updates=%v: an unanswered upload is retried by recovery, not failed", res, f.in.updates)
+	}
+	d := filepath.Join(f.state, "jobs", testJob)
+	for _, n := range []string{"started", "claim.json", "result.tar", "result.json"} {
+		if _, err := os.Lstat(filepath.Join(d, n)); err != nil {
+			t.Fatalf("%s gone: %v", n, err)
+		}
+	}
+}
+
+func TestAcceptedResultIsMarkedReported(t *testing.T) {
+	f := setup(t, happyEngine)
+	f.in.putStatus = 202
+	f.in.dispStatus = "running"
+	f.r.DispWait = 50 * time.Millisecond
+	if res := f.run(); res.Outcome != "done" || res.Keep {
+		t.Fatalf("%+v", res)
+	}
+	if !f.in.reportedSeen {
+		t.Fatal("no durable reported marker while the disposition was pending: a crash now would fail a good result")
 	}
 	f.wiped(t)
 }

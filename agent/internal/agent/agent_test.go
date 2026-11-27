@@ -138,6 +138,76 @@ func TestRestartWithStartedMarkerFailsNotReleases(t *testing.T) {
 	eventually(t, "wipe", func() bool { _, err := os.Stat(d); return os.IsNotExist(err) })
 }
 
+// An upload the control plane never answered is replayed (the PUT is idempotent per claim),
+// not failed: the result exists.
+func TestRecoveryReplaysAnUnansweredUpload(t *testing.T) {
+	e := fresh(t)
+	e.cfg.Claim = false
+	d := jobDir(e, "ju", true, true)
+	os.WriteFile(filepath.Join(d, runner.ResultTarName), make([]byte, 1024), 0o600)
+	os.WriteFile(filepath.Join(d, runner.ResultMetaName), []byte(`{"worker_runtime":"seatbelt","started_at_ms":1,"finished_at_ms":2}`), 0o600)
+	h := newHarness(e)
+	h.start(t)
+	eventually(t, "replayed upload and wipe", func() bool {
+		_, err := os.Stat(d)
+		return e.in.putCount("ju") == 1 && os.IsNotExist(err)
+	})
+	if u := e.in.update("ju"); u != nil {
+		t.Fatalf("a job whose result was delivered on replay was also failed: %v", u)
+	}
+}
+
+func TestRecoveryFailsAReplayTheExtractorRefuses(t *testing.T) {
+	e := fresh(t)
+	e.cfg.Claim = false
+	d := jobDir(e, "jx", true, true)
+	os.WriteFile(filepath.Join(d, runner.ResultTarName), make([]byte, 1024), 0o600)
+	os.WriteFile(filepath.Join(d, runner.ResultMetaName), []byte(`{"worker_runtime":"seatbelt"}`), 0o600)
+	e.in.putStatus["jx"] = 422
+	h := newHarness(e)
+	h.start(t)
+	eventually(t, "failed after the refused replay", func() bool { return e.in.update("jx") != nil })
+	if f := e.in.update("jx")["fields"].(map[string]any); f["status"] != "failed" {
+		t.Fatalf("%v", f)
+	}
+}
+
+// After the control plane answered the upload (done or accepted), a crash must not fail the
+// job: the finalizer may still be turning it DONE.
+func TestRecoveryAfterAReportedUploadSendsNothing(t *testing.T) {
+	e := fresh(t)
+	e.cfg.Claim = false
+	d := jobDir(e, "jd", true, true)
+	os.WriteFile(filepath.Join(d, runner.ResultTarName), make([]byte, 1024), 0o600)
+	os.WriteFile(filepath.Join(d, runner.ReportedName), nil, 0o600)
+	h := newHarness(e)
+	h.start(t)
+	eventually(t, "wipe", func() bool { _, err := os.Stat(d); return os.IsNotExist(err) })
+	if u, n := e.in.update("jd"), e.in.putCount("jd"); u != nil || n != 0 {
+		t.Fatalf("recovery re-reported a reported job: update=%v puts=%d", u, n)
+	}
+}
+
+func TestKeptJobGoesToRecovery(t *testing.T) {
+	e := fresh(t)
+	e.in.onClaim = func(n int) (int, string) {
+		if n == 1 {
+			return 200, claimBody("jk")
+		}
+		return 204, ""
+	}
+	h := newHarness(e)
+	h.a.Runner = fakeRunner{fn: func(context.Context, *wire.Claim) runner.Result {
+		jobDir(e, "jk", true, true)
+		return runner.Result{Outcome: "failed", Reason: "fail not delivered", Keep: true}
+	}}
+	h.start(t)
+	eventually(t, "recovery of the kept job", func() bool { return e.in.update("jk") != nil })
+	if f := e.in.update("jk")["fields"].(map[string]any); f["status"] != "failed" {
+		t.Fatalf("%v", f)
+	}
+}
+
 func TestRestartWithOnlyClaimJSONReleases(t *testing.T) {
 	e := fresh(t)
 	e.cfg.Claim = false
@@ -504,6 +574,55 @@ func TestRecoveryNeverTouchesLiveJobs(t *testing.T) {
 		t.Fatal("a live job's dir was wiped")
 	}
 	close(release)
+}
+
+// Recovery releases job J (a retry pass, after a 503); while that request is in flight the
+// control plane re-queues J and this node claims it again. The live run's dir must survive the
+// recovery pass finishing: recovery and a live run of the same job never overlap.
+func TestRecoveryAndALiveReclaimNeverOverlap(t *testing.T) {
+	e := fresh(t)
+	jobDir(e, "jr2", false, true)
+	inRelease, unblock := make(chan struct{}), make(chan struct{})
+	e.in.onUpdate = func(id string, n int) int {
+		if id != "jr2" || n != 2 {
+			return 503 // the first (startup) pass fails; later live updates don't matter
+		}
+		close(inRelease)
+		<-unblock
+		return 200
+	}
+	var claimed bool
+	e.in.onClaim = func(int) (int, string) {
+		select {
+		case <-inRelease:
+			if !claimed {
+				claimed = true
+				go func() { time.Sleep(50 * time.Millisecond); close(unblock) }()
+				return 200, claimBody("jr2")
+			}
+		default:
+		}
+		return 204, ""
+	}
+	h := newHarness(e)
+	survived := make(chan bool, 1)
+	h.a.Runner = fakeRunner{fn: func(context.Context, *wire.Claim) runner.Result {
+		d := jobDir(e, "jr2", true, true)  // the live run's dir
+		time.Sleep(300 * time.Millisecond) // the recovery pass completes meanwhile
+		_, err := os.Stat(d)
+		survived <- err == nil
+		os.RemoveAll(d)
+		return runner.Result{Outcome: "done"}
+	}}
+	h.start(t)
+	select {
+	case ok := <-survived:
+		if !ok {
+			t.Fatal("recovery wiped a live run's job dir")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the job was never re-claimed")
+	}
 }
 
 func TestRefusedJobGoesToRecovery(t *testing.T) {

@@ -40,6 +40,23 @@ type Result struct {
 	// SandboxFailure: the sandbox could not be built, started or shown to have confined (and
 	// cleaned up) the run. The engine must stop claiming until a probe passes again.
 	SandboxFailure bool
+	// Keep: the terminal report (fail, release or the result upload) was never answered, so
+	// the job dir is kept, intact, for crash recovery to retry; it is not wiped.
+	Keep bool
+}
+
+// Files a job dir may hold besides in/ out/ scratch/ (crash recovery reads them).
+const (
+	ResultTarName  = "result.tar"
+	ResultMetaName = "result.json" // the upload's headers, so recovery can replay it
+	ReportedName   = "reported"    // the control plane answered the upload: nothing left to send
+)
+
+// ResultRecord is result.json.
+type ResultRecord struct {
+	WorkerRuntime string `json:"worker_runtime"`
+	StartedAtMs   int64  `json:"started_at_ms"`
+	FinishedAtMs  int64  `json:"finished_at_ms"`
 }
 
 // Blastbox's default output caps, used when a claim carries none.
@@ -157,7 +174,11 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	if err := os.Mkdir(j.dir, 0o700); err != nil {
 		return j.release(ctx, "job dir: "+err.Error())
 	}
-	defer wipe(j.dir)
+	defer func() {
+		if !res.Keep {
+			wipe(j.dir)
+		}
+	}()
 	j.in, j.out, j.scr = filepath.Join(j.dir, "in"), filepath.Join(j.dir, "out"), filepath.Join(j.dir, "scratch")
 	for _, d := range []string{j.in, j.out, j.scr} {
 		if err := os.Mkdir(d, 0o700); err != nil {
@@ -166,7 +187,8 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	}
 	claimJSON, _ := json.Marshal(map[string]any{
 		"job_id": c.JobID, "claim_id": c.ClaimID, "receipt": c.Receipt, "engine": eng.Name, "started": false})
-	if err := os.WriteFile(filepath.Join(j.dir, "claim.json"), claimJSON, 0o600); err != nil {
+	// Durable before the started marker: recovery needs the claim to settle a started job.
+	if err := atomicWrite(filepath.Join(j.dir, "claim.json"), claimJSON); err != nil {
 		return j.release(ctx, "claim.json: "+err.Error())
 	}
 
@@ -258,7 +280,7 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	if fi, err := os.Lstat(filepath.Join(j.out, metadataName)); err != nil || fi.Size() > orDef(c.Run.Limits.MaxMetadata, defMaxMetadata) {
 		return j.fail(ctx, "metadata.json over max_metadata")
 	}
-	tarPath := filepath.Join(j.dir, "result.tar")
+	tarPath := filepath.Join(j.dir, ResultTarName)
 	if err := Write(j.out, tarPath); err != nil {
 		return j.fail(ctx, "output tree refused: "+err.Error())
 	}
@@ -561,13 +583,42 @@ func handshakeOK(scratch, nonce string) bool {
 	return err == nil && string(b) == nonce
 }
 
+// atomicWrite replaces p with b durably: the data is synced before the rename and the
+// directory after it.
 func atomicWrite(p string, b []byte) error {
 	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, p)
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(p))
 }
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
+// MarkReported durably records that the control plane answered dir's result upload.
+func MarkReported(dir string) error { return atomicWrite(filepath.Join(dir, ReportedName), nil) }
 
 // writeStarted records, durably, that the sandbox is about to see the input.
 func writeStarted(dir string) error {
@@ -778,8 +829,10 @@ func (j *job) releaseOrLost2(_ context.Context, why string, err error) Result {
 		return Result{Outcome: "released", Reason: why}
 	case errors.Is(err, wire.ErrClaimLost):
 		return Result{Outcome: "lost", Reason: why + "; release: " + err.Error()}
+	case errors.Is(err, wire.ErrRefused):
+		return Result{Outcome: "failed", Reason: why + "; release refused: " + err.Error()}
 	}
-	return Result{Outcome: "failed", Reason: why + "; release not delivered: " + err.Error()}
+	return Result{Outcome: "failed", Reason: why + "; release not delivered: " + err.Error(), Keep: true}
 }
 
 // serverReason makes a reason safe to send: printable ASCII only, at most 200 chars.
@@ -808,21 +861,38 @@ func (j *job) fail(ctx context.Context, why string) Result {
 		return Result{Outcome: "failed", Reason: why}
 	case errors.Is(err, wire.ErrClaimLost):
 		return Result{Outcome: "lost", Reason: why + "; fail: " + err.Error()}
+	case errors.Is(err, wire.ErrRefused):
+		return Result{Outcome: "failed", Reason: why + "; fail refused: " + err.Error()}
 	}
-	return Result{Outcome: "failed", Reason: why + "; fail not delivered: " + err.Error()}
+	return Result{Outcome: "failed", Reason: why + "; fail not delivered: " + err.Error(), Keep: true}
 }
 
 func (j *job) upload(ctx context.Context, tarPath string, kind sandbox.Kind) Result {
 	rc, cancel := reportCtx(ctx)
 	defer cancel()
 	meta := wire.ResultMeta{WorkerRuntime: string(kind), StartedAt: j.start, FinishedAt: time.Now()}
+	// Recorded first: if the upload goes unanswered (or the agent dies), recovery replays the
+	// same idempotent PUT rather than failing a job whose result exists.
+	rec, _ := json.Marshal(ResultRecord{meta.WorkerRuntime, meta.StartedAt.UnixMilli(), meta.FinishedAt.UnixMilli()})
+	if err := atomicWrite(filepath.Join(j.dir, ResultMetaName), rec); err != nil {
+		return j.fail(ctx, "result record: "+err.Error())
+	}
 	var out wire.Outcome
 	err := j.r.retry(rc, func() (e error) { out, e = j.cl.PutResult(rc, j.c, tarPath, meta); return })
 	if errors.Is(err, wire.ErrClaimLost) {
 		return Result{Outcome: "lost", Reason: "result upload: " + err.Error()}
 	}
+	if err != nil && retryable(err) {
+		return Result{Outcome: "failed", Reason: "result upload not delivered: " + err.Error(), Keep: true}
+	}
 	if err != nil {
 		return j.fail(ctx, "result upload failed: "+err.Error())
+	}
+	if out.Status == "done" || out.Status == "accepted" {
+		// From here a crash must not fail the job: the control plane holds the result.
+		if err := MarkReported(j.dir); err != nil {
+			j.r.logf("job %s: reported marker: %v", j.c.JobID, err)
+		}
 	}
 	switch out.Status {
 	case "done":

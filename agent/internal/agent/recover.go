@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/wmetcalf/blastbox/agent/internal/runner"
 	"github.com/wmetcalf/blastbox/agent/internal/wire"
 )
 
@@ -49,9 +50,13 @@ func (a *Agent) addRecovery(id string) {
 
 // recoverJobs settles the job dirs in the recovery set and returns how many remain:
 //
-//	started marker       -> Fail("agent restarted mid-run"); never Release (a sandbox saw the input)
-//	claim.json only      -> Release
-//	neither / unreadable -> wipe
+//	reported marker            -> wipe: the control plane answered the upload (a Fail now could
+//	                              beat the finalizer's running->done and discard the result)
+//	started + result.tar/json  -> replay the idempotent result PUT (done/accepted: wipe;
+//	                              refused by the extractor: Fail)
+//	started marker             -> Fail("agent restarted mid-run"); never Release (a sandbox saw the input)
+//	claim.json only            -> Release
+//	neither / unreadable       -> wipe
 //
 // A dir is wiped on success, ErrClaimLost and ErrRefused; any other error keeps it (and its id
 // in the set) for the next pass. Ids that are in flight in this process are skipped.
@@ -65,30 +70,61 @@ func (a *Agent) recoverJobs(ctx context.Context) int {
 	a.mu.Unlock()
 	left := 0
 	for _, id := range ids {
-		a.mu.Lock()
-		_, live := a.inflight[id]
-		a.mu.Unlock()
-		if live {
+		if !a.recoverID(ctx, jobs, id) {
 			left++
-			continue
 		}
-		if ctx.Err() != nil {
-			left++
-			continue
-		}
-		dir := filepath.Join(jobs, id)
-		if _, err := os.Lstat(dir); err != nil || a.recoverOne(ctx, dir, id) {
-			a.mu.Lock()
-			delete(a.recSet, id)
-			a.mu.Unlock()
-			continue
-		}
-		left++
 	}
 	return left
 }
 
+// recoverID settles one id under its lock, so a live run of the same job (claimed again while
+// a recovery request was in flight) waits for the wipe instead of being wiped.
+func (a *Agent) recoverID(ctx context.Context, jobs, id string) (done bool) {
+	unlock := a.lockID(id)
+	defer unlock()
+	a.mu.Lock()
+	_, live := a.inflight[id]
+	a.mu.Unlock()
+	if live || ctx.Err() != nil {
+		return false
+	}
+	dir := filepath.Join(jobs, id)
+	if _, err := os.Lstat(dir); err != nil || a.recoverOne(ctx, dir, id) {
+		a.mu.Lock()
+		delete(a.recSet, id)
+		a.mu.Unlock()
+		return true
+	}
+	return false
+}
+
+// resultRecord returns the kept upload of a job dir: its tar and the headers it was sent with.
+func resultRecord(dir string) (string, wire.ResultMeta, bool) {
+	tar := filepath.Join(dir, runner.ResultTarName)
+	if fi, err := os.Lstat(tar); err != nil || !fi.Mode().IsRegular() {
+		return "", wire.ResultMeta{}, false
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, runner.ResultMetaName))
+	var rec runner.ResultRecord
+	if err != nil || json.Unmarshal(raw, &rec) != nil {
+		return "", wire.ResultMeta{}, false
+	}
+	m := wire.ResultMeta{WorkerRuntime: rec.WorkerRuntime}
+	if rec.StartedAtMs > 0 {
+		m.StartedAt = time.UnixMilli(rec.StartedAtMs)
+	}
+	if rec.FinishedAtMs > 0 {
+		m.FinishedAt = time.UnixMilli(rec.FinishedAtMs)
+	}
+	return tar, m, true
+}
+
 func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool) {
+	if _, err := os.Lstat(filepath.Join(dir, runner.ReportedName)); err == nil {
+		a.Log.Info("recovery: the control plane already answered this job's upload; wiping", "job", name)
+		wipeDir(dir)
+		return true
+	}
 	_, startErr := os.Lstat(filepath.Join(dir, "started"))
 	started := startErr == nil
 	raw, err := os.ReadFile(filepath.Join(dir, "claim.json"))
@@ -110,7 +146,22 @@ func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool)
 	action := "release"
 	if started {
 		action = "fail"
-		cerr = a.client().Fail(rctx, cl, "agent restarted mid-run", a.Now())
+		reason := "agent restarted mid-run"
+		if tar, meta, ok := resultRecord(dir); ok {
+			action = "replay upload"
+			out, err := a.client().PutResult(rctx, cl, tar, meta)
+			switch {
+			case err != nil:
+				cerr = err
+			case out.Status == "failed":
+				action, reason = "fail", "control plane rejected the result: "+out.Reason
+			default:
+				a.Log.Info("recovery: result upload replayed", "job", name, "status", out.Status)
+			}
+		}
+		if action == "fail" {
+			cerr = a.client().Fail(rctx, cl, reason, a.Now())
+		}
 	} else {
 		cerr = a.client().Release(rctx, cl)
 	}
