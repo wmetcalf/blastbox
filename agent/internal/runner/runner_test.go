@@ -361,9 +361,17 @@ func TestUnsandboxedEngineReleases(t *testing.T) {
 
 func TestSandboxBuildErrorReleasesBeforeStarted(t *testing.T) {
 	f := setup(t, happyEngine)
+	var startedAtBuild = true
 	f.r.build = func(context.Context, sandbox.Kind, sandbox.Request, []string, sandbox.Limits) (*exec.Cmd, error) {
+		_, err := os.Lstat(filepath.Join(f.state, "jobs", testJob, "started"))
+		startedAtBuild = err == nil
 		return nil, fmt.Errorf("insecure host")
 	}
+	defer func() {
+		if startedAtBuild {
+			t.Error("started marker existed when the sandbox build failed")
+		}
+	}()
 	if res := f.run(); res.Outcome != "released" {
 		t.Fatalf("%+v", res)
 	}
@@ -427,7 +435,7 @@ func TestMissingMetadataFails(t *testing.T) {
 
 func TestSymlinkInOutputFails(t *testing.T) {
 	f := setup(t, `ln -s /etc/passwd "$1/leak"; echo '{}' > "$1/metadata.json"`)
-	f.wantFail(t, f.run(), "non-regular file in output: leak")
+	f.wantFail(t, f.run(), `non-regular file in output: "leak"`)
 }
 
 func TestHardlinkInOutputFails(t *testing.T) {
@@ -552,5 +560,106 @@ func TestWipeHandlesUnreadableTree(t *testing.T) {
 	wipe(d)
 	if _, err := os.Lstat(d); err == nil {
 		t.Fatal("not wiped")
+	}
+}
+
+func TestCtxCancelMidRunFailsNotReleases(t *testing.T) {
+	f := setup(t, `sleep 60`)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(300 * time.Millisecond); cancel() }()
+	res := f.r.Run(ctx, f.cl, f.eng, f.claim, f.state)
+	f.wantFail(t, res, "run interrupted")
+	if f.in.update(0)["status"] == "queued" {
+		t.Fatal("a started job was released")
+	}
+}
+
+func TestLostClaimOnFail(t *testing.T) {
+	f := setup(t, `exit 1`)
+	srv := f.in.srv
+	h := srv.Config.Handler
+	var posts int
+	srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && r.URL.Path == "/v1/nodes/jobs/"+testJob {
+			posts++
+			w.WriteHeader(409)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+	res := f.run()
+	if res.Outcome != "lost" || posts != 1 {
+		t.Fatalf("%+v posts=%d", res, posts)
+	}
+	f.wiped(t)
+}
+
+func TestWatchdogFailsClosedWhenBlind(t *testing.T) {
+	f := setup(t, `sleep 60`)
+	var calls int
+	f.r.rss = func(int) (int64, error) { calls++; return 0, fmt.Errorf("ps broke") }
+	t0 := time.Now()
+	res := f.run()
+	if time.Since(t0) > 10*time.Second {
+		t.Fatal("blind watchdog did not stop the run")
+	}
+	f.wantFail(t, res, "memory watchdog unavailable")
+	if calls != 3 {
+		t.Fatalf("killed after %d errors, want 3", calls)
+	}
+	// A transient error then success does not kill.
+	f = setup(t, `sleep 0.5`)
+	n := 0
+	f.r.rss = func(int) (int64, error) {
+		n++
+		if n%3 != 0 {
+			return 0, fmt.Errorf("blip")
+		}
+		return 1, nil
+	}
+	f.claim.Run.DeadlineS = 20
+	if res := f.run(); strings.Contains(res.Reason, "watchdog") {
+		t.Fatalf("transient errors killed the job: %+v", res)
+	}
+}
+
+func TestRefusesStartedJobDir(t *testing.T) {
+	f := setup(t, happyEngine)
+	d := filepath.Join(f.state, "jobs", testJob)
+	os.MkdirAll(d, 0o700)
+	os.WriteFile(filepath.Join(d, "started"), []byte("1\n"), 0o600)
+	os.WriteFile(filepath.Join(d, "evidence"), []byte("keep"), 0o600)
+	res := f.run()
+	if res.Outcome != "refused" || f.in.inputGets != 0 || len(f.in.updates) != 0 || f.in.puts != 0 {
+		t.Fatalf("%+v", res)
+	}
+	if b, _ := os.ReadFile(filepath.Join(d, "evidence")); string(b) != "keep" {
+		t.Fatal("started job dir was touched")
+	}
+}
+
+func TestClaimJSONRecordsStarted(t *testing.T) {
+	f := setup(t, `cat "$3/../claim.json" > "$1/c.json"; echo '{}' > "$1/metadata.json"`)
+	if res := f.run(); res.Outcome != "done" {
+		t.Fatalf("%+v", res)
+	}
+	if got := f.in.tarFiles()["c.json"]; !strings.Contains(got, `"started":true`) {
+		t.Fatalf("claim.json %q", got)
+	}
+}
+
+func TestServerReasonIsASCIIAndCapped(t *testing.T) {
+	f := setup(t, `echo '{}' > "$1/metadata.json"; echo x > "$1/caf\303\251"; ln -s /x "$1/l\303\251"`)
+	res := f.run()
+	if res.Outcome != "failed" {
+		t.Fatalf("%+v", res)
+	}
+	for _, r := range fmt.Sprint(f.in.update(0)["error"]) {
+		if r < 0x20 || r > 0x7e {
+			t.Fatalf("non-ASCII in %q", f.in.update(0)["error"])
+		}
+	}
+	if got := serverReason(strings.Repeat("a", 500) + "\n\u00e9"); len(got) != 200 {
+		t.Fatalf("len %d", len(got))
 	}
 }

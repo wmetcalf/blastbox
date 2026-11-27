@@ -78,7 +78,7 @@ func Write(root, dst string) (err error) {
 
 func addFile(tw *tar.Writer, root, name string) error {
 	p := filepath.Join(root, filepath.FromSlash(name))
-	in, err := os.Open(p)
+	in, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
 	}

@@ -35,7 +35,7 @@ import (
 
 // Result is what happened to the claim, for logging and heartbeat use.
 type Result struct {
-	Outcome string // "done" | "failed" | "released" | "lost"
+	Outcome string // "done" | "failed" | "released" | "lost" | "refused" (a started job dir exists; nothing was sent or wiped)
 	Reason  string
 }
 
@@ -63,11 +63,12 @@ type Runner struct {
 	Logf func(format string, args ...any)
 
 	// Tunables (zero = production defaults); tests shorten them.
-	MemPoll     time.Duration // memory watchdog period (500 ms)
-	DispWait    time.Duration // how long to poll Disposition after an "accepted" (60 s)
-	DispPoll    time.Duration // Disposition poll period (2 s)
-	RetryBase   time.Duration // first retry delay for Fail/PutResult on a retryable error (2 s)
-	RetryTries  int           // attempts for Fail/PutResult (3)
+	MemPoll     time.Duration                 // memory watchdog period (500 ms)
+	DispWait    time.Duration                 // how long to poll Disposition after an "accepted" (60 s)
+	DispPoll    time.Duration                 // Disposition poll period (2 s)
+	RetryBase   time.Duration                 // first retry delay for Fail/PutResult on a retryable error (2 s)
+	RetryTries  int                           // attempts for Fail/PutResult (3)
+	rss         func(pgid int) (int64, error) // test seam; nil = groupRSSKiB
 	build       func(context.Context, sandbox.Kind, sandbox.Request, []string, sandbox.Limits) (*exec.Cmd, error)
 	hostPins    *sandbox.HostPins
 	skipAAProbe bool
@@ -139,7 +140,11 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 		return j.release(ctx, "state dir: "+err.Error())
 	}
 	j.dir = filepath.Join(jobs, c.JobID)
-	if _, err := os.Lstat(j.dir); err == nil { // leftover of an earlier attempt
+	if _, err := os.Lstat(filepath.Join(j.dir, "started")); err == nil {
+		// A started job's dir belongs to crash recovery: never wipe or reuse it here.
+		return Result{"refused", "job dir already holds a started marker; left for crash recovery"}
+	}
+	if _, err := os.Lstat(j.dir); err == nil { // leftover of an earlier, unstarted attempt
 		wipe(j.dir)
 	}
 	if err := os.Mkdir(j.dir, 0o700); err != nil {
@@ -187,6 +192,11 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 		return j.release(ctx, "started marker: "+err.Error())
 	}
 	// From here the job is never released.
+	claimJSON, _ = json.Marshal(map[string]any{
+		"job_id": c.JobID, "claim_id": c.ClaimID, "receipt": c.Receipt, "engine": eng.Name, "started": true})
+	if err := atomicWrite(filepath.Join(j.dir, "claim.json"), claimJSON); err != nil {
+		r.logf("job %s: claim.json rewrite: %v (the started marker is authoritative)", c.JobID, err)
+	}
 	j.start = time.Now()
 	killed, runErr := j.exec(runCtx, cmd, capw)
 	if killed != "" {
@@ -421,10 +431,19 @@ func (j *job) exec(ctx context.Context, cmd *exec.Cmd, capw *capWriter) (killed 
 		killed = reason
 		syscall.Kill(-pid, syscall.SIGKILL)
 	}
-	for runErr == nil {
+	rssFails := 0
+	rssFn := j.r.rss
+	if rssFn == nil {
+		rssFn = groupRSSKiB
+	}
+	for {
 		select {
 		case err := <-done:
 			syscall.Kill(-pid, syscall.SIGKILL) // reap strays left in the group
+			if killed == "" && ctx.Err() != nil {
+				// exec.CommandContext's Cancel killed the group before our select saw Done.
+				killed = "run interrupted: agent shutting down"
+			}
 			return killed, err
 		case <-timer.C:
 			kill(fmt.Sprintf("deadline exceeded after %ds", j.c.Run.DeadlineS))
@@ -439,14 +458,27 @@ func (j *job) exec(ctx context.Context, cmd *exec.Cmd, capw *capWriter) (killed 
 			err := <-done
 			return killed, err
 		case <-tick.C:
-			if rss, err := groupRSSKiB(pid); err == nil && rss > limit {
+			rss, err := rssFn(pid)
+			if err != nil {
+				// Fail closed: with no other memory enforcement (darwin), a blind watchdog is
+				// no watchdog.
+				rssFails++
+				j.r.logf("job %s: memory watchdog read failed (%d/3): %v", j.c.JobID, rssFails, err)
+				if rssFails >= 3 {
+					kill("memory watchdog unavailable")
+					err := <-done
+					return killed, err
+				}
+				continue
+			}
+			rssFails = 0
+			if rss > limit {
 				kill("memory cap exceeded")
 				err := <-done
 				return killed, err
 			}
 		}
 	}
-	return killed, runErr
 }
 
 func handshakeOK(scratch, nonce string) bool {
@@ -458,6 +490,14 @@ func handshakeOK(scratch, nonce string) bool {
 	b, err := os.ReadFile(m)
 	os.Remove(m)
 	return err == nil && string(b) == nonce
+}
+
+func atomicWrite(p string, b []byte) error {
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, p)
 }
 
 // writeStarted records, durably, that the sandbox is about to see the input.
@@ -519,10 +559,10 @@ func (j *job) checkOutput() (map[string]int64, error) {
 			return nil
 		}
 		if !fi.Mode().IsRegular() {
-			return fmt.Errorf("non-regular file in output: %s (%s)", rel, fi.Mode().Type())
+			return fmt.Errorf("non-regular file in output: %+q (%s)", rel, fi.Mode().Type())
 		}
 		if st, ok := fi.Sys().(*syscall.Stat_t); ok && uint64(st.Nlink) > 1 {
-			return fmt.Errorf("hardlinked file in output: %s", rel)
+			return fmt.Errorf("hardlinked file in output: %+q", rel)
 		}
 		rel = filepath.ToSlash(rel)
 		files[rel] = fi.Size()
@@ -536,7 +576,7 @@ func (j *job) checkOutput() (map[string]int64, error) {
 			return fmt.Errorf("more than max_artifacts (%d) files in output", maxN)
 		}
 		if fi.Size() > maxArt {
-			return fmt.Errorf("artifact %s is over max_artifact (%d)", rel, maxArt)
+			return fmt.Errorf("artifact %+q is over max_artifact (%d)", rel, maxArt)
 		}
 		if total += fi.Size(); total > maxTotal {
 			return fmt.Errorf("output total is over max_total_artifacts (%d)", maxTotal)
@@ -586,7 +626,7 @@ func (j *job) fillArtifacts(files map[string]int64) error {
 		}
 		sum, err := fileSHA(filepath.Join(j.out, filepath.FromSlash(clean)))
 		if err != nil {
-			return fmt.Errorf("artifact %s: %v", clean, err)
+			return fmt.Errorf("artifact %+q: %v", clean, err)
 		}
 		m["sha256"], m["bytes"] = sum, json.Number(strconv.FormatInt(size, 10))
 		changed = true
@@ -673,7 +713,24 @@ func (j *job) releaseOrLost2(_ context.Context, why string, err error) Result {
 	return Result{"failed", why + "; release not delivered: " + err.Error()}
 }
 
+// serverReason makes a reason safe to send: printable ASCII only, at most 200 chars.
+func serverReason(s string) string {
+	b := make([]byte, 0, len(s))
+	for _, r := range s {
+		if r >= 0x20 && r < 0x7f {
+			b = append(b, byte(r))
+		} else {
+			b = append(b, '?')
+		}
+	}
+	if len(b) > 200 {
+		b = b[:200]
+	}
+	return string(b)
+}
+
 func (j *job) fail(ctx context.Context, why string) Result {
+	why = serverReason(why)
 	rc, cancel := reportCtx(ctx)
 	defer cancel()
 	err := j.r.retry(rc, func() error { return j.cl.Fail(rc, j.c, why, time.Now()) })
@@ -708,12 +765,14 @@ func (j *job) upload(ctx context.Context, tarPath string, kind sandbox.Kind) Res
 	wait := time.Now().Add(def(j.r.DispWait, 60*time.Second))
 	for {
 		st, err := j.cl.Disposition(rc, j.c.JobID)
-		if err == nil && st != "running" && st != "" {
+		if err == nil && (st == "done" || st == "failed") {
 			j.r.logf("job %s: disposition %s", j.c.JobID, st)
 			if st == "failed" {
 				return Result{"failed", "control plane failed the job after acceptance"}
 			}
 			return Result{"done", "disposition " + st}
+		} else if err == nil {
+			j.r.logf("job %s: disposition pending:%s", j.c.JobID, st)
 		}
 		if time.Now().After(wait) {
 			return Result{"done", "accepted; disposition still pending"}
