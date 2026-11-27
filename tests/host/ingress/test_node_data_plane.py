@@ -591,3 +591,21 @@ def test_host_disk_full_while_spooling_body_is_retry(tmp_path, pki_dir, monkeypa
     monkeypatch.setattr(_tempfile, "NamedTemporaryFile", full)
     r = put(c, hdr, make_tar([("a", b"x")]))
     assert r.status_code == 503 and r.headers.get("retry-after"), r.text
+
+
+def test_replay_of_a_retained_result_later_repaired_is_done(tmp_path, pki_dir):  # noqa: F811
+    """The finalizer records 'retained' when the blob upload fails; the pending-upload sweep
+    later repairs the row to DONE. The node's replay must then say done, not the stale 422."""
+    store, c, hdr = _setup(tmp_path, pki_dir)
+    assert put(c, hdr, make_tar([])).status_code == 202
+    (d,) = spool_dirs(tmp_path)
+    node_results.write_outcome(d, "failed", node_results.RETAINED_REASON)
+    claim = hdr["x-blastbox-claim-id"]
+    store.update_if_status("job-1", JobStatus.RUNNING, expect_claim_id=claim,
+                           status=JobStatus.FAILED, error=node_results.RETAINED_REASON)
+    r = put(c, hdr, b"x")
+    assert r.status_code == 422 and r.json()["reason"] == node_results.RETAINED_REASON
+    store.update_if_status("job-1", JobStatus.FAILED, expect_claim_id=claim,
+                           status=JobStatus.DONE, error=None)
+    r = put(c, hdr, b"x")
+    assert r.status_code == 200 and r.json() == {"status": "done"}

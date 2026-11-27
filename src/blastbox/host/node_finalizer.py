@@ -35,7 +35,7 @@ RETAIN_ENV = "BLASTBOX_NODE_RESULTS_RETAIN_S"
 DEFAULT_RETAIN_S = 3600.0
 NODE_TIER = "node-agent"
 POISON_REASON = "finalisation failed repeatedly"
-RETAINED_REASON = "result upload failed; tree retained"
+RETAINED_REASON = nr.RETAINED_REASON
 ATTEMPTS_NAME = ".attempts"
 MAX_ATTEMPTS = 5
 # Failed attempts are SPACED: retry n waits min(BACKOFF_MAX_S, BACKOFF_BASE_S * 2**(n-1)).

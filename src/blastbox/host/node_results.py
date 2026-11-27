@@ -33,6 +33,9 @@ RESULTS_ENV = "BLASTBOX_NODE_RESULTS_DIR"
 MARKER = "upload.json"
 OUTCOME = "outcome.json"
 OUT = "out"
+# The finalizer's outcome reason when the blob upload failed and the sealed tree was retained
+# for the pending-upload sweep. Not final: that sweep may later repair the job to DONE.
+RETAINED_REASON = "result upload failed; tree retained"
 
 
 class TarRejected(ValueError):

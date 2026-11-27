@@ -1660,7 +1660,7 @@ def register_node_claim_routes(
         root = nr.results_root(_jobs_dir)
         final = nr.spool_dir(root, job_id, claim_id)
 
-        def _existing() -> "JSONResponse | None":
+        async def _existing() -> "JSONResponse | None":
             if not final.is_dir():
                 return None
             out = nr.read_outcome(final)
@@ -1668,11 +1668,18 @@ def register_node_claim_routes(
                 return JSONResponse({"status": "accepted"}, status_code=202)
             if out.get("status") == "done":
                 return JSONResponse({"status": "done"}, status_code=200)
+            if out.get("reason") == nr.RETAINED_REASON:
+                # retained is not final: the pending-upload sweep may since have repaired the
+                # row to DONE (claim unchanged; _owned_any proved it is this node's claim)
+                cur = await run_in_threadpool(job_store.get, job_id)
+                if cur is not None and cur.status == JobStatus.DONE \
+                        and cur.claim_id == claim_id:
+                    return JSONResponse({"status": "done"}, status_code=200)
             return JSONResponse({"status": "failed", "reason": out.get("reason")},
                                 status_code=422)
 
         # Idempotent on (job, claim): never re-read or re-extract. The body is discarded.
-        prior = _existing()
+        prior = await _existing()
         if prior is not None:
             return prior
 
@@ -1738,7 +1745,8 @@ def register_node_claim_routes(
                     except OSError:
                         # lost a race with an identical upload: it is already quarantined
                         shutil.rmtree(partial, ignore_errors=True)
-                        return _existing() or JSONResponse({"status": "accepted"}, status_code=202)
+                        return (await _existing()
+                                or JSONResponse({"status": "accepted"}, status_code=202))
                     partial = None
                 except HTTPException:
                     raise
@@ -1779,14 +1787,14 @@ def register_node_claim_routes(
                     continue
                 for _ in range(50):
                     await asyncio.sleep(0.1)
-                    prior = _existing()
+                    prior = await _existing()
                     if prior is not None:
                         return prior
                     if not lock.exists():
                         break
                 # the winner failed (lock gone, nothing stored) or is still busy: nothing has
                 # been accepted, so say "retry" rather than a 202 that would be a lie (503, never 409: 409 means claim lost)
-                return _existing() or JSONResponse({"status": "retry"}, status_code=503,
+                return (await _existing()) or JSONResponse({"status": "retry"}, status_code=503,
                                              headers={"Retry-After": "2"})
         else:
             return JSONResponse({"status": "retry"}, status_code=503,
