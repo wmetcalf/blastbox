@@ -1637,8 +1637,9 @@ def register_node_claim_routes(
         from fastapi.responses import JSONResponse
         from starlette.concurrency import run_in_threadpool
 
+        from blastbox.errors import HOST_RESOURCE_ERRNOS
         from blastbox.host import node_results as nr
-        from blastbox.host.runtime.remote_http import _safe_extract_tar
+        from blastbox.host.runtime import remote_http as _remote_http
         from blastbox.limits import Limits
 
         node_id = _node_from_token(x_blastbox_node_session)
@@ -1713,9 +1714,9 @@ def register_node_claim_routes(
                                max_metadata_bytes=lim.max_metadata_bytes)
                     out = partial / nr.OUT
                     out.mkdir(mode=0o700)
-                    _safe_extract_tar(spool, out, max_total_bytes=lim.max_total_artifact_bytes,
-                                      max_members=max_members,
-                                      max_metadata_bytes=lim.max_metadata_bytes)
+                    _remote_http._safe_extract_tar(
+                        spool, out, max_total_bytes=lim.max_total_artifact_bytes,
+                        max_members=max_members, max_metadata_bytes=lim.max_metadata_bytes)
                     return partial
 
                 try:
@@ -1742,6 +1743,13 @@ def register_node_claim_routes(
                 except HTTPException:
                     raise
                 except Exception as exc:            # noqa: BLE001 - any extraction fault: refuse, no marker
+                    if isinstance(exc, OSError) and exc.errno in HOST_RESOURCE_ERRNOS:
+                        # OUR disk/fds/inodes ran out: not the node's result. Nothing was
+                        # stored, so the honest answer is "retry", never a terminal 422.
+                        _log.error("node_claim: host resource exhausted extracting job=%s: %s",
+                                   job_id, exc)
+                        return JSONResponse({"status": "retry"}, status_code=503,
+                                            headers={"Retry-After": "30"})
                     if not isinstance(exc, (nr.TarRejected, OSError, RuntimeError, ValueError)):
                         _log.exception("node_claim: result extraction failed job=%s", job_id)
                     else:
@@ -1784,7 +1792,16 @@ def register_node_claim_routes(
             return JSONResponse({"status": "retry"}, status_code=503,
                                              headers={"Retry-After": "2"})
         try:
-            return await _receive_and_extract()
+            try:
+                return await _receive_and_extract()
+            except OSError as exc:
+                # spooling the body itself (temp file create/write) ran the host out of space
+                if exc.errno not in HOST_RESOURCE_ERRNOS:
+                    raise
+                _log.error("node_claim: host resource exhausted spooling job=%s: %s",
+                           job_id, exc)
+                return JSONResponse({"status": "retry"}, status_code=503,
+                                    headers={"Retry-After": "30"})
         finally:
             shutil.rmtree(lock, ignore_errors=True)
 

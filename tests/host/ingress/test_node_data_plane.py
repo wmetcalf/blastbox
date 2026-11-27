@@ -552,3 +552,42 @@ def test_metadata_over_its_own_cap_refused_by_vet():
     with pytest.raises(node_results.TarRejected, match="metadata"):
         node_results.vet_tar(io.BytesIO(body), max_members=10, max_total_bytes=10_000,
                              max_metadata_bytes=100)
+
+
+@pytest.mark.parametrize("err", ["ENOSPC", "EMFILE"])
+def test_host_resource_exhaustion_is_retry_not_rejected(tmp_path, pki_dir, monkeypatch, err):  # noqa: F811
+    """Our disk/fds running out is not the node's fault: 503 + Retry-After, never 422."""
+    import errno as _errno
+
+    from blastbox.host.runtime import remote_http
+
+    def full(*a, **k):
+        raise OSError(getattr(_errno, err), "host resource")
+
+    monkeypatch.setattr(remote_http, "_safe_extract_tar", full)
+    _, c, hdr = _setup(tmp_path, pki_dir)
+    r = put(c, hdr, make_tar([("a", b"x")]))
+    assert r.status_code == 503, r.text
+    assert r.headers.get("retry-after")
+    assert spool_dirs(tmp_path) == []
+    # and the node's retry, once the host recovers, is accepted
+    monkeypatch.undo()
+    monkeypatch.setenv("BLASTBOX_NODE_RESULTS_DIR", str(tmp_path / "results"))
+    assert put(c, hdr, make_tar([("a", b"x")])).status_code == 202
+
+
+def test_host_disk_full_while_spooling_body_is_retry(tmp_path, pki_dir, monkeypatch):  # noqa: F811
+    import errno as _errno
+    import tempfile as _tempfile
+
+    real = _tempfile.NamedTemporaryFile
+
+    def full(*a, **k):
+        if k.get("prefix") == ".upload-":
+            raise OSError(_errno.ENOSPC, "disk full")
+        return real(*a, **k)
+
+    _, c, hdr = _setup(tmp_path, pki_dir)
+    monkeypatch.setattr(_tempfile, "NamedTemporaryFile", full)
+    r = put(c, hdr, make_tar([("a", b"x")]))
+    assert r.status_code == 503 and r.headers.get("retry-after"), r.text
