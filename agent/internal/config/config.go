@@ -68,16 +68,12 @@ func (e *Engine) SlotCount() int {
 	return *e.Slots
 }
 
-// FloorRank is the numeric rank of the engine's effective min_sandbox (default seatbelt), as
-// reported in the heartbeat: 0 none, 1 seatbelt/nsjail. The control plane's heartbeat schema
-// carries the floor as an integer.
-func (e *Engine) FloorRank() int {
-	min := e.MinSandbox
-	if min == "" {
-		min = "seatbelt"
+// FloorName is the engine's effective min_sandbox (default seatbelt), as reported in the heartbeat.
+func (e *Engine) FloorName() string {
+	if e.MinSandbox == "" {
+		return "seatbelt"
 	}
-	r, _ := sandboxRank(min)
-	return r
+	return e.MinSandbox
 }
 
 // RSSLimitMiB returns the effective RSS cap (default 2048).

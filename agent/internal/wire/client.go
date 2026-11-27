@@ -125,7 +125,7 @@ type Heartbeat struct {
 type HeartbeatEngine struct {
 	Name       string `json:"name"`
 	Sandbox    string `json:"sandbox"`
-	Floor      int    `json:"floor"` // rank of min_sandbox: 0 none, 1 seatbelt/nsjail
+	Floor      string `json:"floor"` // the engine's min_sandbox name
 	Slots      int    `json:"slots"`
 	Busy       int    `json:"busy"`
 	SelftestOK bool   `json:"selftest_ok"`
