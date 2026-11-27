@@ -167,6 +167,16 @@ class _Current:
     others: list[tuple[Path, bytes]]    #: the rest, superseded by a renewal
 
 
+def _links_out(crt: Path, d: Path) -> bool:
+    """True if ``crt`` is a symlink resolving outside ``d`` (or not resolving at all)."""
+    if not crt.is_symlink():
+        return False
+    try:
+        return Path(os.path.realpath(crt)).parent != Path(os.path.realpath(d))
+    except OSError:
+        return True
+
+
 def _find_current(pki_dir: Path, node_id: str,
                   anchor: CertAuthority | TrustAnchor | None = None) -> _Current | None:
     """The node's verifying certs in ``pki_dir``, or None.
@@ -194,15 +204,22 @@ def _find_current(pki_dir: Path, node_id: str,
             return None
     found: list[tuple[Path, bytes, NodeIdentity]] = []
     for crt in sorted(d.glob("*.crt")):
+        if strict and _links_out(crt, d):
+            continue
         try:
             # OSError propagates (transient). Strict: the dir is someone else's to write,
-            # so bounded and FIFO-safe -- but a symlinked cert is FOLLOWED, as the ingress
-            # (fleet_grants) and revoke follow it: a cert that authorises the node must
-            # also be renewable. Writing replaces the link, never its target.
+            # so bounded and FIFO-safe. A symlinked cert is followed only WITHIN its dir:
+            # resolved on the CA host, a link out of it can reach a cert the ingress itself
+            # never sees (another ingress's mount), which must not authorise anything here.
+            # Writing replaces the link, never its target.
             pem = (_read_capped(crt, MAX_CERT_BYTES, follow=True) if strict
                    else crt.read_bytes())
         except _Unreadable:
             continue                                    # FIFO, device, huge: not a cert
+        except FileNotFoundError:
+            if strict:
+                continue                                # a dangling link is not a cert
+            raise
         try:
             ident = node_identity(anchor, pem)
         except Exception:                               # noqa: BLE001 - one bad file is not fatal
@@ -348,12 +365,14 @@ def _drain(ca: CertAuthority, qdir: Path, days: int,
     for node_id in ids:
         csr_path, aside = d / f"{node_id}.csr", d / f"{node_id}.csr.signing"
         try:
-            for link in (csr_path, aside):
-                if link.is_symlink():           # never read or move through a link
-                    link.unlink()
-                    raise _Unreadable(f"{link.name} is a symlink")
+            linked = [p.name for p in (csr_path, aside) if p.is_symlink()]
+            for name in linked:                 # never read or move through a link,
+                (d / name).unlink()             # but a kept retry is not lost to one
             if csr_path.exists():
                 os.replace(csr_path, aside)     # newest wins over a kept older one
+            if linked and not aside.exists():
+                results.append((node_id, f"refused: {linked[0]} is a symlink"))
+                continue
             csr_pem = _read_capped(aside, MAX_CSR_BYTES)
         except _Unreadable as exc:              # FIFO, device, dir, oversized, link: refuse it
             _discard(aside)
@@ -407,6 +426,12 @@ def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
     except OSError as exc:
         return f"deferred: {exc}", True
     if qdir not in states:
+        if any(_links_out(c, qdir) for c in qdir.glob("*.crt")):
+            # Kept and loud (exit 2), not refused: the ingress may be authorising the node
+            # through that link, and the fix -- a file instead of the link -- is the
+            # operator's, after which the next run renews.
+            return ("deferred: no current certificate here; a cert linked from outside its "
+                    "node dir does not count -- replace the link with the file"), True
         return "refused: no current certificate", False
     grants: NodeGrants | None = None
     for cur in states.values():

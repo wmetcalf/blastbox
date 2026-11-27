@@ -759,20 +759,21 @@ def test_revoke_removes_a_symlink_to_the_nodes_cert_but_not_its_target(tmp_path)
     assert "n1" not in fleet_grants(i1)
 
 
-def test_a_symlinked_cert_the_ingress_authorises_is_renewed_too(tmp_path):
-    """Every reader of a cert dir follows a symlinked cert the same way: the ingress
-    authorises the node through it, so renewal must see it, and replaces only the link."""
+def test_a_cert_linked_from_outside_its_dir_defers_loudly_and_keeps_the_csr(tmp_path):
+    """The ingress follows the link; renewal will not (see the out-of-dir test), so it
+    must say why and keep the CSR rather than refuse and drop it."""
     d, ca = rig(tmp_path)
     outside = tmp_path / "store" / "n1.crt"
     outside.parent.mkdir()
     os.replace(d / "node-n1.crt", outside)
     (d / "node-n1.crt").symlink_to(outside)
     assert set(fleet_grants(d)) == {"n1"}
-    before = outside.read_bytes()
     queue_csr(d, "n1", make_csr("n1")[0])
+    [(nid, outcome)] = sign_pending(ca, d)
+    assert outcome.startswith("deferred") and "link" in outcome
+    assert pending(d) == ["n1"]
+    os.replace(outside, d / "node-n1.crt")              # operator replaces the link
     assert sign_pending(ca, d) == [("n1", "renewed")]
-    assert not (d / "node-n1.crt").is_symlink()     # the link was replaced ...
-    assert outside.read_bytes() == before           # ... never written through
 
 
 def test_one_unreadable_file_does_not_stop_a_dirs_revocation(tmp_path):
@@ -927,3 +928,41 @@ def test_a_transient_pass_one_error_fixed_by_pass_two_is_not_reported(tmp_path, 
     finally:
         t.join()
     assert not (i1 / "node-n1.crt").exists()
+
+
+def test_a_dangling_cert_link_does_not_defer_renewals(tmp_path):
+    ca, ca_dir, i1, i2 = _split(tmp_path)
+    (i1 / "stale.crt").symlink_to(tmp_path / "gone.crt")
+    queue_csr(i2, "n1", make_csr("n1")[0])
+    assert sign_pending(ca, ca_dir, node_dirs=[i1, i2]) == [("n1", "renewed")]
+
+
+def test_a_cert_link_out_of_its_node_dir_never_authorises_a_renewal(tmp_path):
+    """Resolved on the CA host, a link out of the dir may point at a cert the ingress
+    itself cannot see (another ingress's mount): it must not count for that dir."""
+    ca, ca_dir, i1, i2 = _split(tmp_path)
+    (i1 / "node-n1.crt").unlink()                       # n1 revoked on ingress-1 ...
+    (i1 / "takeover.crt").symlink_to(i2 / "node-n1.crt")  # ... but a link points out
+    queue_csr(i1, "n1", make_csr("n1")[0])
+    [(nid, outcome)] = sign_pending(ca, ca_dir, node_dirs=[i1, i2])
+    assert not outcome.startswith("renewed")
+    assert (i1 / "takeover.crt").is_symlink()           # nothing written into ingress-1
+
+
+def test_a_cert_link_inside_its_node_dir_is_followed(tmp_path):
+    d, ca = rig(tmp_path)
+    os.replace(d / "node-n1.crt", d / "store-n1.pem")
+    (d / "node-n1.crt").symlink_to("store-n1.pem")
+    queue_csr(d, "n1", make_csr("n1")[0])
+    assert sign_pending(ca, d) == [("n1", "renewed")]
+
+
+def test_a_symlinked_csr_does_not_destroy_a_kept_retry(tmp_path, monkeypatch):
+    d, ca = rig(tmp_path)
+    queue_csr(d, "n1", make_csr("n1")[0])
+    monkeypatch.setattr(node_renew, "_replace_file",
+                        lambda *a: (_ for _ in ()).throw(OSError("disk full")))
+    sign_pending(ca, d)                                 # kept as n1.csr.signing
+    monkeypatch.undo()
+    (d / "renew" / "n1.csr").symlink_to(tmp_path / "whatever")
+    assert sign_pending(ca, d) == [("n1", "renewed")]
