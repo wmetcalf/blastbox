@@ -237,6 +237,9 @@ def test_finalizer_only_result_summary_is_the_finalizers(tmp_path, pki_dir, monk
     {"status": "queued", "claim_id": None, "expires_at": __import__("time").time() + 60},
     {"status": "failed"},                                     # no retention clock: never purged
     {"status": "failed", "error": "x", "finished_at": 1.0},   # no expires_at
+    {"status": "failed", "finished_at": None, "expires_at": None},       # null clocks
+    {"status": "failed", "finished_at": 1.0, "expires_at": None},
+    {"status": "failed", "finished_at": None, "expires_at": __import__("time").time() + 60},
 ])
 def test_finalizer_only_each_shape_is_checked_on_its_own(tmp_path, pki_dir, monkeypatch,  # noqa: F811
                                                          fields):

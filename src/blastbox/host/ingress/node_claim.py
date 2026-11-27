@@ -1557,6 +1557,9 @@ def register_node_claim_routes(
                 # finished_at and expires_at are required: without expires_at the FAILED row
                 # (and anything stored for it) is never retention-purged
                 why = f"fail write with {', '.join(sorted(req.fields))}"
+            elif fields["status"] == JobStatus.FAILED and (fields.get("finished_at") is None
+                                                           or fields.get("expires_at") is None):
+                why = "fail write with a null finished_at or expires_at"
             elif req.expect_status is not None and req.expect_status != JobStatus.RUNNING.value:
                 why = f"expect_status={req.expect_status}"
             if why is not None:

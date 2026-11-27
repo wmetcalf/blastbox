@@ -896,7 +896,7 @@ Three things an operator must know:
   the trust gate themselves; for an untrusted pull agent it means DONE with no result, no trust
   gate and no receipt. `finalizer-only` accepts exactly the agent's two writes, release
   `{status: queued, claim_id: null}` and fail `{status: failed, error, finished_at,
-  expires_at}` (`error` optional; `finished_at` and `expires_at` required, so the FAILED row
+  expires_at}` (`error` optional; `finished_at` and `expires_at` required and non-null, so the FAILED row
   is retention-purged; the error is scrubbed like a dispatcher's and `finished_at` is never
   earlier than the run's start), each shape checked on its own and only while the job is
   RUNNING (the write's CAS is always on RUNNING); any other
