@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import os
 from pathlib import Path
 
@@ -127,3 +128,62 @@ def test_cli_renew_pending_prints_one_line_per_node(tmp_path, capsys):
     assert capsys.readouterr().out.strip() == "n1: renewed"
     os.unlink(d / "ca.key")
     assert main(["pki", "--dir", str(d), "renew-pending"]) == 1
+
+
+def _issue_expired(d, ca, node, monkeypatch):
+    real = pki._now
+    monkeypatch.setattr(pki, "_now", lambda: real() - datetime.timedelta(days=30))
+    csr, _ = make_csr(node)
+    (d / f"node-{node}.crt").write_bytes(ca.sign_node_csr(csr, node_id=node, grants=GRANTS))
+    monkeypatch.setattr(pki, "_now", real)
+
+
+def test_expired_current_cert_is_not_renewed(tmp_path, monkeypatch):
+    d = tmp_path / "pki"
+    ca = pki.ensure_ca(d)
+    _issue_expired(d, ca, "n1", monkeypatch)
+    before = (d / "node-n1.crt").read_bytes()
+    queue_csr(d, "n1", make_csr("n1")[0])
+    assert sign_pending(ca, d) == [("n1", "refused: no current certificate")]
+    assert (d / "node-n1.crt").read_bytes() == before
+    assert not list((d / "renew").glob("*.csr*"))
+
+
+def test_cn_mismatch_at_signing_time_is_refused(tmp_path):
+    d, ca = rig(tmp_path)
+    (d / "renew").mkdir()
+    (d / "renew" / "n1.csr").write_bytes(make_csr("other")[0])
+    before = (d / "node-n1.crt").read_bytes()
+    [(nid, outcome)] = sign_pending(ca, d)
+    assert nid == "n1" and outcome.startswith("refused")
+    assert (d / "node-n1.crt").read_bytes() == before
+    assert not list((d / "renew").glob("*.csr*"))
+
+
+def test_oserror_while_replacing_keeps_the_csr(tmp_path, monkeypatch):
+    d, ca = rig(tmp_path)
+    queue_csr(d, "n1", make_csr("n1")[0])
+    monkeypatch.setattr(node_renew, "_replace_file",
+                        lambda *a: (_ for _ in ()).throw(OSError("disk full")))
+    [(nid, outcome)] = sign_pending(ca, d)
+    assert outcome.startswith("deferred:")
+    assert [p.name for p in (d / "renew").glob("*.csr*")] == ["n1.csr"]
+    monkeypatch.undo()
+    assert sign_pending(ca, d) == [("n1", "renewed")]
+
+
+def test_queue_full_count_ignores_lock_and_tmp(tmp_path, monkeypatch):
+    d, ca = rig(tmp_path)
+    monkeypatch.setattr(node_renew, "MAX_QUEUED", 1)
+    (d / "renew").mkdir()
+    for n in (".lock", ".a.tmp", ".b.tmp"):
+        (d / "renew" / n).write_bytes(b"")
+    queue_csr(d, "n1", make_csr("n1")[0])
+
+
+def test_existing_renew_dir_is_chmodded_0700(tmp_path):
+    d, _ = rig(tmp_path)
+    (d / "renew").mkdir(mode=0o755)
+    os.chmod(d / "renew", 0o755)
+    queue_csr(d, "n1", make_csr("n1")[0])
+    assert (d / "renew").stat().st_mode & 0o777 == 0o700

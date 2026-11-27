@@ -41,6 +41,7 @@ def _renew_dir(pki_dir: Path, *, create: bool = False) -> Path:
     d = Path(pki_dir) / RENEW_DIR
     if create:
         d.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(d, 0o700)          # an existing dir may predate this mode
     return d
 
 
@@ -69,7 +70,7 @@ def queue_csr(pki_dir: Path, node_id: str, csr_pem: bytes) -> None:
     target = d / f"{node_id}.csr"
     if not target.exists():
         try:
-            n = sum(1 for _ in d.iterdir())
+            n = sum(1 for _ in d.glob("*.csr"))
         except OSError:
             n = 0
         if n > MAX_QUEUED:
@@ -137,13 +138,25 @@ def sign_pending(ca: CertAuthority, pki_dir: Path, *, days: int = 7) -> list[tup
     results: list[tuple[str, str]] = []
     with open(d / ".lock", "a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        # A crash mid-sign leaves "<id>.csr.signing"; put it back unless a newer CSR landed.
+        for aside in d.glob("*.csr.signing"):
+            orig = aside.with_suffix("")
+            if orig.exists():
+                aside.unlink(missing_ok=True)
+            else:
+                os.replace(aside, orig)
         for csr_path in sorted(d.glob("*.csr")):
             node_id = csr_path.stem
+            # Rename aside under the lock, so a newer CSR can land on the original name
+            # while we sign and is never deleted by us.
+            aside = csr_path.with_name(csr_path.name + ".signing")
             try:
-                csr_pem = csr_path.read_bytes()
+                os.replace(csr_path, aside)
+                csr_pem = aside.read_bytes()
             except OSError:
                 continue
             found = _find_current(pki_dir, node_id)
+            keep = False
             if found is None:
                 outcome = "refused: no current certificate"
             else:
@@ -153,13 +166,18 @@ def sign_pending(ca: CertAuthority, pki_dir: Path, *, days: int = 7) -> list[tup
                                            grants=ident.grants, days=days)
                     _replace_file(path, new)
                     outcome = "renewed"
-                except (ValueError, OSError) as exc:
+                except ValueError as exc:
                     outcome = f"refused: {exc}"
-            # A node may have queued a newer CSR while we signed; leave that one for next run.
-            try:
-                if csr_path.read_bytes() == csr_pem:
-                    csr_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+                except OSError as exc:
+                    outcome = f"deferred: {exc}"
+                    keep = True
+            if keep:
+                # Transient fault: retry next run, unless the node has queued a newer one.
+                if csr_path.exists():
+                    aside.unlink(missing_ok=True)
+                else:
+                    os.replace(aside, csr_path)
+            else:
+                aside.unlink(missing_ok=True)
             results.append((node_id, outcome))
     return results

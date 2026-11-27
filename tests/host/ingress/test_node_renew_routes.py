@@ -59,8 +59,11 @@ def test_renew_queues_202(tmp_path, monkeypatch):
 def test_cert_route_returns_latest(tmp_path, monkeypatch):
     c, d, ca, keys = _setup(tmp_path, monkeypatch, nodes=("n1", "n2"))
     h = _session(c, d, "n1", keys["n1"])
-    old_cert = d / "old-n1.crt"
-    old_cert.write_bytes((d / "node-n1.crt").read_bytes())
+    # a second, shorter-lived cert for the same node sits beside the live one; the
+    # route must return the one with the later not_after.
+    csr0, _k = make_csr("n1")
+    short = ca.sign_node_csr(csr0, node_id="n1", grants=GRANTS, days=1)
+    (d / "old-n1.crt").write_bytes(short)
     new_key_csr, new_key = make_csr("n1")
     node_renew.queue_csr(d, "n1", new_key_csr)
     assert node_renew.sign_pending(ca, d) == [("n1", "renewed")]
@@ -70,6 +73,10 @@ def test_cert_route_returns_latest(tmp_path, monkeypatch):
     assert body["cert_pem"].encode() == node_renew.current_cert(d, "n1")
     assert body["cert_pem"] == (d / "node-n1.crt").read_text()
     assert body["not_after"]
+    assert body["cert_pem"].encode() != short
+    import datetime
+    assert datetime.datetime.fromisoformat(body["not_after"]) > (
+        pki.node_identity(pki.load_trust_anchor(d), short).not_after)
     # never another node's cert
     assert "n2" not in body["cert_pem"]
 
