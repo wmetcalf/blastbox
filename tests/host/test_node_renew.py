@@ -1113,3 +1113,32 @@ def test_an_unresolvable_out_of_dir_link_defers_rather_than_drop_the_csr(tmp_pat
     [(nid, outcome)] = sign_pending(ca, d)
     assert outcome.startswith("deferred")
     assert pending(d) == ["n1"]
+
+
+def test_an_unrelated_readable_link_does_not_keep_a_dead_nodes_csr(tmp_path):
+    d, ca = rig(tmp_path)
+    queue_csr(d, "n1", make_csr("n1")[0])
+    (d / "node-n1.crt").unlink()                        # n1 revoked after queueing
+    other = tmp_path / "store" / "n2.crt"
+    other.parent.mkdir()
+    other.write_bytes(ca.sign_node_csr(make_csr("n2")[0], node_id="n2", grants=GRANTS))
+    (d / "zz.crt").symlink_to(other)                    # a link, but to another node
+    assert sign_pending(ca, d) == [("n1", "refused: no current certificate")]
+    assert pending(d) == []
+
+
+def test_a_deferral_for_an_unresolvable_link_ends_with_the_proof_window(tmp_path):
+    d, ca = rig(tmp_path)
+    pem = (d / "node-n1.crt").read_bytes()
+    key = _KEYS[_spki(x509.load_pem_x509_certificate(pem).public_key())]
+    csr, _ = make_csr("n1")
+    old = int(__import__("time").time()) - node_renew.RENEW_PROOF_MAX_AGE_S - 1
+    cert, at, sig = proof_for(ca, "n1", csr, key=key, cert=pem, issued_at=old)
+    (d / "renew").mkdir()
+    (d / "renew" / "n1.csr").write_text(json.dumps(
+        {"csr_pem": csr.decode(), "cert_pem": cert.decode(), "issued_at": at,
+         "signature": sig}))
+    (d / "node-n1.crt").unlink()
+    (d / "node-n1.crt").symlink_to("/nonexistent/n1.crt")
+    [(nid, outcome)] = sign_pending(ca, d)
+    assert outcome.startswith("refused") and pending(d) == []

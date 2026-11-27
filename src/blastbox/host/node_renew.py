@@ -306,13 +306,24 @@ def _links_out(crt: Path, d: Path) -> bool:
         return True
 
 
-def _links_out_for(d: Path, node_id: str, ca: CertAuthority) -> bool:
-    """Does ``d`` hold a cert for ``node_id`` through a link that leaves ``d``?"""
+def _links_out_for(d: Path, node_id: str, ca: CertAuthority, *,
+                   unknown_counts: bool = False) -> bool:
+    """Does ``d`` hold a cert for ``node_id`` through a link that leaves ``d``?
+
+    ``unknown_counts``: a link this host cannot read at all (dangling here, unreadable)
+    MAY be the node's, so it counts; one that reads as something else does not.
+    """
     for c in sorted(d.glob("*.crt")):
         if not _links_out(c, d):
             continue
         try:
-            if node_identity(ca, _read_capped(c, MAX_CERT_BYTES, follow=True)).node_id == node_id:
+            pem = _read_capped(c, MAX_CERT_BYTES, follow=True)
+        except (OSError, _Unreadable):
+            if unknown_counts:
+                return True
+            continue
+        try:
+            if node_identity(ca, pem).node_id == node_id:
                 return True
         except Exception:                               # noqa: BLE001 - not a cert of it
             continue
@@ -615,9 +626,10 @@ def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
         return (f"deferred: {linked[0]} has a cert for this node linked from outside the "
                 "dir, which renewal does not follow -- replace the link with the file"), True
     if qdir not in states:
-        if any(_links_out(c, qdir) for c in qdir.glob("*.crt")):
+        if _links_out_for(qdir, node_id, ca, unknown_counts=True):
             # The queueing ingress may hold the node through a link this host cannot follow
-            # (or even resolve): it cannot tell, so keep the CSR and say why.
+            # (or even resolve): it cannot tell, so keep the CSR and say why. Bounded: once
+            # the proof is older than RENEW_PROOF_MAX_AGE_S the entry is refused anyway.
             return ("deferred: no current certificate here except through a link out of "
                     f"{qdir} -- replace the link with the file"), True
         return "refused: no current certificate", False
