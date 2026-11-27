@@ -263,8 +263,14 @@ func (a *Agent) startup(ctx context.Context) error {
 	if a.Runner == nil {
 		a.Runner = &runner.Runner{Host: a.Host, Logf: func(f string, args ...any) {
 			a.Log.Info("runner", "msg", fmt.Sprintf(f, args...))
-		}, SandboxFault: func(engine, reason string) {
-			// Stop claiming on the engine NOW, before the failed job is reported.
+		}, SandboxFault: func(engine, jobID, reason string, unswept bool) {
+			// Stop claiming on the engine NOW, before the failed job is reported; an unswept
+			// run also gates the engine's next probes until recovery stops it.
+			if unswept {
+				a.mu.Lock()
+				a.unswept[jobID] = engine
+				a.mu.Unlock()
+			}
 			for _, es := range a.engines {
 				if es.eng.Name == engine {
 					es.markRed("sandbox failure: " + reason)

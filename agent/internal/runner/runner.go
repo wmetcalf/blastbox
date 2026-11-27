@@ -86,7 +86,8 @@ type Runner struct {
 	Logf func(format string, args ...any)
 	// SandboxFault, if set, is called as soon as a run's sandbox fails (before the job is
 	// reported), so the host can stop claiming on that engine at once.
-	SandboxFault func(engine, reason string)
+	// unswept: processes of the run could not be shown gone.
+	SandboxFault func(engine, jobID, reason string, unswept bool)
 
 	// Tunables (zero = production defaults); tests shorten them.
 	MemPoll     time.Duration                 // memory watchdog period (500 ms)
@@ -148,6 +149,9 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	j := &job{r: r, cl: cl, c: c, eng: eng}
 	defer func() { r.logf("job %s: %s %s", c.JobID, res.Outcome, res.Reason) }()
 
+	if c.Run.DeadlineS <= 0 {
+		return j.release(ctx, fmt.Sprintf("run.deadline_s is %d, not positive", c.Run.DeadlineS))
+	}
 	if c.Run.Network != "none" {
 		return j.release(ctx, fmt.Sprintf("run.network is %q, not none", c.Run.Network))
 	}
@@ -254,7 +258,7 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 		n, err := sweep(j.ident)
 		if err != nil {
 			why := "sandbox: escaped processes not shown gone: " + err.Error()
-			res := j.sandboxFault(why, func() Result { return j.fail(ctx, why) })
+			res := j.sandboxFaultU(why, true, func() Result { return j.fail(ctx, why) })
 			// Keep the dir and its run record: recovery retries the kill until the run is gone.
 			res.Keep, res.Unswept = true, true
 			return res
@@ -321,8 +325,12 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 // sandboxFault tells the host at once (so the engine stops claiming before the report, which may
 // take minutes against a struggling control plane), then reports and flags the result.
 func (j *job) sandboxFault(why string, report func() Result) Result {
+	return j.sandboxFaultU(why, false, report)
+}
+
+func (j *job) sandboxFaultU(why string, unswept bool, report func() Result) Result {
 	if f := j.r.SandboxFault; f != nil {
-		f(j.eng.Name, why)
+		f(j.eng.Name, j.c.JobID, why, unswept)
 	}
 	res := report()
 	res.SandboxFailure = true

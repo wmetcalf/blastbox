@@ -816,9 +816,12 @@ func TestSandboxFaultHookMarksEngineRed(t *testing.T) {
 	if !ok || r.SandboxFault == nil {
 		t.Fatal("the production runner has no sandbox-fault hook")
 	}
-	r.SandboxFault(es.eng.Name, "handshake missing")
+	r.SandboxFault(es.eng.Name, "j9", "sweep failed", true)
 	if es.claimable() {
 		t.Fatal("engine still claimable after a sandbox fault")
+	}
+	if ok, why := a.evaluate(context.Background(), es.eng); ok || !strings.Contains(why, "j9") {
+		t.Fatalf("an unswept run reported through the hook does not gate the engine: %v %q", ok, why)
 	}
 }
 

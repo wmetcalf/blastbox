@@ -424,7 +424,7 @@ func TestRunRecordWrittenWhileRunning(t *testing.T) {
 func TestSandboxFaultReportedBeforeTheJobReport(t *testing.T) {
 	f := setup(t, `rm -f "$3/.bb-handshake"; echo '{}' > "$1/metadata.json"`)
 	var beforeReport bool
-	f.r.SandboxFault = func(engine, reason string) {
+	f.r.SandboxFault = func(engine, jobID, reason string, unswept bool) {
 		f.in.mu.Lock()
 		beforeReport = len(f.in.updates) == 0
 		f.in.mu.Unlock()
@@ -469,6 +469,32 @@ func TestStartFailureIsNotReportedAsUnconfined(t *testing.T) {
 	res := f.run()
 	if !strings.Contains(res.Reason, "engine did not run") || strings.Contains(res.Reason, "handshake") {
 		t.Fatalf("%+v", res)
+	}
+}
+
+// An unproven sweep is reported to the host as unswept at once, before the job's report.
+func TestUnsweptReportedBeforeTheJobReport(t *testing.T) {
+	f := setup(t, `echo '{}' > "$1/metadata.json"`)
+	f.r.sweep = func(sandbox.RunIdentity) (int, error) { return 0, fmt.Errorf("still alive") }
+	var early bool
+	f.r.SandboxFault = func(engine, jobID, reason string, unswept bool) {
+		f.in.mu.Lock()
+		early = unswept && jobID == testJob && len(f.in.updates) == 0
+		f.in.mu.Unlock()
+	}
+	if res := f.run(); !res.Unswept || !early {
+		t.Fatalf("%+v early=%v", res, early)
+	}
+}
+
+// A claim without a positive deadline is handed back before anything runs.
+func TestNonPositiveDeadlineIsReleased(t *testing.T) {
+	for _, d := range []int{0, -5} {
+		f := setup(t, happyEngine)
+		f.claim.Run.DeadlineS = d
+		if res := f.run(); res.Outcome != "released" || f.in.inputGets != 0 {
+			t.Fatalf("deadline_s=%d: %+v", d, res)
+		}
 	}
 }
 
