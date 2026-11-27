@@ -6,9 +6,11 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 
 	"github.com/wmetcalf/blastbox/agent/internal/config"
+	"github.com/wmetcalf/blastbox/agent/internal/conformance"
 )
 
 func nsjailHost(t *testing.T) Host {
@@ -19,9 +21,15 @@ func nsjailHost(t *testing.T) Host {
 	if _, err := os.Stat(p); err != nil {
 		t.Skipf("nsjail not installed at %s", p)
 	}
-	h := Host{NsjailPath: p}
-	if _, err := os.Stat("/etc/blastbox/seccomp.policy"); err == nil {
-		h.SeccompPolicy = "/etc/blastbox/seccomp.policy"
+	h := Host{NsjailPath: p, AllowMissingAppArmor: true}
+	for _, pol := range []string{"/etc/blastbox/seccomp.policy", filepath.Join(conformance.Dir(), "..", "..", "deploy", "seccomp", "blastbox.seccomp.policy")} {
+		if _, err := os.Stat(pol); err == nil {
+			h.SeccompPolicy = pol
+			break
+		}
+	}
+	if h.SeccompPolicy == "" {
+		t.Skip("no KAFEL seccomp policy on this host (nsjail host would be insecure)")
 	}
 	// Does a bare jail start here (user namespaces may be blocked)?
 	out, err := exec.Command(p, "--mode", "o", "--quiet", "--really_quiet", "--user", "65534", "--group", "65534",

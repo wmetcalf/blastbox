@@ -37,16 +37,27 @@ type Engine struct {
 	ROPaths      []string `toml:"ro_paths"`
 	Accelerators []string `toml:"accelerators"`
 	Slots        *int     `toml:"slots"`
+	// ProbeArgv optionally replaces the built-in confinement probe. CONTRACT: it must try to read
+	// {canary}, connect to {connect} and create {outside}, and print ONE JSON line to stdout,
+	// {"read":"denied","connect":"denied","write":"denied"}; the agent requires all three to be
+	// "denied". Missing or unparseable output is not OK (exit status alone proves nothing).
 	ProbeArgv    []string `toml:"probe_argv"`
 	SelftestArgv []string `toml:"selftest_argv"` // known-positive self-test, must exit 0
 	MaxRSSMiB    *int     `toml:"max_rss_mib"`
 	EnvParams    *bool    `toml:"env_params"` // forward run.params as env vars (default true)
 }
 
-// Nsjail pins the nsjail binary.
+// Nsjail pins the nsjail binary and the confinement layers around it. Like blastbox's nsjail
+// backend, a host without the seccomp policy or an AppArmor profile is INSECURE and the agent
+// refuses to claim work on it unless the operator explicitly opts out of AppArmor.
 type Nsjail struct {
-	Path   string `toml:"path"`
-	SHA256 string `toml:"sha256"`
+	Path            string `toml:"path"`
+	SHA256          string `toml:"sha256"`
+	SeccompPolicy   string `toml:"seccomp_policy"`   // required: absolute path of an existing KAFEL policy
+	AppArmorProfile string `toml:"apparmor_profile"` // required unless allow_missing_apparmor; the agent proves it attaches
+	// AllowMissingAppArmor accepts a host with no AppArmor profile. The probe result then
+	// records that layer as absent.
+	AllowMissingAppArmor bool `toml:"allow_missing_apparmor"`
 }
 
 // SlotCount returns the effective slot count (default 1).
@@ -148,6 +159,12 @@ func (c *Config) validate(goos string) error {
 	if needNsjail {
 		if c.Nsjail == nil || !filepath.IsAbs(c.Nsjail.Path) || !sha256RE.MatchString(c.Nsjail.SHA256) {
 			return fmt.Errorf("[nsjail] needs an absolute path and a pinned lowercase hex sha256")
+		}
+		if st, err := os.Stat(c.Nsjail.SeccompPolicy); !filepath.IsAbs(c.Nsjail.SeccompPolicy) || err != nil || !st.Mode().IsRegular() {
+			return fmt.Errorf("[nsjail] seccomp_policy %q must be an absolute path of an existing file", c.Nsjail.SeccompPolicy)
+		}
+		if c.Nsjail.AppArmorProfile == "" && !c.Nsjail.AllowMissingAppArmor {
+			return fmt.Errorf("[nsjail] needs apparmor_profile, or allow_missing_apparmor = true to run without it")
 		}
 	}
 	return nil

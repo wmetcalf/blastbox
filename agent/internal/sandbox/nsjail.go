@@ -3,13 +3,13 @@ package sandbox
 import (
 	"os"
 	"strconv"
-	"strings"
 )
 
 // Mount is a bind mount source:target.
 type Mount struct{ Source, Target string }
 
-// NsjailLimits mirrors blastbox Limits; zero values mean the blastbox defaults.
+// NsjailLimits mirrors blastbox Limits; zero values mean the blastbox defaults. NetEgress exists
+// only so the golden vectors can exercise the builder: Command never sets it.
 type NsjailLimits struct {
 	MemoryBytes int64 // default 8 GiB
 	TimeoutS    int64 // default 120
@@ -67,16 +67,6 @@ func DetectHostPins() HostPins {
 		p.AAExec = "/usr/bin/aa-exec"
 	}
 	return p
-}
-
-// AppArmorEnforcing reports whether the child profile is loaded in enforce mode right now.
-// Unreadable securityfs means "not confirmed" (fail to the less-hardened-but-working argv).
-func AppArmorEnforcing(profile string) bool {
-	raw, err := os.ReadFile("/sys/kernel/security/apparmor/profiles")
-	if err != nil {
-		return false
-	}
-	return strings.Contains(string(raw), profile+" (enforce)")
 }
 
 // BuildNsjailArgv is a port of NsjailSandbox._build_argv. pins carries the host probes.

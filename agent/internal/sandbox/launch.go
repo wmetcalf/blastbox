@@ -30,7 +30,6 @@ type Limits struct {
 	NoFile     uint64
 	NProc      uint64
 	TimeoutS   int64
-	NetEgress  bool // nsjail only; seatbelt always denies
 }
 
 var reservedEnv = map[string]bool{"HOME": true, "CFFIXED_USER_HOME": true, "TMPDIR": true, "PATH": true, "LANG": true}
@@ -151,9 +150,12 @@ func Command(ctx context.Context, sb Kind, req Request, argv []string, lim Limit
 		nreq := NsjailRequest{
 			Argv: shimArgv(req.Nonce, marker, argv),
 			Env:  env,
-			Limits: NsjailLimits{TimeoutS: lim.TimeoutS, NetEgress: lim.NetEgress,
-				MemoryBytes: 0, TmpfsBytes: 0},
-			AttachAppArmor: pins.AAExec != "" && AppArmorEnforcing(pins.AppArmorProfile),
+			// Never egress: Command cannot produce --disable_clone_newnet.
+			Limits:         NsjailLimits{TimeoutS: lim.TimeoutS},
+			AttachAppArmor: req.AttachAppArmor,
+		}
+		if req.AppArmorProfile != "" {
+			pins.AppArmorProfile = req.AppArmorProfile
 		}
 		nreq.EnvOrder = []string{"HOME", "TMPDIR", "LANG"}
 		// Engine and probe binaries outside /usr must be visible in the jail; mounting the

@@ -30,19 +30,80 @@ type ProbeResult struct {
 
 // Host carries the host-level inputs the proofs need.
 type Host struct {
-	AgentBin      string // blastbox-agent binary; "" = os.Executable()
-	NsjailPath    string // linux
-	SeccompPolicy string // "" = none
-	ScratchBase   string // "" = os.TempDir()
-	Timeout       time.Duration
+	AgentBin             string // blastbox-agent binary; "" = os.Executable()
+	NsjailPath           string // linux
+	SeccompPolicy        string // required for nsjail; "" or missing = insecure
+	AppArmorProfile      string // nsjail: operator-declared profile; proven by an aa-exec probe
+	AllowMissingAppArmor bool   // operator accepts a host with no usable AppArmor profile
+	ScratchBase          string // "" = os.TempDir()
+	Timeout              time.Duration
+
+	build func(context.Context, Kind, Request, []string, Limits) (*exec.Cmd, error) // test seam; nil = Command
 }
 
 // DefaultHost is used by the package-level Probe and SelfTest.
 var DefaultHost = Host{NsjailPath: "/usr/local/bin/nsjail"}
 
+// HostFromConfig builds the Host for a loaded config (nsjail layers come from [nsjail]).
+func HostFromConfig(c *config.Config) Host {
+	h := Host{}
+	if c.Nsjail != nil {
+		h.NsjailPath, h.SeccompPolicy = c.Nsjail.Path, c.Nsjail.SeccompPolicy
+		h.AppArmorProfile, h.AllowMissingAppArmor = c.Nsjail.AppArmorProfile, c.Nsjail.AllowMissingAppArmor
+	}
+	return h
+}
+
 func Probe(ctx context.Context, eng config.Engine) ProbeResult { return DefaultHost.Probe(ctx, eng) }
 func SelfTest(ctx context.Context, eng config.Engine) ProbeResult {
 	return DefaultHost.SelfTest(ctx, eng)
+}
+
+// apparmorAttaches reports whether the declared profile can be attached on this host. securityfs
+// is root-only, so (like blastbox's apparmor.py for a non-root worker) the profile is the
+// operator's declaration and is PROVEN by running `aa-exec -p <profile> -- /usr/bin/true`: an
+// unloaded profile makes aa-exec fail, whatever the reason.
+func (h Host) apparmorAttaches() (bool, string) {
+	if h.AppArmorProfile == "" {
+		return false, "no apparmor_profile configured"
+	}
+	aa := DetectHostPins().AAExec
+	if aa == "" {
+		return false, "aa-exec not found"
+	}
+	true_ := "/usr/bin/true"
+	if _, err := os.Stat(true_); err != nil {
+		true_ = "/bin/true"
+	}
+	if out, err := exec.Command(aa, "-p", h.AppArmorProfile, "--", true_).CombinedOutput(); err != nil {
+		return false, fmt.Sprintf("aa-exec -p %s failed: %v: %s", h.AppArmorProfile, err, strings.TrimSpace(string(out)))
+	}
+	return true, ""
+}
+
+// InsecurityReasons lists why the nsjail backend would run with a missing layer, mirroring
+// nsjail.py: "seccomp_policy_missing" and "apparmor_missing" (the latter waived only by an
+// explicit allow_missing_apparmor). Probe and SelfTest refuse while any reason is present.
+func (h Host) InsecurityReasons() []string {
+	var reasons []string
+	if st, err := os.Stat(h.SeccompPolicy); h.SeccompPolicy == "" || err != nil || !st.Mode().IsRegular() {
+		reasons = append(reasons, "seccomp_policy_missing")
+	}
+	if ok, _ := h.apparmorAttaches(); !ok && !h.AllowMissingAppArmor {
+		reasons = append(reasons, "apparmor_missing")
+	}
+	return reasons
+}
+
+func (h Host) layers(kind Kind) string {
+	if kind != Nsjail {
+		return "seatbelt"
+	}
+	l := "nsjail+seccomp"
+	if ok, _ := h.apparmorAttaches(); ok {
+		return l + "+apparmor(" + h.AppArmorProfile + ")"
+	}
+	return l + " (apparmor ABSENT, allowed by operator)"
 }
 
 // RunProbe is `blastbox-agent __probe --read F --connect HOST:PORT --write P`. It attempts all
@@ -142,6 +203,7 @@ func (h Host) request(eng config.Engine, scratch, argv0 string) (Request, error)
 		Scratch: scratch, Canary: "bb.canary." + hex.EncodeToString(nonce[:8]),
 		Nonce: hex.EncodeToString(nonce), AgentBin: agent,
 		NsjailPath: h.NsjailPath, SeccompPolicy: h.SeccompPolicy,
+		AppArmorProfile: h.AppArmorProfile,
 	}, nil
 }
 
@@ -156,15 +218,26 @@ func handshakeOK(scratch, nonce string) bool {
 	return err == nil && string(b) == nonce
 }
 
-// runUnder runs argv under eng's sandbox in a fresh scratch; returns (exit, stdout, handshake).
-func (h Host) runUnder(ctx context.Context, eng config.Engine, scratch string, argv []string) (int, []byte, bool, error) {
+type runResult struct {
+	code      int
+	stdout    []byte
+	stderr    []byte
+	handshake bool
+	layers    string
+}
+
+// runUnder runs argv under eng's sandbox in a fresh scratch.
+func (h Host) runUnder(ctx context.Context, eng config.Engine, scratch string, argv []string) (runResult, error) {
 	kind, err := kindFor(eng)
 	if err != nil {
-		return 0, nil, false, err
+		return runResult{}, err
 	}
 	req, err := h.request(eng, scratch, argv[0])
 	if err != nil {
-		return 0, nil, false, err
+		return runResult{}, err
+	}
+	if kind == Nsjail {
+		req.AttachAppArmor, _ = h.apparmorAttaches()
 	}
 	to := h.Timeout
 	if to == 0 {
@@ -172,9 +245,13 @@ func (h Host) runUnder(ctx context.Context, eng config.Engine, scratch string, a
 	}
 	ctx, cancel := context.WithTimeout(ctx, to)
 	defer cancel()
-	cmd, err := Command(ctx, kind, req, argv, Limits{TimeoutS: int64(to / time.Second)})
+	build := h.build
+	if build == nil {
+		build = Command
+	}
+	cmd, err := build(ctx, kind, req, argv, Limits{TimeoutS: int64(to / time.Second)})
 	if err != nil {
-		return 0, nil, false, err
+		return runResult{}, err
 	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -183,12 +260,31 @@ func (h Host) runUnder(ctx context.Context, eng config.Engine, scratch string, a
 	if runErr != nil {
 		var ee *exec.ExitError
 		if !errors.As(runErr, &ee) {
-			return 0, nil, false, runErr
+			return runResult{}, runErr
 		}
 		code = ee.ExitCode()
 	}
-	hs := handshakeOK(scratch, req.Nonce)
-	return code, append(stdout.Bytes(), stderr.Bytes()...), hs, nil
+	return runResult{code, stdout.Bytes(), stderr.Bytes(), handshakeOK(scratch, req.Nonce), h.layers(kind)}, nil
+}
+
+// parseVerdict enforces the probe output contract: the last non-empty stdout line is a JSON
+// object whose "read", "connect" and "write" are all "denied".
+func parseVerdict(stdout []byte) error {
+	lines := strings.Split(strings.TrimSpace(string(stdout)), "\n")
+	last := strings.TrimSpace(lines[len(lines)-1])
+	if last == "" {
+		return errors.New("probe printed no verdict")
+	}
+	var v map[string]any
+	if err := json.Unmarshal([]byte(last), &v); err != nil {
+		return fmt.Errorf("probe verdict is not JSON: %v", err)
+	}
+	for _, k := range []string{"read", "connect", "write"} {
+		if s, ok := v[k].(string); !ok || s != "denied" {
+			return fmt.Errorf("probe verdict %q = %v, want \"denied\"", k, v[k])
+		}
+	}
+	return nil
 }
 
 func fail(format string, a ...any) ProbeResult {
@@ -243,6 +339,10 @@ func (h Host) Probe(ctx context.Context, eng config.Engine) ProbeResult {
 		}
 	}()
 
+	kind, kerr := kindFor(eng)
+	if kerr != nil {
+		return fail("%v", kerr)
+	}
 	var argv []string
 	if len(eng.ProbeArgv) > 0 {
 		repl := strings.NewReplacer("{canary}", canary, "{connect}", ln.Addr().String(), "{outside}", outside)
@@ -256,18 +356,31 @@ func (h Host) Probe(ctx context.Context, eng config.Engine) ProbeResult {
 		}
 		argv = []string{agent, "__probe", "--read", canary, "--connect", ln.Addr().String(), "--write", outside}
 	}
-	code, out, hs, err := h.runUnder(ctx, eng, scratch, argv)
+	if kind == Nsjail {
+		if reasons := h.InsecurityReasons(); len(reasons) > 0 {
+			return fail("insecure nsjail host: %s", strings.Join(reasons, ", "))
+		}
+	}
+	for _, ro := range eng.ROPaths {
+		if r, err := filepath.EvalSymlinks(ro); err == nil && (isRelativeTo(canary, r) || isRelativeTo(outside, r)) {
+			return fail("probe paths lie under the engine's ro_paths %s", r)
+		}
+	}
+	rr, err := h.runUnder(ctx, eng, scratch, argv)
 	if err != nil {
 		return fail("probe did not run: %v", err)
 	}
 	time.Sleep(50 * time.Millisecond) // let a stray accept land
 	switch {
-	case !hs:
-		return fail("no handshake nonce: the run was not confined (exit %d)", code)
-	case code != 0:
-		return fail("probe exit %d (something was not denied): %s", code, strings.TrimSpace(string(out)))
+	case !rr.handshake:
+		return fail("no handshake nonce: the run was not confined (exit %d)", rr.code)
 	case conns.Load() != 0:
 		return fail("loopback listener received %d connection(s)", conns.Load())
+	case rr.code != 0:
+		return fail("probe exit %d (something was not denied): %s", rr.code, strings.TrimSpace(string(rr.stdout)+string(rr.stderr)))
+	}
+	if err := parseVerdict(rr.stdout); err != nil {
+		return fail("%v", err)
 	}
 	if _, err := os.Lstat(outside); err == nil {
 		return fail("outside path was created")
@@ -275,7 +388,7 @@ func (h Host) Probe(ctx context.Context, eng config.Engine) ProbeResult {
 	if b, _ := os.ReadFile(canary); string(b) != "canary" {
 		return fail("canary was modified")
 	}
-	return ProbeResult{OK: true, Reason: "denied: read, connect, write", At: time.Now()}
+	return ProbeResult{OK: true, Reason: "denied: read, connect, write; layers: " + rr.layers, At: time.Now()}
 }
 
 // SelfTest runs the engine's known-positive selftest_argv under the same sandbox: it must exit
@@ -289,15 +402,22 @@ func (h Host) SelfTest(ctx context.Context, eng config.Engine) ProbeResult {
 		return fail("scratch: %v", err)
 	}
 	defer os.RemoveAll(scratch)
-	code, out, hs, err := h.runUnder(ctx, eng, scratch, eng.SelftestArgv)
+	if kind, err := kindFor(eng); err != nil {
+		return fail("%v", err)
+	} else if kind == Nsjail {
+		if reasons := h.InsecurityReasons(); len(reasons) > 0 {
+			return fail("insecure nsjail host: %s", strings.Join(reasons, ", "))
+		}
+	}
+	rr, err := h.runUnder(ctx, eng, scratch, eng.SelftestArgv)
 	if err != nil {
 		return fail("selftest did not run: %v", err)
 	}
 	switch {
-	case !hs:
-		return fail("no handshake nonce: the run was not confined (exit %d)", code)
-	case code != 0:
-		return fail("selftest exit %d: %s", code, strings.TrimSpace(string(out)))
+	case !rr.handshake:
+		return fail("no handshake nonce: the run was not confined (exit %d)", rr.code)
+	case rr.code != 0:
+		return fail("selftest exit %d: %s", rr.code, strings.TrimSpace(string(rr.stdout)+string(rr.stderr)))
 	}
-	return ProbeResult{OK: true, Reason: "selftest passed", At: time.Now()}
+	return ProbeResult{OK: true, Reason: "selftest passed; layers: " + rr.layers, At: time.Now()}
 }

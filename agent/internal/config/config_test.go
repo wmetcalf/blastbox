@@ -74,7 +74,7 @@ selftest_argv = ["/opt/wt/bin/scan", "self-test"]
 		t.Fatalf("defaults wrong: %+v", e)
 	}
 	// nsjail on linux with a pinned binary
-	p = write(t, f, f.toml(eng(`sandbox = "nsjail"`+"\n"), "[nsjail]\npath = \"/usr/local/bin/nsjail\"\nsha256 = \""+strings.Repeat("a", 64)+"\"\n"))
+	p = write(t, f, f.toml(eng(`sandbox = "nsjail"`+"\n"), "[nsjail]\npath = \"/usr/local/bin/nsjail\"\nsha256 = \""+strings.Repeat("a", 64)+"\"\nseccomp_policy = \"/etc/passwd\"\nallow_missing_apparmor = true\n"))
 	if _, err := load(p, "linux"); err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ selftest_argv = ["/opt/wt/bin/scan", "self-test"]
 
 func TestLoadRefusals(t *testing.T) {
 	good := `sandbox = "nsjail"` + "\n"
-	nsj := "[nsjail]\npath = \"/usr/local/bin/nsjail\"\nsha256 = \"" + strings.Repeat("b", 64) + "\"\n"
+	nsj := "[nsjail]\npath = \"/usr/local/bin/nsjail\"\nsha256 = \"" + strings.Repeat("b", 64) + "\"\nseccomp_policy = \"/etc/passwd\"\nallow_missing_apparmor = true\n"
 	cases := []struct {
 		name  string
 		goos  string
@@ -137,8 +137,14 @@ func TestLoadRefusals(t *testing.T) {
 		{"nsjail on darwin", "darwin", func(f fixture) string { return f.toml(eng(good), nsj) }, "linux"},
 		{"nsjail unpinned", "linux", func(f fixture) string { return f.toml(eng(good), "") }, "nsjail"},
 		{"nsjail bad sha", "linux", func(f fixture) string {
-			return f.toml(eng(good), "[nsjail]\npath = \"/x/nsjail\"\nsha256 = \"abc\"\n")
+			return f.toml(eng(good), "[nsjail]\npath = \"/x/nsjail\"\nsha256 = \"abc\"\n"+"seccomp_policy = \"/etc/passwd\"\nallow_missing_apparmor = true\n")
 		}, "sha256"},
+		{"nsjail no seccomp", "linux", func(f fixture) string {
+			return f.toml(eng(good), strings.Replace(nsj, "seccomp_policy = \"/etc/passwd\"", "seccomp_policy = \"/nonexistent/policy\"", 1))
+		}, "seccomp_policy"},
+		{"nsjail no apparmor", "linux", func(f fixture) string {
+			return f.toml(eng(good), strings.Replace(nsj, "allow_missing_apparmor = true", "", 1))
+		}, "apparmor_profile"},
 		{"slots 0", "linux", func(f fixture) string { return f.toml(eng(good+"slots = 0\n"), nsj) }, "slots"},
 		{"slots 17", "linux", func(f fixture) string { return f.toml(eng(good+"slots = 17\n"), nsj) }, "slots"},
 		{"argv relative", "linux", func(f fixture) string {

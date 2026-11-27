@@ -67,6 +67,10 @@ type Request struct {
 	NsjailPath    string
 	SeccompPolicy string
 	Pins          *HostPins // nil = DetectHostPins()
+	// AppArmorProfile and AttachAppArmor: nsjail only. Attach only when the host proved the
+	// profile attaches (Host does); otherwise the layer is absent and reported as such.
+	AppArmorProfile string
+	AttachAppArmor  bool
 }
 
 // BuildSeatbeltProfile is an exact port of seatbelt.build_profile.
