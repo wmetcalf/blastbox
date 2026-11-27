@@ -38,6 +38,16 @@ POISON_REASON = "finalisation failed repeatedly"
 RETAINED_REASON = "result upload failed; tree retained"
 ATTEMPTS_NAME = ".attempts"
 MAX_ATTEMPTS = 5
+# Failed attempts are SPACED: retry n waits min(BACKOFF_MAX_S, BACKOFF_BASE_S * 2**(n-1)).
+# The sweep runs every second, so without this five failures of a DB or blob-store blip
+# (seconds) would poison and destroy a perfectly good quarantined result. With it the
+# poison verdict needs failures across ~15 minutes.
+BACKOFF_BASE_S = 60.0
+BACKOFF_MAX_S = 900.0
+
+
+def _now() -> float:
+    return time.time()
 STALE_NO_OUTCOME_S = 24 * 3600.0
 
 
@@ -124,6 +134,8 @@ class NodeFinalizer:
             marker = nr.read_marker(d)
             if marker is None or marker.job_id != d.parent.name:
                 return False
+            if self._backing_off(d):
+                return False
             try:
                 status, reason = self._decide(d, marker)
             except Exception:  # noqa: BLE001
@@ -138,6 +150,10 @@ class NodeFinalizer:
                 job = self._store.get(marker.job_id)
                 if job is not None and job.claim_id == marker.claim_id:
                     self._dispatcher._fail_job(job, POISON_REASON)
+                    # an earlier attempt may already have staged the tree under job_root
+                    staged = self._output_dir(marker.job_id)
+                    if staged.is_dir():
+                        self._discard_staged(job, staged)
                 shutil.rmtree(d / nr.OUT, ignore_errors=True)
             nr.write_outcome(d, status, reason)
             _log.info("node-finalizer: job %s claim %s -> %s%s", marker.job_id,
@@ -147,15 +163,27 @@ class NodeFinalizer:
             os.close(fd)                        # releases the flock
 
     @staticmethod
-    def _bump_attempts(d: Path) -> int:
-        f = d / ATTEMPTS_NAME
+    def _read_attempts(d: Path) -> tuple[int, float]:
+        """(failed attempts so far, wall time of the last one); a bare count reads as 0.0."""
         try:
-            n = int(f.read_text().strip() or "0")
+            parts = (d / ATTEMPTS_NAME).read_text().split()
+            n = int(parts[0]) if parts else 0
+            last = float(parts[1]) if len(parts) > 1 else 0.0
         except (OSError, ValueError):
-            n = 0
-        n += 1
+            return 0, 0.0
+        return max(0, n), last
+
+    def _backing_off(self, d: Path) -> bool:
+        n, last = self._read_attempts(d)
+        if n <= 0:
+            return False
+        wait = min(BACKOFF_MAX_S, BACKOFF_BASE_S * (2 ** (n - 1)))
+        return 0.0 <= _now() - last < wait
+
+    def _bump_attempts(self, d: Path) -> int:
+        n = self._read_attempts(d)[0] + 1
         try:
-            f.write_text(str(n))
+            (d / ATTEMPTS_NAME).write_text(f"{n} {_now()}")
         except OSError:
             _log.warning("node-finalizer: cannot persist the attempt counter in %s", d)
         return n

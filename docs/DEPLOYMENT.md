@@ -923,8 +923,10 @@ blastbox node-finalizer [--once] [--interval 1.0] [--no-receipts]
   and the finalizer runs the dispatcher's pending-upload retry sweep every loop (no dispatcher
   need run); a later successful upload repairs the row to DONE. `BLASTBOX_PENDING_UPLOAD_RETRY=0`
   is not honoured by the finalizer.
-* **Poison trees.** A tree whose finalisation raises an unexpected error is retried; after 5
-  attempts the job is failed (`finalisation failed repeatedly`) and the outcome recorded.
+* **Poison trees.** A tree whose finalisation raises an unexpected error is retried with backoff
+  (60 s doubling, capped at 15 min, so a store blip of seconds never counts five times); after 5
+  spaced attempts the job is failed (`finalisation failed repeatedly`), its staged tree removed,
+  and the outcome recorded.
 * **Set `BLASTBOX_NODE_CLAIM_RECLAIM_AFTER_S`** on the ingress. Without it a claim whose node
   never uploads is never reclaimed; the finalizer logs an ERROR at startup when it is unset.
 * Receipts it signs carry `worker_tier: node-agent`, plus `node_id` and `node_cert_sha256` of

@@ -336,7 +336,24 @@ def test_claim_lost_during_finalise_discards_nothing_on_a_live_owner(tmp_path, m
     assert (tmp_path / "jobs" / "job-1" / "output").exists()
 
 
-def test_poison_tree_is_failed_after_five_attempts(tmp_path, monkeypatch):
+class _Clock:
+    def __init__(self):
+        self.t = time.time()
+
+    def __call__(self):
+        return self.t
+
+
+def _clock(monkeypatch):
+    from blastbox.host import node_finalizer as nf
+
+    c = _Clock()
+    monkeypatch.setattr(nf, "_now", c)
+    return c
+
+
+def test_poison_tree_is_failed_after_five_spaced_attempts(tmp_path, monkeypatch):
+    clock = _clock(monkeypatch)
     store, job, fin, _ = build(tmp_path)
     d = spool(tmp_path, job)
 
@@ -348,10 +365,39 @@ def test_poison_tree_is_failed_after_five_attempts(tmp_path, monkeypatch):
         assert fin.run_once() == 0
         assert nr.read_outcome(d) is None
         assert store.get("job-1").status == JobStatus.RUNNING
+        clock.t += 3600
     assert fin.run_once() == 1
     assert nr.read_outcome(d) == {"status": "failed", "reason": "finalisation failed repeatedly"}
     j = store.get("job-1")
     assert j.status == JobStatus.FAILED and "repeatedly" in (j.error or "")
+    # the staged copy under job_root is spent too: nothing is left to leak
+    assert not (tmp_path / "jobs" / "job-1" / "output").exists()
+
+
+def test_a_short_outage_does_not_burn_the_poison_cap(tmp_path, monkeypatch):
+    """The sweep runs every second; five failures inside a few seconds (a DB blip) must not
+    destroy a quarantined result. Attempts back off, so only spaced failures count."""
+    clock = _clock(monkeypatch)
+    store, job, fin, _ = build(tmp_path)
+    d = spool(tmp_path, job)
+    real = fin._dispatcher.finalise_output
+    down = {"on": True}
+
+    def blip(*a, **k):
+        if down["on"]:
+            raise RuntimeError("store unavailable")
+        return real(*a, **k)
+
+    monkeypatch.setattr(fin._dispatcher, "finalise_output", blip)
+    for _ in range(20):
+        fin.run_once()
+        clock.t += 1.0
+    assert nr.read_outcome(d) is None
+    assert store.get("job-1").status == JobStatus.RUNNING
+    down["on"] = False
+    clock.t += 3600
+    assert fin.run_once() == 1
+    assert store.get("job-1").status == JobStatus.DONE
 
 
 def test_transient_error_under_the_cap_then_succeeds(tmp_path, monkeypatch):
@@ -367,7 +413,12 @@ def test_transient_error_under_the_cap_then_succeeds(tmp_path, monkeypatch):
         return real(*a, **k)
 
     monkeypatch.setattr(fin._dispatcher, "finalise_output", flaky)
-    assert [fin.run_once() for _ in range(3)] == [0, 0, 1]
+    clock = _clock(monkeypatch)
+    got = []
+    for _ in range(3):
+        got.append(fin.run_once())
+        clock.t += 3600
+    assert got == [0, 0, 1]
     assert store.get("job-1").status == JobStatus.DONE
 
 
