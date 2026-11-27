@@ -43,6 +43,9 @@ type Result struct {
 	// Keep: the terminal report (fail, release or the result upload) was never answered, so
 	// the job dir is kept, intact, for crash recovery to retry; it is not wiped.
 	Keep bool
+	// Unswept: processes of this (seatbelt) run could not be shown gone; recovery keeps trying
+	// to stop them, and the engine must not claim until it has.
+	Unswept bool
 }
 
 // Files a job dir may hold besides in/ out/ scratch/ (crash recovery reads them).
@@ -94,6 +97,7 @@ type Runner struct {
 	rss         func(pgid int) (int64, error) // test seam; nil = groupRSSKiB (plus the run's escapees)
 	build       func(context.Context, sandbox.Kind, sandbox.Request, []string, sandbox.Limits) (*exec.Cmd, error)
 	hostPins    *sandbox.HostPins
+	sweep       func(sandbox.RunIdentity) (int, error) // test seam; nil = sandbox.SweepRun
 	skipAAProbe bool
 }
 
@@ -233,25 +237,26 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	}
 	j.start = time.Now()
 	killed, runErr := j.exec(runCtx, cmd, capw)
-	if errors.Is(runErr, exec.ErrWaitDelay) && cmd.ProcessState != nil {
-		// The engine exited, but something it left held its stdout/stderr open past WaitDelay.
-		// Judge the run by the engine's own exit status; the leftover is killed with the group
-		// (and swept below).
+	if errors.Is(runErr, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.Success() {
+		// The engine exited 0, but something it left held its stdout/stderr open past WaitDelay
+		// (Wait reports that only for a successful exit). The leftover is killed with the group
+		// and swept below; the run is judged by the engine's own status.
 		runErr = nil
-		if !cmd.ProcessState.Success() {
-			runErr = &exec.ExitError{ProcessState: cmd.ProcessState}
-		}
 	}
 	// A seatbelt child that setsid()s leaves the process group, so the group kill above cannot
 	// reach it: find the run's processes by their sandbox and kill them BEFORE anything reads
 	// the output (a survivor could still be rewriting it) and whatever the run's outcome.
 	if j.ident.Canary != "" {
-		n, err := sandbox.SweepRun(j.ident)
+		sweep := r.sweep
+		if sweep == nil {
+			sweep = sandbox.SweepRun
+		}
+		n, err := sweep(j.ident)
 		if err != nil {
 			why := "sandbox: escaped processes not shown gone: " + err.Error()
 			res := j.sandboxFault(why, func() Result { return j.fail(ctx, why) })
 			// Keep the dir and its run record: recovery retries the kill until the run is gone.
-			res.Keep = true
+			res.Keep, res.Unswept = true, true
 			return res
 		}
 		if n > 0 {
@@ -264,13 +269,19 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	if capw != nil && capw.overflowed() {
 		return j.fail(ctx, "envelope over max_metadata")
 	}
+	var ee *exec.ExitError
+	if runErr != nil && killed == "" && !errors.As(runErr, &ee) {
+		// Nothing ran (the sandbox binary could not be started, the run record could not be
+		// written): say so, rather than "not confined".
+		why := "engine did not run: " + runErr.Error()
+		return j.sandboxFault(why, func() Result { return j.fail(ctx, why) })
+	}
 	if !handshakeOK(j.scr, nonce) {
 		why := "sandbox handshake missing: the run was not confined"
 		return j.sandboxFault(why, func() Result { return j.fail(ctx, why) })
 	}
 	if runErr != nil {
 		r.logf("job %s: engine stderr tail: %q", c.JobID, tail.String())
-		var ee *exec.ExitError
 		if errors.As(runErr, &ee) {
 			if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
 				return j.fail(ctx, "engine killed by signal "+ws.Signal().String())

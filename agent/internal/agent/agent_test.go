@@ -822,6 +822,44 @@ func TestSandboxFaultHookMarksEngineRed(t *testing.T) {
 	}
 }
 
+// While processes of an earlier run are not shown gone, the engine stays unclaimable even if a
+// fresh probe passes; once recovery stops them, claiming resumes.
+func TestUnsweptRunKeepsEngineRed(t *testing.T) {
+	e := fresh(t)
+	e.in.onClaim = func(n int) (int, string) {
+		if n == 1 {
+			return 200, claimBody("ju2")
+		}
+		return 204, ""
+	}
+	h := newHarness(e)
+	var mu sync.Mutex
+	stuck := true
+	h.a.KillRunFn = func(sandbox.RunRecord) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if stuck {
+			return fmt.Errorf("still alive")
+		}
+		return nil
+	}
+	h.a.Runner = fakeRunner{fn: func(context.Context, *wire.Claim) runner.Result {
+		d := jobDir(e, "ju2", true, true)
+		os.WriteFile(filepath.Join(d, runner.RunRecordName), []byte(`{"pid":0}`), 0o600)
+		return runner.Result{Outcome: "failed", SandboxFailure: true, Keep: true, Unswept: true}
+	}}
+	h.start(t)
+	eventually(t, "first claim", func() bool { return e.in.claimCount() >= 1 })
+	time.Sleep(200 * time.Millisecond) // probes pass, recovery retries
+	if n := e.in.claimCount(); n != 1 {
+		t.Fatalf("claimed %d times while an earlier run's processes were not shown gone", n)
+	}
+	mu.Lock()
+	stuck = false
+	mu.Unlock()
+	eventually(t, "claims resume after recovery stops the run", func() bool { return e.in.claimCount() > 1 })
+}
+
 func TestRefusedJobGoesToRecovery(t *testing.T) {
 	e := fresh(t)
 	e.in.onClaim = func(n int) (int, string) {

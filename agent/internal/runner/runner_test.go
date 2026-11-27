@@ -446,6 +446,32 @@ func TestLingeringChildIsNotASandboxFault(t *testing.T) {
 	}
 }
 
+// A sweep that cannot show a seatbelt run's escapees gone: the job is failed as a sandbox
+// fault, and the dir (with its run record) is kept for recovery, flagged unswept.
+func TestUnprovenSweepKeepsTheRunRecord(t *testing.T) {
+	f := setup(t, `echo '{}' > "$1/metadata.json"`)
+	f.r.sweep = func(sandbox.RunIdentity) (int, error) { return 0, fmt.Errorf("process 42 still alive") }
+	res := f.run()
+	if !res.SandboxFailure || !res.Keep || !res.Unswept {
+		t.Fatalf("%+v", res)
+	}
+	if _, err := os.Lstat(filepath.Join(f.state, "jobs", testJob, RunRecordName)); err != nil {
+		t.Fatalf("run record gone: %v", err)
+	}
+}
+
+// A run that never started is reported as such, not as an unconfined run.
+func TestStartFailureIsNotReportedAsUnconfined(t *testing.T) {
+	f := setup(t, happyEngine)
+	f.r.build = func(ctx context.Context, _ sandbox.Kind, req sandbox.Request, argv []string, _ sandbox.Limits) (*exec.Cmd, error) {
+		return exec.CommandContext(ctx, "/nonexistent/sandbox-exec"), nil
+	}
+	res := f.run()
+	if !strings.Contains(res.Reason, "engine did not run") || strings.Contains(res.Reason, "handshake") {
+		t.Fatalf("%+v", res)
+	}
+}
+
 func TestEnvelopeModeKeepsBytesVerbatim(t *testing.T) {
 	// No declared artifacts: the engine's bytes (odd spacing and key order) go through untouched.
 	f := setup(t, `printf '{ "schema" : "wtqrk",  "b":1, "a":2 }\n'`)

@@ -93,6 +93,7 @@ func (a *Agent) recoverID(ctx context.Context, jobs, id string) (done bool) {
 	if _, err := os.Lstat(dir); err != nil || a.recoverOne(ctx, dir, id) {
 		a.mu.Lock()
 		delete(a.recSet, id)
+		delete(a.unswept, id)
 		a.mu.Unlock()
 		return true
 	}
@@ -134,13 +135,17 @@ func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool)
 		if raw, err := os.ReadFile(filepath.Join(dir, runner.RunRecordName)); err == nil {
 			var rec sandbox.RunRecord
 			if json.Unmarshal(raw, &rec) == nil {
-				if err := sandbox.KillRun(rec); err != nil {
+				if err := a.KillRunFn(rec); err != nil {
 					a.Log.Warn("recovery: the previous run could not be shown stopped; will retry", "job", name, "err", err.Error())
 					return false
 				}
+
 			}
 		}
 	}
+	a.mu.Lock()
+	delete(a.unswept, name) // stopped, or nothing recorded that could be stopped
+	a.mu.Unlock()
 	raw, err := os.ReadFile(filepath.Join(dir, "claim.json"))
 	var cj struct {
 		JobID   string `json:"job_id"`

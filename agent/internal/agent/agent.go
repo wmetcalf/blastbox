@@ -50,6 +50,7 @@ type Agent struct {
 	Runner  JobRunner
 	Log     *slog.Logger
 
+	KillRunFn  func(sandbox.RunRecord) error // recovery's kill of a left-behind run; default sandbox.KillRun
 	ProbeFn    func(context.Context, config.Engine) sandbox.ProbeResult
 	SelfTestFn func(context.Context, config.Engine) sandbox.ProbeResult
 	InsecureFn func() []string
@@ -71,6 +72,7 @@ type Agent struct {
 	inflight  map[string]wire.HeartbeatJob
 	recSet    map[string]bool // job ids left on disk by a previous run (and runner-refused ids)
 	idLocks   map[string]*idLock
+	unswept   map[string]string // job id -> engine: a run whose processes are not shown gone
 	maxDeadln time.Time
 
 	engines []*engState
@@ -106,11 +108,13 @@ func (e *engState) claimable() bool { e.mu.Lock(); defer e.mu.Unlock(); return e
 // New builds an Agent with production defaults. It touches neither the network nor the disk.
 func New(cfg *config.Config) *Agent {
 	a := &Agent{Cfg: cfg, Version: Version, Host: sandbox.HostFromConfig(cfg), hbReady: make(chan struct{}),
-		inflight: map[string]wire.HeartbeatJob{}, recSet: map[string]bool{}, idLocks: map[string]*idLock{}}
+		inflight: map[string]wire.HeartbeatJob{}, recSet: map[string]bool{}, idLocks: map[string]*idLock{},
+		unswept: map[string]string{}}
 	a.Log = slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	a.ProbeFn = func(ctx context.Context, e config.Engine) sandbox.ProbeResult { return a.Host.Probe(ctx, e) }
 	a.SelfTestFn = func(ctx context.Context, e config.Engine) sandbox.ProbeResult { return a.Host.SelfTest(ctx, e) }
 	a.InsecureFn = a.Host.InsecurityReasons
+	a.KillRunFn = sandbox.KillRun
 	a.Now = time.Now
 	a.Sleep = realSleep
 	a.Rand = rand.Float64
@@ -189,6 +193,14 @@ func (a *Agent) probeEngine(ctx context.Context, es *engState, wait bool) {
 }
 
 func (a *Agent) evaluate(ctx context.Context, eng config.Engine) (bool, string) {
+	a.mu.Lock()
+	for id, name := range a.unswept {
+		if name == eng.Name {
+			a.mu.Unlock()
+			return false, "processes of an earlier run (job " + id + ") are not shown gone; recovery is retrying"
+		}
+	}
+	a.mu.Unlock()
 	if eng.Sandbox == "nsjail" {
 		if err := a.checkNsjailPin(); err != nil {
 			return false, err.Error()
@@ -630,8 +642,10 @@ func (a *Agent) runClaim(ctx, jobsCtx context.Context, es *engState, c *wire.Cla
 	if live, dup := a.inflight[c.JobID]; dup {
 		a.mu.Unlock()
 		if live.ClaimID == c.ClaimID {
-			// The same claim handed over again: it is the live run's own; nothing to do.
+			// The same claim handed over again: it is the live run's own; nothing to do (but do
+			// not spin on the claim route).
 			a.Log.Warn("claim re-delivered for a job running here; ignored", "job", c.JobID)
+			a.Sleep(ctx, idleDelay)
 			return
 		}
 		// The control plane re-issued a job this node is still running (its earlier claim was
@@ -663,6 +677,11 @@ func (a *Agent) runClaim(ctx, jobsCtx context.Context, es *engState, c *wire.Cla
 	delete(a.inflight, c.JobID)
 	a.mu.Unlock()
 	a.Log.Info("job finished", "job", c.JobID, "engine", es.eng.Name, "outcome", res.Outcome)
+	if res.Unswept {
+		a.mu.Lock()
+		a.unswept[c.JobID] = es.eng.Name
+		a.mu.Unlock()
+	}
 	switch {
 	case res.Keep:
 		// The terminal report went unanswered: recovery retries it from the kept dir.
