@@ -110,21 +110,21 @@ def refusal(
     return None
 
 
-#: A cert file larger than this is not read (real ones are ~1 KiB).
-_MAX_CERT_FILE_BYTES = 1024 * 1024
-
-
 def _read_cert_file(path: Path) -> bytes:
     """Read a cert file without ever blocking: O_NONBLOCK, and only if what was opened is a
     regular file (a symlink to one is still followed, as before). A FIFO or device planted
-    in the PKI dir would otherwise hang every request that resolves grants."""
+    in the PKI dir would otherwise hang every request that resolves grants. A regular file
+    is read whole, whatever its size or however short the reads: skipping one could drop a
+    narrower cert from the intersection and widen the node."""
     import stat as _stat
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC)
     try:
-        st = os.fstat(fd)
-        if not _stat.S_ISREG(st.st_mode) or st.st_size > _MAX_CERT_FILE_BYTES:
-            raise ValueError(f"{path} is not a regular cert file")
-        return os.read(fd, _MAX_CERT_FILE_BYTES + 1)
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"{path} is not a regular file")   # no content: not a cert
+        chunks = []
+        while chunk := os.read(fd, 1 << 16):
+            chunks.append(chunk)
+        return b"".join(chunks)
     finally:
         os.close(fd)
 
