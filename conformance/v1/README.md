@@ -28,6 +28,9 @@ Notes for consumers:
   except the deliberately `expired` case.
 * `canonical_json.json` inputs must be decoded with exact integers (Go: `json.Decoder.UseNumber`), or integers beyond 2^53 lose precision.
 * `node_plus_client_auth_eku` (node EKU plus clientAuth) is refused: a node cert must never double as a transport cert.
+* `node_plus_server_auth_eku`, `node_plus_any_eku` and `node_eku_not_critical` are refused too: the node EKU must be critical and alone among transport EKUs.
+* `v2_with_wg` is accepted (v2 MAY carry a key, and it is validated); `v2_bad_wg` and `v1_without_wg` are refused.
+* `session_token.json` entries all verify under the single `secret_hex`; a `forged` entry was minted under another secret.
 * `rsa_key` verifies as an identity but its `admit` verdict is `refused` (EC keys only).
 
 Regenerate / check:

@@ -66,7 +66,7 @@
     },
     {
       "node_id": null,
-      "token": "mac-mini-1:1700000600.0:00936c5f5c230770b3ab7206baa2257ef6e4aa7bcf49e95dd5e15c0c9b5094d4",
+      "token": "mac-mini-1:1700000600.0:67456d0fc00eb48b8bb63804cbe9d6dd05124baa5cf3a0bdad5e0c4885213d04",
       "verdict": "forged",
       "verify_at": 1700000001.0
     },

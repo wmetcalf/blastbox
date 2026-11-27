@@ -129,3 +129,45 @@ def test_node_cert_verdicts_replay():
         assert verdicts[name] == "refused", name
     assert any(c["name"] == "rsa_key" and c["admit"]["verdict"] == "refused"
                for c in doc["cases"])
+
+
+def test_session_token_verdicts_replay_under_the_file_secret():
+    """Every verify entry must hold under the ONE secret the file publishes."""
+    from blastbox.host import node_auth
+
+    doc = _load("session_token.json")
+    secret = bytes.fromhex(doc["secret_hex"])
+    for case in doc["verify"]:
+        try:
+            got_id = node_auth.verify_session(case["token"], secret=secret,
+                                              now=case["verify_at"])
+            got = "ok"
+        except node_auth.ClaimRefused as exc:
+            got_id = None
+            got = ("malformed" if "malformed" in str(exc)
+                   else "expired" if "expired" in str(exc) else "forged")
+        assert (got, got_id) == (case["verdict"], case["node_id"]), case
+
+
+def test_vector_pairs_never_contradict():
+    """The same (token, verify_at) must not carry two different verdicts."""
+    seen: dict = {}
+    for case in _load("session_token.json")["verify"]:
+        k = (case["token"], case["verify_at"])
+        assert seen.setdefault(k, case["verdict"]) == case["verdict"], case
+
+
+def test_fresh_node_cert_generation_does_not_trip_the_lifetime_cap():
+    files = gen.build_node_certs()       # in memory only; writes nothing
+    assert "cases.json" in files and "v1_with_wg.crt" in files
+
+
+ADDED_NEGATIVES = ("node_eku_not_critical", "node_plus_server_auth_eku", "node_plus_any_eku",
+                   "v2_bad_wg", "v1_without_wg")
+
+
+def test_node_cert_vectors_pin_every_eku_and_wg_refusal():
+    verdicts = {c["name"]: c["verdict"] for c in _load("node_certs/cases.json")["cases"]}
+    for name in ADDED_NEGATIVES:
+        assert verdicts.get(name) == "refused", name
+    assert verdicts.get("v2_with_wg") == "ok"

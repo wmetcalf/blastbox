@@ -147,6 +147,96 @@
       "node_id": "node-dual",
       "verdict": "refused",
       "why": "node EKU plus clientAuth: a node cert must never double as a transport cert"
+    },
+    {
+      "admit": {
+        "challenge": "1811808060.0:22718422e3688308c1ff4a1273cf916b061848be0edfaa6bac71cc31a149c320",
+        "scope": "claim-next",
+        "signature_b64": "MEQCIEufI0O56HACD0B4B/85ZpPInY+TwpMlxyHM1xgMXGMZAiBCdiMh++p7BP5kSJpC83VBzIwGqoJbWb0DVjdLd2YCLQ==",
+        "verdict": "refused",
+        "verify_at": 1811808005.0
+      },
+      "cert": "node_eku_not_critical.crt",
+      "key": "node_eku_not_critical.key",
+      "name": "node_eku_not_critical",
+      "node_id": "node-noncrit",
+      "verdict": "refused",
+      "why": "node EKU present but the extension is not marked critical"
+    },
+    {
+      "admit": {
+        "challenge": "1811808060.0:22718422e3688308c1ff4a1273cf916b061848be0edfaa6bac71cc31a149c320",
+        "scope": "claim-next",
+        "signature_b64": "MEUCICkBgFT9moazPBRGptIhpmrVwSSdnhT/T9aDwZtJ57TgAiEA+g+ASKx6qKMYAQp4fcE6/0lZM2yCr8Yxn8Ehnrn3pjE=",
+        "verdict": "refused",
+        "verify_at": 1811808005.0
+      },
+      "cert": "node_plus_server_auth_eku.crt",
+      "key": "node_plus_server_auth_eku.key",
+      "name": "node_plus_server_auth_eku",
+      "node_id": "node-srv",
+      "verdict": "refused",
+      "why": "node EKU plus serverAuth: a node cert must never double as a transport cert"
+    },
+    {
+      "admit": {
+        "challenge": "1811808060.0:22718422e3688308c1ff4a1273cf916b061848be0edfaa6bac71cc31a149c320",
+        "scope": "claim-next",
+        "signature_b64": "MEQCIGLWHfIHKIp3UFf9Tf52plqNW8iyy97CWxmGgQ/8YoYrAiAFfbMvr4XBg7TU/ffkj5BFq6seRNpFU5Pc8xuvGjQYHA==",
+        "verdict": "refused",
+        "verify_at": 1811808005.0
+      },
+      "cert": "node_plus_any_eku.crt",
+      "key": "node_plus_any_eku.key",
+      "name": "node_plus_any_eku",
+      "node_id": "node-any",
+      "verdict": "refused",
+      "why": "node EKU plus anyExtendedKeyUsage"
+    },
+    {
+      "admit": {
+        "challenge": "1811808060.0:22718422e3688308c1ff4a1273cf916b061848be0edfaa6bac71cc31a149c320",
+        "scope": "claim-next",
+        "signature_b64": "MEYCIQDK51czfrHcX3WFT2cP82foWdPrJok7UMRB596ysOVM4wIhALXnr5JZArmvKadW762Ab52m8NJWGTPPi3nJ/+oJPSsF",
+        "verdict": "ok",
+        "verify_at": 1811808005.0
+      },
+      "cert": "v2_with_wg.crt",
+      "key": "v2_with_wg.key",
+      "name": "v2_with_wg",
+      "node_id": "node-v2wg",
+      "verdict": "ok",
+      "why": "node-info v2 MAY carry a WireGuard key; when present it is validated"
+    },
+    {
+      "admit": {
+        "challenge": "1811808060.0:22718422e3688308c1ff4a1273cf916b061848be0edfaa6bac71cc31a149c320",
+        "scope": "claim-next",
+        "signature_b64": "MEYCIQCtq7NKJ0WFStkKYgUYznMsittF5YZertZPCB97Tp7JVAIhAM26w1bNEYrlU43kj2MqbUmvWvk6QR3Ucin/lGsQLDZg",
+        "verdict": "refused",
+        "verify_at": 1811808005.0
+      },
+      "cert": "v2_bad_wg.crt",
+      "key": "v2_bad_wg.key",
+      "name": "v2_bad_wg",
+      "node_id": "node-v2badwg",
+      "verdict": "refused",
+      "why": "node-info v2 with a wg that is not a 32-byte base64 key"
+    },
+    {
+      "admit": {
+        "challenge": "1811808060.0:22718422e3688308c1ff4a1273cf916b061848be0edfaa6bac71cc31a149c320",
+        "scope": "claim-next",
+        "signature_b64": "MEUCIFgcrUbg3DWLV9GJUzZY4D6t3AEJWIcgxRW7ecUDDj1KAiEAusfZDjCGqCTrLvtTQxqY4VhvWmLPiPu7eIEn0h+GkWs=",
+        "verdict": "refused",
+        "verify_at": 1811808005.0
+      },
+      "cert": "v1_without_wg.crt",
+      "key": "v1_without_wg.key",
+      "name": "v1_without_wg",
+      "node_id": "node-v1nowg",
+      "verdict": "refused",
+      "why": "node-info v1 requires a WireGuard key"
     }
   ],
   "now": "2027-06-01T00:00:00+00:00",

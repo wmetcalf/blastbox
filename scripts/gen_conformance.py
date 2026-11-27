@@ -198,7 +198,8 @@ def gen_session_token() -> dict[str, Any]:
     add(f"{node}:{exp}:{mac[:-1]}0" if mac[-1] != "0" else f"{node}:{exp}:{mac[:-1]}1",
         T0 + 1, "forged")
     add(f"{node}:{exp}:{mac.upper()}", T0 + 1, "forged")
-    add(t, T0 + 1, "forged", secret=OTHER_SECRET)
+    # minted under ANOTHER secret, verified under the file's: a consumer only has secret_hex
+    add(node_auth.issue_session("mac-mini-1", secret=OTHER_SECRET, now=T0), T0 + 1, "forged")
     for bad in ("", "x", "a:b", f"::{mac}", f"{node}::{mac}", f"{node}:{exp}:", f"{node}:nan1:{mac}"):
         add(bad, T0 + 1, "malformed")
     return {"secret_hex": SECRET.hex(), "ttl_s": node_auth.SESSION_TTL_S,
@@ -431,7 +432,7 @@ _TEST_ONLY = (b"# TEST ONLY -- a conformance fixture. Never deploy, never trust 
 
 def _node_like(ca: pki.CertAuthority, cn: str, public_key: Any, *, ekus: list[Any],
                info: bytes | None, not_before: datetime.datetime,
-               not_after: datetime.datetime) -> bytes:
+               not_after: datetime.datetime, eku_critical: bool = True) -> bytes:
     """A node-shaped cert with exactly the deviations a negative vector needs."""
     builder = (
         x509.CertificateBuilder()
@@ -440,7 +441,7 @@ def _node_like(ca: pki.CertAuthority, cn: str, public_key: Any, *, ekus: list[An
         .serial_number(x509.random_serial_number())
         .not_valid_before(not_before).not_valid_after(not_after)
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-        .add_extension(x509.ExtendedKeyUsage(ekus), critical=True)
+        .add_extension(x509.ExtendedKeyUsage(ekus), critical=eku_critical)
     )
     if info is not None:
         builder = builder.add_extension(
@@ -472,7 +473,10 @@ def _admit_claim(key: Any, node_id: str, scope: str = node_auth.SCOPE_CLAIM_NEXT
 def build_node_certs() -> dict[str, bytes]:
     """Create the test CA + every cert. Random keys/serials: run ONCE and commit."""
     files: dict[str, bytes] = {}
-    with mock.patch.object(pki, "_now", lambda: CERT_ISSUED):
+    # The fixtures must outlive the 30-day production cap so their verdicts stay stable;
+    # lift the cap for this in-memory build only.
+    with mock.patch.object(pki, "_now", lambda: CERT_ISSUED), \
+            mock.patch.object(pki, "MAX_NODE_CERT_DAYS", CERT_DAYS):
         ca = pki._generate_ca("Blastbox CONFORMANCE TEST CA (TEST ONLY)", days=CERT_DAYS)
         foreign = pki._generate_ca("Blastbox CONFORMANCE FOREIGN CA (TEST ONLY)", days=CERT_DAYS)
         files["ca.crt"] = ca.cert_pem
@@ -571,15 +575,43 @@ def build_node_certs() -> dict[str, bytes]:
     return files
 
 
+#: (name, node_id, verdict, why, _node_like overrides) -- appended after the first commit
+ADDED_CERT_CASES: list[tuple[str, str, str, str, dict[str, Any]]] = [
+    ("node_plus_client_auth_eku", "node-dual", "refused",
+     "node EKU plus clientAuth: a node cert must never double as a transport cert",
+     {"ekus": [pki.OID_NODE_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH]}),
+    ("node_eku_not_critical", "node-noncrit", "refused",
+     "node EKU present but the extension is not marked critical",
+     {"eku_critical": False}),
+    ("node_plus_server_auth_eku", "node-srv", "refused",
+     "node EKU plus serverAuth: a node cert must never double as a transport cert",
+     {"ekus": [pki.OID_NODE_AUTH, ExtendedKeyUsageOID.SERVER_AUTH]}),
+    ("node_plus_any_eku", "node-any", "refused",
+     "node EKU plus anyExtendedKeyUsage",
+     {"ekus": [pki.OID_NODE_AUTH, ExtendedKeyUsageOID.ANY_EXTENDED_KEY_USAGE]}),
+    ("v2_with_wg", "node-v2wg", "ok",
+     "node-info v2 MAY carry a WireGuard key; when present it is validated",
+     {"info_over": {"wg": WG_KEY}}),
+    ("v2_bad_wg", "node-v2badwg", "refused",
+     "node-info v2 with a wg that is not a 32-byte base64 key",
+     {"info_over": {"wg": "not-a-key"}}),
+    ("v1_without_wg", "node-v1nowg", "refused",
+     "node-info v1 requires a WireGuard key",
+     {"info_over": {"v": 1}}),
+]
+
+
 def add_node_cert_negatives(certs: Path) -> bool:
-    """Append negatives added AFTER the first commit, signed by the EXISTING test CA.
+    """Append cases added AFTER the first commit, signed by the EXISTING test CA.
 
     Additive only: nothing already committed is regenerated, so a Go agent's recorded
-    verdicts and ``go_signed`` stay valid. Returns True if ``cases.json`` changed.
+    verdicts and ``go_signed`` stay valid. Each case is added once, when missing.
+    Returns True if ``cases.json`` changed.
     """
     doc = json.loads((certs / "cases.json").read_text())
     names = {c["name"] for c in doc["cases"]}
-    if "node_plus_client_auth_eku" in names:
+    missing = [c for c in ADDED_CERT_CASES if c[0] not in names]
+    if not missing:
         return False
     ca_cert = x509.load_pem_x509_certificate((certs / "ca.crt").read_bytes())
     raw = (certs / "ca.key").read_bytes()
@@ -587,19 +619,21 @@ def add_node_cert_negatives(certs: Path) -> bool:
         b"-----BEGIN" + raw.partition(b"-----BEGIN")[2], password=None)   # skip TEST ONLY line
     assert isinstance(ca_key, ec.EllipticCurvePrivateKey)
     ca = pki.CertAuthority(ca_cert, ca_key)
-    key = ec.generate_private_key(ec.SECP256R1())
     nb = CERT_ISSUED - datetime.timedelta(minutes=5)
     na = CERT_ISSUED + datetime.timedelta(days=CERT_DAYS)
-    cert = _node_like(ca, "node-dual", key.public_key(),
-                      ekus=[pki.OID_NODE_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH],
-                      info=_info("node-dual"), not_before=nb, not_after=na)
-    (certs / "node_plus_client_auth_eku.crt").write_bytes(cert)
-    (certs / "node_plus_client_auth_eku.key").write_bytes(_TEST_ONLY + _pem_key(key))
-    doc["cases"].append({
-        "name": "node_plus_client_auth_eku", "node_id": "node-dual", "verdict": "refused",
-        "why": "node EKU plus clientAuth: a node cert must never double as a transport cert",
-        "cert": "node_plus_client_auth_eku.crt", "key": "node_plus_client_auth_eku.key",
-        "admit": {"verdict": "refused", **_admit_claim(key, "node-dual")}})
+    for name, node_id, verdict, why, over in missing:
+        key = ec.generate_private_key(ec.SECP256R1())
+        over = dict(over)
+        info = _info(node_id, **over.pop("info_over", {}))
+        cert = _node_like(ca, node_id, key.public_key(),
+                          ekus=over.pop("ekus", [pki.OID_NODE_AUTH]), info=info,
+                          not_before=nb, not_after=na, **over)
+        (certs / f"{name}.crt").write_bytes(cert)
+        (certs / f"{name}.key").write_bytes(_TEST_ONLY + _pem_key(key))
+        doc["cases"].append({
+            "name": name, "node_id": node_id, "verdict": verdict, "why": why,
+            "cert": f"{name}.crt", "key": f"{name}.key",
+            "admit": {"verdict": verdict, **_admit_claim(key, node_id)}})
     (certs / "cases.json").write_bytes(_dumps(doc))
     return True
 
@@ -818,6 +852,9 @@ Notes for consumers:
   except the deliberately `expired` case.
 * `canonical_json.json` inputs must be decoded with exact integers (Go: `json.Decoder.UseNumber`), or integers beyond 2^53 lose precision.
 * `node_plus_client_auth_eku` (node EKU plus clientAuth) is refused: a node cert must never double as a transport cert.
+* `node_plus_server_auth_eku`, `node_plus_any_eku` and `node_eku_not_critical` are refused too: the node EKU must be critical and alone among transport EKUs.
+* `v2_with_wg` is accepted (v2 MAY carry a key, and it is validated); `v2_bad_wg` and `v1_without_wg` are refused.
+* `session_token.json` entries all verify under the single `secret_hex`; a `forged` entry was minted under another secret.
 * `rsa_key` verifies as an identity but its `admit` verdict is `refused` (EC keys only).
 
 Regenerate / check:
