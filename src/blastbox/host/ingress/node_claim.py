@@ -629,10 +629,11 @@ def register_node_claim_routes(
 
     def _run_params(job) -> "dict[str, str]":
         """job.params through the SAME gate the cold path applies before worker env (shape,
-        reserved floor incl. BLASTBOX_*/LD_*/PATH/PYTHON*, the engine's reserved keys, its
-        allowlist and its operator defaults), read from the same per-engine env the
-        dispatcher's EngineSpec is built from."""
-        from blastbox.host.cli import _parse_default_params
+        reserved floor incl. BLASTBOX_*/LD_*/PATH/PYTHON*, the engine's reserved keys and its
+        allowlist), read from the same per-engine env the dispatcher's EngineSpec is built
+        from, so the INGRESS must carry BLASTBOX_ENGINE_<NAME>_PARAM_KEYS/_RESERVED_KEYS for
+        every engine it serves to nodes. Operator DEFAULT_PARAMS are deliberately NOT merged:
+        they are operator material and the node is untrusted."""
         from blastbox.host.dispatch import Dispatcher
 
         eng = job.engine.upper().replace("-", "_")
@@ -643,8 +644,7 @@ def register_node_claim_routes(
             k.strip().upper()
             for k in (os.environ.get(f"BLASTBOX_ENGINE_{eng}_RESERVED_KEYS") or "").split(",")
             if k.strip())
-        defaults = _parse_default_params(os.environ.get(f"BLASTBOX_ENGINE_{eng}_DEFAULT_PARAMS"))
-        return Dispatcher._sanitize_params(job.params or {}, allowed, reserved, defaults)
+        return Dispatcher._sanitize_params(job.params or {}, allowed, reserved, None)
 
     def _run_block(job) -> "dict[str, Any]":
         """The server-authored run description a credential-less agent reads and nothing else."""

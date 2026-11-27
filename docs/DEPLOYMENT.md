@@ -889,6 +889,11 @@ Three things an operator must know:
 * **A refusal never says why.** Wrong CA, unheld key, ungranted engine and expired challenge
   all return the same message, so a caller cannot map the fleet's grants by probing. The
   reason is in the ingress log (`node_claim: refused …`); look there, not at the response.
+* **Set the engine param gate on the ingress too.** The claim's `run.params` is what a node
+  passes its engine, and the ingress computes it with the dispatcher's own gate from
+  `BLASTBOX_ENGINE_<NAME>_PARAM_KEYS` and `BLASTBOX_ENGINE_<NAME>_RESERVED_KEYS`, read from the
+  *ingress* environment. Without them it falls back to the shape + reserved-floor denylist, as
+  a dispatcher would. `BLASTBOX_ENGINE_<NAME>_DEFAULT_PARAMS` are never sent to a node.
 
 #### node-finalizer (seals what pull nodes upload)
 

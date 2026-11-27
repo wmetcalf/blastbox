@@ -66,10 +66,13 @@ def test_run_params_go_through_the_engine_param_gate(tmp_path, pki_dir, monkeypa
 
     monkeypatch.setenv("BLASTBOX_ENGINE_CLAMAV_PARAM_KEYS", "scan,secret_mode,LEVEL")
     monkeypatch.setenv("BLASTBOX_ENGINE_CLAMAV_RESERVED_KEYS", "SECRET_MODE")
-    monkeypatch.setenv("BLASTBOX_ENGINE_CLAMAV_DEFAULT_PARAMS", "LEVEL=2")
+    monkeypatch.setenv("BLASTBOX_ENGINE_CLAMAV_DEFAULT_PARAMS", "LEVEL=2,API_TOKEN=s3cret")
     _, _, c = _setup(tmp_path / "b", pki_dir, params=params)
-    assert _claim(c, pki_dir, "alpha", engine="clamav").json()["run"]["params"] == {
-        "SCAN": "fast", "LEVEL": "2"}
+    body = _claim(c, pki_dir, "alpha", engine="clamav").json()
+    # operator defaults stay on the control plane: they can carry operator material, and an
+    # untrusted node must never be handed them
+    assert body["run"]["params"] == {"SCAN": "fast"}
+    assert "s3cret" not in str(body)
 
 
 def test_run_limits_are_the_enforced_limits(tmp_path, pki_dir):  # noqa: F811
