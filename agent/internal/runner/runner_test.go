@@ -149,7 +149,7 @@ func (in *ingress) serve(w http.ResponseWriter, r *http.Request) {
 		js(200, map[string]any{"ok": true})
 	case r.Method == "GET" && r.URL.Path == jp+"/disposition":
 		in.disps++
-		if _, err := os.Lstat(filepath.Join(in.state, "jobs", testJob, "reported")); err == nil {
+		if _, err := os.Lstat(filepath.Join(in.state, "jobs", testJob, "uploaded")); err == nil {
 			in.reportedSeen = true
 		}
 		st := in.dispStatus
@@ -308,6 +308,10 @@ func TestAcceptedPollsDisposition(t *testing.T) {
 	if res := f.run(); res.Outcome != "failed" {
 		t.Fatalf("%+v", res)
 	}
+	// Finalizer-only mode refuses release/fail after a 202: nothing may be sent.
+	if len(f.in.updates) != 0 {
+		t.Fatalf("update sent after a 202: %v", f.in.updates)
+	}
 }
 
 func TestRejectedResultIsFailed(t *testing.T) {
@@ -372,7 +376,7 @@ func TestUndeliveredUploadIsKeptForRecovery(t *testing.T) {
 	}
 }
 
-func TestAcceptedResultIsMarkedReported(t *testing.T) {
+func TestAcceptedResultIsMarkedUploaded(t *testing.T) {
 	f := setup(t, happyEngine)
 	f.in.putStatus = 202
 	f.in.dispStatus = "running"
@@ -381,7 +385,7 @@ func TestAcceptedResultIsMarkedReported(t *testing.T) {
 		t.Fatalf("%+v", res)
 	}
 	if !f.in.reportedSeen {
-		t.Fatal("no durable reported marker while the disposition was pending: a crash now would fail a good result")
+		t.Fatal("no durable uploaded marker while the disposition was pending: a crash now would fail a good result")
 	}
 	f.wiped(t)
 }

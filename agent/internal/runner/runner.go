@@ -52,7 +52,8 @@ type Result struct {
 const (
 	ResultTarName  = "result.tar"
 	ResultMetaName = "result.json"  // the upload's headers, so recovery can replay it
-	ReportedName   = "reported"     // the control plane answered the upload: nothing left to send
+	ReportedName   = "reported"     // the control plane answered the upload (200): nothing left to send
+	UploadedName   = "uploaded"     // the upload was accepted (202): only replay the PUT or poll, never fail/release
 	RunRecordName  = "sandbox.json" // the running sandbox's identity (sandbox.RunRecord)
 )
 
@@ -198,7 +199,8 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 		}
 	}
 	claimJSON, _ := json.Marshal(map[string]any{
-		"job_id": c.JobID, "claim_id": c.ClaimID, "receipt": c.Receipt, "engine": eng.Name, "started": false})
+		"job_id": c.JobID, "claim_id": c.ClaimID, "receipt": c.Receipt, "engine": eng.Name, "started": false,
+		"claimed_at_ms": claimedMs(c)})
 	// Durable before the started marker: recovery needs the claim to settle a started job.
 	if err := atomicWrite(filepath.Join(j.dir, "claim.json"), claimJSON); err != nil {
 		return j.release(ctx, "claim.json: "+err.Error())
@@ -235,7 +237,8 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	}
 	// From here the job is never released.
 	claimJSON, _ = json.Marshal(map[string]any{
-		"job_id": c.JobID, "claim_id": c.ClaimID, "receipt": c.Receipt, "engine": eng.Name, "started": true})
+		"job_id": c.JobID, "claim_id": c.ClaimID, "receipt": c.Receipt, "engine": eng.Name, "started": true,
+		"claimed_at_ms": claimedMs(c)})
 	if err := atomicWrite(filepath.Join(j.dir, "claim.json"), claimJSON); err != nil {
 		r.logf("job %s: claim.json rewrite: %v (the started marker is authoritative)", c.JobID, err)
 	}
@@ -709,8 +712,21 @@ func syncDir(dir string) error {
 	return d.Sync()
 }
 
+// claimedMs is the claim's node-clock receipt time in ms (0 when unknown), kept in claim.json so
+// a recovery Fail can clamp finished_at to it.
+func claimedMs(c *wire.Claim) int64 {
+	if c.ClaimedAt.IsZero() {
+		return 0
+	}
+	return c.ClaimedAt.UnixMilli()
+}
+
 // MarkReported durably records that the control plane answered dir's result upload.
 func MarkReported(dir string) error { return atomicWrite(filepath.Join(dir, ReportedName), nil) }
+
+// MarkUploaded durably (fsync'd, with its directory) records that the control plane accepted
+// dir's result upload with a 202. The server refuses release and fail from then on.
+func MarkUploaded(dir string) error { return atomicWrite(filepath.Join(dir, UploadedName), nil) }
 
 // writeStarted records, durably, that the sandbox is about to see the input.
 func writeStarted(dir string) error {
@@ -990,9 +1006,14 @@ func (j *job) upload(ctx context.Context, tarPath string, kind sandbox.Kind) Res
 		return j.fail(ctx, "result upload failed: "+err.Error())
 	}
 	if out.Status == "done" || out.Status == "accepted" {
-		// From here a crash must not fail the job: the control plane holds the result.
-		if err := MarkReported(j.dir); err != nil {
-			j.r.logf("job %s: reported marker: %v", j.c.JobID, err)
+		// From here a crash must not fail the job: the control plane holds the result. After a
+		// 202 recovery replays the PUT or polls the disposition; it never sends fail or release.
+		mark, name := MarkReported, ReportedName
+		if out.Status == "accepted" {
+			mark, name = MarkUploaded, UploadedName
+		}
+		if err := mark(j.dir); err != nil {
+			j.r.logf("job %s: %s marker: %v", j.c.JobID, name, err)
 		}
 	}
 	switch out.Status {
