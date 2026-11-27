@@ -403,14 +403,10 @@ func (a *Agent) buildHeartbeat() wire.Heartbeat {
 	a.mu.Unlock()
 	for _, es := range a.engines {
 		es.mu.Lock()
-		floor := es.eng.MinSandbox
-		if floor == "" {
-			floor = "seatbelt"
-		}
 		// selftest_ok/selftest_at mean "probe AND selftest (if configured) passed, and when";
 		// an engine without selftest_argv reports its probe result and probe time.
 		hb.Engines = append(hb.Engines, wire.HeartbeatEngine{
-			Name: es.eng.Name, Sandbox: es.eng.Sandbox, Floor: floor, Slots: es.eng.SlotCount(),
+			Name: es.eng.Name, Sandbox: es.eng.Sandbox, Floor: es.eng.FloorRank(), Slots: es.eng.SlotCount(),
 			Busy: es.busy, SelftestOK: es.ok, SelftestAt: rfc3339(es.at)})
 		es.mu.Unlock()
 	}
