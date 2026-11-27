@@ -71,6 +71,13 @@ MAX_QUEUED = 1024
 
 _NODE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
+#: In the CA host's own PKI dir (never a node dir): per node, the keys a renewal that is
+#: not yet published everywhere links together (see :func:`_renew_one`).
+PUBLISHING_DIR = ".renew-publishing"
+#: How long such a record lets the old and new keys stand for each other. A renewal that
+#: has not converged by then needs the operator (its proof is too old to retry anyway).
+PUBLISHING_TTL_S = RENEW_PROOF_MAX_AGE_S
+
 
 class RenewRefused(Exception):
     """The CSR was not queued; the message is safe to show the (authenticated) node.
@@ -246,15 +253,16 @@ class _TooLarge(_Unreadable):
 _OPEN_FLAGS = os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
 
 
-def _read_capped(path: Path, limit: int) -> bytes:
+def _read_capped(path: Path, limit: int, *, dir_fd: int | None = None) -> bytes:
     """Read a small REGULAR file without following a link or blocking on a FIFO.
 
     A node dir is the ingress's to write, so the CA host checks what it opened (fstat on
     the same descriptor, no check-then-open window) and never reads more than ``limit``.
+    ``dir_fd`` resolves a relative ``path`` against a pinned directory.
     """
     try:
         flags = _OPEN_FLAGS | os.O_NOFOLLOW
-        fd = os.open(path, flags)
+        fd = os.open(path, flags, dir_fd=dir_fd)
     except OSError as exc:
         if exc.errno == errno.ELOOP:
             raise _Unreadable(f"{path.name} is a symlink") from None
@@ -484,9 +492,11 @@ def sign_pending(ca: CertAuthority, pki_dir: Path, *, days: int = 7,
     recently ISSUED of them -- mid-rotation the old-key cert is still valid, and the newest
     is the operator's intent -- and is written to every one of those dirs, so no ingress
     is ever widened by a renewal queued through another. It must verify in the dir that
-    queued it. A dir where it does not verify -- revoked there -- is left alone. If any
-    write fails, or a cert changed or vanished meanwhile, the CSR is kept and the next
-    run redoes the whole renewal; a partly published one converges then.
+    queued it, and the proof's key must be current in EVERY dir where it verifies: one
+    ingress's copy of a cert is not evidence for the others. A dir where it does not
+    verify -- revoked there -- is left alone. If any write fails, or a cert changed or
+    vanished meanwhile, the CSR is kept and the next run redoes the whole renewal; a partly
+    published one converges then (``pki_dir`` records it, see :data:`PUBLISHING_DIR`).
 
     Raises ValueError for an out-of-range ``days``, and OSError when a node dir cannot be
     locked (an unreachable mount), BEFORE touching any queue.
@@ -505,7 +515,7 @@ def sign_pending(ca: CertAuthority, pki_dir: Path, *, days: int = 7,
             results.append((f"<{d}>", f"deferred: {LINKS_REFUSED} ({names})"))
         for qdir in every:
             try:
-                results += _drain(ca, qdir, days, every, bad)
+                results += _drain(ca, qdir, days, every, bad, ledger=Path(pki_dir))
             except OSError as exc:
                 # One queue going bad mid-run (a mount dropping) must not abort the others,
                 # nor lose the outcomes already reached; say it, so the run exits 2.
@@ -513,8 +523,33 @@ def sign_pending(ca: CertAuthority, pki_dir: Path, *, days: int = 7,
     return results
 
 
+def _open_queue(qdir: Path) -> int | None:
+    """Pin ``qdir``'s ``renew/`` once, never through a link; None if there is no such dir.
+
+    Everything after works relative to this descriptor: the ingress owns ``qdir`` and can
+    swap ``renew/`` for a link to anywhere on the CA host at any moment.
+    """
+    try:
+        return os.open(_renew_dir(qdir),
+                       os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            return None                 # a queue linked out of the node dir is not ours
+        raise
+
+
+def _lstat_at(name: str, dfd: int) -> os.stat_result | None:
+    try:
+        return os.lstat(name, dir_fd=dfd)
+    except FileNotFoundError:
+        return None
+
+
 def _drain(ca: CertAuthority, qdir: Path, days: int, every: list[Path],
-           bad: frozenset[Path] = frozenset()) -> list[tuple[str, str]]:
+           bad: frozenset[Path] = frozenset(), *, ledger: Path | None = None
+           ) -> list[tuple[str, str]]:
     """Sign what ``qdir``'s ingress queued.
 
     A CSR being worked on is ``<id>.csr.signing``, and it is never renamed back: a kept
@@ -522,41 +557,49 @@ def _drain(ca: CertAuthority, qdir: Path, days: int, every: list[Path],
     ``<id>.csr`` the node queued meanwhile replaces it then. So no step ever writes onto
     a name the ingress may be writing, which needs no hard links and has no window.
     """
-    d = _renew_dir(qdir)
     results: list[tuple[str, str]] = []
-    if d.is_symlink() or not d.is_dir():
-        return results                  # a queue linked out of the node dir is not ours
-    ids = sorted({p.name[:-len(".csr")] for p in d.glob("*.csr")}
-                 | {p.name[:-len(".csr.signing")] for p in d.glob("*.csr.signing")})
-    for node_id in ids:
-        csr_path, aside = d / f"{node_id}.csr", d / f"{node_id}.csr.signing"
-        try:
-            linked = [p.name for p in (csr_path, aside) if p.is_symlink()]
-            for name in linked:                 # never read or move through a link,
-                (d / name).unlink()             # but a kept retry is not lost to one
-            if csr_path.exists():
-                os.replace(csr_path, aside)     # newest wins over a kept older one
-            if linked and not aside.exists():
-                results.append((node_id, f"refused: {linked[0]} is a symlink"))
+    dfd = _open_queue(qdir)
+    if dfd is None:
+        return results
+    try:
+        names = os.listdir(dfd)
+        ids = sorted({n[:-len(".csr")] for n in names if n.endswith(".csr")}
+                     | {n[:-len(".csr.signing")] for n in names if n.endswith(".csr.signing")})
+        for node_id in ids:
+            csr_name, aside = f"{node_id}.csr", f"{node_id}.csr.signing"
+            try:
+                linked = [n for n in (csr_name, aside)
+                          if (st := _lstat_at(n, dfd)) is not None and stat.S_ISLNK(st.st_mode)]
+                for name in linked:             # never read or move through a link,
+                    os.unlink(name, dir_fd=dfd)  # but a kept retry is not lost to one
+                if _lstat_at(csr_name, dfd) is not None:
+                    # newest wins over a kept older one
+                    os.replace(csr_name, aside, src_dir_fd=dfd, dst_dir_fd=dfd)
+                if linked and _lstat_at(aside, dfd) is None:
+                    results.append((node_id, f"refused: {linked[0]} is a symlink"))
+                    continue
+                raw = _read_capped(Path(aside), MAX_QUEUE_ENTRY_BYTES, dir_fd=dfd)
+            except _Unreadable as exc:          # FIFO, device, dir, oversized, link: refuse it
+                _discard(aside, dfd)
+                results.append((node_id, f"refused: {exc}"))
                 continue
-            raw = _read_capped(aside, MAX_QUEUE_ENTRY_BYTES)
-        except _Unreadable as exc:              # FIFO, device, dir, oversized, link: refuse it
-            _discard(aside)
-            results.append((node_id, f"refused: {exc}"))
-            continue
-        except OSError as exc:                  # say it, so the run exits 2 and is seen
-            results.append((node_id, f"deferred: cannot read the queued CSR: {exc}"))
-            continue
-        try:
-            csr_pem, proof_key = _verified_entry(ca, node_id, raw)
-        except RenewRefused as exc:
-            _discard(aside)
-            results.append((node_id, f"refused: {exc}"))
-            continue
-        outcome, keep = _renew_one(ca, qdir, every, node_id, csr_pem, days, proof_key, bad)
-        if not keep:
-            aside.unlink(missing_ok=True)
-        results.append((node_id, outcome))
+            except OSError as exc:              # say it, so the run exits 2 and is seen
+                results.append((node_id, f"deferred: cannot read the queued CSR: {exc}"))
+                continue
+            try:
+                csr_pem, proof_key = _verified_entry(ca, node_id, raw)
+            except RenewRefused as exc:
+                _discard(aside, dfd)
+                results.append((node_id, f"refused: {exc}"))
+                continue
+            outcome, keep = _renew_one(ca, qdir, every, node_id, csr_pem, days, proof_key, bad,
+                                       ledger=ledger if ledger is not None else every[0])
+            if not keep:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(aside, dir_fd=dfd)
+            results.append((node_id, outcome))
+    finally:
+        os.close(dfd)
     return results
 
 
@@ -574,7 +617,7 @@ def _verified_entry(ca: CertAuthority, node_id: str, raw: bytes) -> tuple[bytes,
         issued_at, sig = doc["issued_at"], doc["signature"]
         if not all(isinstance(v, str) for v in (csr_text, cert_text, sig)):
             raise TypeError
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError, RecursionError):   # deep nesting: RecursionError
         raise RenewRefused("malformed queue entry") from None
     try:
         verify_renew_proof(ca, node_id, csr_text, cert_text, issued_at, sig,
@@ -587,14 +630,17 @@ def _verified_entry(ca: CertAuthority, node_id: str, raw: bytes) -> tuple[bytes,
     return csr_text.encode("utf-8"), proof_key
 
 
-def _discard(path: Path) -> None:
-    """Remove a refused queue entry, whatever it is; never raise (a planted directory
-    must not crash the run and starve every other queue)."""
+def _discard(name: str, dfd: int) -> None:
+    """Remove a refused queue entry (in the pinned queue ``dfd``), whatever it is; never
+    raise (a planted directory must not crash the run and starve every other queue)."""
     try:
-        if path.is_dir() and not path.is_symlink():
-            shutil.rmtree(path, ignore_errors=True)
+        st = _lstat_at(name, dfd)
+        if st is None:
+            return
+        if stat.S_ISDIR(st.st_mode):
+            shutil.rmtree(name, dir_fd=dfd, ignore_errors=True)
         else:
-            path.unlink(missing_ok=True)
+            os.unlink(name, dir_fd=dfd)
     except OSError:
         pass
 
@@ -613,11 +659,62 @@ def _swap_if_unchanged(path: Path, expected: bytes, new: bytes) -> str | None:
     return None
 
 
+def _publishing_path(ledger: Path, node_id: str) -> Path:
+    return Path(ledger) / PUBLISHING_DIR / f"{node_id}.json"
+
+
+def _publishing_keys(ledger: Path, node_id: str, now: float) -> tuple[set[bytes], int | None]:
+    """The keys an unfinished publication links for ``node_id`` and when it began, or
+    (empty, None) if there is none (or it is older than :data:`PUBLISHING_TTL_S`).
+
+    The record is the CA host's own, so damage to it is a fault (OSError), not "none"."""
+    path = _publishing_path(ledger, node_id)
+    try:
+        raw = _read_capped(path, MAX_QUEUE_ENTRY_BYTES)
+    except FileNotFoundError:
+        return set(), None
+    except _Unreadable as exc:
+        raise OSError(errno.EINVAL, f"{path}: {exc}") from None
+    try:
+        doc = json.loads(raw)
+        since = doc["since"]
+        if not isinstance(since, int) or isinstance(since, bool):
+            raise TypeError
+        keys = {bytes.fromhex(k) for k in doc["keys"]}
+    except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
+        raise OSError(errno.EINVAL, f"{path} is not a publication record") from None
+    if not 0 <= now - since <= PUBLISHING_TTL_S:
+        return set(), None
+    return keys, since
+
+
+def _record_publishing(ledger: Path, node_id: str, keys: set[bytes], since: int) -> None:
+    d = Path(ledger) / PUBLISHING_DIR
+    d.mkdir(mode=0o700, exist_ok=True)
+    _replace_file(_publishing_path(ledger, node_id),
+                  json.dumps({"keys": sorted(k.hex() for k in keys), "since": since}).encode())
+
+
 def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
                csr_pem: bytes, days: int, proof_key: bytes,
-               bad: frozenset[Path] = frozenset()) -> tuple[str, bool]:
-    """Renew one set-aside CSR across every node dir. Returns (outcome, keep the CSR)."""
+               bad: frozenset[Path] = frozenset(), *,
+               ledger: Path | None = None) -> tuple[str, bool]:
+    """Renew one set-aside CSR across every node dir. Returns (outcome, keep the CSR).
+
+    The proof's key must be current in EVERY dir where the node verifies. Any one dir is
+    an ingress's to write, so its copy of a cert proves nothing about the others: a hostile
+    ingress could restore a revoked-then-re-enrolled node's old, still unexpired cert and
+    have its old key overwrite the honest dirs. The one exception is a renewal published
+    to some dirs but not yet all: the CA host records, in its OWN dir (``ledger``, the
+    ``pki_dir`` holding the CA key), that the old and new key are the same node's, so the
+    retry -- or a renewal by the node's new key -- can finish the job. The record expires
+    after :data:`PUBLISHING_TTL_S` and goes once publication completes.
+    """
+    ledger = Path(ledger) if ledger is not None else Path(every[0])
+    now = int(time.time())
     states: dict[Path, _Current] = {}
+    linked: set[bytes] = set()
+    since: int | None = None
     try:
         for d in every:
             if d in bad:
@@ -631,16 +728,25 @@ def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
             cur = _find_current(d, node_id, anchor=ca)
             if cur is not None:
                 states[d] = cur
+        if qdir in states:
+            linked, since = _publishing_keys(ledger, node_id, now)
     except OSError as exc:
         return f"deferred: {exc}", True
     if qdir not in states:
         return "refused: no current certificate", False
-    if not any(proof_key in cur.keys for cur in states.values()):
-        # The proof's cert is CA-valid but not one the node holds NOW in any dir: an old
-        # key after a revoke-and-re-enrol, or a copy of something no longer current. (Any
-        # dir, not just the queueing one: a retry after a partly published renewal finds
-        # the new cert there and the proof's key still current in the others.)
+
+    def current(cur: _Current) -> set[bytes]:
+        return cur.keys | linked if cur.keys & linked else cur.keys
+    lacking = [d for d, cur in states.items() if proof_key not in current(cur)]
+    if qdir in lacking:
+        # CA-valid but not a key the node holds NOW where it asked: an old key after a
+        # revoke-and-re-enrol, or a copy of something no longer current.
         return "refused: proof certificate is not the node's current certificate", False
+    if lacking:
+        # Current where it was queued but not elsewhere: that ingress disagrees with the
+        # rest (an operator who copied a cert to some dirs only, or a restored old one).
+        return ("deferred: proof certificate is not the node's current certificate in "
+                + ", ".join(str(d) for d in lacking)), True
     grants: NodeGrants | None = None
     for cur in states.values():
         grants = _intersect(grants, cur.grants)
@@ -658,7 +764,12 @@ def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
                                wg_pubkey=next(iter(keys)))
     except ValueError as exc:
         return f"refused: {exc}", False
+    new_key = _spki(x509.load_pem_x509_certificate(new).public_key())
     try:
+        # BEFORE the first write: if publication stops part-way, the next run must know the
+        # new key and the proof's are the same node's.
+        _record_publishing(ledger, node_id, linked | {proof_key, new_key},
+                           since if since is not None else now)
         for d, cur in states.items():
             # Swap only if the cert is still the one we judged: an operator who deleted it
             # (revocation) while we signed must not have it written back.
@@ -674,6 +785,7 @@ def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
                         path.unlink()
                 except (FileNotFoundError, _Unreadable):
                     pass
+        _publishing_path(ledger, node_id).unlink(missing_ok=True)   # published everywhere
     except OSError as exc:
         return f"deferred: {exc}", True
     return "renewed", False
@@ -746,6 +858,10 @@ def revoke(pki_dir: Path, node_id: str, *, node_dirs: list[Path] | None = None) 
         if one(d, LOCK_TIMEOUT_S):
             unlocked.remove(d)
     failed += [(d, why) for d, errs in errors_by_dir.items() for why in errs]
+    try:            # an unfinished publication no longer links anything for this node
+        _publishing_path(Path(pki_dir), node_id).unlink(missing_ok=True)
+    except OSError as exc:
+        failed.append((Path(pki_dir), f"{PUBLISHING_DIR}/: {exc.strerror or exc}"))
     if unlocked or failed:
         raise PartialRevoke(removed, unlocked, failed)
     return removed
@@ -772,11 +888,15 @@ def _revoke_in(anchor: TrustAnchor, d: Path, node_id: str) -> tuple[list[Path], 
             continue
         except OSError as exc:                   # cannot tell: it MAY be the node's
             errors.append(f"{crt.name}: {exc.strerror or exc}")
-    q = _renew_dir(d)
     try:
-        if q.is_dir() and not q.is_symlink():
-            for name in (f"{node_id}.csr", f"{node_id}.csr.signing"):
-                (q / name).unlink(missing_ok=True)
+        dfd = _open_queue(d)            # pinned: never through a renew/ swapped for a link
+        if dfd is not None:
+            try:
+                for name in (f"{node_id}.csr", f"{node_id}.csr.signing"):
+                    with contextlib.suppress(FileNotFoundError):
+                        os.unlink(name, dir_fd=dfd)
+            finally:
+                os.close(dfd)
     except OSError as exc:
         errors.append(f"renew/: {exc.strerror or exc}")
     return removed, errors

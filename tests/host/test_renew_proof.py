@@ -24,6 +24,7 @@ from blastbox.host.node_renew import (
     sign_renew_proof,
 )
 from tests.host.test_node_renew import GRANTS, _split, entry, make_csr, pending, pub
+from tests.host.test_node_renew import queue_csr as queue_proven
 
 
 def _node(ca, d, node_id="n1"):
@@ -256,3 +257,98 @@ def test_an_absurd_issued_at_is_refused_not_a_crash(tmp_path, at):
               signature=sign_renew_proof(key, "n1", csr.decode(), int(time.time())))
     out = dict(sign_pending(ca, d))
     assert out["aaa"].startswith("refused") and out["n1"] == "renewed"
+
+
+def test_a_deeply_nested_entry_is_refused_and_the_run_goes_on(tmp_path):
+    """json.loads raises RecursionError (not ValueError) on deep nesting: one hostile entry
+    must be discarded as malformed, not abort every other node's renewal, every run."""
+    ca, ca_dir, i1, _i2 = _split(tmp_path)
+    (i1 / "renew").mkdir()
+    deep = b"[" * 10_000 + b"]" * 10_000
+    assert len(deep) < node_renew.MAX_QUEUE_ENTRY_BYTES
+    (i1 / "renew" / "aaa.csr").write_bytes(deep)
+    (i1 / "renew" / "n1.csr").write_bytes(entry(ca, "n1", make_csr("n1")[0], d=i1))
+    out = dict(sign_pending(ca, ca_dir, node_dirs=[i1]))
+    assert out["aaa"].startswith("refused") and "malformed" in out["aaa"]
+    assert out["n1"] == "renewed"
+    assert pending(i1) == []
+
+
+def test_a_restored_revoked_cert_on_one_ingress_cannot_overwrite_the_others(tmp_path):
+    """Revoke, re-enrol with a new key everywhere; a hostile ingress then restores the OLD
+    (still unexpired) cert in its own dir and queues a renewal proven with the old key.
+    Its copy must not count as 'the key is current': the honest dirs keep the new cert."""
+    ca, ca_dir, i1, i2 = _split(tmp_path)
+    old = (i2 / "node-n1.crt").read_bytes()
+    node_renew.revoke(ca_dir, "n1", node_dirs=[i1, i2])
+    issued = ca.issue_node("n1", grants=GRANTS)            # re-enrolled with a NEW key
+    for d in (ca_dir, i1, i2):
+        (d / "node-n1.crt").write_bytes(issued.cert_pem)
+    (i2 / "node-n1.crt").write_bytes(old)                  # the hostile ingress restores it
+    attacker_csr, _ = make_csr("n1")
+    (i2 / "renew").mkdir(exist_ok=True)
+    (i2 / "renew" / "n1.csr").write_bytes(entry(ca, "n1", attacker_csr, d=i2))
+    [(nid, outcome)] = sign_pending(ca, ca_dir, node_dirs=[i1, i2])
+    assert outcome != "renewed" and "current" in outcome
+    for d in (ca_dir, i1):
+        assert (d / "node-n1.crt").read_bytes() == issued.cert_pem, d
+
+
+def test_a_partly_published_renewal_lets_the_node_renew_with_its_new_key(tmp_path,
+                                                                           monkeypatch):
+    """A renewal published to some dirs only: the CA host records that the new key and the
+    old one are the same node's, so the node -- which already adopted the new cert -- can
+    renew with it, and the publication converges."""
+    ca, ca_dir, i1, i2 = _split(tmp_path)
+    queue_proven(i1, "n1", make_csr("n1")[0])
+    real = node_renew._replace_file
+
+    def flaky(path, data):
+        if path.parent == i2:
+            raise OSError("EIO")
+        return real(path, data)
+    monkeypatch.setattr(node_renew, "_replace_file", flaky)
+    [(_nid, outcome)] = sign_pending(ca, ca_dir, node_dirs=[i1, i2])
+    assert outcome.startswith("deferred")
+    monkeypatch.undo()
+    # The node fetched the new cert from ingress-1 and renews with ITS key, which ingress-2
+    # (still the old cert) has never seen.
+    assert pending(i1) == ["n1"]                           # kept; the node's newer CSR wins
+    new_csr, new_key = make_csr("n1")
+    queue_proven(i1, "n1", new_csr)
+    assert sign_pending(ca, ca_dir, node_dirs=[i1, i2]) == [("n1", "renewed")]
+    want = new_key.public_key().public_bytes(serialization.Encoding.DER,
+                                             serialization.PublicFormat.SubjectPublicKeyInfo)
+    for d in (ca_dir, i1, i2):
+        assert pub(node_renew.current_cert(d, "n1")) == want, d
+    assert not list((ca_dir / node_renew.PUBLISHING_DIR).glob("*"))
+
+
+def _partly_published(tmp_path, monkeypatch):
+    ca, ca_dir, i1, i2 = _split(tmp_path)
+    queue_proven(i1, "n1", make_csr("n1")[0])
+    real = node_renew._replace_file
+
+    def flaky(path, data):
+        if path.parent == i2:
+            raise OSError("EIO")
+        return real(path, data)
+    monkeypatch.setattr(node_renew, "_replace_file", flaky)
+    [(_nid, outcome)] = sign_pending(ca, ca_dir, node_dirs=[i1, i2])
+    assert outcome.startswith("deferred")
+    monkeypatch.setattr(node_renew, "_replace_file", real)
+    return ca, ca_dir, i1, i2
+
+
+def test_an_expired_publication_record_links_nothing(tmp_path, monkeypatch):
+    ca, ca_dir, i1, i2 = _partly_published(tmp_path, monkeypatch)
+    monkeypatch.setattr(node_renew, "PUBLISHING_TTL_S", -1)
+    [(_nid, outcome)] = sign_pending(ca, ca_dir, node_dirs=[i1, i2])
+    assert outcome.startswith("refused") and "current" in outcome   # i1 holds only the new key
+
+
+def test_revoke_drops_the_publication_record(tmp_path, monkeypatch):
+    ca, ca_dir, i1, i2 = _partly_published(tmp_path, monkeypatch)
+    assert node_renew._publishing_path(ca_dir, "n1").exists()
+    node_renew.revoke(ca_dir, "n1", node_dirs=[i1, i2])
+    assert not node_renew._publishing_path(ca_dir, "n1").exists()

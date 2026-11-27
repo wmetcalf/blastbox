@@ -949,7 +949,13 @@ certificates in ALL of those dirs as its current state: the renewed certificate 
 **intersection** of their grants and the WireGuard key (or none) of the most recently issued of
 them, and replaces the node's certificates in every dir where it still verifies, so an
 ingress that narrowed a node is never widened by a renewal queued through another. A dir where
-it was revoked is left alone. Every certificate is verified against the CA host's own CA, never
+it was revoked is left alone. The proof's key must be current in EVERY dir where the node
+verifies, not just the one that queued it: one ingress's copy of a certificate (say, an old one
+restored after a revoke and re-enrol) is not evidence for the others. A renewal whose key is
+current where it was queued but not in another dir is deferred, naming that dir. While a renewal
+is published to some dirs but not yet all, the CA host links its old and new key in its own
+`--dir` (`.renew-publishing/<node>.json`, at most 24 h; removed once published everywhere and by
+`revoke-node`) so the retry can finish. Every certificate is verified against the CA host's own CA, never
 a node dir's `ca.crt`, and reads from a node dir are bounded and never block on a FIFO: the dir is
 the ingress's to write.
 

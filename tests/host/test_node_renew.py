@@ -476,8 +476,10 @@ def test_split_renewal_never_widens_a_narrower_ingress(tmp_path):
     broad = pki.NodeGrants(engines=("x", "y"), tiers=("warm",), credentials=True)
     narrow = pki.NodeGrants(engines=("x",), tiers=(), credentials=False)
     i1, i2 = tmp_path / "i1", tmp_path / "i2"
-    _put(i1, ca_dir, ca.sign_node_csr(make_csr("n1")[0], node_id="n1", grants=broad))
-    _put(i2, ca_dir, ca.sign_node_csr(make_csr("n1")[0], node_id="n1", grants=narrow))
+    # One node, one key: the proof's key must be current in every dir it verifies in.
+    csr, _key = make_csr("n1")
+    _put(i1, ca_dir, ca.sign_node_csr(csr, node_id="n1", grants=broad))
+    _put(i2, ca_dir, ca.sign_node_csr(csr, node_id="n1", grants=narrow))
     queue_csr(i1, "n1", make_csr("n1")[0])
     assert sign_pending(ca, ca_dir, node_dirs=[i1, i2]) == [("n1", "renewed")]
     assert fleet_grants(i2)["n1"] == narrow
@@ -588,6 +590,53 @@ def test_a_symlinked_renew_dir_is_not_drained(tmp_path):
     (i1 / "renew").symlink_to(victim)
     assert sign_pending(ca, ca_dir, node_dirs=[i1]) == []
     assert (victim / "keep.csr").exists()
+
+
+def test_a_renew_dir_swapped_for_a_link_after_the_check_is_not_followed(tmp_path,
+                                                                         monkeypatch):
+    """The ingress owns its PKI dir, so it can swap ``renew/`` for a link to anywhere on the
+    CA host between the check and the use: the queue must be pinned once, then used only
+    through that pin."""
+    ca, ca_dir, i1, _i2 = _split(tmp_path)
+    queue_csr(i1, "n1", make_csr("n1")[0])
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "important.csr").write_bytes(b"x")
+    q = i1 / "renew"
+    swapped = []
+
+    def swap():
+        if not swapped:
+            swapped.append(True)
+            q.rename(i1 / "renew.real")
+            q.symlink_to(victim)
+
+    real_glob, real_listdir, real_scandir = Path.glob, os.listdir, os.scandir
+
+    def glob(self, pat, *a, **kw):
+        if self == q:
+            swap()
+        return real_glob(self, pat, *a, **kw)
+
+    def listdir(p="."):
+        if isinstance(p, int) or Path(p) == q:
+            swap()
+        return real_listdir(p)
+
+    def scandir(p="."):
+        if isinstance(p, int) or Path(p) == q:
+            swap()
+        return real_scandir(p)
+    monkeypatch.setattr(Path, "glob", glob)
+    monkeypatch.setattr(os, "listdir", listdir)
+    monkeypatch.setattr(os, "scandir", scandir)
+    out = sign_pending(ca, ca_dir, node_dirs=[i1])
+    monkeypatch.undo()
+    assert swapped
+    assert (victim / "important.csr").read_bytes() == b"x"
+    assert sorted(p.name for p in victim.iterdir()) == ["important.csr"]
+    assert ("important", "refused: malformed queue entry") not in out
+    assert dict(out).get("n1") == "renewed"
 
 
 def test_a_symlinked_csr_is_not_read(tmp_path):
