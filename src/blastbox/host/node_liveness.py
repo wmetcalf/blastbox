@@ -21,9 +21,13 @@ import threading
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Iterator, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, Mapping, Protocol
+
+if TYPE_CHECKING:
+    from blastbox.host.pki import NodeIdentity
 
 __all__ = [
+    "ClaimThrottle", "CERT_EXPIRED_GRACE_S",
     "NodeLiveness", "LivenessStore", "InMemoryLivenessStore", "SqlLivenessStore",
     "RedisLivenessStore", "build_liveness_store",
     "safe_record_heartbeat", "safe_record_claim",
@@ -66,6 +70,25 @@ def safe_record_claim(store: LivenessStore, node_id: str, engine: str | None,
     except Exception:  # noqa: BLE001 - liveness must never fail a claim
         _log.exception("node_liveness: could not record claim for node=%s", node_id)
         return False
+
+
+class ClaimThrottle:
+    """At most one claim write per node per ``min_interval_s``, in process. Agents poll every
+    ~2 s per slot, so unthrottled this is a write per poll; ``last_claim_at`` stays accurate to
+    within the interval, which is far inside any silence threshold."""
+
+    def __init__(self, min_interval_s: float = 5.0) -> None:
+        self._min = min_interval_s
+        self._lock = threading.Lock()
+        self._last: dict[str, float] = {}
+
+    def allow(self, node_id: str, at: float) -> bool:
+        with self._lock:
+            prev = self._last.get(node_id)
+            if prev is not None and 0 <= at - prev < self._min:
+                return False
+            self._last[node_id] = at
+            return True
 
 
 class InMemoryLivenessStore:
@@ -154,10 +177,11 @@ class RedisLivenessStore:
             "body": json.dumps(body, separators=(",", ":"))})
 
     def record_claim(self, node_id: str, engine: str | None, at: float) -> None:
-        mapping = {"last_claim_at": repr(float(at))}
-        if engine:
-            mapping["last_claim_engine"] = engine
-        self._r.hset(self.PREFIX + node_id, mapping=mapping)
+        key = self.PREFIX + node_id
+        self._r.hset(key, mapping={"last_claim_at": repr(float(at)),
+                                   "last_claim_engine": engine or ""})
+        # "" reads back as None (snapshot's `or None`), i.e. engine=None overwrites the prior
+        # engine exactly as the memory store does.
 
     def snapshot(self) -> dict[str, NodeLiveness]:
         def s(v):
@@ -196,6 +220,9 @@ def build_liveness_store(store=None) -> LivenessStore:
     client = getattr(store, "_r", None)
     if client is not None and hasattr(client, "scan_iter"):
         return RedisLivenessStore(client)
+    _log.warning("node_liveness: job store %s has no SQL or Redis backing; liveness is kept "
+                 "in memory only, per process, and is lost on restart",
+                 type(store).__name__)
     return InMemoryLivenessStore()
 
 
@@ -206,7 +233,11 @@ def build_liveness_store(store=None) -> LivenessStore:
 #: Bound on the fallback queue scan used by stores without ``oldest_queued_by_engine``.
 MAX_QUEUED_SCAN = 10_000
 
-AlertKind = Literal["node_silent", "node_unhealthy", "engine_orphaned", "cert_expiring"]
+AlertKind = Literal["node_silent", "node_unhealthy", "engine_orphaned", "cert_expiring",
+                    "cert_expired"]
+
+#: A cert that lapsed within this window stays in the evaluation as ``cert_expired``.
+CERT_EXPIRED_GRACE_S = 86400.0
 
 
 def _env_float(name: str, default: float) -> float:
@@ -267,15 +298,21 @@ def _fresh(live: "NodeLiveness | None", now: float, cfg: LivenessConfig) -> bool
             and now - live.last_heartbeat_at <= cfg.silent_after_s)
 
 
-def evaluate(*, now: float, enrolled: "dict[str, Any]", live: dict[str, NodeLiveness],
+def evaluate(*, now: float, enrolled: "Mapping[str, NodeIdentity]", live: dict[str, NodeLiveness],
              oldest_queued: dict[str, float], cfg: LivenessConfig) -> list[Alert]:
     """Pure alert evaluation. ``enrolled`` maps node id -> ``pki.NodeIdentity`` for the
-    verifying, unexpired certificates; only those nodes are expected to be alive."""
+    verifying certificates that are unexpired or expired within :data:`CERT_EXPIRED_GRACE_S`.
+    An unexpired node is expected to be alive; an expired one raises ``cert_expired`` instead of
+    vanishing (a dead node whose cert lapsed is still a dead node)."""
     alerts: list[Alert] = []
     for node_id in sorted(enrolled):
         ident = enrolled[node_id]
         lv = live.get(node_id)
         not_after = ident.not_after.timestamp()
+        if not_after <= now:
+            alerts.append(Alert("cert_expired", node_id, now,
+                                f"certificate expired {now - not_after:.0f}s ago"))
+            continue
         if lv is not None and _fresh(lv, now, cfg):
             engines = _engines_of(lv)
             bad = sorted(str(e.get("name", "")) for e in engines if not e.get("selftest_ok"))
@@ -292,10 +329,12 @@ def evaluate(*, now: float, enrolled: "dict[str, Any]", live: dict[str, NodeLive
                       else f"no heartbeat for {now - hb:.0f}s (limit {cfg.silent_after_s:g}s)")
             alerts.append(Alert("node_silent", node_id, since, detail))
         if not_after - now < cfg.cert_expiring_s:
-            alerts.append(Alert("cert_expiring", node_id, not_after,
+            alerts.append(Alert("cert_expiring", node_id, now,
                                 f"certificate expires in {max(0.0, not_after - now):.0f}s"))
     granted: dict[str, set[str]] = {}
     for node_id, ident in enrolled.items():
+        if ident.not_after.timestamp() <= now:
+            continue                       # an expired cert serves nothing
         for eng in ident.grants.engines:
             granted.setdefault(eng, set()).add(node_id)
     watched = set(cfg.orphaned_engines) if cfg.orphaned_engines else set(granted)
@@ -316,13 +355,15 @@ def evaluate(*, now: float, enrolled: "dict[str, Any]", live: dict[str, NodeLive
     return alerts
 
 
-def enrolled_nodes(pki_dir: "Path | str") -> "dict[str, Any]":
+def enrolled_nodes(pki_dir: "Path | str", *, now: float | None = None) -> "dict[str, NodeIdentity]":
     """Node id -> ``NodeIdentity`` for every verifying, unexpired ``*.crt`` in ``pki_dir``
     (same scan as ``placement.fleet_grants``). Two certs for one id (a re-issue overlap) merge
-    to the intersection of grants and the LATER expiry, so an overlap never false-alarms."""
+    to the intersection of grants and the LATER expiry, so an overlap never false-alarms.
+    Certs that expired within :data:`CERT_EXPIRED_GRACE_S` are kept (see :func:`evaluate`)."""
     from blastbox.host.pki import load_trust_anchor, node_identity
 
     d = Path(pki_dir)
+    cutoff = (time.time() if now is None else now) - CERT_EXPIRED_GRACE_S
     out: dict[str, Any] = {}
     try:
         ca = load_trust_anchor(d)
@@ -330,9 +371,11 @@ def enrolled_nodes(pki_dir: "Path | str") -> "dict[str, Any]":
         return out
     for crt in sorted(d.glob("*.crt")):
         try:
-            ident = node_identity(ca, crt.read_bytes())
+            ident = node_identity(ca, crt.read_bytes(), allow_expired=True)
         except Exception:  # noqa: BLE001 - one bad file is not a fleet outage
             continue
+        if ident.not_after.timestamp() <= cutoff:
+            continue                         # long gone: decommissioned, not an incident
         prior = out.get(ident.node_id)
         if prior is not None:
             from blastbox.host.pki import NodeGrants
@@ -389,10 +432,31 @@ class LivenessMonitor:
         self._clock = clock
         self._lock = threading.Lock()
         self._memo: dict[tuple[str, str], Alert] = {}
+        self._enrolled_cache: tuple[Any, float, dict[str, Any]] | None = None
+
+    def _pki_signature(self) -> tuple:
+        try:
+            return tuple(sorted((c.name, c.stat().st_mtime_ns, c.stat().st_size)
+                                for c in Path(self._pki).glob("*.crt")))
+        except OSError:
+            return ("unreadable", self._clock())
+
+    def _enrolled(self, now: float) -> dict[str, Any]:
+        """The cert scan verifies every certificate (O(certs)); /metrics may be public, so it is
+        cached for ENROLLED_TTL_S, keyed on the directory signature."""
+        sig = self._pki_signature()
+        c = self._enrolled_cache
+        if c is not None and c[0] == sig and 0 <= now - c[1] < self.ENROLLED_TTL_S:
+            return c[2]
+        got = enrolled_nodes(self._pki, now=now)
+        self._enrolled_cache = (sig, now, got)
+        return got
+
+    ENROLLED_TTL_S = 10.0
 
     def view(self) -> _View:
         now = self._clock()
-        enrolled = enrolled_nodes(self._pki)
+        enrolled = self._enrolled(now)
         live = self._liveness.snapshot()
         queued = oldest_queued(self._jobs)
         alerts = evaluate(now=now, enrolled=enrolled, live=live, oldest_queued=queued,

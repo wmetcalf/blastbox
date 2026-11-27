@@ -464,6 +464,9 @@ peers:
     node granted it. This is the user-visible symptom, and it fires even if node bookkeeping is
     wrong.
   * `cert_expiring`: less than 48 h to `not_after`.
+  * `cert_expired`: the cert lapsed within the last 24 h. Such a node stays visible instead of
+    vanishing from the expected set; it is not also `node_silent`. Consumers (Loadout) must
+    accept alert kinds they do not know.
 * **Metrics** on `/metrics`:
   `blastbox_node_last_heartbeat_seconds{node}`, `blastbox_node_last_claim_seconds{node}`,
   `blastbox_node_selftest_ok{node,engine}`, `blastbox_node_cert_expiry_seconds{node}`,

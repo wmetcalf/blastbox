@@ -134,3 +134,37 @@ def test_heartbeat_listing_extra_engines_changes_no_grant(rig, pki_dir):
     assert store.get("job-1").status == JobStatus.QUEUED
     r = _claim(c, pki_dir, "beta", token=tok)          # unscoped: only boxjs, so nothing
     assert r.status_code == 204
+
+
+def test_in_flight_claim_ids_are_not_persisted(rig, pki_dir):
+    _, c = rig
+    r = c.post("/v1/nodes/heartbeat", json=GOOD, headers=auth(token_for(c, pki_dir, "alpha")))
+    assert r.status_code == 200
+    body = _liveness(c).snapshot()["alpha"].body
+    assert [e["job_id"] for e in body["in_flight"]] == ["j"]
+    assert "claim_id" not in body["in_flight"][0] and body["in_flight"][0]["started_at"]
+
+
+def test_claim_writes_are_throttled(rig, pki_dir):
+    _, c = rig
+    tok = token_for(c, pki_dir, "alpha")
+    _claim(c, pki_dir, "alpha", token=tok)
+    first = _liveness(c).snapshot()["alpha"].last_claim_at
+    _claim(c, pki_dir, "alpha", token=tok)
+    assert _liveness(c).snapshot()["alpha"].last_claim_at == first
+
+
+@pytest.mark.parametrize("floor,stored", [("seatbelt", "seatbelt"), (1, "1")])
+def test_floor_is_a_sandbox_name_and_an_int_is_tolerated(rig, pki_dir, floor, stored):
+    _, c = rig
+    body = dict(GOOD, engines=[dict(GOOD["engines"][0], floor=floor)])
+    r = c.post("/v1/nodes/heartbeat", json=body, headers=auth(token_for(c, pki_dir, "alpha")))
+    assert r.status_code == 200
+    assert _liveness(c).snapshot()["alpha"].body["engines"][0]["floor"] == stored
+
+
+def test_floor_longer_than_32_chars_is_refused(rig, pki_dir):
+    _, c = rig
+    body = dict(GOOD, engines=[dict(GOOD["engines"][0], floor="x" * 33)])
+    r = c.post("/v1/nodes/heartbeat", json=body, headers=auth(token_for(c, pki_dir, "alpha")))
+    assert r.status_code == 422

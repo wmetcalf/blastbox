@@ -69,7 +69,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
-from pydantic import BaseModel, Field, StrictInt, StringConstraints
+from pydantic import BaseModel, BeforeValidator, Field, StrictInt, StringConstraints
 
 from blastbox.host import node_auth, node_renew
 from blastbox.host.jobs.base import NODE_CLAIM_PREFIX as _NODE_CLAIM_PREFIX
@@ -492,13 +492,17 @@ class ClaimRequest(BaseModel):
 
 _Str = Annotated[str, StringConstraints(max_length=128)]
 _Ts = Annotated[str, StringConstraints(max_length=64)]
+#: A sandbox NAME ("seatbelt", "nsjail"). Older agents sent an int; coerce it rather than 422.
+_Floor = Annotated[str, BeforeValidator(lambda v: str(v) if isinstance(v, int)
+                                        and not isinstance(v, bool) else v),
+                   StringConstraints(max_length=32)]
 
 
 class HeartbeatEngine(BaseModel):
     model_config = {"extra": "ignore"}
     name: _Str = ""
     sandbox: _Str = ""
-    floor: int = Field(0, ge=0, le=1_000_000)
+    floor: _Floor = ""
     slots: int = Field(0, ge=0, le=1_000_000)
     busy: int = Field(0, ge=0, le=1_000_000)
     selftest_ok: bool = False
@@ -808,7 +812,9 @@ def register_node_claim_routes(
     _signing_key = node_auth.resolve_claim_secret(job_store, resolved, pepper=pepper)
 
     from blastbox.host.node_liveness import (
-        build_liveness_store, safe_record_claim, safe_record_heartbeat)
+        ClaimThrottle, build_liveness_store, safe_record_claim, safe_record_heartbeat)
+
+    _claim_throttle = ClaimThrottle(5.0)
 
     try:
         _liveness = build_liveness_store(job_store)
@@ -981,7 +987,9 @@ def register_node_claim_routes(
         # Every AUTHENTICATED attempt counts as the node being alive and polling -- including
         # one that ends in a 204, which is the common case for an idle node. Not a 401 (above
         # raised already). Best-effort: a store error is logged, never fails the claim.
-        safe_record_claim(_liveness, node_id, req.engine, time.time())
+        _t = time.time()
+        if _claim_throttle.allow(node_id, _t):
+            safe_record_claim(_liveness, node_id, req.engine, _t)
         if req.claimant_tier:
             # REFUSED, not ignored, and not honoured.
             #
@@ -1152,7 +1160,12 @@ def register_node_claim_routes(
                          node_id)
             raise HTTPException(status_code=403, detail=_REFUSED)
         now = time.time()
-        safe_record_heartbeat(_liveness, node_id, body.model_dump(), now)
+        stored = body.model_dump()
+        # A claim_id is an ownership token for a job; the liveness row is for alerting, so keep
+        # the job id and times and never persist the token.
+        stored["in_flight"] = [{k: v for k, v in e.items() if k != "claim_id"}
+                               for e in stored.get("in_flight", [])]
+        safe_record_heartbeat(_liveness, node_id, stored, now)
         return {"server_time": now,
                 "min_agent_version": os.environ.get("BLASTBOX_NODE_MIN_AGENT_VERSION")
                 or "0.0.0",

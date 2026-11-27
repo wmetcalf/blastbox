@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -13,8 +14,8 @@ from blastbox.host.ingress.app import build_app
 from blastbox.host.jobs.base import Job, JobStatus
 from blastbox.host.jobs.memory import InMemoryJobStore
 from blastbox.host.node_liveness import (
-    LivenessConfig, LivenessMonitor, InMemoryLivenessStore, NodeLiveness, evaluate,
-    oldest_queued)
+    LivenessConfig, LivenessMonitor, InMemoryLivenessStore, NodeLiveness, enrolled_nodes,
+    evaluate, oldest_queued)
 
 WG = "A" * 42 + "B="
 T0 = 1_800_000_000.0
@@ -150,7 +151,7 @@ def test_view_shape_and_cert_not_after_from_enrolled_cert(rig):
     app, _, c = rig
     app.state.node_liveness.record_heartbeat(
         "alpha", {"agent_version": "9.9", "cert_not_after": "bogus",
-                  "engines": [{"name": "clamav", "selftest_ok": True}]}, __import__("time").time())
+                  "engines": [{"name": "clamav", "selftest_ok": True}]}, time.time())
     j = c.get("/v1/fleet/liveness", headers={"Authorization": "Bearer k"}).json()
     assert set(j) == {"config", "nodes", "alerts", "generated_at"}
     assert {"silent_after_s", "orphaned_after_s", "cert_expiring_s"} <= set(j["config"])
@@ -164,7 +165,7 @@ def test_view_shape_and_cert_not_after_from_enrolled_cert(rig):
 def test_metrics_export_gauges_and_alert(rig):
     app, store, c = rig
     store.create(Job(job_id="x", engine="clamav", filename="f", status=JobStatus.QUEUED,
-                     created_at=__import__("time").time() - 1000))
+                     created_at=time.time() - 1000))
     text = c.get("/metrics").text
     assert 'blastbox_node_alert{kind="node_silent",subject="alpha"} 1.0' in text
     assert 'blastbox_node_alert{kind="engine_orphaned",subject="clamav"} 1.0' in text
@@ -184,7 +185,7 @@ def test_transition_logged_once_on_raise_and_once_on_clear(tmp_path, caplog):
     pki.ensure_ca(d).issue_node("alpha", wg_pubkey=WG, grants=pki.NodeGrants(
         engines=("clamav",))).write(d, "node-alpha")
     lvs = InMemoryLivenessStore()
-    now = [__import__("time").time()]
+    now = [time.time()]
     lvs.record_heartbeat("alpha", {"engines": [{"name": "clamav", "selftest_ok": True}]}, now[0])
     m = LivenessMonitor(liveness=lvs, job_store=InMemoryJobStore(), pki_dir=d,
                         clock=lambda: now[0])
@@ -202,3 +203,73 @@ def test_transition_logged_once_on_raise_and_once_on_clear(tmp_path, caplog):
     infos = [r for r in caplog.records if r.levelno == logging.INFO]
     assert len(infos) == 1 and "CLEARED" in infos[0].getMessage()
     assert first_since < now[0]
+
+
+def test_since_is_pinned_to_first_seen_while_the_alert_stays_active(tmp_path):
+    d = tmp_path / "pki"
+    pki.ensure_ca(d).issue_node("alpha", wg_pubkey=WG, grants=pki.NodeGrants(
+        engines=("clamav",)), days=1).write(d, "node-alpha")      # < 48 h: cert_expiring
+    lvs = InMemoryLivenessStore()
+    now = [time.time()]
+    lvs.record_heartbeat("alpha", {"engines": [{"name": "clamav", "selftest_ok": True}]}, now[0])
+    m = LivenessMonitor(liveness=lvs, job_store=InMemoryJobStore(), pki_dir=d,
+                        clock=lambda: now[0])
+    t_first = now[0]
+    (a,) = m.as_json()["alerts"]
+    assert a["kind"] == "cert_expiring" and a["since"] == t_first
+    now[0] += 5
+    lvs.record_heartbeat("alpha", {"engines": [{"name": "clamav", "selftest_ok": True}]}, now[0])
+    (a,) = m.as_json()["alerts"]
+    assert a["since"] == t_first                                   # not advanced to now
+
+
+def test_evaluate_with_real_node_identities_and_cert_expired(tmp_path):
+    d = tmp_path / "pki"
+    ca = pki.ensure_ca(d)
+    ca.issue_node("alpha", wg_pubkey=WG, grants=pki.NodeGrants(engines=("clamav",)),
+                  days=7).write(d, "node-alpha")
+    t = time.time()
+    enrolled = enrolled_nodes(d, now=t)
+    assert isinstance(enrolled["alpha"], pki.NodeIdentity)
+    live = {"alpha": NodeLiveness("alpha", t, None, None, {
+        "engines": [{"name": "clamav", "selftest_ok": True}]})}
+    assert evaluate(now=t, enrolled=enrolled, live=live, oldest_queued={}, cfg=CFG) == []
+    # 8 days on: expired 1 day-ish ago is inside the window only if < 24 h; use +7d+1h.
+    later = t + 7 * 86400 + 3600
+    enrolled = enrolled_nodes(d, now=later)
+    got = evaluate(now=later, enrolled=enrolled, live={}, oldest_queued={"clamav": later - 999},
+                   cfg=CFG)
+    assert kinds(got) == [("cert_expired", "alpha")]               # not silent, not orphaned-by-it
+    # past the 24 h grace the node is simply gone
+    assert enrolled_nodes(d, now=t + 7 * 86400 + 2 * 86400) == {}
+
+
+def test_enrolled_scan_is_cached_for_10s_and_invalidated_by_a_new_cert(tmp_path, monkeypatch):
+    from blastbox.host import node_liveness as nl
+    d = tmp_path / "pki"
+    ca = pki.ensure_ca(d)
+    ca.issue_node("a", wg_pubkey=WG, grants=pki.NodeGrants(engines=("clamav",))).write(d, "node-a")
+    calls = []
+    real = nl.enrolled_nodes
+    monkeypatch.setattr(nl, "enrolled_nodes", lambda *a, **k: calls.append(1) or real(*a, **k))
+    now = [1000.0]
+    m = LivenessMonitor(liveness=InMemoryLivenessStore(), job_store=InMemoryJobStore(),
+                        pki_dir=d, clock=lambda: now[0])
+    m.view()
+    m.view()
+    now[0] += 9
+    m.view()
+    assert len(calls) == 1
+    now[0] += 2
+    m.view()
+    assert len(calls) == 2                                          # TTL elapsed
+    ca.issue_node("b", wg_pubkey=WG, grants=pki.NodeGrants(engines=("clamav",))).write(d, "node-b")
+    m.view()
+    assert len(calls) == 3                                          # signature changed
+
+
+def test_claim_writes_are_throttled_per_node():
+    from blastbox.host.node_liveness import ClaimThrottle
+    t = ClaimThrottle(5.0)
+    assert t.allow("a", 100.0) and not t.allow("a", 102.0) and not t.allow("a", 104.9)
+    assert t.allow("a", 105.0) and t.allow("b", 102.0)

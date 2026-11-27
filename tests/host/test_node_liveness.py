@@ -77,3 +77,18 @@ def test_writes_are_best_effort():
 
     assert safe_record_heartbeat(Boom(), "a", {}, 1.0) is False
     assert safe_record_claim(Boom(), "a", None, 1.0) is False
+
+
+def test_redis_claim_with_no_engine_clears_the_engine():
+    s = RedisLivenessStore(FakeRedis())
+    s.record_claim("n1", "boxjs", 6.0)
+    s.record_claim("n1", None, 7.0)
+    r = s.snapshot()["n1"]
+    assert (r.last_claim_at, r.last_claim_engine) == (7.0, None)
+
+
+def test_memory_fallback_warns(caplog):
+    import logging
+    with caplog.at_level(logging.WARNING, logger="blastbox.node_liveness"):
+        build_liveness_store(InMemoryJobStore())
+    assert any("in memory only" in r.getMessage() for r in caplog.records)
