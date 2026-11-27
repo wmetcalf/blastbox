@@ -878,7 +878,8 @@ Three things an operator must know:
   scp /var/lib/blastbox/pki/node-toolz3.crt ingress-2:/var/lib/blastbox/pki/   # every replica
   ```
 
-  The public certificate only — never the key. Renewals must be copied the same way.
+  The public certificate only — never the key. A manual re-issue must be copied the same way;
+  an online renewal is published to every ingress by `renew-pending --node-dir` (below).
 * **`BLASTBOX_API_KEY` does not apply to these routes, by design.** They authenticate with a
   CA-issued certificate and a session bound to it — stronger than the key, and orthogonal to
   it. Requiring the key too would put the *submitter's* credential on every node, letting
@@ -918,6 +919,16 @@ was removed or has expired is never renewed: that is still the revocation path. 
 `cp deploy/systemd/blastbox-pki-renew.* /etc/systemd/system/ && systemctl enable --now
 blastbox-pki-renew.timer` on the CA host only. The unit passes `--dir /var/lib/blastbox/pki`;
 edit it if your PKI dir differs.
+
+When the ingress is **not** the CA host, the queue and the certificates the ingress authorises
+with live in the ingress's PKI dir, so the CA host must reach it. Make each ingress host's PKI
+dir reachable on the CA host (an sshfs or NFS mount, CA host as the client, so the ingress never
+sees `ca.key`) and add one `--node-dir <mount>` per ingress to the unit's `ExecStart`.
+`renew-pending` then drains every ingress's `renew/` queue, judges each CSR against the
+certificates of the ingress that queued it, and writes the renewed certificate to every node dir
+(and `--dir`) where the node still verifies; a dir where it was revoked is left alone. Without
+`--node-dir` a split deployment's renewals are never seen: the node gets 202 and its old
+certificate until it expires.
 
 `--name`/`--public-key` still work for nodes not yet enrolled, and say plainly that the key
 is unauthenticated. The certificate's node-info extension uses a **placeholder OID arc that

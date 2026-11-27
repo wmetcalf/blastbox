@@ -307,3 +307,46 @@ def test_queue_cap_is_exact(tmp_path, monkeypatch):
         (d / "renew" / f"x{i}.csr").write_bytes(b"x")
     with pytest.raises(RenewRefused):
         queue_csr(d, "n1", make_csr("n1")[0])
+
+
+def _split(tmp_path):
+    """A CA host and two ingress hosts, each with its own PKI dir (no shared queue)."""
+    ca_dir = tmp_path / "ca"
+    ca = pki.ensure_ca(ca_dir)
+    i1, i2 = tmp_path / "ingress-1", tmp_path / "ingress-2"
+    cert = ca.sign_node_csr(make_csr("n1")[0], node_id="n1", grants=GRANTS)
+    for d in (ca_dir, i1, i2):
+        d.mkdir(exist_ok=True)
+        if d != ca_dir:
+            (d / "ca.crt").write_bytes((ca_dir / "ca.crt").read_bytes())
+        (d / "node-n1.crt").write_bytes(cert)
+    return ca, ca_dir, i1, i2
+
+
+def test_split_hosts_sign_the_ingress_queue_and_publish_everywhere(tmp_path):
+    ca, ca_dir, i1, i2 = _split(tmp_path)
+    csr, key = make_csr("n1")
+    queue_csr(i1, "n1", csr)                       # the node renewed through ingress-1
+    assert sign_pending(ca, ca_dir, days=7, node_dirs=[i1, i2]) == [("n1", "renewed")]
+    want = key.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    for d in (i1, i2, ca_dir):
+        assert pub(node_renew.current_cert(d, "n1")) == want, d
+    assert not list((i1 / "renew").glob("*.csr*"))
+
+
+def test_split_hosts_do_not_republish_where_the_node_was_revoked(tmp_path):
+    ca, ca_dir, i1, i2 = _split(tmp_path)
+    (i2 / "node-n1.crt").unlink()                  # revoked on ingress-2 only
+    queue_csr(i1, "n1", make_csr("n1")[0])
+    assert sign_pending(ca, ca_dir, days=7, node_dirs=[i1, i2]) == [("n1", "renewed")]
+    assert not (i2 / "node-n1.crt").exists()
+
+
+def test_cli_renew_pending_accepts_node_dirs(tmp_path, capsys):
+    from blastbox.host.cli import main
+    ca, ca_dir, i1, i2 = _split(tmp_path)
+    queue_csr(i2, "n1", make_csr("n1")[0])
+    assert main(["pki", "--dir", str(ca_dir), "renew-pending",
+                 "--node-dir", str(i1), "--node-dir", str(i2)]) == 0
+    assert capsys.readouterr().out.strip() == "n1: renewed"

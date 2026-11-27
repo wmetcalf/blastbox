@@ -4,6 +4,10 @@
 # node's CSR and queues it under <pki>/renew/. This unit signs what is queued, using the
 # grants of each node's CURRENT certificate; a removed or expired node is refused, which is
 # the revocation path. Fired by blastbox-pki-renew.timer.
+#
+# CA and ingress on different hosts: mount each ingress's PKI dir here and append one
+# `--node-dir <mount>` per ingress to ExecStart, or its queue is never drained
+# (docs/DEPLOYMENT.md, "Node certificate renewal").
 [Unit]
 Description=sign queued blastbox node-certificate renewals
 

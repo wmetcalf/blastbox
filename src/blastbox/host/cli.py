@@ -1519,7 +1519,8 @@ def _pki_cmd(args: argparse.Namespace) -> int:
             print(f"error: cannot load the CA (this needs the CA key): {exc}", file=sys.stderr)
             return 1
         try:
-            outcomes = sign_pending(ca, pki_dir, days=args.days)
+            outcomes = sign_pending(ca, pki_dir, days=args.days,
+                                    node_dirs=[Path(p) for p in args.node_dir] or None)
         except ValueError as exc:     # an out-of-range --days: nothing was touched
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -2236,6 +2237,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="sign the CSRs nodes queued through POST /v1/nodes/renew, with the grants of "
              "each node's CURRENT cert (CA host only; run from a timer)")
     pk_rp.add_argument("--days", type=int, default=7)
+    pk_rp.add_argument(
+        "--node-dir", action="append", default=[],
+        help="an ingress host's PKI dir, reachable here (repeatable): drain its renew/ "
+             "queue and publish renewed certs to every node dir where the node still "
+             "verifies. Default: --dir only (CA and ingress on one host)")
     pk_ns = pks.add_parser(
         "node-status",
         help="what THIS node's environment resolves to: is the grants gate armed, does "
