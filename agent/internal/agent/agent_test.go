@@ -860,6 +860,23 @@ func TestUnsweptRunKeepsEngineRed(t *testing.T) {
 	eventually(t, "claims resume after recovery stops the run", func() bool { return e.in.claimCount() > 1 })
 }
 
+// After a restart the gate is rebuilt from disk: a kept run that recovery cannot show stopped
+// keeps its engine red, as it did before the restart.
+func TestUnsweptGateSurvivesRestart(t *testing.T) {
+	e := fresh(t)
+	d := jobDir(e, "jr3", true, true)
+	os.WriteFile(filepath.Join(d, runner.RunRecordName), []byte(`{"pid":0,"canary":"io.blastbox.run.x"}`), 0o600)
+	e.in.onClaim = func(int) (int, string) { return 204, "" }
+	h := newHarness(e)
+	h.a.KillRunFn = func(sandbox.RunRecord) error { return fmt.Errorf("still alive") }
+	h.start(t)
+	eventually(t, "heartbeats", func() bool { return e.in.hbCount() >= 2 })
+	time.Sleep(100 * time.Millisecond)
+	if n := e.in.claimCount(); n != 0 {
+		t.Fatalf("claimed %d times while a recovered run was not shown stopped", n)
+	}
+}
+
 func TestRefusedJobGoesToRecovery(t *testing.T) {
 	e := fresh(t)
 	e.in.onClaim = func(n int) (int, string) {

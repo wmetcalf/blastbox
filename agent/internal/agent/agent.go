@@ -195,7 +195,7 @@ func (a *Agent) probeEngine(ctx context.Context, es *engState, wait bool) {
 func (a *Agent) evaluate(ctx context.Context, eng config.Engine) (bool, string) {
 	a.mu.Lock()
 	for id, name := range a.unswept {
-		if name == eng.Name {
+		if name == eng.Name || name == "" { // "": the run's engine is unknown, so gate them all
 			a.mu.Unlock()
 			return false, "processes of an earlier run (job " + id + ") are not shown gone; recovery is retrying"
 		}

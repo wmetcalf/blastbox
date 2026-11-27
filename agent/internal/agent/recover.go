@@ -137,6 +137,17 @@ func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool)
 			if json.Unmarshal(raw, &rec) == nil {
 				if err := a.KillRunFn(rec); err != nil {
 					a.Log.Warn("recovery: the previous run could not be shown stopped; will retry", "job", name, "err", err.Error())
+					// Its engine must not claim meanwhile, also after a restart (the gate lives in
+					// memory): name it from the claim record, or gate every engine if unreadable.
+					var ce struct {
+						Engine string `json:"engine"`
+					}
+					if raw, err := os.ReadFile(filepath.Join(dir, "claim.json")); err == nil {
+						json.Unmarshal(raw, &ce)
+					}
+					a.mu.Lock()
+					a.unswept[name] = ce.Engine
+					a.mu.Unlock()
 					return false
 				}
 
