@@ -11,6 +11,7 @@ import (
 var version = "dev"
 
 func main() {
+	runHelper(os.Args)
 	if len(os.Args) >= 2 && os.Args[1] == "version" {
 		fmt.Printf("blastbox-agent %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
 		return

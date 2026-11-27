@@ -12,6 +12,9 @@ import (
 // Dir returns the absolute path of conformance/v1 (walks up from this source file to go.mod,
 // then ../conformance/v1).
 func Dir() string {
+	if d := os.Getenv("BLASTBOX_CONFORMANCE_DIR"); d != "" { // cross-compiled test binaries
+		return d
+	}
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		panic("conformance: cannot locate source")
@@ -100,4 +103,67 @@ type CertCases struct {
 	Cases    []CertCase `json:"cases"`
 	Now      string     `json:"now"`
 	NowEpoch float64    `json:"now_epoch"`
+}
+
+// SandboxFiles lists the vector files under sandbox/<kind> (kind is "seatbelt" or "nsjail"),
+// as paths relative to Dir(), sorted.
+func SandboxFiles(kind string) ([]string, error) {
+	ents, err := os.ReadDir(Path("sandbox", kind))
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range ents {
+		if !e.IsDir() && filepath.Ext(e.Name()) == ".json" {
+			out = append(out, filepath.Join("sandbox", kind, e.Name()))
+		}
+	}
+	return out, nil
+}
+
+// SeatbeltCase is one sandbox/seatbelt vector.
+type SeatbeltCase struct {
+	Request struct {
+		Accelerators []string `json:"accelerators"`
+		Canary       *string  `json:"canary"`
+		ExecPaths    []string `json:"exec_paths"`
+		ROPaths      []string `json:"ro_paths"`
+		RWPaths      []string `json:"rw_paths"`
+		Scratch      *string  `json:"scratch"`
+	} `json:"request"`
+	Params  map[string]string `json:"params"`
+	Profile string            `json:"profile"`
+}
+
+// NsjailMount is a source/target bind mount in an nsjail vector.
+type NsjailMount struct {
+	Source string `json:"source"`
+	Target string `json:"target"`
+}
+
+// NsjailCase is one sandbox/nsjail vector.
+type NsjailCase struct {
+	Request struct {
+		AAExec         bool              `json:"aa_exec"`
+		Argv           []string          `json:"argv"`
+		AttachAppArmor bool              `json:"attach_apparmor"`
+		Env            map[string]string `json:"env"`
+		Limits         struct {
+			MemoryBytes *int64 `json:"memory_bytes"`
+			TimeoutS    *int64 `json:"timeout_s"`
+			TmpfsBytes  *int64 `json:"tmpfs_bytes"`
+			NetEgress   bool   `json:"net_egress"`
+		} `json:"limits"`
+		ROMounts []NsjailMount `json:"ro_mounts"`
+		RWMounts []NsjailMount `json:"rw_mounts"`
+	} `json:"request"`
+	HostPins struct {
+		AAExec              string   `json:"aa_exec"`
+		AppArmorProfile     string   `json:"apparmor_profile"`
+		Nsjail              string   `json:"nsjail"`
+		SeccompPolicy       string   `json:"seccomp_policy"`
+		PathsThatExist      []string `json:"paths_that_exist"`
+		PathsThatAreSymlink []string `json:"paths_that_are_symlinks"`
+	} `json:"host_pins"`
+	Argv []string `json:"argv"`
 }
