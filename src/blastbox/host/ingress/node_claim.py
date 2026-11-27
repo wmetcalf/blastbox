@@ -69,7 +69,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 from fastapi import APIRouter, Header, HTTPException, Query, Response
 from pydantic import BaseModel, Field, StringConstraints
 
-from blastbox.host import node_auth
+from blastbox.host import node_auth, node_renew
 from blastbox.host.jobs.base import NODE_CLAIM_PREFIX as _NODE_CLAIM_PREFIX
 
 if TYPE_CHECKING:                       # pragma: no cover - typing only
@@ -395,6 +395,12 @@ class _RefusalMemo:
 _REFUSED = "not authorised to claim this work"
 
 
+class RenewRequest(BaseModel):
+    """A fresh CSR from a node that already holds a valid session."""
+
+    csr_pem: str = Field(..., max_length=16384, description="the node's new CSR, PEM")
+
+
 class SessionRequest(BaseModel):
     """A node proving possession of its certificate's key, once per session."""
 
@@ -664,6 +670,33 @@ def register_node_claim_routes(
             _grants_cache["sig"] = sig
             _grants_cache["until"] = now + _GRANTS_CACHE_TTL_S
         return _grants_cache["map"].get(node_id)
+
+    @router.post("/renew", status_code=202)
+    def renew(req: RenewRequest,
+              x_blastbox_node_session: str | None = Header(None)) -> dict[str, Any]:
+        """Queue a fresh CSR for the CA host's timer to sign. No CA key lives here."""
+        node_id = _node_from_token(x_blastbox_node_session)
+        if _grants_now(node_id) is None:
+            raise HTTPException(status_code=403, detail=_REFUSED)
+        try:
+            node_renew.queue_csr(resolved, node_id, req.csr_pem.encode())
+        except node_renew.RenewRefused as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        except OSError as exc:
+            _log.warning("node_claim: renew queue write failed: %s", exc)
+            raise HTTPException(status_code=503, detail="renewal queue unavailable") from None
+        return {"queued": True}
+
+    @router.get("/cert")
+    def current_node_cert(x_blastbox_node_session: str | None = Header(None)) -> dict[str, Any]:
+        """The session node's own current certificate, never another node's."""
+        node_id = _node_from_token(x_blastbox_node_session)
+        if _grants_now(node_id) is None:
+            raise HTTPException(status_code=403, detail=_REFUSED)
+        found = node_renew.current_cert_info(resolved, node_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="no current certificate")
+        return {"cert_pem": found[0].decode(), "not_after": found[1]}
 
     @router.post("/session", response_model=None)
     def session(req: SessionRequest) -> dict[str, Any]:

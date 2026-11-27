@@ -1510,6 +1510,17 @@ def _pki_cmd(args: argparse.Namespace) -> int:
             f"  ca.key  (issuing key -- keep on issuing hosts only, 0600)      : {pki_dir / 'ca.key'}"
         )
         return 0
+    if args.pki_action == "renew-pending":
+        from blastbox.host.node_renew import sign_pending
+        from blastbox.host.pki import load_ca
+        try:
+            ca = load_ca(pki_dir)
+        except Exception as exc:  # noqa: BLE001 - no CA key here is an operator error
+            print(f"error: cannot load the CA (this needs the CA key): {exc}", file=sys.stderr)
+            return 1
+        for node_id, outcome in sign_pending(ca, pki_dir, days=args.days):
+            print(f"{node_id}: {outcome}")
+        return 0
     ca = ensure_ca(pki_dir)  # generate-or-load the CA
     if args.pki_action == "init":
         crt, key = ca.issue_client("dispatcher", days=args.days).write(
@@ -2211,6 +2222,11 @@ def build_parser() -> argparse.ArgumentParser:
     pk_sc.add_argument("--days", type=int, default=7)
     pk_sc.add_argument("--out", default=None,
                        help="cert path to write (default: <pki-dir>/node-<node-id>.crt)")
+    pk_rp = pks.add_parser(
+        "renew-pending",
+        help="sign the CSRs nodes queued through POST /v1/nodes/renew, with the grants of "
+             "each node's CURRENT cert (CA host only; run from a timer)")
+    pk_rp.add_argument("--days", type=int, default=7)
     pk_ns = pks.add_parser(
         "node-status",
         help="what THIS node's environment resolves to: is the grants gate armed, does "

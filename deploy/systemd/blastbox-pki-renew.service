@@ -1,0 +1,13 @@
+# blastbox-pki-renew — sign the node-cert renewal CSRs queued by the ingress.
+#
+# Runs on the CA host ONLY (it needs ca.key). The ingress holds no CA key: it validates a
+# node's CSR and queues it under <pki>/renew/. This unit signs what is queued, using the
+# grants of each node's CURRENT certificate; a removed or expired node is refused, which is
+# the revocation path. Fired by blastbox-pki-renew.timer.
+[Unit]
+Description=sign queued blastbox node-certificate renewals
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/blastbox/pki.env
+ExecStart=/usr/local/bin/blastbox pki --dir /var/lib/blastbox/pki renew-pending

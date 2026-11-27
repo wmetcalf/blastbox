@@ -908,6 +908,17 @@ rather than trust in a string an operator retyped. Grants default to **nothing**
 issued without them produces an idle node rather than an unrestricted one, and revocation is
 "stop renewing" — which is why the default lifetime is a week.
 
+**Node certificate renewal.** A node holding a valid session renews online: it POSTs a fresh
+CSR to `/v1/nodes/renew` (202), then polls `GET /v1/nodes/cert` for the new certificate. The
+ingress has no CA key, so it only validates and queues the CSR under `<pki>/renew/` (one file
+per node, 8 KiB cap). On the CA host, `blastbox-pki-renew.timer` (every 5 min) runs
+`blastbox pki renew-pending`, which signs each queued CSR with the grants of the node's
+**current** certificate and replaces that certificate file in place. A node whose certificate
+was removed or has expired is never renewed: that is still the revocation path. Install with
+`cp deploy/systemd/blastbox-pki-renew.* /etc/systemd/system/ && systemctl enable --now
+blastbox-pki-renew.timer` on the CA host only. The unit passes `--dir /var/lib/blastbox/pki`;
+edit it if your PKI dir differs.
+
 `--name`/`--public-key` still work for nodes not yet enrolled, and say plainly that the key
 is unauthenticated. The certificate's node-info extension uses a **placeholder OID arc that
 is not an IANA Private Enterprise Number**; it is fine while these certs never leave this
