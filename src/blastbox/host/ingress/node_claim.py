@@ -393,6 +393,9 @@ class _RefusalMemo:
 #: over the wire would let a caller map the fleet's grants by probing; the real reason is
 #: logged server-side, where it is diagnosis rather than a disclosure.
 _REFUSED = "not authorised to claim this work"
+#: Said when this ingress's PKI dir holds a non-regular *.crt entry (renewal refuses links).
+_LINKS_REFUSED = ("this ingress's PKI dir contains cert entries that are not regular files; "
+                  "links are refused -- an operator must replace them with regular files")
 
 
 class RenewRequest(BaseModel):
@@ -690,6 +693,9 @@ def register_node_claim_routes(
             node_renew.queue_csr(resolved, node_id, req.csr_pem.encode(),
                                  cert_pem=req.cert_pem.encode(), issued_at=req.issued_at,
                                  signature=req.signature)
+        except node_renew.NonRegularEntries as exc:
+            _log.warning("node_claim: %s", exc)
+            raise HTTPException(status_code=503, detail=_LINKS_REFUSED) from None
         except node_renew.RenewRefused as exc:
             if exc.identity:            # who is asking failed: the uniform refusal
                 _log.warning("node_claim: renew refused for %s: %s", node_id, exc)
@@ -708,6 +714,9 @@ def register_node_claim_routes(
             raise HTTPException(status_code=403, detail=_REFUSED)
         try:
             found = node_renew.current_cert_info(resolved, node_id)
+        except node_renew.NonRegularEntries as exc:
+            _log.warning("node_claim: %s", exc)
+            raise HTTPException(status_code=503, detail=_LINKS_REFUSED) from None
         except OSError as exc:
             _log.warning("node_claim: cert store read failed: %s", exc)
             raise HTTPException(status_code=503, detail="certificate store unavailable") from None

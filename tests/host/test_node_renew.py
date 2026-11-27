@@ -762,28 +762,6 @@ def test_cli_renew_pending_exits_2_when_a_renewal_is_deferred(tmp_path, monkeypa
     assert "deferred" in capsys.readouterr().out
 
 
-def test_oversized_and_fifo_files_in_a_node_dir_are_skipped(tmp_path):
-    import signal
-    ca, ca_dir, i1, _i2 = _split(tmp_path)
-    with open(i1 / "zz.crt", "wb") as fh:           # sparse, huge
-        fh.truncate(3 << 30)
-    os.mkfifo(i1 / "fifo.crt")
-    (i1 / "renew").mkdir(exist_ok=True)
-    os.mkfifo(i1 / "renew" / "n2.csr.signing")
-    queue_csr(i1, "n1", make_csr("n1")[0])
-    signal.signal(signal.SIGALRM, lambda *a: (_ for _ in ()).throw(TimeoutError()))
-    signal.alarm(20)
-    try:
-        out = dict(sign_pending(ca, ca_dir, node_dirs=[i1]))
-        assert out["n1"] == "renewed" and out["n2"].startswith("refused")
-        with pytest.raises(node_renew.PartialRevoke) as exc:   # the huge one is reported
-            node_renew.revoke(ca_dir, "n1", node_dirs=[i1])
-        assert any("zz.crt" in why for _d, why in exc.value.failed)
-        assert not (i1 / "node-n1.crt").exists()
-    finally:
-        signal.alarm(0)
-
-
 def test_oversized_queued_csr_is_refused_without_reading_it(tmp_path, monkeypatch):
     d, ca = rig(tmp_path)
     (d / "renew").mkdir()
@@ -824,39 +802,6 @@ def test_same_second_certs_with_different_wg_keys_defer_not_guess(tmp_path, monk
     assert outcome.startswith("deferred") and "WireGuard" in outcome
     assert {p.name: p.read_bytes() for p in d.glob("*.crt")} == before
     assert pending(d) == ["n1"]
-
-
-def test_revoke_removes_a_symlink_to_the_nodes_cert_but_not_its_target(tmp_path):
-    ca, ca_dir, i1, _i2 = _split(tmp_path)
-    outside = tmp_path / "outside.crt"
-    os.replace(i1 / "node-n1.crt", outside)
-    (i1 / "node-n1.crt").symlink_to(outside)        # the ingress follows it
-    assert set(fleet_grants(i1)) == {"n1"}
-    node_renew.revoke(ca_dir, "n1", node_dirs=[i1])
-    assert not (i1 / "node-n1.crt").is_symlink()
-    assert outside.exists()
-    assert "n1" not in fleet_grants(i1)
-
-
-def test_a_cert_linked_from_outside_its_dir_defers_loudly_and_keeps_the_csr(tmp_path):
-    """The ingress follows the link; renewal will not (see the out-of-dir test), so it
-    must say why and keep the CSR rather than refuse and drop it."""
-    d, ca = rig(tmp_path)
-    outside = tmp_path / "store" / "n1.crt"
-    outside.parent.mkdir()
-    os.replace(d / "node-n1.crt", outside)
-    (d / "node-n1.crt").symlink_to(outside)
-    assert set(fleet_grants(d)) == {"n1"}
-    # queued through the ingress, which follows the link: proven by the node's real key
-    pem = outside.read_bytes()
-    key = _KEYS[_spki(x509.load_pem_x509_certificate(pem).public_key())]
-    cert, at, sig = proof_for(ca, "n1", (csr := make_csr("n1")[0]), key=key, cert=pem)
-    _queue_csr(d, "n1", csr, cert_pem=cert, issued_at=at, signature=sig)
-    [(nid, outcome)] = sign_pending(ca, d)
-    assert outcome.startswith("deferred") and "link" in outcome
-    assert pending(d) == ["n1"]
-    os.replace(outside, d / "node-n1.crt")              # operator replaces the link
-    assert sign_pending(ca, d) == [("n1", "renewed")]
 
 
 def test_one_unreadable_file_does_not_stop_a_dirs_revocation(tmp_path):
@@ -1013,40 +958,6 @@ def test_a_transient_pass_one_error_fixed_by_pass_two_is_not_reported(tmp_path, 
     assert not (i1 / "node-n1.crt").exists()
 
 
-def test_a_dangling_cert_link_defers_only_the_nodes_its_dir_holds(tmp_path):
-    """A link this host cannot read, in a dir that holds the node, may narrow it (it may
-    resolve on that ingress), so that node's renewal defers -- loudly, naming the link.
-    Nodes that dir does not hold are unaffected. (Never widening beats availability; the
-    operator's fix is to make the link readable here or replace it with the file.)"""
-    ca, ca_dir, i1, i2 = _split(tmp_path)
-    (i1 / "stale.crt").symlink_to(tmp_path / "gone.crt")
-    queue_csr(i2, "n1", make_csr("n1")[0])
-    [(nid, outcome)] = sign_pending(ca, ca_dir, node_dirs=[i1, i2])
-    assert outcome.startswith("deferred") and "stale.crt" in outcome
-    (i1 / "stale.crt").unlink()
-    assert sign_pending(ca, ca_dir, node_dirs=[i1, i2]) == [("n1", "renewed")]
-
-
-def test_a_cert_link_out_of_its_node_dir_never_authorises_a_renewal(tmp_path):
-    """Resolved on the CA host, a link out of the dir may point at a cert the ingress
-    itself cannot see (another ingress's mount): it must not count for that dir."""
-    ca, ca_dir, i1, i2 = _split(tmp_path)
-    (i1 / "node-n1.crt").unlink()                       # n1 revoked on ingress-1 ...
-    (i1 / "takeover.crt").symlink_to(i2 / "node-n1.crt")  # ... but a link points out
-    queue_csr(i1, "n1", make_csr("n1")[0])
-    [(nid, outcome)] = sign_pending(ca, ca_dir, node_dirs=[i1, i2])
-    assert not outcome.startswith("renewed")
-    assert (i1 / "takeover.crt").is_symlink()           # nothing written into ingress-1
-
-
-def test_a_cert_link_inside_its_node_dir_is_followed(tmp_path):
-    d, ca = rig(tmp_path)
-    os.replace(d / "node-n1.crt", d / "store-n1.pem")
-    (d / "node-n1.crt").symlink_to("store-n1.pem")
-    queue_csr(d, "n1", make_csr("n1")[0])
-    assert sign_pending(ca, d) == [("n1", "renewed")]
-
-
 def test_a_symlinked_csr_does_not_destroy_a_kept_retry(tmp_path, monkeypatch):
     d, ca = rig(tmp_path)
     queue_csr(d, "n1", make_csr("n1")[0])
@@ -1056,26 +967,6 @@ def test_a_symlinked_csr_does_not_destroy_a_kept_retry(tmp_path, monkeypatch):
     monkeypatch.undo()
     (d / "renew" / "n1.csr").symlink_to(tmp_path / "whatever")
     assert sign_pending(ca, d) == [("n1", "renewed")]
-
-
-def test_an_out_of_dir_cert_link_beside_a_broad_cert_defers_rather_than_widen(tmp_path):
-    """The ingress intersects the broad cert with the linked narrow one; renewal cannot see
-    the link, so it must defer, not sign the broad grants alone."""
-    d, ca = rig(tmp_path)
-    broad = pki.NodeGrants(engines=("a", "b"), tiers=(), credentials=True)
-    narrow = pki.NodeGrants(engines=("a",), tiers=(), credentials=False)
-    (d / "node-n1.crt").write_bytes(ca.sign_node_csr(make_csr("n1")[0], node_id="n1",
-                                                     grants=broad))
-    store = tmp_path / "store"
-    store.mkdir()
-    (store / "narrow.crt").write_bytes(ca.sign_node_csr(make_csr("n1")[0], node_id="n1",
-                                                        grants=narrow))
-    (d / "narrow.crt").symlink_to(store / "narrow.crt")
-    assert fleet_grants(d)["n1"] == narrow
-    queue_csr(d, "n1", make_csr("n1")[0])
-    [(nid, outcome)] = sign_pending(ca, d)
-    assert outcome.startswith("deferred") and "link" in outcome
-    assert fleet_grants(d)["n1"] == narrow
 
 
 def test_a_lone_surrogate_in_a_queue_entry_is_refused_not_a_crash(tmp_path):
@@ -1089,110 +980,8 @@ def test_a_lone_surrogate_in_a_queue_entry_is_refused_not_a_crash(tmp_path):
     assert out["aaa"].startswith("refused") and out["n1"] == "renewed"
 
 
-def test_a_dir_that_only_links_a_nodes_cert_cannot_veto_its_renewal(tmp_path):
-    """A dir that does not itself hold the node (only a link out to a copy) is not one of
-    its authorisers here, so it must not be able to hold the node's renewal hostage."""
-    ca, ca_dir, i1, i2 = _split(tmp_path)
-    (i2 / "node-n1.crt").unlink()
-    copy = tmp_path / "copies" / "n1.crt"
-    copy.parent.mkdir()
-    copy.write_bytes((i1 / "node-n1.crt").read_bytes())
-    (i2 / "x.crt").symlink_to(copy)                    # hostile: a link, nothing else
-    queue_csr(i1, "n1", make_csr("n1")[0])
-    [(nid, outcome)] = sign_pending(ca, ca_dir, node_dirs=[i1, i2])
-    assert outcome.startswith("renewed")                # renewed, with i2 named as stale
-
-
 def test_ca_host_reads_never_take_a_controlling_terminal():
     assert node_renew._OPEN_FLAGS & os.O_NOCTTY
-
-
-def test_an_unresolvable_out_of_dir_link_defers_rather_than_drop_the_csr(tmp_path):
-    """The ingress resolves the link; the CA host (which mounts only the PKI dir) cannot.
-    It cannot tell what the link authorises, so it must keep the CSR, not refuse it."""
-    d, ca = rig(tmp_path)
-    pem = (d / "node-n1.crt").read_bytes()
-    key = _KEYS[_spki(x509.load_pem_x509_certificate(pem).public_key())]
-    csr, _ = make_csr("n1")
-    cert, at, sig = proof_for(ca, "n1", csr, key=key, cert=pem)
-    _queue_csr(d, "n1", csr, cert_pem=cert, issued_at=at, signature=sig)
-    (d / "node-n1.crt").unlink()
-    (d / "node-n1.crt").symlink_to("/nonexistent/on/the/ca/host/n1.crt")
-    [(nid, outcome)] = sign_pending(ca, d)
-    assert outcome.startswith("deferred")
-    assert pending(d) == ["n1"]
-
-
-def test_an_unrelated_readable_link_does_not_keep_a_dead_nodes_csr(tmp_path):
-    d, ca = rig(tmp_path)
-    queue_csr(d, "n1", make_csr("n1")[0])
-    (d / "node-n1.crt").unlink()                        # n1 revoked after queueing
-    other = tmp_path / "store" / "n2.crt"
-    other.parent.mkdir()
-    other.write_bytes(ca.sign_node_csr(make_csr("n2")[0], node_id="n2", grants=GRANTS))
-    (d / "zz.crt").symlink_to(other)                    # a link, but to another node
-    assert sign_pending(ca, d) == [("n1", "refused: no current certificate")]
-    assert pending(d) == []
-
-
-def test_a_deferral_for_an_unresolvable_link_ends_with_the_proof_window(tmp_path):
-    d, ca = rig(tmp_path)
-    pem = (d / "node-n1.crt").read_bytes()
-    key = _KEYS[_spki(x509.load_pem_x509_certificate(pem).public_key())]
-    csr, _ = make_csr("n1")
-    old = int(__import__("time").time()) - node_renew.RENEW_PROOF_MAX_AGE_S - 1
-    cert, at, sig = proof_for(ca, "n1", csr, key=key, cert=pem, issued_at=old)
-    (d / "renew").mkdir()
-    (d / "renew" / "n1.csr").write_text(json.dumps(
-        {"csr_pem": csr.decode(), "cert_pem": cert.decode(), "issued_at": at,
-         "signature": sig}))
-    (d / "node-n1.crt").unlink()
-    (d / "node-n1.crt").symlink_to("/nonexistent/n1.crt")
-    [(nid, outcome)] = sign_pending(ca, d)
-    assert outcome.startswith("refused") and pending(d) == []
-
-
-def test_a_renewal_says_which_link_only_dir_it_could_not_update(tmp_path, capsys):
-    from blastbox.host.cli import main
-    ca, ca_dir, i1, i2 = _split(tmp_path)
-    copy = tmp_path / "copies" / "n1.crt"
-    copy.parent.mkdir()
-    os.replace(i2 / "node-n1.crt", copy)
-    (i2 / "node-n1.crt").symlink_to(copy)               # i2 serves n1 through a link
-    queue_csr(i1, "n1", make_csr("n1")[0])
-    rc = main(["pki", "--dir", str(ca_dir), "renew-pending",
-               "--node-dir", str(i1), "--node-dir", str(i2)])
-    out = capsys.readouterr().out
-    assert out.startswith("n1: renewed") and str(i2) in out and "link" in out
-    assert rc == 2                                       # loud: i2 still serves the old cert
-
-
-def test_an_unreadable_out_of_dir_link_is_warned_once_per_run_not_per_node(tmp_path, capsys):
-    """A link this host cannot read is attributed only by its conventional name,
-    node-<id>.crt: that one makes the node's renewal "NOT written" (exit 2); any other is
-    one stderr warning per run, so one junk link cannot fail the whole fleet."""
-    from blastbox.host.cli import main
-    ca, ca_dir, i1, i2 = _split(tmp_path)
-    (i2 / "node-n1.crt").unlink()
-    (i2 / "junk.crt").symlink_to("/nonexistent/x.crt")
-    queue_csr(i1, "n1", make_csr("n1")[0])
-    rc = main(["pki", "--dir", str(ca_dir), "renew-pending",
-               "--node-dir", str(i1), "--node-dir", str(i2)])
-    cap = capsys.readouterr()
-    assert rc == 0 and cap.out.strip() == "n1: renewed"
-    assert "junk.crt" in cap.err and cap.err.count("warning:") == 1
-
-
-def test_an_unreadable_link_named_for_the_node_fails_its_renewal_loudly(tmp_path, capsys):
-    from blastbox.host.cli import main
-    ca, ca_dir, i1, i2 = _split(tmp_path)
-    (i2 / "node-n1.crt").unlink()
-    (i2 / "node-n1.crt").symlink_to("/mnt/ingress2-only/n1.crt")   # resolves only there
-    queue_csr(i1, "n1", make_csr("n1")[0])
-    rc = main(["pki", "--dir", str(ca_dir), "renew-pending",
-               "--node-dir", str(i1), "--node-dir", str(i2)])
-    out = capsys.readouterr().out
-    assert rc == 2 and out.startswith("n1: renewed; NOT written") and str(i2) in out
 
 
 def test_a_queue_name_cannot_fake_the_exit_code(tmp_path, capsys):
@@ -1201,24 +990,6 @@ def test_a_queue_name_cannot_fake_the_exit_code(tmp_path, capsys):
     (d / "renew").mkdir()
     os.mkfifo(d / "renew" / "NOT written.csr")
     assert main(["pki", "--dir", str(d), "renew-pending"]) == 0
-
-
-def test_an_unrelated_unreadable_link_in_the_queueing_dir_does_not_defer(tmp_path):
-    ca, ca_dir, i1, i2 = _split(tmp_path)
-    queue_csr(i1, "n1", make_csr("n1")[0])
-    (i1 / "node-n1.crt").unlink()                        # revoked on i1 after queueing
-    (i1 / "junk.crt").symlink_to("/nonexistent/x.crt")
-    (i1 / "node-n2.crt").symlink_to("/nonexistent/n2.crt")
-    assert sign_pending(ca, ca_dir, node_dirs=[i1, i2]) == [
-        ("n1", "refused: no current certificate")]
-
-
-def test_every_unreadable_link_is_warned_including_other_nodes(tmp_path):
-    ca, ca_dir, i1, i2 = _split(tmp_path)
-    (i1 / "node-n2.crt").symlink_to("/nonexistent/n2.crt")
-    (i1 / "junk.crt").symlink_to("/nonexistent/x.crt")
-    names = {p.name for p in node_renew.unreadable_links(ca_dir, [i1, i2])}
-    assert names == {"node-n2.crt", "junk.crt"}
 
 
 def test_serve_tls_sans_does_not_print_a_pki_warning(monkeypatch, capsys):
@@ -1234,38 +1005,81 @@ def test_serve_tls_sans_does_not_print_a_pki_warning(monkeypatch, capsys):
     assert "unreadable cert links" not in capsys.readouterr().err
 
 
-def test_an_unreadable_node_named_link_beside_a_real_cert_defers(tmp_path):
-    """The ingress may intersect the real cert with what the link points at; the CA host
-    cannot see it, so it must not sign the real cert's grants alone."""
-    d, ca = rig(tmp_path)
-    os.replace(d / "node-n1.crt", d / "n1-real.crt")
-    (d / "node-n1.crt").symlink_to("/mnt/ingress-only/n1-narrow.crt")
-    queue_csr(d, "n1", make_csr("n1")[0])
-    [(nid, outcome)] = sign_pending(ca, d)
-    assert outcome.startswith("deferred") and pending(d) == ["n1"]
+# --- PKI and node dirs must contain regular files; links are refused --------------------
+
+def _plant(kind: str, path: Path, tmp_path: Path) -> None:
+    if kind == "symlink":
+        target = tmp_path / "elsewhere.crt"
+        if not target.exists():
+            target.write_bytes(b"x")
+        path.symlink_to(target)
+    elif kind == "dangling":
+        path.symlink_to(tmp_path / "gone.crt")
+    elif kind == "fifo":
+        os.mkfifo(path)
+    elif kind == "dir":
+        path.mkdir()
 
 
-def test_any_unreadable_link_in_a_dir_holding_the_node_defers(tmp_path):
-    """It may be a narrower cert of the node under any name (the ingress reads every
-    *.crt); renewal cannot see it, so it must not sign the visible grants alone."""
+@pytest.mark.parametrize("kind", ["symlink", "dangling", "fifo", "dir"])
+def test_a_non_regular_cert_entry_defers_the_dirs_renewals_and_names_it(tmp_path, kind):
+    import signal
     d, ca = rig(tmp_path)
-    (d / "restricted.crt").symlink_to("/mnt/ingress-only/n1-narrow.crt")
     queue_csr(d, "n1", make_csr("n1")[0])
-    [(nid, outcome)] = sign_pending(ca, d)
-    assert outcome.startswith("deferred") and "restricted.crt" in outcome
+    before = (d / "node-n1.crt").read_bytes()
+    _plant(kind, d / "odd.crt", tmp_path)
+    signal.signal(signal.SIGALRM, lambda *a: (_ for _ in ()).throw(TimeoutError()))
+    signal.alarm(20)
+    try:
+        out = sign_pending(ca, d)
+    finally:
+        signal.alarm(0)
+    assert dict(out)["n1"].startswith("deferred")
+    assert any("odd.crt" in o and "regular files" in o for _n, o in out)
+    assert (d / "node-n1.crt").read_bytes() == before     # nothing written there
     assert pending(d) == ["n1"]
+    assert os.path.lexists(d / "odd.crt")                 # never touched
 
 
-def test_an_inaccessible_dir_entry_after_signing_does_not_crash_the_run(tmp_path, monkeypatch):
+def test_a_linked_dir_defers_a_node_it_holds_even_if_queued_elsewhere(tmp_path):
     ca, ca_dir, i1, i2 = _split(tmp_path)
-    (i2 / "node-n1.crt").unlink()                        # i2 does not hold n1
-    queue_csr(i1, "n1", make_csr("n1")[0])
-    real = Path.is_symlink
+    (i2 / "x.crt").symlink_to(tmp_path / "gone.crt")
+    queue_csr(i1, "n1", make_csr("n1")[0])               # i2 also holds n1 (regular file)
+    out = dict(sign_pending(ca, ca_dir, node_dirs=[i1, i2]))
+    assert out["n1"].startswith("deferred")
+    assert pending(i1) == ["n1"]
 
-    def flaky(self):
-        if self.parent == i2:
-            raise PermissionError(13, "Permission denied")
-        return real(self)
-    monkeypatch.setattr(Path, "is_symlink", flaky)
-    out = sign_pending(ca, ca_dir, node_dirs=[i1, i2])   # must not raise
-    assert out and out[0][0] == "n1"
+
+def test_a_linked_dir_that_does_not_hold_the_node_is_reported_not_written(tmp_path):
+    ca, ca_dir, i1, i2 = _split(tmp_path)
+    (i2 / "node-n1.crt").unlink()
+    (i2 / "x.crt").symlink_to(tmp_path / "gone.crt")
+    queue_csr(i1, "n1", make_csr("n1")[0])
+    out = sign_pending(ca, ca_dir, node_dirs=[i1, i2])
+    assert ("n1", "renewed") in out
+    assert any(str(i2) in n and o.startswith("deferred") for n, o in out)
+    assert not (i2 / "node-n1.crt").exists()
+
+
+def test_cli_exits_2_and_says_to_replace_links(tmp_path, capsys):
+    from blastbox.host.cli import main
+    d, _ = rig(tmp_path)
+    (d / "odd.crt").symlink_to(tmp_path / "gone.crt")
+    assert main(["pki", "--dir", str(d), "renew-pending"]) == 2
+    assert "regular files" in capsys.readouterr().out
+
+
+def test_revoke_refuses_a_dir_with_links_but_revokes_the_rest(tmp_path):
+    ca, ca_dir, i1, i2 = _split(tmp_path)
+    (i2 / "x.crt").symlink_to(tmp_path / "gone.crt")
+    with pytest.raises(node_renew.PartialRevoke) as exc:
+        node_renew.revoke(ca_dir, "n1", node_dirs=[i1, i2])
+    assert any(d == i2 and "regular files" in why for d, why in exc.value.failed)
+    assert not (i1 / "node-n1.crt").exists() and (i2 / "node-n1.crt").exists()
+    assert (i2 / "x.crt").is_symlink()
+
+
+def test_renewal_never_follows_a_cert_link():
+    import inspect
+    src = inspect.getsource(node_renew)
+    assert "follow=True" not in src and "_links_out" not in src

@@ -951,19 +951,16 @@ them, and replaces the node's certificates in every dir where it still verifies,
 ingress that narrowed a node is never widened by a renewal queued through another. A dir where
 it was revoked is left alone. Every certificate is verified against the CA host's own CA, never
 a node dir's `ca.crt`, and reads from a node dir are bounded and never block on a FIFO: the dir is
-the ingress's to write. A symlinked certificate is followed only to a file in the same dir, and
-renewing it replaces the link, never its target. A link out of the dir is resolved on the CA
-host, where it can reach a certificate that ingress never sees, so it does not count: renewal is
-deferred (exit 2) until the link is replaced by the file, at most for the 24 h proof window. A dir
-that holds the node ONLY through such a link is never written: the renewal reports it by name
-(`renewed; NOT written to …`, exit 2), since that ingress still serves the old certificate. A
-cert link the CA host cannot read at all (it resolves only on that ingress, or is dangling) is
-charged to a node by its conventional name, `node-<id>.crt`, which then counts as above (for the
-queueing dir too). In a dir that holds the node, ANY such link defers the node's renewal (exit 2,
-naming the link): it may be a narrower certificate of that node under another name, and renewal
-must not sign the visible grants alone. Every unreadable link is also printed once per run as a
-`warning:` line on stderr. A queue that cannot be read mid-run is reported and skipped; the rest
-still run. A symlinked queued CSR is refused. A run that cannot lock every dir within two minutes, or finds a node dir without `ca.crt`
+the ingress's to write.
+
+**PKI and node dirs must contain regular files; links are refused.** Renewal never follows a
+link. A dir with any `*.crt` entry that is not a regular file (a symlink, FIFO, directory...) is
+reported by name and nothing in it is read, written or followed: the renewal of every node it
+holds in a regular file (or that it queued) is deferred, and the run exits 2, until an operator
+replaces the links with regular files. The ingress likewise answers `/v1/nodes/renew` and
+`/v1/nodes/cert` with 503 while its PKI dir holds one, and `revoke-node` refuses such a dir
+(reported, exit 1) while revoking the others. A queue that cannot be read mid-run is reported and
+skipped; the rest still run. A symlinked queued CSR is refused. A run that cannot lock every dir within two minutes, or finds a node dir without `ca.crt`
 (an unmounted mountpoint), renews nothing and exits 1; a write that fails mid-way keeps the CSR, and the next run redoes it. Without
 `--node-dir` a split deployment's renewals are never seen: the node gets 202 and its old
 certificate until it expires.

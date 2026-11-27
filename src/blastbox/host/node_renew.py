@@ -54,8 +54,9 @@ from blastbox.host.pki import (
 )
 
 RENEW_DIR = "renew"
-#: Outcome prefix for a renewal that left some dir serving the old cert (CLI exits 2).
-RENEWED_NOT_WRITTEN = "renewed; NOT written to"
+#: What renewal says about a dir holding a non-regular *.crt entry.
+LINKS_REFUSED = ("contains cert entries that are not regular files; links are refused -- "
+                 "replace them with regular files")
 MAX_CSR_BYTES = 8 * 1024
 #: The renewal proof's signed-message prefix (see :func:`renew_payload`).
 RENEW_PROOF_DOMAIN = b"blastbox/node-renew/v1"
@@ -195,7 +196,8 @@ def queue_csr(pki_dir: Path, node_id: str, csr_pem: bytes, *, cert_pem: bytes,
             raise                                       # the caller's 503
         except Exception:                               # noqa: BLE001 - a garbled ca.crt
             raise OSError(errno.EIO, f"{pki_dir}/ca.crt is not a certificate") from None
-    # The node's current certs as THIS ingress sees them (it follows its own links).
+    # The node's current certs as THIS ingress holds them (regular files only; a dir with
+    # anything else raises NonRegularEntries, the route's 503).
     cur = _find_current(Path(pki_dir), node_id, anchor=anchor if explicit else None)
     verify_renew_proof(anchor, node_id, csr_text, cert_text, issued_at, signature,
                        now=time.time() if now is None else now,
@@ -244,14 +246,14 @@ class _TooLarge(_Unreadable):
 _OPEN_FLAGS = os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
 
 
-def _read_capped(path: Path, limit: int, *, follow: bool = False) -> bytes:
+def _read_capped(path: Path, limit: int) -> bytes:
     """Read a small REGULAR file without following a link or blocking on a FIFO.
 
     A node dir is the ingress's to write, so the CA host checks what it opened (fstat on
     the same descriptor, no check-then-open window) and never reads more than ``limit``.
     """
     try:
-        flags = _OPEN_FLAGS | (0 if follow else os.O_NOFOLLOW)
+        flags = _OPEN_FLAGS | os.O_NOFOLLOW
         fd = os.open(path, flags)
     except OSError as exc:
         if exc.errno == errno.ELOOP:
@@ -298,75 +300,33 @@ class _Current:
     others: list[tuple[Path, bytes]]    #: the rest, superseded by a renewal
 
 
-def _links_out(crt: Path, d: Path) -> bool:
-    """True if ``crt`` is a symlink resolving outside ``d`` (or not resolving at all).
+class NonRegularEntries(OSError):
+    """A PKI/node dir holds *.crt entries that are not regular files (links refused)."""
 
-    An entry this host cannot even lstat counts as one: unknown, so never trusted, and
-    never an exception that could abort a run after certs were written.
-    """
-    try:
-        if not crt.is_symlink():
-            return False
-        return Path(os.path.realpath(crt)).parent != Path(os.path.realpath(d))
-    except OSError:
-        return True
+    def __init__(self, d: Path, entries: list[Path]) -> None:
+        super().__init__(errno.EINVAL,
+                         f"{d} {LINKS_REFUSED}: {', '.join(e.name for e in entries)}")
+        self.dir, self.entries = d, entries
 
 
-def _unreadable_named_link(d: Path, node_id: str) -> bool:
-    """Is ``d/node-<node_id>.crt`` a link out of ``d`` that this host cannot read?"""
-    c = d / f"node-{node_id}.crt"
-    if not _links_out(c, d):
-        return False
-    try:
-        _read_capped(c, MAX_CERT_BYTES, follow=True)
-    except (OSError, _Unreadable):
-        return True
-    return False
-
-
-def _unreadable_out_links(d: Path) -> list[Path]:
-    """The cert links out of ``d`` that this host cannot read."""
+def _non_regular(d: Path) -> list[Path]:
+    """The *.crt entries of ``d`` that are not regular files (symlinks included, never
+    followed). An entry that cannot be lstat'd counts: it cannot be shown to be regular."""
     out: list[Path] = []
-    for c in sorted(d.glob("*.crt")):
-        if _links_out(c, d):
-            try:
-                _read_capped(c, MAX_CERT_BYTES, follow=True)
-            except (OSError, _Unreadable):
-                out.append(c)
-    return out
-
-
-def unreadable_links(pki_dir: Path, node_dirs: list[Path] | None = None) -> list[Path]:
-    """Cert links out of a node dir that this host cannot read (dangling here, unreadable).
-
-    Renewal cannot tell whose they are, so it reports them once per run rather than per
-    node: an ingress may be serving certs through one that no renewal will ever update.
-    """
-    out: list[Path] = []
-    for d in _dirs(pki_dir, node_dirs):
-        out += _unreadable_out_links(d)     # node-<id>.crt ones are ALSO charged per node
-    return out
-
-
-def _links_out_for(d: Path, node_id: str, ca: CertAuthority) -> bool:
-    """Does ``d`` hold a cert for ``node_id`` through a READABLE link that leaves ``d``?
-
-    (A link this host cannot read is attributed only by name: see _unreadable_named_link.)
-    """
-    for c in sorted(d.glob("*.crt")):
-        if not _links_out(c, d):
-            continue
+    for c in sorted(Path(d).glob("*.crt")):
         try:
-            pem = _read_capped(c, MAX_CERT_BYTES, follow=True)
-            if node_identity(ca, pem).node_id == node_id:
-                return True
-        except Exception:                               # noqa: BLE001 - not a cert of it
+            if not stat.S_ISREG(os.lstat(c).st_mode):
+                out.append(c)
+        except FileNotFoundError:
             continue
-    return False
+        except OSError:
+            out.append(c)
+    return out
 
 
 def _find_current(pki_dir: Path, node_id: str,
-                  anchor: CertAuthority | TrustAnchor | None = None) -> _Current | None:
+                  anchor: CertAuthority | TrustAnchor | None = None, *,
+                  skip_irregular: bool = False) -> _Current | None:
     """The node's verifying certs in ``pki_dir``, or None.
 
     ``grants`` is the intersection over every verifying cert for the node, the same rule
@@ -377,12 +337,20 @@ def _find_current(pki_dir: Path, node_id: str,
     certs). The CA host passes ITS OWN CA instead: a node dir is the ingress's to write,
     so its ``ca.crt`` may not decide what the real CA signs.
 
+    PKI and node dirs must contain REGULAR files: a dir with any other *.crt entry (a
+    symlink, FIFO, directory...) raises :class:`NonRegularEntries`, and nothing in it is
+    followed or read. ``skip_irregular`` instead ignores those entries (used only to ask
+    whether such a dir holds the node in a regular file).
+
     A cert that does not verify is skipped, but an OSError reading the anchor or a cert
     file PROPAGATES: "could not read" is a transient fault, not "has no certificate", and
     the caller must not turn it into a refusal that deletes the node's CSR.
     """
     d = Path(pki_dir)
-    strict = anchor is not None
+    if not skip_irregular:
+        bad = _non_regular(d)
+        if bad:
+            raise NonRegularEntries(d, bad)
     if anchor is None:
         try:
             anchor = load_trust_anchor(d)
@@ -392,22 +360,11 @@ def _find_current(pki_dir: Path, node_id: str,
             return None
     found: list[tuple[Path, bytes, NodeIdentity]] = []
     for crt in sorted(d.glob("*.crt")):
-        if strict and _links_out(crt, d):
-            continue
         try:
-            # OSError propagates (transient). Strict: the dir is someone else's to write,
-            # so bounded and FIFO-safe. A symlinked cert is followed only WITHIN its dir:
-            # resolved on the CA host, a link out of it can reach a cert the ingress itself
-            # never sees (another ingress's mount), which must not authorise anything here.
-            # Writing replaces the link, never its target.
-            pem = (_read_capped(crt, MAX_CERT_BYTES, follow=True) if strict
-                   else crt.read_bytes())
+            # Bounded, no-follow, FIFO-safe: the dir may be someone else's to write.
+            pem = _read_capped(crt, MAX_CERT_BYTES)    # OSError propagates (transient)
         except _Unreadable:
-            continue                                    # FIFO, device, huge: not a cert
-        except FileNotFoundError:
-            if strict:
-                continue                                # a dangling link is not a cert
-            raise
+            continue                                    # not a regular file / huge: skip
         try:
             ident = node_identity(anchor, pem)
         except Exception:                               # noqa: BLE001 - one bad file is not fatal
@@ -532,9 +489,15 @@ def sign_pending(ca: CertAuthority, pki_dir: Path, *, days: int = 7,
     every = _dirs(pki_dir, node_dirs)
     results: list[tuple[str, str]] = []
     with _locked(every):
+        # PKI and node dirs must contain regular files: a dir with any other *.crt entry is
+        # reported (the run exits 2) and nothing in it is followed, read or written.
+        bad = frozenset(d for d in every if _non_regular(d))
+        for d in sorted(bad, key=str):
+            names = ", ".join(e.name for e in _non_regular(d))
+            results.append((f"<{d}>", f"deferred: {LINKS_REFUSED} ({names})"))
         for qdir in every:
             try:
-                results += _drain(ca, qdir, days, every)
+                results += _drain(ca, qdir, days, every, bad)
             except OSError as exc:
                 # One queue going bad mid-run (a mount dropping) must not abort the others,
                 # nor lose the outcomes already reached; say it, so the run exits 2.
@@ -542,8 +505,8 @@ def sign_pending(ca: CertAuthority, pki_dir: Path, *, days: int = 7,
     return results
 
 
-def _drain(ca: CertAuthority, qdir: Path, days: int,
-           every: list[Path]) -> list[tuple[str, str]]:
+def _drain(ca: CertAuthority, qdir: Path, days: int, every: list[Path],
+           bad: frozenset[Path] = frozenset()) -> list[tuple[str, str]]:
     """Sign what ``qdir``'s ingress queued.
 
     A CSR being worked on is ``<id>.csr.signing``, and it is never renamed back: a kept
@@ -582,7 +545,7 @@ def _drain(ca: CertAuthority, qdir: Path, days: int,
             _discard(aside)
             results.append((node_id, f"refused: {exc}"))
             continue
-        outcome, keep = _renew_one(ca, qdir, every, node_id, csr_pem, days, proof_key)
+        outcome, keep = _renew_one(ca, qdir, every, node_id, csr_pem, days, proof_key, bad)
         if not keep:
             aside.unlink(missing_ok=True)
         results.append((node_id, outcome))
@@ -631,7 +594,7 @@ def _discard(path: Path) -> None:
 def _swap_if_unchanged(path: Path, expected: bytes, new: bytes) -> str | None:
     """Replace ``path`` with ``new`` if it still holds ``expected``; else say why not."""
     try:
-        still = _read_capped(path, MAX_CERT_BYTES, follow=True)   # the link, as judged
+        still = _read_capped(path, MAX_CERT_BYTES)
     except FileNotFoundError:
         return "removed"
     except _Unreadable:
@@ -643,46 +606,26 @@ def _swap_if_unchanged(path: Path, expected: bytes, new: bytes) -> str | None:
 
 
 def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
-               csr_pem: bytes, days: int, proof_key: bytes) -> tuple[str, bool]:
+               csr_pem: bytes, days: int, proof_key: bytes,
+               bad: frozenset[Path] = frozenset()) -> tuple[str, bool]:
     """Renew one set-aside CSR across every node dir. Returns (outcome, keep the CSR)."""
     states: dict[Path, _Current] = {}
     try:
         for d in every:
+            if d in bad:
+                # Nothing in a dir with non-regular cert entries is followed or trusted. If
+                # it holds the node in a regular file (or queued it), the node's renewal
+                # waits for the operator; otherwise it is simply not written.
+                if d == qdir or _find_current(d, node_id, anchor=ca,
+                                              skip_irregular=True) is not None:
+                    return f"deferred: {d} {LINKS_REFUSED}", True
+                continue
             cur = _find_current(d, node_id, anchor=ca)
             if cur is not None:
                 states[d] = cur
     except OSError as exc:
         return f"deferred: {exc}", True
-    # Only a dir that itself holds the node (or the one that queued it) counts: a dir with
-    # nothing but a link to a copy is not one of its authorisers here, and must not be able
-    # to hold the renewal hostage.
-    # In a dir that HOLDS the node, any cert link this host cannot read may be a narrower
-    # cert of it under any name (the ingress reads every *.crt): renewal cannot see it, so
-    # it must not sign the visible grants alone.
-    blind = {d: links for d in every if d in states
-             for links in [_unreadable_out_links(d)] if links}
-    if blind:
-        d, links = next(iter(blind.items()))
-        return (f"deferred: {links[0]} is a cert link this host cannot read, in a dir that "
-                "holds this node; it may narrow the node -- make it readable here or replace "
-                "it with the file"), True
-    linked = [d for d in every
-              if (d in states or d == qdir)
-              and (_links_out_for(d, node_id, ca) or _unreadable_named_link(d, node_id))]
-    if linked:
-        # The ingress follows a cert link out of its dir; renewal will not (resolved here,
-        # it can reach what that ingress never sees). Signing without it could drop the
-        # narrower grants it adds, so defer -- kept and loud (exit 2), not refused: the fix,
-        # a file instead of the link, is the operator's, and the next run renews.
-        return (f"deferred: {linked[0]} has a cert for this node linked from outside the "
-                "dir, which renewal does not follow -- replace the link with the file"), True
     if qdir not in states:
-        if _links_out_for(qdir, node_id, ca) or _unreadable_named_link(qdir, node_id):
-            # The queueing ingress may hold the node through a link this host cannot follow
-            # (or even resolve): it cannot tell, so keep the CSR and say why. Bounded: once
-            # the proof is older than RENEW_PROOF_MAX_AGE_S the entry is refused anyway.
-            return ("deferred: no current certificate here except through a link out of "
-                    f"{qdir} -- replace the link with the file"), True
         return "refused: no current certificate", False
     if not any(proof_key in cur.keys for cur in states.values()):
         # The proof's cert is CA-valid but not one the node holds NOW in any dir: an old
@@ -719,23 +662,12 @@ def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
             # grants when the renewed one lapsed.
             for path, pem in cur.others:
                 try:
-                    if _read_capped(path, MAX_CERT_BYTES, follow=True) == pem:
+                    if _read_capped(path, MAX_CERT_BYTES) == pem:
                         path.unlink()
                 except (FileNotFoundError, _Unreadable):
                     pass
     except OSError as exc:
         return f"deferred: {exc}", True
-    # A dir that serves the node only through a link out of it was not (cannot be) written:
-    # that ingress still serves the old cert. Renewed, but say so (the CLI exits 2).
-    # A link this host cannot read at all is charged to a node only by its conventional
-    # name (node-<id>.crt, what issue-node/sign-node-csr write); any other is reported once
-    # per run by unreadable_links: it may be anything, and naming it on every node's
-    # renewal would make one junk link fail the whole fleet's run.
-    stale = [d for d in every if d not in states
-             and (_links_out_for(d, node_id, ca) or _unreadable_named_link(d, node_id))]
-    if stale:
-        return (f"{RENEWED_NOT_WRITTEN} {', '.join(map(str, stale))}: it holds the node only "
-                "through a link out of the dir, so it still serves the old certificate"), False
     return "renewed", False
 
 
@@ -794,6 +726,10 @@ def revoke(pki_dir: Path, node_id: str, *, node_dirs: list[Path] | None = None) 
         if not (d / "ca.crt").is_file():
             failed.append((d, "not a PKI dir (no ca.crt) -- unmounted?"))
             continue
+        bad = _non_regular(d)
+        if bad:                               # refused like renewal: nothing is followed
+            failed.append((d, f"{LINKS_REFUSED} ({', '.join(e.name for e in bad)})"))
+            continue
         if not one(d, REVOKE_LOCK_WAIT_S):
             unlocked.append(d)
     for d in list(unlocked):                  # second pass, now waiting for the lock
@@ -814,17 +750,15 @@ def _revoke_in(anchor: TrustAnchor, d: Path, node_id: str) -> tuple[list[Path], 
     except OSError as exc:
         return removed, [str(exc)]
     for crt in certs:
-        # A symlinked cert is FOLLOWED here (the ingress follows it too, so it authorises
-        # the node), and only the link is removed, never its target.
         try:
-            pem = _read_capped(crt, MAX_CERT_BYTES, follow=True)
+            pem = _read_capped(crt, MAX_CERT_BYTES)      # regular files only, no follow
             if node_identity(anchor, pem, allow_expired=True).node_id != node_id:
                 continue
             crt.unlink()
             removed.append(crt)
-        except _TooLarge as exc:                 # may be the node's: say so, never skip
+        except _Unreadable as exc:               # appeared since the check: say so, never skip
             errors.append(f"{exc} (not checked)")
-        except (ValueError, FileNotFoundError):  # not a cert / a dangling link
+        except (ValueError, FileNotFoundError):  # not a cert / gone meanwhile
             continue
         except OSError as exc:                   # cannot tell: it MAY be the node's
             errors.append(f"{crt.name}: {exc.strerror or exc}")

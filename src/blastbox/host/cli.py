@@ -1547,19 +1547,9 @@ def _pki_cmd(args: argparse.Namespace) -> int:
             return 1
         for node_id, outcome in outcomes:
             print(f"{node_id}: {outcome}")
-        from blastbox.host.node_renew import unreadable_links
-        try:
-            for link in unreadable_links(pki_dir, [Path(p) for p in args.node_dir] or None):
-                print(f"warning: {link} links out of its node dir and cannot be read here; an "
-                      "ingress serving a cert through it never gets renewals", file=sys.stderr)
-        except OSError as exc:      # say so: the warnings are the only evidence
-            print(f"warning: could not check node dirs for unreadable cert links: {exc}",
-                  file=sys.stderr)
         # A deferral repeats every run until someone fixes its cause; exit 2 so the timer
         # unit shows it, instead of staying green while the node's cert runs out.
-        from blastbox.host.node_renew import RENEWED_NOT_WRITTEN
-        return 2 if any(o.startswith(("deferred", RENEWED_NOT_WRITTEN))
-                        for _, o in outcomes) else 0
+        return 2 if any(o.startswith("deferred") for _, o in outcomes) else 0
     if args.pki_action == "sign-node-csr":
         # LOAD, never generate: a mistyped --dir must not mint a rogue CA and sign with it.
         from blastbox.host.pki import load_ca

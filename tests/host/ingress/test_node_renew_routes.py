@@ -184,3 +184,14 @@ def test_cert_route_store_read_fault_is_503_not_404(tmp_path, monkeypatch):
     monkeypatch.setattr(node_renew, "_find_current", boom)
     assert c.get("/v1/nodes/cert", headers=h).status_code == 503
 
+
+
+def test_renew_and_cert_refuse_a_pki_dir_with_links(tmp_path, monkeypatch):
+    c, d, _, keys = _setup(tmp_path, monkeypatch)
+    h = _session(c, d, "n1", keys["n1"])
+    (d / "x.crt").symlink_to(tmp_path / "gone.crt")
+    r = c.get("/v1/nodes/cert", headers=h)
+    assert r.status_code == 503 and "regular files" in r.json()["detail"]
+    csr, _ = make_csr("n1")
+    r = c.post("/v1/nodes/renew", json=_body(d, "n1", keys["n1"], csr), headers=h)
+    assert r.status_code == 503 and "regular files" in r.json()["detail"]
