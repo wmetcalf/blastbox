@@ -69,6 +69,7 @@ type Agent struct {
 	cl        *wire.Client
 	notAfter  time.Time
 	inflight  map[string]wire.HeartbeatJob
+	recSet    map[string]bool // job ids left on disk by a previous run (and runner-refused ids)
 	maxDeadln time.Time
 
 	engines []*engState
@@ -86,6 +87,16 @@ type engState struct {
 	at      time.Time
 	reason  string
 	busy    int
+	gen     int // bumped by markRed; a probe that started before a bump cannot make the engine claimable
+}
+
+// markRed makes the engine unclaimable at once (before any re-probe) and invalidates any probe
+// already running.
+func (e *engState) markRed(reason string) {
+	e.mu.Lock()
+	e.ok, e.reason = false, reason
+	e.gen++
+	e.mu.Unlock()
 }
 
 func (e *engState) claimable() bool { e.mu.Lock(); defer e.mu.Unlock(); return e.ok }
@@ -93,7 +104,7 @@ func (e *engState) claimable() bool { e.mu.Lock(); defer e.mu.Unlock(); return e
 // New builds an Agent with production defaults. It touches neither the network nor the disk.
 func New(cfg *config.Config) *Agent {
 	a := &Agent{Cfg: cfg, Version: Version, Host: sandbox.HostFromConfig(cfg), hbReady: make(chan struct{}),
-		inflight: map[string]wire.HeartbeatJob{}}
+		inflight: map[string]wire.HeartbeatJob{}, recSet: map[string]bool{}}
 	a.Log = slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	a.ProbeFn = func(ctx context.Context, e config.Engine) sandbox.ProbeResult { return a.Host.Probe(ctx, e) }
 	a.SelfTestFn = func(ctx context.Context, e config.Engine) sandbox.ProbeResult { return a.Host.SelfTest(ctx, e) }
@@ -155,8 +166,14 @@ func (a *Agent) probeEngine(ctx context.Context, es *engState, wait bool) {
 		return
 	}
 	defer es.probeMu.Unlock()
+	es.mu.Lock()
+	g := es.gen
+	es.mu.Unlock()
 	ok, reason := a.evaluate(ctx, es.eng)
 	es.mu.Lock()
+	if es.gen != g && ok {
+		ok, reason = false, "a sandbox failure happened during this probe; re-probing"
+	}
 	prev := es.ok
 	es.ok, es.reason, es.at = ok, reason, a.Now()
 	es.mu.Unlock()
@@ -293,6 +310,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err := a.client().Session(ctx); err != nil {
 		a.Log.Warn("initial session failed; will retry", "err", err.Error())
 	}
+	a.snapshotRecovery()
 	a.recoverJobs(ctx)
 	for _, es := range a.engines {
 		a.probeEngine(ctx, es, true)
@@ -389,6 +407,8 @@ func (a *Agent) buildHeartbeat() wire.Heartbeat {
 		if floor == "" {
 			floor = "seatbelt"
 		}
+		// selftest_ok/selftest_at mean "probe AND selftest (if configured) passed, and when";
+		// an engine without selftest_argv reports its probe result and probe time.
 		hb.Engines = append(hb.Engines, wire.HeartbeatEngine{
 			Name: es.eng.Name, Sandbox: es.eng.Sandbox, Floor: floor, Slots: es.eng.SlotCount(),
 			Busy: es.busy, SelftestOK: es.ok, SelftestAt: rfc3339(es.at)})
@@ -551,6 +571,11 @@ func (a *Agent) slotLoop(ctx, jobsCtx context.Context, es *engState) {
 	}
 }
 
+// runClaim runs one claimed job. The job id is registered in-flight before the runner creates
+// its dir, so recovery never touches it.
+//
+// Known gap: a Claim request in flight when SIGTERM arrives is cancelled client-side; if the
+// server had already assigned the job, it stays claimed until the server's reclaim sweep.
 func (a *Agent) runClaim(ctx, jobsCtx context.Context, es *engState, c *wire.Claim) {
 	if ctx.Err() != nil { // claimed as we were told to stop: hand it straight back
 		rctx, cancel := context.WithTimeout(jobsCtx, 30*time.Second)
@@ -581,7 +606,14 @@ func (a *Agent) runClaim(ctx, jobsCtx context.Context, es *engState, c *wire.Cla
 	delete(a.inflight, c.JobID)
 	a.mu.Unlock()
 	a.Log.Info("job finished", "job", c.JobID, "engine", es.eng.Name, "outcome", res.Outcome)
-	if res.Outcome == "failed" && strings.HasPrefix(res.Reason, "sandbox") {
-		a.probeEngine(jobsCtx, es, false)
+	switch {
+	case res.Outcome == "refused":
+		// A job dir already held a started marker: it now belongs to crash recovery.
+		a.Log.Warn("runner refused a claim whose job dir holds a started marker; left to recovery", "job", c.JobID)
+		a.addRecovery(c.JobID)
+	case res.Outcome == "failed" && strings.HasPrefix(res.Reason, "sandbox"):
+		// Stop claiming NOW, then re-probe (queued behind any probe already running).
+		es.markRed("sandbox failure: " + res.Reason)
+		a.probeEngine(jobsCtx, es, true)
 	}
 }

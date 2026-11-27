@@ -26,34 +26,64 @@ func wipeDir(dir string) {
 	os.RemoveAll(dir)
 }
 
-// recoverJobs settles every job dir left under <state>/jobs by a previous run and returns how
-// many remain (to be retried):
+// snapshotRecovery records the job ids present on disk at startup, BEFORE any slot loop runs.
+// Only these ids (plus any the runner reports as "refused") are ever recovered: a job dir that
+// appears later belongs to a live job of this process and must never be touched.
+func (a *Agent) snapshotRecovery() {
+	ents, err := os.ReadDir(filepath.Join(a.Cfg.StateDir, "jobs"))
+	if err != nil {
+		return
+	}
+	a.mu.Lock()
+	for _, e := range ents {
+		a.recSet[e.Name()] = true
+	}
+	a.mu.Unlock()
+}
+
+func (a *Agent) addRecovery(id string) {
+	a.mu.Lock()
+	a.recSet[id] = true
+	a.mu.Unlock()
+}
+
+// recoverJobs settles the job dirs in the recovery set and returns how many remain:
 //
-//	started marker      -> Fail("agent restarted mid-run"); never Release (a sandbox saw the input)
-//	claim.json only     -> Release
+//	started marker       -> Fail("agent restarted mid-run"); never Release (a sandbox saw the input)
+//	claim.json only      -> Release
 //	neither / unreadable -> wipe
 //
-// A dir is wiped on success, ErrClaimLost and ErrRefused; any other error keeps it.
+// A dir is wiped on success, ErrClaimLost and ErrRefused; any other error keeps it (and its id
+// in the set) for the next pass. Ids that are in flight in this process are skipped.
 func (a *Agent) recoverJobs(ctx context.Context) int {
 	jobs := filepath.Join(a.Cfg.StateDir, "jobs")
-	ents, err := os.ReadDir(jobs)
-	if err != nil {
-		return 0
+	a.mu.Lock()
+	ids := make([]string, 0, len(a.recSet))
+	for id := range a.recSet {
+		ids = append(ids, id)
 	}
+	a.mu.Unlock()
 	left := 0
-	for _, e := range ents {
-		dir := filepath.Join(jobs, e.Name())
-		if !e.IsDir() {
-			os.Remove(dir)
+	for _, id := range ids {
+		a.mu.Lock()
+		_, live := a.inflight[id]
+		a.mu.Unlock()
+		if live {
+			left++
 			continue
 		}
 		if ctx.Err() != nil {
 			left++
 			continue
 		}
-		if !a.recoverOne(ctx, dir, e.Name()) {
-			left++
+		dir := filepath.Join(jobs, id)
+		if _, err := os.Lstat(dir); err != nil || a.recoverOne(ctx, dir, id) {
+			a.mu.Lock()
+			delete(a.recSet, id)
+			a.mu.Unlock()
+			continue
 		}
+		left++
 	}
 	return left
 }

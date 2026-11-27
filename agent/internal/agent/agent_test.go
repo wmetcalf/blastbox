@@ -190,6 +190,9 @@ func TestRedProbeStopsClaims(t *testing.T) {
 		return len(e.in.hbs) >= 2 && !e.in.hbs[len(e.in.hbs)-1].Engines[0].SelftestOK
 	})
 	time.Sleep(30 * time.Millisecond)
+	if e.in.claimCount() != 0 {
+		t.Fatal("claimed on a red engine")
+	}
 }
 
 func TestSelftestRedAndSandboxFailureReprobe(t *testing.T) {
@@ -214,14 +217,14 @@ func TestSelftestRedAndSandboxFailureReprobe(t *testing.T) {
 		return runner.Result{Outcome: "failed", Reason: "sandbox: cannot build"}
 	}}
 	h.start(t)
-	eventually(t, "re-probe after the sandbox failure", func() bool {
+	eventually(t, "the sandbox failure and a re-probe after it", func() bool {
 		<-mu
 		defer func() { mu <- struct{}{} }()
-		return probes >= 2
+		return !good && probes >= 2
 	})
 	n := e.in.claimCount()
 	time.Sleep(60 * time.Millisecond)
-	if got := e.in.claimCount(); got > n+1 { // at most one claim already in flight
+	if got := e.in.claimCount(); got != n || got != 1 {
 		t.Fatalf("claims continued on a red engine: %d -> %d", n, got)
 	}
 	if !strings.Contains(h.logs.String(), "selftest: selftest says") {
@@ -463,5 +466,99 @@ func TestEnrol(t *testing.T) {
 	}
 	if err := Enrol("Bad ID", t.TempDir(), &out); err == nil {
 		t.Fatal("bad id accepted")
+	}
+}
+
+func TestRecoveryNeverTouchesLiveJobs(t *testing.T) {
+	e := fresh(t)
+	e.in.onClaim = func(n int) (int, string) {
+		if n == 1 {
+			return 200, claimBody("live")
+		}
+		return 204, ""
+	}
+	h := newHarness(e)
+	entered, release := make(chan struct{}), make(chan struct{})
+	h.a.Runner = fakeRunner{fn: func(ctx context.Context, c *wire.Claim) runner.Result {
+		jobDir(e, "live", true, true) // claim.json + started, as the real runner leaves them
+		close(entered)
+		<-release
+		return runner.Result{Outcome: "done"}
+	}}
+	h.start(t)
+	<-entered
+	// the recover loop ticks every ~1 ms under the harness; let it tick many times
+	time.Sleep(300 * time.Millisecond)
+	if u := e.in.update("live"); u != nil {
+		t.Fatalf("recovery posted an update for a live job: %v", u)
+	}
+	if _, err := os.Stat(filepath.Join(e.cfg.StateDir, "jobs", "live")); err != nil {
+		t.Fatal("a live job's dir was wiped")
+	}
+	close(release)
+}
+
+func TestRefusedJobGoesToRecovery(t *testing.T) {
+	e := fresh(t)
+	e.in.onClaim = func(n int) (int, string) {
+		if n == 1 {
+			return 200, claimBody("jr")
+		}
+		return 204, ""
+	}
+	h := newHarness(e)
+	h.a.Runner = fakeRunner{fn: func(context.Context, *wire.Claim) runner.Result {
+		jobDir(e, "jr", true, true)
+		return runner.Result{Outcome: "refused", Reason: "started marker"}
+	}}
+	h.start(t)
+	eventually(t, "recovery of the refused job", func() bool { return e.in.update("jr") != nil })
+	if f := e.in.update("jr")["fields"].(map[string]any); f["status"] != "failed" {
+		t.Fatalf("%v", f)
+	}
+	if !strings.Contains(h.logs.String(), "left to recovery") {
+		t.Fatal("not logged")
+	}
+}
+
+func TestRenewNowAgainstControlPlane(t *testing.T) {
+	e := newEnv(t, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour)) // not due: force still renews
+	var out strings.Builder
+	if err := RenewNow(context.Background(), e.cfg, time.Now, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "installed") {
+		t.Fatalf("%q", out.String())
+	}
+	e.in.mu.Lock()
+	n := len(e.in.csrs)
+	e.in.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("csrs %d", n)
+	}
+	raw, _ := os.ReadFile(e.cfg.CertFile)
+	pub, _, _ := certPub(raw)
+	if !keyMatches(e.cfg.KeyFile, pub) || string(raw) == string(e.cert) {
+		t.Fatal("pair not swapped")
+	}
+}
+
+func TestEnrolRefusesExistingKeyAndFixesDirMode(t *testing.T) {
+	d := t.TempDir()
+	os.Chmod(d, 0o755)
+	os.WriteFile(filepath.Join(d, "node.key"), []byte("x"), 0o600)
+	if err := Enrol("node-b", d, &strings.Builder{}); err == nil {
+		t.Fatal("overwrote an existing node.key")
+	}
+	if _, err := os.Stat(filepath.Join(d, "node.csr")); err == nil {
+		t.Fatal("generated a csr before refusing")
+	}
+	d2 := t.TempDir()
+	os.Chmod(d2, 0o755)
+	if err := Enrol("node-b", d2, &strings.Builder{}); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := os.Stat(d2); st.Mode().Perm() != 0o700 {
+		t.Fatal(st.Mode())
 	}
 }

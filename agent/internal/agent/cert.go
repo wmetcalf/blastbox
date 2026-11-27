@@ -187,8 +187,9 @@ func ensureNextKey(path string) (*ecdsa.PrivateKey, error) {
 	if k, err := wire.LoadKey(path); err == nil {
 		return k, nil
 	} else if _, serr := os.Lstat(path); serr == nil {
-		os.Remove(path) // corrupt leftover of a crash
-		_ = err
+		if rerr := os.Remove(path); rerr != nil { // corrupt leftover of a crash
+			return nil, fmt.Errorf("unreadable %s (%v) and cannot be removed: %w", path, err, rerr)
+		}
 	}
 	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -298,17 +299,22 @@ func Enrol(nodeID, dir string, w io.Writer) error {
 	if !nodeIDRE.MatchString(nodeID) {
 		return fmt.Errorf("node id %q must match %s", nodeID, nodeIDRE)
 	}
+	keyPath := filepath.Join(dir, "node.key")
+	csrPath := filepath.Join(dir, "node.csr")
+	for _, p := range []string{keyPath, csrPath} {
+		if _, err := os.Lstat(p); err == nil {
+			return fmt.Errorf("%s already exists; refusing to overwrite an identity", p)
+		}
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
 		return err
 	}
 	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return err
-	}
-	keyPath := filepath.Join(dir, "node.key")
-	csrPath := filepath.Join(dir, "node.csr")
-	if _, err := os.Lstat(csrPath); err == nil {
-		return fmt.Errorf("%s already exists", csrPath)
 	}
 	if err := writeKeyExcl(keyPath, k); err != nil {
 		return fmt.Errorf("node.key: %w", err)
@@ -326,5 +332,35 @@ func Enrol(nodeID, dir string, w io.Writer) error {
 	fmt.Fprintf(w, "wrote %s (private, mode 0600) and %s\n", keyPath, csrPath)
 	fmt.Fprintf(w, "copy %s to the CA host and run (replace <E> with an engine this node serves):\n", csrPath)
 	fmt.Fprintf(w, "  blastbox pki sign-node-csr --csr %s --node-id %s --engine <E> --tier none --days 7\n", csrPath, nodeID)
+	return nil
+}
+
+// RenewNow is `blastbox-agent renew`: force one renewal attempt (the wire client handshakes
+// lazily on its first authenticated call), then check once whether the cert is already issued.
+func RenewNow(ctx context.Context, cfg *config.Config, now func() time.Time, w io.Writer) error {
+	if _, err := RecoverPair(cfg, now()); err != nil {
+		return err
+	}
+	cl, err := wire.New(cfg, "blastbox-agent/"+Version)
+	if err != nil {
+		return err
+	}
+	if err := cl.Session(ctx); err != nil {
+		return err
+	}
+	r := &Renewer{Cfg: cfg, Client: cl, Now: now}
+	st, err := r.Step(ctx, true)
+	if err == nil && st == RenewSubmitted {
+		fmt.Fprintln(w, "renewal requested; the CA host must sign the CSR")
+		st, err = r.Step(ctx, false) // it may already be issued
+	}
+	if err != nil {
+		return err
+	}
+	if st == RenewInstalled {
+		fmt.Fprintln(w, "new certificate installed; restart the agent to use it")
+	} else {
+		fmt.Fprintln(w, "renewal pending; a running agent installs the certificate once issued, or re-run renew later")
+	}
 	return nil
 }
