@@ -372,8 +372,8 @@ func TestSandboxBuildErrorReleasesBeforeStarted(t *testing.T) {
 			t.Error("started marker existed when the sandbox build failed")
 		}
 	}()
-	if res := f.run(); res.Outcome != "released" {
-		t.Fatalf("%+v", res)
+	if res := f.run(); res.Outcome != "released" || !res.SandboxFailure {
+		t.Fatalf("%+v, want released as a sandbox failure", res)
 	}
 }
 
@@ -500,7 +500,18 @@ func TestNonZeroExitFails(t *testing.T) {
 
 func TestMissingHandshakeFails(t *testing.T) {
 	f := setup(t, `rm -f "$3/.bb-handshake"; echo '{}' > "$1/metadata.json"`)
-	f.wantFail(t, f.run(), "handshake")
+	res := f.run()
+	f.wantFail(t, res, "handshake")
+	if !res.SandboxFailure {
+		t.Fatalf("%+v: a missing handshake is a sandbox failure", res)
+	}
+}
+
+func TestNonSandboxFailureIsNotFlagged(t *testing.T) {
+	f := setup(t, `exit 3`)
+	if res := f.run(); res.Outcome != "failed" || res.SandboxFailure {
+		t.Fatalf("%+v: an engine's own exit status is not a sandbox failure", res)
+	}
 }
 
 func TestFailIsRetriedOnServerError(t *testing.T) {

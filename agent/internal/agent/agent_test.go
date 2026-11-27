@@ -196,6 +196,14 @@ func TestRedProbeStopsClaims(t *testing.T) {
 }
 
 func TestSelftestRedAndSandboxFailureReprobe(t *testing.T) {
+	// The runner reports a sandbox that could not be built as a release (no sandbox saw the
+	// input) and one that failed mid-run as a failure; either must stop claims at once.
+	for _, outcome := range []string{"released", "failed"} {
+		t.Run(outcome, func(t *testing.T) { sandboxFailureStopsClaims(t, outcome) })
+	}
+}
+
+func sandboxFailureStopsClaims(t *testing.T, outcome string) {
 	e := fresh(t)
 	e.cfg.Engines[0].SelftestArgv = []string{"/bin/true"}
 	var probes int
@@ -214,7 +222,7 @@ func TestSelftestRedAndSandboxFailureReprobe(t *testing.T) {
 		<-mu
 		good = false // the host went bad underneath the job
 		mu <- struct{}{}
-		return runner.Result{Outcome: "failed", Reason: "sandbox: cannot build"}
+		return runner.Result{Outcome: outcome, Reason: "could not build: insecure host", SandboxFailure: true}
 	}}
 	h.start(t)
 	eventually(t, "the sandbox failure and a re-probe after it", func() bool {

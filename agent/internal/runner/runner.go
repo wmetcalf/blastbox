@@ -37,6 +37,9 @@ import (
 type Result struct {
 	Outcome string // "done" | "failed" | "released" | "lost" | "refused" (a started job dir exists; nothing was sent or wiped)
 	Reason  string
+	// SandboxFailure: the sandbox could not be built, started or shown to have confined (and
+	// cleaned up) the run. The engine must stop claiming until a probe passes again.
+	SandboxFailure bool
 }
 
 // Blastbox's default output caps, used when a claim carries none.
@@ -143,7 +146,7 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	j.dir = filepath.Join(jobs, c.JobID)
 	if _, err := os.Lstat(filepath.Join(j.dir, "started")); err == nil {
 		// A started job's dir belongs to crash recovery: never wipe or reuse it here.
-		return Result{"refused", "job dir already holds a started marker; left for crash recovery"}
+		return Result{Outcome: "refused", Reason: "job dir already holds a started marker; left for crash recovery"}
 	}
 	if _, err := os.Lstat(j.dir); err == nil { // leftover of an earlier, unstarted attempt
 		wipe(j.dir)
@@ -179,7 +182,7 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	defer cancel()
 	cmd, nonce, err := j.command(runCtx, kind, argv, env)
 	if err != nil {
-		return j.release(ctx, "sandbox: "+err.Error())
+		return sandboxFailure(j.release(ctx, "sandbox: "+err.Error()))
 	}
 	var capw *capWriter
 	if eng.Output == "stdout-envelope" {
@@ -206,7 +209,7 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	if j.ident.Canary != "" {
 		n, err := sandbox.SweepRun(j.ident)
 		if err != nil {
-			return j.fail(ctx, "sandbox: escaped processes not shown gone: "+err.Error())
+			return sandboxFailure(j.fail(ctx, "sandbox: escaped processes not shown gone: "+err.Error()))
 		}
 		if n > 0 {
 			r.logf("job %s: killed %d process(es) that escaped the run's process group", c.JobID, n)
@@ -219,7 +222,7 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 		return j.fail(ctx, "envelope over max_metadata")
 	}
 	if !handshakeOK(j.scr, nonce) {
-		return j.fail(ctx, "sandbox handshake missing: the run was not confined")
+		return sandboxFailure(j.fail(ctx, "sandbox handshake missing: the run was not confined"))
 	}
 	if runErr != nil {
 		r.logf("job %s: engine stderr tail: %q", c.JobID, tail.String())
@@ -230,7 +233,7 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 			}
 			return j.fail(ctx, fmt.Sprintf("engine exited with status %d", ee.ExitCode()))
 		}
-		return j.fail(ctx, "engine did not run: "+runErr.Error())
+		return sandboxFailure(j.fail(ctx, "engine did not run: "+runErr.Error()))
 	}
 
 	if capw != nil {
@@ -258,6 +261,8 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	}
 	return j.upload(ctx, tarPath, kind)
 }
+
+func sandboxFailure(r Result) Result { r.SandboxFailure = true; return r }
 
 func orDef(v, d int64) int64 {
 	if v > 0 {
@@ -718,7 +723,7 @@ func (j *job) release(ctx context.Context, why string) Result {
 // releaseOrLost handles a step error that is itself the reason to release: a lost claim wins.
 func (j *job) releaseOrLost(ctx context.Context, why string, cause error) Result {
 	if errors.Is(cause, wire.ErrClaimLost) {
-		return Result{"lost", why}
+		return Result{Outcome: "lost", Reason: why}
 	}
 	return j.release(ctx, why)
 }
@@ -726,11 +731,11 @@ func (j *job) releaseOrLost(ctx context.Context, why string, cause error) Result
 func (j *job) releaseOrLost2(_ context.Context, why string, err error) Result {
 	switch {
 	case err == nil:
-		return Result{"released", why}
+		return Result{Outcome: "released", Reason: why}
 	case errors.Is(err, wire.ErrClaimLost):
-		return Result{"lost", why + "; release: " + err.Error()}
+		return Result{Outcome: "lost", Reason: why + "; release: " + err.Error()}
 	}
-	return Result{"failed", why + "; release not delivered: " + err.Error()}
+	return Result{Outcome: "failed", Reason: why + "; release not delivered: " + err.Error()}
 }
 
 // serverReason makes a reason safe to send: printable ASCII only, at most 200 chars.
@@ -756,11 +761,11 @@ func (j *job) fail(ctx context.Context, why string) Result {
 	err := j.r.retry(rc, func() error { return j.cl.Fail(rc, j.c, why, time.Now()) })
 	switch {
 	case err == nil:
-		return Result{"failed", why}
+		return Result{Outcome: "failed", Reason: why}
 	case errors.Is(err, wire.ErrClaimLost):
-		return Result{"lost", why + "; fail: " + err.Error()}
+		return Result{Outcome: "lost", Reason: why + "; fail: " + err.Error()}
 	}
-	return Result{"failed", why + "; fail not delivered: " + err.Error()}
+	return Result{Outcome: "failed", Reason: why + "; fail not delivered: " + err.Error()}
 }
 
 func (j *job) upload(ctx context.Context, tarPath string, kind sandbox.Kind) Result {
@@ -770,16 +775,16 @@ func (j *job) upload(ctx context.Context, tarPath string, kind sandbox.Kind) Res
 	var out wire.Outcome
 	err := j.r.retry(rc, func() (e error) { out, e = j.cl.PutResult(rc, j.c, tarPath, meta); return })
 	if errors.Is(err, wire.ErrClaimLost) {
-		return Result{"lost", "result upload: " + err.Error()}
+		return Result{Outcome: "lost", Reason: "result upload: " + err.Error()}
 	}
 	if err != nil {
 		return j.fail(ctx, "result upload failed: "+err.Error())
 	}
 	switch out.Status {
 	case "done":
-		return Result{"done", ""}
+		return Result{Outcome: "done", Reason: ""}
 	case "failed":
-		return Result{"failed", "control plane rejected the result: " + out.Reason}
+		return Result{Outcome: "failed", Reason: "control plane rejected the result: " + out.Reason}
 	}
 	// accepted: the finalizer is still working. Poll for a log line.
 	wait := time.Now().Add(def(j.r.DispWait, 60*time.Second))
@@ -788,19 +793,19 @@ func (j *job) upload(ctx context.Context, tarPath string, kind sandbox.Kind) Res
 		if err == nil && (st == "done" || st == "failed") {
 			j.r.logf("job %s: disposition %s", j.c.JobID, st)
 			if st == "failed" {
-				return Result{"failed", "control plane failed the job after acceptance"}
+				return Result{Outcome: "failed", Reason: "control plane failed the job after acceptance"}
 			}
-			return Result{"done", "disposition " + st}
+			return Result{Outcome: "done", Reason: "disposition " + st}
 		} else if err == nil {
 			j.r.logf("job %s: disposition pending:%s", j.c.JobID, st)
 		}
 		if time.Now().After(wait) {
-			return Result{"done", "accepted; disposition still pending"}
+			return Result{Outcome: "done", Reason: "accepted; disposition still pending"}
 		}
 		select {
 		case <-time.After(def(j.r.DispPoll, 2*time.Second)):
 		case <-rc.Done():
-			return Result{"done", "accepted; disposition not observed"}
+			return Result{Outcome: "done", Reason: "accepted; disposition not observed"}
 		}
 	}
 }

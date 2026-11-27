@@ -607,8 +607,9 @@ func (a *Agent) runClaim(ctx, jobsCtx context.Context, es *engState, c *wire.Cla
 		// A job dir already held a started marker: it now belongs to crash recovery.
 		a.Log.Warn("runner refused a claim whose job dir holds a started marker; left to recovery", "job", c.JobID)
 		a.addRecovery(c.JobID)
-	case res.Outcome == "failed" && strings.HasPrefix(res.Reason, "sandbox"):
-		// Stop claiming NOW, then re-probe (queued behind any probe already running).
+	case res.SandboxFailure:
+		// Stop claiming NOW, then re-probe (queued behind any probe already running). A sandbox
+		// that could not even be built is released, not failed, but is the same host fault.
 		es.markRed("sandbox failure: " + res.Reason)
 		a.probeEngine(jobsCtx, es, true)
 	}
