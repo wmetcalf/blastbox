@@ -19,10 +19,10 @@ user; the finalizer runs as the same uid in a different container.
 from __future__ import annotations
 
 import dataclasses
+import fcntl
 import hashlib
 import json
 import os
-import shutil
 import tarfile
 import time
 from collections.abc import Iterator
@@ -111,60 +111,54 @@ def fsync_dir(d: Path) -> None:
 
 
 class UploadLock:
-    """The one-extraction-per-(job, claim) lock: a directory, so creating it is atomic.
+    """The one-extraction-per-(job, claim) lock: an ``flock`` on a file next to the spool dir.
 
-    It holds an owner token, so a holder that finishes after its lock was broken as stale
-    never removes its successor's lock; and a live holder ``touch``es it, so a slow but
-    alive upload is never mistaken for a crashed one.
+    The kernel drops an flock when its holder dies, so there is no age threshold to guess
+    and nothing ever "breaks" a live lock: a slow upload is never mistaken for a crashed one,
+    and two waiters can never both end up holding it. ``release`` unlinks the file WHILE
+    still holding it; ``try_acquire`` then re-checks that the path still names the inode it
+    locked, so a waiter that opened the old (now unlinked) inode cannot win a dead lock while
+    a newcomer holds the live one.
     """
-
-    STALE_S = 900.0
-    TOKEN = "owner"
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
-        self.token = os.urandom(16).hex()
-        self._held = False
+        self._fd: int | None = None
 
     def try_acquire(self) -> bool:
-        try:
-            os.mkdir(self.path, 0o700)
-        except FileExistsError:
+        for _ in range(3):
+            fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(fd)
+                return False
+            try:
+                same = os.stat(self.path, follow_symlinks=False).st_ino == os.fstat(fd).st_ino
+            except FileNotFoundError:
+                same = False
+            if same:
+                self._fd = fd
+                return True
+            os.close(fd)                    # we locked an inode its holder already unlinked
+        return False
+
+    def held_elsewhere(self) -> bool:
+        if self.try_acquire():
+            self.release()
             return False
-        try:
-            (self.path / self.TOKEN).write_text(self.token)
-        except OSError:
-            shutil.rmtree(self.path, ignore_errors=True)
-            raise
-        self._held = True
         return True
 
-    def is_stale(self) -> bool:
-        try:
-            return time.time() - self.path.stat().st_mtime > self.STALE_S
-        except OSError:
-            return True
-
-    def break_stale(self) -> None:
-        shutil.rmtree(self.path, ignore_errors=True)
-
-    def touch(self) -> None:
-        if self._held:
-            try:
-                os.utime(self.path)
-            except OSError:
-                pass
-
     def release(self) -> None:
-        if not self._held:
+        fd, self._fd = self._fd, None
+        if fd is None:
             return
-        self._held = False
         try:
-            mine = (self.path / self.TOKEN).read_text() == self.token
+            os.unlink(self.path)
         except OSError:
-            return
-        if mine:
-            shutil.rmtree(self.path, ignore_errors=True)
+            pass
+        finally:
+            os.close(fd)
 
 
 def write_marker(d: Path, marker: UploadMarker) -> None:

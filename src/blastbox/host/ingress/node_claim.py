@@ -1703,15 +1703,11 @@ def register_node_claim_routes(
                 if declared and declared.isdigit() and int(declared) > cap:
                     raise HTTPException(status_code=413, detail="result too large")
                 got = 0
-                beat = time.monotonic()
                 async for chunk in request.stream():
                     got += len(chunk)
                     if got > cap:
                         raise HTTPException(status_code=413, detail="result too large")
                     await run_in_threadpool(spool.write, chunk)
-                    if time.monotonic() - beat > 30:
-                        upload_lock.touch()     # alive: a slow upload is not a crashed one
-                        beat = time.monotonic()
                 spool.flush()
                 spool.seek(0)
 
@@ -1784,16 +1780,13 @@ def register_node_claim_routes(
             if upload_lock.try_acquire():
                 break
             else:
-                # a live holder touches the lock while it streams; only a silent one is stale
-                if upload_lock.is_stale():
-                    upload_lock.break_stale()
-                    continue
+                # held by a live upload (an flock dies with a crashed holder, so it is live)
                 for _ in range(50):
                     await asyncio.sleep(0.1)
                     prior = await _existing()
                     if prior is not None:
                         return prior
-                    if not lock.exists():
+                    if not upload_lock.held_elsewhere():
                         break
                 # the winner failed (lock gone, nothing stored) or is still busy: nothing has
                 # been accepted, so say "retry" rather than a 202 that would be a lie (503, never 409: 409 means claim lost)

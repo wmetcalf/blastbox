@@ -48,6 +48,17 @@ BACKOFF_MAX_S = 900.0
 
 def _now() -> float:
     return time.time()
+
+
+def _newest_mtime(top: Path) -> float:
+    newest = top.stat().st_mtime
+    for dirpath, dirs, files in os.walk(top, followlinks=False):
+        for name in (*dirs, *files):
+            try:
+                newest = max(newest, os.lstat(os.path.join(dirpath, name)).st_mtime)
+            except OSError:
+                continue
+    return newest
 STALE_NO_OUTCOME_S = 24 * 3600.0
 # A .partial-* extraction dir or a root .upload-*.tar older than this belongs to a dead ingress.
 STALE_PARTIAL_S = 3600.0
@@ -301,9 +312,18 @@ class NodeFinalizer:
             for cd in claims:
                 try:
                     if ".partial" in cd.name:
-                        # an extraction killed mid-way (never renamed into place)
-                        if cd.is_dir() and cd.stat().st_mtime < orphan_cutoff:
+                        # an extraction killed mid-way (never renamed into place). The dir's
+                        # own mtime does not move while a file deep inside grows, so judge it
+                        # by the newest write anywhere in the tree.
+                        if cd.is_dir() and _newest_mtime(cd) < orphan_cutoff:
                             shutil.rmtree(cd, ignore_errors=True)
+                        continue
+                    if cd.name.endswith(".claim") and cd.is_file():
+                        # an upload lock its (crashed) holder never unlinked; a held one stays
+                        if cd.stat().st_mtime < orphan_cutoff:
+                            lk = nr.UploadLock(cd)
+                            if lk.try_acquire():
+                                lk.release()
                         continue
                     if (cd / nr.OUTCOME).is_file():
                         if (cd / nr.OUTCOME).stat().st_mtime < cutoff:

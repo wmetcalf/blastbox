@@ -559,8 +559,39 @@ def test_sweep_removes_crash_orphaned_partials_and_upload_spools(tmp_path):
     fresh = root / "job-1" / "ffff.partial-new"
     fresh.mkdir()
     old = time.time() - 2 * 3600
-    for p in (partial, spool_tmp):
+    for p in (partial / "out" / "f", partial / "out", partial, spool_tmp):
         os.utime(p, (old, old))
     fin.run_once()
     assert not partial.exists() and not spool_tmp.exists()
     assert fresh.exists()                    # a live extraction is left alone
+
+
+def test_sweep_spares_a_partial_whose_extraction_is_still_writing(tmp_path):
+    """The partial dir's own mtime does not move while a big file inside grows."""
+    store, job, fin, _ = build(tmp_path)
+    root = nr.results_root(tmp_path / "jobs")
+    partial = root / "job-1" / "abcd.partial-live"
+    (partial / "out" / "deep").mkdir(parents=True)
+    (partial / "out" / "deep" / "big").write_bytes(b"x")       # written just now
+    old = time.time() - 2 * 3600
+    for p in (partial, partial / "out", partial / "out" / "deep"):
+        os.utime(p, (old, old))
+    fin.run_once()
+    assert (partial / "out" / "deep" / "big").exists()
+
+
+def test_sweep_removes_a_crash_left_upload_lock_but_not_a_held_one(tmp_path):
+    store, job, fin, _ = build(tmp_path)
+    root = nr.results_root(tmp_path / "jobs")
+    (root / "job-1").mkdir(parents=True, exist_ok=True)
+    left = root / "job-1" / "aaaa.claim"
+    left.write_bytes(b"")
+    held = nr.UploadLock(root / "job-1" / "bbbb.claim")
+    assert held.try_acquire()
+    old = time.time() - 2 * 3600
+    for p in (left, held.path):
+        os.utime(p, (old, old))
+    fin.run_once()
+    assert not left.exists()
+    assert held.path.exists()
+    held.release()

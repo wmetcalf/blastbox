@@ -476,10 +476,10 @@ def test_lock_loser_with_no_outcome_gets_503_retry_not_202(tmp_path, pki_dir, mo
     root = tmp_path / "results"
     final = node_results.spool_dir(root, "job-1", hdr["x-blastbox-claim-id"])
     final.parent.mkdir(parents=True, exist_ok=True)
-    lock = final.with_name(final.name + ".claim")
-    lock.mkdir()                                          # a winner that never produced anything
+    holder = node_results.UploadLock(final.with_name(final.name + ".claim"))
+    assert holder.try_acquire()                           # a winner that never produced anything
     import threading
-    threading.Timer(0.3, lock.rmdir).start()              # ...then died and released the lock
+    threading.Timer(0.3, holder.release).start()          # ...then died and released the lock
     r = put(c, hdr, make_tar([]))
     assert r.status_code == 503 and r.json() == {"status": "retry"}
     assert r.headers["retry-after"] == "2"
@@ -671,31 +671,34 @@ def test_replay_of_a_retained_result_later_repaired_is_done(tmp_path, pki_dir): 
 
 # ---------------------------------------------------------------- upload lock + durability
 
-def test_upload_lock_release_never_removes_a_successors_lock(tmp_path):
+def test_upload_lock_is_exclusive_and_needs_no_staleness_guess(tmp_path):
+    """An flock dies with its holder: no age threshold, so nothing can 'break' a live lock
+    and two waiters can never both end up holding it."""
     lk = tmp_path / "x.claim"
     a = node_results.UploadLock(lk)
     assert a.try_acquire()
+    b, c = node_results.UploadLock(lk), node_results.UploadLock(lk)
     old = time.time() - 10_000
-    os.utime(lk, (old, old))
-    b = node_results.UploadLock(lk)
-    assert not b.try_acquire() and b.is_stale()
-    b.break_stale()
-    assert b.try_acquire()
-    a.release()                     # the slow original finishing late
-    assert lk.is_dir() and not node_results.UploadLock(lk).try_acquire()
-    b.release()
+    os.utime(lk, (old, old))                 # however old, a held lock is held
+    assert not b.try_acquire() and not c.try_acquire()
+    assert b.held_elsewhere()
+    a.release()
     assert not lk.exists()
+    assert b.try_acquire() and not c.try_acquire()
+    b.release()
 
 
-def test_upload_lock_heartbeat_keeps_a_live_upload_fresh(tmp_path):
+def test_upload_lock_left_by_a_crashed_holder_is_free(tmp_path):
     lk = tmp_path / "x.claim"
     a = node_results.UploadLock(lk)
     assert a.try_acquire()
-    old = time.time() - 10_000
-    os.utime(lk, (old, old))
-    assert node_results.UploadLock(lk).is_stale()
-    a.touch()
-    assert not node_results.UploadLock(lk).is_stale()
+    assert a._fd is not None
+    os.close(a._fd)                          # the process died: the kernel drops the flock
+    a._fd = None
+    assert lk.exists()
+    b = node_results.UploadLock(lk)
+    assert not b.held_elsewhere() and b.try_acquire()
+    b.release()
 
 
 def test_extracted_tree_is_fsynced_before_accepting(tmp_path, pki_dir, monkeypatch):  # noqa: F811
