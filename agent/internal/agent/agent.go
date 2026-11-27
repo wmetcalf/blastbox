@@ -620,6 +620,17 @@ func (a *Agent) runClaim(ctx, jobsCtx context.Context, es *engState, c *wire.Cla
 	start := a.Now()
 	dl := start.Add(time.Duration(c.Run.DeadlineS) * time.Second)
 	a.mu.Lock()
+	if _, dup := a.inflight[c.JobID]; dup {
+		a.mu.Unlock()
+		// The control plane re-issued a job this node is still running (its earlier claim was
+		// reclaimed). The live run is left alone; the job reached a sandbox here, so the new
+		// claim is failed, never run and never released.
+		rctx, cancel := context.WithTimeout(jobsCtx, 2*time.Minute)
+		defer cancel()
+		err := a.client().Fail(rctx, c, "this node is still running the job under an earlier claim", a.Now())
+		a.Log.Warn("claimed a job that is still running here; failed the new claim", "job", c.JobID, "err", fmt.Sprint(err))
+		return
+	}
 	a.inflight[c.JobID] = wire.HeartbeatJob{JobID: c.JobID, ClaimID: c.ClaimID, StartedAt: rfc3339(start), DeadlineAt: rfc3339(dl)}
 	if t := time.Now().Add(time.Duration(c.Run.DeadlineS) * time.Second); t.After(a.maxDeadln) {
 		a.maxDeadln = t
@@ -649,9 +660,11 @@ func (a *Agent) runClaim(ctx, jobsCtx context.Context, es *engState, c *wire.Cla
 		// A job dir already held a started marker: it now belongs to crash recovery.
 		a.Log.Warn("runner refused a claim whose job dir holds a started marker; left to recovery", "job", c.JobID)
 		a.addRecovery(c.JobID)
-	case res.SandboxFailure:
-		// Stop claiming NOW, then re-probe (queued behind any probe already running). A sandbox
-		// that could not even be built is released, not failed, but is the same host fault.
+	}
+	if res.SandboxFailure {
+		// Stop claiming NOW, then re-probe (queued behind any probe already running) -- whether
+		// or not the report was delivered. A sandbox that could not even be built is released,
+		// not failed, but is the same host fault.
 		es.markRed("sandbox failure: " + res.Reason)
 		a.probeEngine(jobsCtx, es, true)
 	}

@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -268,12 +270,15 @@ func TestRedProbeStopsClaims(t *testing.T) {
 func TestSelftestRedAndSandboxFailureReprobe(t *testing.T) {
 	// The runner reports a sandbox that could not be built as a release (no sandbox saw the
 	// input) and one that failed mid-run as a failure; either must stop claims at once.
+	// Either way the report may go undelivered (Keep): that must not hide the sandbox fault.
 	for _, outcome := range []string{"released", "failed"} {
-		t.Run(outcome, func(t *testing.T) { sandboxFailureStopsClaims(t, outcome) })
+		for _, keep := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/keep=%v", outcome, keep), func(t *testing.T) { sandboxFailureStopsClaims(t, outcome, keep) })
+		}
 	}
 }
 
-func sandboxFailureStopsClaims(t *testing.T, outcome string) {
+func sandboxFailureStopsClaims(t *testing.T, outcome string, keep bool) {
 	e := fresh(t)
 	e.cfg.Engines[0].SelftestArgv = []string{"/bin/true"}
 	var probes int
@@ -292,7 +297,7 @@ func sandboxFailureStopsClaims(t *testing.T, outcome string) {
 		<-mu
 		good = false // the host went bad underneath the job
 		mu <- struct{}{}
-		return runner.Result{Outcome: outcome, Reason: "could not build: insecure host", SandboxFailure: true}
+		return runner.Result{Outcome: outcome, Reason: "could not build: insecure host", SandboxFailure: true, Keep: keep}
 	}}
 	h.start(t)
 	eventually(t, "the sandbox failure and a re-probe after it", func() bool {
@@ -639,6 +644,67 @@ func TestOneAgentPerStateDir(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "state dir") {
 		t.Fatalf("second agent on the same state dir: %v", err)
 	}
+}
+
+// The control plane hands this node a job it is still running (its claim was reclaimed and the
+// job re-queued). The second claim must not touch the live run: no second run, no recovery of
+// the live dir; the new claim is failed (the job already reached a sandbox here).
+func TestDuplicateClaimOfALiveJob(t *testing.T) {
+	e := fresh(t)
+	two := 2
+	e.cfg.Engines[0].Slots = &two
+	body := func(cid string) string {
+		return strings.Replace(claimBody("jd"), `"claim_id":"cid-jd"`, `"claim_id":"`+cid+`"`, 1)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	e.in.onClaim = func(n int) (int, string) {
+		switch n {
+		case 1:
+			return 200, body("cid-1")
+		}
+		select {
+		case <-entered:
+			if n < 50 {
+				return 200, body(fmt.Sprintf("cid-%d", n))
+			}
+		default:
+		}
+		return 204, ""
+	}
+	h := newHarness(e)
+	var mu sync.Mutex
+	runs := 0
+	h.a.Runner = fakeRunner{fn: func(ctx context.Context, c *wire.Claim) runner.Result {
+		mu.Lock()
+		runs++
+		first := runs == 1
+		mu.Unlock()
+		if !first {
+			return runner.Result{Outcome: "done"}
+		}
+		jobDir(e, "jd", true, true)
+		close(entered)
+		<-release
+		return runner.Result{Outcome: "done"}
+	}}
+	h.start(t)
+	<-entered
+	eventually(t, "the duplicate claim answered", func() bool { return e.in.update("jd") != nil })
+	time.Sleep(200 * time.Millisecond) // recovery loop ticks
+	if _, err := os.Stat(filepath.Join(e.cfg.StateDir, "jobs", "jd")); err != nil {
+		t.Fatal("the live run's dir was wiped")
+	}
+	mu.Lock()
+	n := runs
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("the job ran %d times concurrently", n)
+	}
+	u := e.in.update("jd")
+	if f := u["fields"].(map[string]any); f["status"] != "failed" || u["claim_id"] == "cid-1" {
+		t.Fatalf("duplicate claim not failed (or the live claim was): %v", u)
+	}
+	close(release)
 }
 
 func TestRefusedJobGoesToRecovery(t *testing.T) {
