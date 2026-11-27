@@ -57,8 +57,8 @@ exposes no peer certificate to an ASGI app in any case.
 
 from __future__ import annotations
 
-import base64
 import asyncio
+import base64
 import binascii
 import logging
 import math
@@ -1576,11 +1576,14 @@ def register_node_claim_routes(
         fh = os.fdopen(fd, "rb")
 
         def _body():
-            for chunk in iter(lambda: fh.read(1 << 20), b""):
-                yield chunk
+            try:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    yield chunk
+            finally:
+                _done()          # a disconnect closes the generator without the BackgroundTask
 
         def _done() -> None:
-            # a BackgroundTask runs even when the client disconnects before iterating
+            # idempotent: runs from the generator's finally AND the BackgroundTask
             fh.close()
             if cleanup:
                 shutil.rmtree(cleanup, ignore_errors=True)
@@ -1753,9 +1756,11 @@ def register_node_claim_routes(
                         return prior
                     if not lock.exists():
                         break
-                return _existing() or JSONResponse({"status": "accepted"}, status_code=202)
+                # the winner failed (lock gone, nothing stored) or is still busy: nothing has
+                # been accepted, so say "retry" rather than a 202 that would be a lie
+                return _existing() or JSONResponse({"status": "retry"}, status_code=409)
         else:
-            return JSONResponse({"status": "accepted"}, status_code=202)
+            return JSONResponse({"status": "retry"}, status_code=409)
         try:
             return await _receive_and_extract()
         finally:

@@ -434,3 +434,52 @@ def test_middleware_ceiling_is_per_route():
     assert c.put("/v1/nodes/jobs/x/result", content=b"x" * 500).status_code == 200
     assert c.put("/v1/nodes/jobs/x/result", content=b"x" * 2000).status_code == 413
     assert c.put("/other", content=b"x" * 500).status_code == 413
+
+
+def test_input_generator_cleans_up_when_closed_early(tmp_path, pki_dir, monkeypatch):  # noqa: F811
+    from fastapi.responses import StreamingResponse
+
+    captured = {}
+    real_init = StreamingResponse.__init__
+
+    def spy(self, content, *a, **k):
+        captured["gen"] = content
+        real_init(self, content, *a, **k)
+
+    monkeypatch.setattr(StreamingResponse, "__init__", spy)
+    _, c, hdr = _setup(tmp_path, pki_dir, spool=None, blobs=Blobs(b"y" * (3 << 20)))
+    c.get("/v1/nodes/jobs/job-1/input", headers=hdr)      # full read; now drive one by hand
+    tmp_root = tmp_path / "jobs" / ".node-input-tmp"
+    assert list(tmp_root.iterdir()) == []
+    # second request, but never iterate it to the end: call the route's generator directly
+    gen = captured["gen"]
+    gen.close()                                           # already finished: must stay safe
+    captured.clear()
+    import starlette.responses as sr
+
+    async def fake_call(self, scope, receive, send):      # headers only; the body is never iterated
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    monkeypatch.setattr(sr.StreamingResponse, "__call__", fake_call)
+    c.get("/v1/nodes/jobs/job-1/input", headers=hdr)
+    gen = captured["gen"]
+    assert len(list(tmp_root.iterdir())) == 1             # temp tree exists, nothing iterated
+    next(gen)                                             # started reading
+    gen.close()                                           # client went away mid-stream
+    assert list(tmp_root.iterdir()) == []
+
+
+def test_lock_loser_with_no_outcome_gets_409_not_202(tmp_path, pki_dir, monkeypatch):  # noqa: F811
+    _, c, hdr = _setup(tmp_path, pki_dir)
+    root = tmp_path / "results"
+    final = node_results.spool_dir(root, "job-1", hdr["x-blastbox-claim-id"])
+    final.parent.mkdir(parents=True, exist_ok=True)
+    lock = final.with_name(final.name + ".claim")
+    lock.mkdir()                                          # a winner that never produced anything
+    import threading
+    threading.Timer(0.3, lock.rmdir).start()              # ...then died and released the lock
+    r = put(c, hdr, make_tar([]))
+    assert r.status_code == 409 and r.json() == {"status": "retry"}
+    assert spool_dirs(tmp_path) == []
+    assert put(c, hdr, make_tar([])).status_code == 202   # a retry succeeds
