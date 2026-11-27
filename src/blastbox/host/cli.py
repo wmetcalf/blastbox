@@ -1515,13 +1515,15 @@ def _pki_cmd(args: argparse.Namespace) -> int:
         try:
             removed = revoke(pki_dir, args.node_id,
                              node_dirs=[Path(p) for p in args.node_dir] or None)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:   # bad id, unreadable CA, unreachable dir
             print(f"error: {exc}", file=sys.stderr)
             return 1
         for path in removed:
             print(f"removed {path}")
         if not removed:
-            print(f"no certificate for {args.node_id} found", file=sys.stderr)
+            print(f"error: no certificate for {args.node_id} found; nothing revoked",
+                  file=sys.stderr)
+            return 1
         return 0
     if args.pki_action == "renew-pending":
         from blastbox.host.node_renew import sign_pending

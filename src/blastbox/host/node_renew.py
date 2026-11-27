@@ -15,21 +15,25 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import errno
 import fcntl
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
+from blastbox.host.pki import _NODE_ID_RE as _PKI_NODE_ID
 from blastbox.host.pki import (
     MAX_NODE_CERT_DAYS,
     CertAuthority,
     NodeGrants,
     NodeIdentity,
+    TrustAnchor,
     load_trust_anchor,
     node_identity,
 )
@@ -110,30 +114,40 @@ class _Current:
     pem: bytes
     ident: NodeIdentity
     grants: NodeGrants                  #: INTERSECTION over every verifying cert
-    wg_keys: set[str | None]            #: every WireGuard key they carry (None = keyless)
+    newest: NodeIdentity                #: the most recently ISSUED (latest not_before)
     others: list[tuple[Path, bytes]]    #: the rest, superseded by a renewal
 
 
-def _find_current(pki_dir: Path, node_id: str) -> _Current | None:
+def _find_current(pki_dir: Path, node_id: str,
+                  anchor: CertAuthority | TrustAnchor | None = None) -> _Current | None:
     """The node's verifying certs in ``pki_dir``, or None.
 
     ``grants`` is the intersection over every verifying cert for the node, the same rule
     :func:`blastbox.host.placement.fleet_grants` applies on the ingress, so a renewal can
     never restore a grant a narrower cert beside it is withholding.
 
+    ``anchor`` None verifies against the dir's own ``ca.crt`` (the ingress serving its own
+    certs). The CA host passes ITS OWN CA instead, and then also skips symlinks: a node dir
+    is the ingress's to write, so neither its ``ca.crt`` nor a link out of it may decide
+    what the real CA signs.
+
     A cert that does not verify is skipped, but an OSError reading the anchor or a cert
     file PROPAGATES: "could not read" is a transient fault, not "has no certificate", and
     the caller must not turn it into a refusal that deletes the node's CSR.
     """
     d = Path(pki_dir)
-    try:
-        anchor = load_trust_anchor(d)
-    except OSError:
-        raise
-    except Exception:                                   # noqa: BLE001 - garbled CA: verify nothing
-        return None
+    strict = anchor is not None
+    if anchor is None:
+        try:
+            anchor = load_trust_anchor(d)
+        except OSError:
+            raise
+        except Exception:                               # noqa: BLE001 - garbled CA: verify nothing
+            return None
     found: list[tuple[Path, bytes, NodeIdentity]] = []
     for crt in sorted(d.glob("*.crt")):
+        if strict and (crt.is_symlink() or not crt.is_file()):
+            continue
         pem = crt.read_bytes()                          # OSError propagates (transient)
         try:
             ident = node_identity(anchor, pem)
@@ -149,7 +163,7 @@ def _find_current(pki_dir: Path, node_id: str) -> _Current | None:
         grants = _intersect(grants, f[2].grants)
     assert grants is not None
     return _Current(path=best[0], pem=best[1], ident=best[2], grants=grants,
-                    wg_keys={f[2].wg_pubkey for f in found},
+                    newest=max(found, key=lambda f: f[2].not_before)[2],
                     others=[(f[0], f[1]) for f in found if f is not best])
 
 
@@ -176,25 +190,23 @@ def _replace_file(path: Path, data: bytes) -> None:
         Path(tmp).unlink(missing_ok=True)
 
 
-def _restore(aside: Path, orig: Path) -> None:
-    """Put a set-aside CSR back, unless a newer one landed on ``orig`` meanwhile.
+#: How long a run waits for another holder of a node dir's lock before failing.
+LOCK_TIMEOUT_S = 120.0
 
-    ``os.link`` fails if ``orig`` exists, so this is a no-clobber move: an exists()
-    check followed by ``os.replace`` would overwrite a CSR queued between the two. A
-    mount without hard links (sshfs, SMB) falls back to that check-then-replace; never
-    raise, since one stuck aside must not wedge every later run.
-    """
-    try:
-        os.link(aside, orig)
-    except FileExistsError:
-        pass
-    except OSError:
-        try:
-            if not orig.exists():
-                os.replace(aside, orig)
-        except OSError:
-            return                      # left as .signing; the next run retries it
-    aside.unlink(missing_ok=True)
+
+def _dirs(pki_dir: Path, node_dirs: list[Path] | None) -> list[Path]:
+    """``pki_dir`` then ``node_dirs``, once each by REAL path: two spellings of one dir
+    would otherwise be locked twice, and the second flock waits on the first forever."""
+    out: dict[str, Path] = {}
+    for p in [Path(pki_dir), *(Path(p) for p in node_dirs or [])]:
+        out.setdefault(os.path.realpath(p), p)
+    dirs = list(out.values())
+    for d in dirs:
+        # An unmounted mountpoint is an empty dir. Renewing or revoking "around" it would
+        # leave that ingress with a stale or unrevoked cert, so fail the run instead.
+        if not (d / "ca.crt").is_file():
+            raise OSError(errno.ENOENT, f"{d} is not a PKI dir (no ca.crt) -- unmounted?")
+    return dirs
 
 
 @contextlib.contextmanager
@@ -203,14 +215,28 @@ def _locked(dirs: list[Path]):
 
     ALL of them for the whole run: a renewal writes certs into every dir where the node
     verifies, so a second run over an overlapping set must wait rather than interleave.
-    An OSError (missing or stale mount) propagates before anything is consumed.
+    Bounded by :data:`LOCK_TIMEOUT_S`, because a node dir is the ingress's to write and a
+    lock it never releases must fail the run, not hang the timer and ``revoke-node``. The
+    lock file is never followed through a symlink. An OSError (missing or stale mount, a
+    held lock) propagates before anything is consumed.
     """
     with contextlib.ExitStack() as stack:
-        for d in sorted(set(dirs)):
+        for d in sorted(dirs, key=lambda p: os.path.realpath(p)):
             # In the PKI dir itself, not renew/: creating renew/ from the CA host could
             # leave the ingress a queue dir it does not own.
-            fh = stack.enter_context(open(Path(d) / ".renew.lock", "a+"))
-            fcntl.flock(fh, fcntl.LOCK_EX)
+            fd = os.open(Path(d) / ".renew.lock",
+                         os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            stack.callback(os.close, fd)
+            deadline = time.monotonic() + LOCK_TIMEOUT_S
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise OSError(errno.ETIMEDOUT,
+                                      f"{d}: renewal lock held for over {LOCK_TIMEOUT_S:g}s")
+                    time.sleep(0.05)
         yield
 
 
@@ -224,8 +250,9 @@ def sign_pending(ca: CertAuthority, pki_dir: Path, *, days: int = 7,
     key; the mount runs the other way). ``pki_dir`` is always one of them.
 
     A node's CURRENT state is taken over EVERY dir where it verifies: the new cert carries
-    the intersection of all their grants and their one WireGuard key (dirs that disagree
-    about the key are refused), and is written to every one of those dirs, so no ingress
+    the intersection of all their grants and the WireGuard key (or none) of the most
+    recently ISSUED of them -- mid-rotation the old-key cert is still valid, and the newest
+    is the operator's intent -- and is written to every one of those dirs, so no ingress
     is ever widened by a renewal queued through another. It must verify in the dir that
     queued it. A dir where it does not verify -- revoked there -- is left alone. If any
     write fails, or a cert changed or vanished meanwhile, the CSR is kept and the next
@@ -236,7 +263,7 @@ def sign_pending(ca: CertAuthority, pki_dir: Path, *, days: int = 7,
     """
     if not 1 <= days <= MAX_NODE_CERT_DAYS:
         raise ValueError(f"node cert lifetime must be 1..{MAX_NODE_CERT_DAYS} days, got {days}")
-    every = list(dict.fromkeys([Path(pki_dir), *(Path(p) for p in node_dirs or [])]))
+    every = _dirs(pki_dir, node_dirs)
     results: list[tuple[str, str]] = []
     with _locked(every):
         for qdir in every:
@@ -246,28 +273,31 @@ def sign_pending(ca: CertAuthority, pki_dir: Path, *, days: int = 7,
 
 def _drain(ca: CertAuthority, qdir: Path, days: int,
            every: list[Path]) -> list[tuple[str, str]]:
+    """Sign what ``qdir``'s ingress queued.
+
+    A CSR being worked on is ``<id>.csr.signing``, and it is never renamed back: a kept
+    one (transient fault, crash) simply stays and is retried next run, and a newer
+    ``<id>.csr`` the node queued meanwhile replaces it then. So no step ever writes onto
+    a name the ingress may be writing, which needs no hard links and has no window.
+    """
     d = _renew_dir(qdir)
     results: list[tuple[str, str]] = []
-    if not d.is_dir():
-        return results
-    # A crash mid-sign leaves "<id>.csr.signing"; put it back unless a newer CSR landed.
-    for aside in d.glob("*.csr.signing"):
-        _restore(aside, aside.with_suffix(""))
-    for csr_path in sorted(d.glob("*.csr")):
-        node_id = csr_path.stem
-        # Set aside, so a newer CSR can land on the original name while we sign and is
-        # never deleted by us.
-        aside = csr_path.with_name(csr_path.name + ".signing")
+    if d.is_symlink() or not d.is_dir():
+        return results                  # a queue linked out of the node dir is not ours
+    ids = sorted({p.name[:-len(".csr")] for p in d.glob("*.csr")}
+                 | {p.name[:-len(".csr.signing")] for p in d.glob("*.csr.signing")})
+    for node_id in ids:
+        csr_path, aside = d / f"{node_id}.csr", d / f"{node_id}.csr.signing"
         try:
-            os.replace(csr_path, aside)
+            if csr_path.exists() and not csr_path.is_symlink():
+                os.replace(csr_path, aside)     # newest wins over a kept older one
+            if aside.is_symlink() or not aside.is_file():
+                continue                        # never read a file through a link
             csr_pem = aside.read_bytes()
         except OSError:
             continue
         outcome, keep = _renew_one(ca, qdir, every, node_id, csr_pem, days)
-        if keep:
-            # Transient fault: retry next run, unless the node has queued a newer one.
-            _restore(aside, csr_path)
-        else:
+        if not keep:
             aside.unlink(missing_ok=True)
         results.append((node_id, outcome))
     return results
@@ -291,7 +321,7 @@ def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
     states: dict[Path, _Current] = {}
     try:
         for d in every:
-            cur = _find_current(d, node_id)
+            cur = _find_current(d, node_id, anchor=ca)
             if cur is not None:
                 states[d] = cur
     except OSError as exc:
@@ -299,16 +329,13 @@ def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
     if qdir not in states:
         return "refused: no current certificate", False
     grants: NodeGrants | None = None
-    wg_keys: set[str | None] = set()
     for cur in states.values():
         grants = _intersect(grants, cur.grants)
-        wg_keys |= cur.wg_keys
-    if len(wg_keys) != 1:
-        return "refused: the node's certificates disagree about its WireGuard key", False
     assert grants is not None
+    newest = max((cur.newest for cur in states.values()), key=lambda i: i.not_before)
     try:
         new = ca.sign_node_csr(csr_pem, node_id=node_id, grants=grants, days=days,
-                               wg_pubkey=next(iter(wg_keys)))
+                               wg_pubkey=newest.wg_pubkey)
     except ValueError as exc:
         return f"refused: {exc}", False
     try:
@@ -336,19 +363,20 @@ def revoke(pki_dir: Path, node_id: str, *, node_dirs: list[Path] | None = None) 
     """Revoke ``node_id``: delete its certs and queued CSRs in every node dir.
 
     Under the same locks as :func:`sign_pending`, so a renewal in flight cannot write a
-    cert back after it. Returns the cert files removed.
+    cert back after it. Certs are matched by verifying them (expired ones too) against
+    ``pki_dir``'s CA, never a node dir's own ``ca.crt``. Returns the cert files removed.
+    Raises ValueError for a malformed node id, OSError for an unreadable CA or dir.
     """
-    every = list(dict.fromkeys([Path(pki_dir), *(Path(p) for p in node_dirs or [])]))
+    if not _PKI_NODE_ID.match(node_id):
+        raise ValueError(f"invalid node id {node_id!r}")
+    anchor = load_trust_anchor(Path(pki_dir))
+    every = _dirs(pki_dir, node_dirs)
     removed: list[Path] = []
     with _locked(every):
         for d in every:
-            try:
-                anchor = load_trust_anchor(d)
-            except Exception:                           # noqa: BLE001 - nothing verifies here
-                anchor = None
             for crt in sorted(d.glob("*.crt")):
-                if anchor is None:
-                    break
+                if crt.is_symlink() or not crt.is_file():
+                    continue
                 try:
                     if node_identity(anchor, crt.read_bytes(),
                                      allow_expired=True).node_id != node_id:
@@ -357,6 +385,9 @@ def revoke(pki_dir: Path, node_id: str, *, node_dirs: list[Path] | None = None) 
                     continue
                 crt.unlink()
                 removed.append(crt)
-            for q in _renew_dir(d).glob(f"{node_id}.csr*"):
-                q.unlink(missing_ok=True)
+            q = _renew_dir(d)
+            if q.is_symlink():
+                continue
+            for name in (f"{node_id}.csr", f"{node_id}.csr.signing"):
+                (q / name).unlink(missing_ok=True)
     return removed

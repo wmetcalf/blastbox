@@ -926,11 +926,13 @@ dir reachable on the CA host (an sshfs or NFS mount, CA host as the client, so t
 sees `ca.key`) and add one `--node-dir <mount>` per ingress to the unit's `ExecStart`.
 `renew-pending` then drains every queue (`--dir`'s own included) and treats the node's
 certificates in ALL of those dirs as its current state: the renewed certificate carries the
-**intersection** of their grants and their one WireGuard key (dirs that disagree about the key
-are refused), and replaces the node's certificates in every dir where it still verifies, so an
+**intersection** of their grants and the WireGuard key (or none) of the most recently issued of
+them, and replaces the node's certificates in every dir where it still verifies, so an
 ingress that narrowed a node is never widened by a renewal queued through another. A dir where
-it was revoked is left alone. A run that cannot lock every dir (a stale mount) renews nothing and
-exits 1; a write that fails mid-way keeps the CSR, and the next run redoes it. Without
+it was revoked is left alone. Every certificate is verified against the CA host's own CA, never
+a node dir's `ca.crt`, and symlinks in a node dir are not followed: the dir is the ingress's to
+write. A run that cannot lock every dir within two minutes, or finds a node dir without `ca.crt`
+(an unmounted mountpoint), renews nothing and exits 1; a write that fails mid-way keeps the CSR, and the next run redoes it. Without
 `--node-dir` a split deployment's renewals are never seen: the node gets 202 and its old
 certificate until it expires.
 
