@@ -30,23 +30,34 @@ class BodySizeLimitMiddleware:
     flag is set, replacing it with a definitive 413.
     """
 
-    def __init__(self, app, max_bytes: int) -> None:
+    def __init__(self, app, max_bytes: int, *, route_ceilings: "tuple[tuple[str, str, int], ...]" = ()) -> None:
         self.app = app
-        self._max = max_bytes
+        self._default_max = max_bytes
+        # (method, path-regex, ceiling): a route whose legitimate body is not an INPUT (a node's
+        # result tar) gets its own ceiling; every other route keeps ``max_bytes``.
+        import re
+        self._routes = tuple((m.upper(), re.compile(p), c) for m, p, c in route_ceilings)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        limit = self._default_max
+        for method, rx, ceiling in self._routes:
+            if scope.get("method") == method and rx.fullmatch(scope.get("path", "")):
+                limit = ceiling
+                break
+        return await self._limited(scope, receive, send, limit)
 
+    async def _limited(self, scope, receive, send, limit):
         # Fast path: Content-Length header present
         headers = dict(scope.get("headers", []))
         cl = headers.get(b"content-length")
         if cl is not None:
             try:
-                if int(cl) > self._max:
+                if int(cl) > limit:
                     record_rejection("body_too_large")
                     response = PlainTextResponse(
-                        f"request body exceeds {self._max} bytes", status_code=413
+                        f"request body exceeds {limit} bytes", status_code=413
                     )
                     await response(scope, receive, send)
                     return
@@ -69,7 +80,7 @@ class BodySizeLimitMiddleware:
             msg = await receive()
             if msg["type"] == "http.request":
                 body_size += len(msg.get("body", b""))
-                if body_size > self._max:
+                if body_size > limit:
                     scope["state"]["body_too_large"] = True
                     raise RuntimeError("request_body_too_large")
             return msg
@@ -84,7 +95,7 @@ class BodySizeLimitMiddleware:
                     # Emit our 413 instead and skip the inner app's response.
                     record_rejection("body_too_large")
                     err_response = PlainTextResponse(
-                        f"request body exceeds {self._max} bytes", status_code=413
+                        f"request body exceeds {limit} bytes", status_code=413
                     )
                     await err_response(scope, receive, send)
                     headers_sent = True
@@ -103,7 +114,7 @@ class BodySizeLimitMiddleware:
                     return
                 record_rejection("body_too_large")
                 response = PlainTextResponse(
-                    f"request body exceeds {self._max} bytes", status_code=413
+                    f"request body exceeds {limit} bytes", status_code=413
                 )
                 await response(scope, receive, send)
                 return

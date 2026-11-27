@@ -592,7 +592,16 @@ def build_app(
     )
 
     # Requirement 1: 413 before spool (Content-Length fast path + streaming).
-    app.add_middleware(BodySizeLimitMiddleware, max_bytes=_limits.max_input_bytes)
+    from blastbox.host.node_results import stream_cap as _result_stream_cap
+
+    # A node's result tar is not an input: it carries up to max_total_artifacts + metadata.
+    # Only that one route gets the larger ceiling (the route enforces the same cap itself).
+    app.add_middleware(
+        BodySizeLimitMiddleware, max_bytes=_limits.max_input_bytes,
+        route_ceilings=(("PUT", r"/v1/nodes/jobs/[^/]+/result", _result_stream_cap(
+            max_artifact_total=_limits.max_total_artifact_bytes,
+            max_metadata=_limits.max_metadata_bytes,
+            max_artifacts=_limits.max_artifacts)),))
 
     if _api_key:
         app.add_middleware(
@@ -1460,6 +1469,7 @@ def build_app(
     # The API key doubles as the pepper for the store-held node signing key: every ingress
     # host already has it and a queue reader does not. See node_auth.resolve_claim_secret.
     register_node_claim_routes(app, job_store=_job_store, job_root=_job_root,
+                               blob_store=_blob_store,
                                pepper=_api_key.encode() if _api_key else None)
 
     return app

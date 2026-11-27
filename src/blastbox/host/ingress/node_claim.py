@@ -62,11 +62,12 @@ import binascii
 import logging
 import math
 import os
+import stat
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
-from fastapi import APIRouter, Header, HTTPException, Query, Response
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field, StrictInt, StringConstraints
 
 from blastbox.host import node_auth, node_renew
@@ -598,6 +599,7 @@ def _job_requirements(job) -> "tuple[str | None, bool, bool]":
 def register_node_claim_routes(
     app: "FastAPI", *, job_store: "JobStore", pki_dir: "Path | str | None" = None,
     pepper: bytes | None = None, job_root: "Path | str | None" = None,
+    blob_store: "Any | None" = None,
 ) -> bool:
     """Mount the claim routes if this deployment has a PKI. Returns whether it did."""
     resolved = resolve_pki_dir(pki_dir)
@@ -1495,6 +1497,220 @@ def register_node_claim_routes(
         if fresh is None:
             raise HTTPException(status_code=409, detail="status changed")
         return {"job": fresh.to_dict()}
+
+    # ---- data plane: input to the node, result tar back into the quarantine spool ----------
+    # The ingress only QUARANTINES. It holds no attest key and runs no trust gate; the
+    # node-finalizer (a separate process) does both. See blastbox.host.node_results.
+    _runtimes_ok = frozenset({"seatbelt", "nsjail"})
+
+    def _running_owned(job_id: str, node_id: str, claim_id: str | None, receipt: str | None):
+        from blastbox.host.jobs.base import JobStatus
+
+        if not claim_id or not receipt:
+            raise HTTPException(status_code=403, detail=_REFUSED)
+        job = _owned_job(job_id, node_id, claim_id, receipt)
+        if job.status != JobStatus.RUNNING:
+            raise HTTPException(status_code=403, detail=_REFUSED)
+        return job
+
+    def _local_input(job) -> "Path | None":
+        name = Path(job.filename or "").name
+        if not name or name != job.filename:
+            return None
+        p = _jobs_dir / job.job_id / "input" / name
+        try:
+            return p if stat.S_ISREG(p.lstat().st_mode) else None
+        except OSError:
+            return None
+
+    @router.get("/jobs/{job_id}/input", response_model=None)
+    def get_input(job_id: str,
+                  x_blastbox_node_session: str | None = Header(None),
+                  x_blastbox_claim_id: str | None = Header(None),
+                  x_blastbox_receipt: str | None = Header(None)):
+        import hashlib
+        import shutil
+        import tempfile
+
+        from fastapi.responses import StreamingResponse
+
+        node_id = _node_from_token(x_blastbox_node_session)
+        job = _running_owned(job_id, node_id, x_blastbox_claim_id, x_blastbox_receipt)
+        local = _local_input(job)
+        cleanup: "Path | None" = None
+        if local is None:
+            if blob_store is None or not job.input_sha256:
+                raise HTTPException(status_code=503, detail="input unavailable")
+            tmp_root = _jobs_dir / ".node-input-tmp"
+            tmp_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            cleanup = Path(tempfile.mkdtemp(dir=tmp_root))
+            local = cleanup / "input"
+            try:
+                blob_store.get_sample(job.input_sha256, local)
+                if not local.is_file():
+                    raise FileNotFoundError(str(local))
+            except Exception:                   # noqa: BLE001 - agent releases on 503
+                shutil.rmtree(cleanup, ignore_errors=True)
+                raise HTTPException(status_code=503, detail="input unavailable") from None
+        try:
+            fd = os.open(local, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            if cleanup:
+                shutil.rmtree(cleanup, ignore_errors=True)
+            raise HTTPException(status_code=503, detail="input unavailable") from None
+        size = os.fstat(fd).st_size
+        sha = job.input_sha256
+        if not sha:
+            h = hashlib.sha256()
+            with os.fdopen(os.dup(fd), "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            os.lseek(fd, 0, os.SEEK_SET)
+            sha = h.hexdigest()
+
+        def _body():
+            try:
+                with os.fdopen(fd, "rb") as f:
+                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                        yield chunk
+            finally:
+                if cleanup:
+                    shutil.rmtree(cleanup, ignore_errors=True)
+
+        return StreamingResponse(_body(), media_type="application/octet-stream",
+                                 headers={"Content-Length": str(size),
+                                          "x-blastbox-input-sha256": sha})
+
+    def _ms_header(name: str, raw: "str | None") -> "int | None":
+        if raw is None or raw == "":
+            return None
+        try:
+            v = int(raw)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"{name}: must be an integer") from None
+        if v < 0:
+            raise HTTPException(status_code=400, detail=f"{name}: must be non-negative")
+        return min(v, int((time.time() + MAX_FUTURE_SKEW_S) * 1000))
+
+    @router.put("/jobs/{job_id}/result", response_model=None)
+    async def put_result(job_id: str, request: Request,
+                         x_blastbox_node_session: str | None = Header(None),
+                         x_blastbox_claim_id: str | None = Header(None),
+                         x_blastbox_receipt: str | None = Header(None),
+                         x_blastbox_worker_runtime: str | None = Header(None),
+                         x_blastbox_started_at_ms: str | None = Header(None),
+                         x_blastbox_finished_at_ms: str | None = Header(None)):
+        import shutil
+        import tempfile
+
+        from fastapi.responses import JSONResponse
+        from starlette.concurrency import run_in_threadpool
+
+        from blastbox.host import node_results as nr
+        from blastbox.host.runtime.remote_http import _safe_extract_tar
+        from blastbox.limits import Limits
+
+        node_id = _node_from_token(x_blastbox_node_session)
+        await run_in_threadpool(_running_owned, job_id, node_id,
+                                      x_blastbox_claim_id, x_blastbox_receipt)
+        claim_id = x_blastbox_claim_id or ""
+        runtime = x_blastbox_worker_runtime
+        if runtime is not None and runtime not in _runtimes_ok:
+            raise HTTPException(status_code=400, detail="worker runtime not allowed")
+        started = _ms_header("x-blastbox-started-at-ms", x_blastbox_started_at_ms)
+        finished = _ms_header("x-blastbox-finished-at-ms", x_blastbox_finished_at_ms)
+
+        root = nr.results_root(_jobs_dir)
+        final = nr.spool_dir(root, job_id, claim_id)
+
+        def _existing() -> "JSONResponse | None":
+            if not final.is_dir():
+                return None
+            out = nr.read_outcome(final)
+            if out is None:
+                return JSONResponse({"status": "accepted"}, status_code=202)
+            if out.get("status") == "done":
+                return JSONResponse({"status": "done"}, status_code=200)
+            return JSONResponse({"status": "failed", "reason": out.get("reason")},
+                                status_code=422)
+
+        # Idempotent on (job, claim): never re-read or re-extract. The body is discarded.
+        prior = _existing()
+        if prior is not None:
+            return prior
+
+        lim = Limits.from_env()
+        cap = nr.stream_cap(max_artifact_total=lim.max_total_artifact_bytes,
+                            max_metadata=lim.max_metadata_bytes,
+                            max_artifacts=lim.max_artifacts)
+        cert = await run_in_threadpool(nr.node_cert_sha256, resolved, node_id)
+        if cert is None:
+            raise HTTPException(status_code=403, detail=_REFUSED)
+        jobdir = root / job_id
+        jobdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        partial: "Path | None" = None
+        with tempfile.NamedTemporaryFile(dir=root, prefix=".upload-", suffix=".tar") as spool:
+            os.chmod(spool.name, 0o600)
+            declared = request.headers.get("content-length")
+            if declared and declared.isdigit() and int(declared) > cap:
+                raise HTTPException(status_code=413, detail="result too large")
+            got = 0
+            async for chunk in request.stream():
+                got += len(chunk)
+                if got > cap:
+                    raise HTTPException(status_code=413, detail="result too large")
+                await run_in_threadpool(spool.write, chunk)
+            spool.flush()
+            spool.seek(0)
+
+            def _extract() -> Path:
+                nonlocal partial
+                partial = Path(tempfile.mkdtemp(dir=jobdir, prefix=final.name + ".partial-"))
+                os.chmod(partial, 0o700)
+                max_members = lim.max_artifacts + 64
+                nr.vet_tar(spool, max_members=max_members,
+                           max_total_bytes=lim.max_total_artifact_bytes)
+                out = partial / nr.OUT
+                out.mkdir(mode=0o700)
+                _safe_extract_tar(spool, out, max_total_bytes=lim.max_total_artifact_bytes,
+                                  max_members=max_members,
+                                  max_metadata_bytes=lim.max_metadata_bytes)
+                return partial
+
+            try:
+                await run_in_threadpool(_extract)
+                # Ownership re-check: the reclaim sweep may have taken the job while we read.
+                try:
+                    await run_in_threadpool(_running_owned, job_id, node_id,
+                                            x_blastbox_claim_id, x_blastbox_receipt)
+                except HTTPException:
+                    raise
+                assert partial is not None
+                nr.write_marker(partial, nr.UploadMarker(
+                    job_id=job_id, claim_id=claim_id, node_id=node_id,
+                    node_cert_sha256=cert, worker_runtime=runtime,
+                    received_at=time.time(), started_at_ms=started,
+                    finished_at_ms=finished))
+                try:
+                    os.rename(partial, final)
+                except OSError:
+                    # lost a race with an identical upload: it is already quarantined
+                    shutil.rmtree(partial, ignore_errors=True)
+                    return _existing() or JSONResponse({"status": "accepted"}, status_code=202)
+                partial = None
+            except HTTPException:
+                raise
+            except Exception as exc:            # noqa: BLE001 - any extraction fault: refuse, no marker
+                if not isinstance(exc, (nr.TarRejected, OSError, RuntimeError, ValueError)):
+                    _log.exception("node_claim: result extraction failed job=%s", job_id)
+                else:
+                    _log.warning("node_claim: result refused job=%s: %s", job_id, exc)
+                return JSONResponse({"status": "failed", "reason": "result rejected"},
+                                    status_code=422)
+            finally:
+                if partial is not None:
+                    shutil.rmtree(partial, ignore_errors=True)
+        return JSONResponse({"status": "accepted"}, status_code=202)
 
     app.include_router(router)
     _log.info("node_claim: enforcing node grants at the hand-over (pki=%s)", resolved)
