@@ -38,7 +38,7 @@ from pathlib import Path
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
@@ -92,6 +92,11 @@ def renew_payload(node_id: str, csr_pem: str, issued_at: int) -> bytes:
                           str(int(issued_at)).encode()])
 
 
+def _spki(pub: object) -> bytes:
+    return pub.public_bytes(serialization.Encoding.DER,  # type: ignore[attr-defined]
+                            serialization.PublicFormat.SubjectPublicKeyInfo)
+
+
 def sign_renew_proof(key: ec.EllipticCurvePrivateKey, node_id: str, csr_pem: str,
                      issued_at: int) -> str:
     """Base64 (std) DER ECDSA-P256-SHA256 signature over :func:`renew_payload`."""
@@ -101,11 +106,19 @@ def sign_renew_proof(key: ec.EllipticCurvePrivateKey, node_id: str, csr_pem: str
 
 def verify_renew_proof(anchor: CertAuthority | TrustAnchor, node_id: str, csr_pem: str,
                        cert_pem: str, issued_at: object, signature_b64: str, *,
-                       now: float, max_skew: float) -> NodeIdentity:
+                       now: float, max_skew: float,
+                       current_keys: set[bytes] | None = None) -> NodeIdentity:
     """Check that the holder of a CA-signed, unexpired cert for ``node_id`` asked for this
-    CSR, at ``issued_at`` within ``max_skew`` of ``now``. Raises :class:`RenewRefused`."""
-    if not isinstance(issued_at, int) or isinstance(issued_at, bool):
-        raise RenewRefused("issued_at must be an integer (unix seconds)")
+    CSR, at ``issued_at`` within ``max_skew`` of ``now``. Raises :class:`RenewRefused`.
+
+    ``current_keys`` (SubjectPublicKeyInfo DER) are the keys of the node's CURRENT certs:
+    the proof cert's key must be one of them. Revocation is deletion, so an older cert
+    stays CA-valid until it expires; a revoked-then-re-enrolled node's OLD key must not
+    renew it.
+    """
+    if (not isinstance(issued_at, int) or isinstance(issued_at, bool)
+            or not 0 <= issued_at < 2 ** 63):
+        raise RenewRefused("issued_at must be an integer (unix seconds, 0 <= t < 2**63)")
     if abs(now - issued_at) > max_skew:
         raise RenewRefused(f"proof issued_at is more than {max_skew:g}s from now")
     try:
@@ -121,6 +134,9 @@ def verify_renew_proof(anchor: CertAuthority | TrustAnchor, node_id: str, csr_pe
     pub = x509.load_pem_x509_certificate(cert_pem.encode("utf-8")).public_key()
     if not isinstance(pub, ec.EllipticCurvePublicKey) or not isinstance(pub.curve, ec.SECP256R1):
         raise RenewRefused("proof certificate key must be EC P-256", identity=True)
+    if current_keys is not None and _spki(pub) not in current_keys:
+        raise RenewRefused("proof certificate is not the node's current certificate",
+                           identity=True)
     try:
         pub.verify(sig, renew_payload(node_id, csr_pem, issued_at), ec.ECDSA(hashes.SHA256()))
     except InvalidSignature:
@@ -169,11 +185,20 @@ def queue_csr(pki_dir: Path, node_id: str, csr_pem: bytes, *, cert_pem: bytes,
         csr_text, cert_text = csr_pem.decode("utf-8"), cert_pem.decode("utf-8")
     except UnicodeDecodeError:
         raise RenewRefused("CSR and certificate must be UTF-8 PEM") from None
+    explicit = anchor is not None
     if anchor is None:
-        anchor = load_trust_anchor(Path(pki_dir))      # OSError: the caller's 503
+        try:
+            anchor = load_trust_anchor(Path(pki_dir))
+        except OSError:
+            raise                                       # the caller's 503
+        except Exception:                               # noqa: BLE001 - a garbled ca.crt
+            raise OSError(errno.EIO, f"{pki_dir}/ca.crt is not a certificate") from None
+    # The node's current certs as THIS ingress sees them (it follows its own links).
+    cur = _find_current(Path(pki_dir), node_id, anchor=anchor if explicit else None)
     verify_renew_proof(anchor, node_id, csr_text, cert_text, issued_at, signature,
                        now=time.time() if now is None else now,
-                       max_skew=RENEW_PROOF_MAX_SKEW_S)
+                       max_skew=RENEW_PROOF_MAX_SKEW_S,
+                       current_keys=cur.keys if cur else set())
     entry = json.dumps({"csr_pem": csr_text, "cert_pem": cert_text,
                         "issued_at": issued_at, "signature": signature},
                        sort_keys=True).encode()
@@ -261,6 +286,7 @@ class _Current:
     ident: NodeIdentity
     grants: NodeGrants                  #: INTERSECTION over every verifying cert
     idents: list[NodeIdentity]          #: every verifying cert's identity
+    keys: set[bytes]                    #: every verifying cert's public key (SPKI DER)
     others: list[tuple[Path, bytes]]    #: the rest, superseded by a renewal
 
 
@@ -332,6 +358,8 @@ def _find_current(pki_dir: Path, node_id: str,
     assert grants is not None
     return _Current(path=best[0], pem=best[1], ident=best[2], grants=grants,
                     idents=[f[2] for f in found],
+                    keys={_spki(x509.load_pem_x509_certificate(f[1]).public_key())
+                          for f in found},
                     others=[(f[0], f[1]) for f in found if f is not best])
 
 
@@ -479,19 +507,19 @@ def _drain(ca: CertAuthority, qdir: Path, days: int,
             results.append((node_id, f"deferred: cannot read the queued CSR: {exc}"))
             continue
         try:
-            csr_pem = _verified_entry(ca, node_id, raw)
+            csr_pem, proof_key = _verified_entry(ca, node_id, raw)
         except RenewRefused as exc:
             _discard(aside)
             results.append((node_id, f"refused: {exc}"))
             continue
-        outcome, keep = _renew_one(ca, qdir, every, node_id, csr_pem, days)
+        outcome, keep = _renew_one(ca, qdir, every, node_id, csr_pem, days, proof_key)
         if not keep:
             aside.unlink(missing_ok=True)
         results.append((node_id, outcome))
     return results
 
 
-def _verified_entry(ca: CertAuthority, node_id: str, raw: bytes) -> bytes:
+def _verified_entry(ca: CertAuthority, node_id: str, raw: bytes) -> tuple[bytes, bytes]:
     """The CSR of a queue entry whose proof verifies against the REAL CA, or refuse.
 
     Everything is checked again here: the queue lives in the ingress's dir, and the
@@ -507,9 +535,15 @@ def _verified_entry(ca: CertAuthority, node_id: str, raw: bytes) -> bytes:
             raise TypeError
     except (ValueError, KeyError, TypeError):
         raise RenewRefused("malformed queue entry") from None
-    verify_renew_proof(ca, node_id, csr_text, cert_text, issued_at, sig,
-                       now=time.time(), max_skew=RENEW_PROOF_MAX_AGE_S)
-    return csr_text.encode("utf-8")
+    try:
+        verify_renew_proof(ca, node_id, csr_text, cert_text, issued_at, sig,
+                           now=time.time(), max_skew=RENEW_PROOF_MAX_AGE_S)
+        proof_key = _spki(x509.load_pem_x509_certificate(cert_text.encode()).public_key())
+    except RenewRefused:
+        raise
+    except Exception as exc:                            # noqa: BLE001 - hostile input
+        raise RenewRefused(f"malformed queue entry ({type(exc).__name__})") from None
+    return csr_text.encode("utf-8"), proof_key
 
 
 def _discard(path: Path) -> None:
@@ -539,7 +573,7 @@ def _swap_if_unchanged(path: Path, expected: bytes, new: bytes) -> str | None:
 
 
 def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
-               csr_pem: bytes, days: int) -> tuple[str, bool]:
+               csr_pem: bytes, days: int, proof_key: bytes) -> tuple[str, bool]:
     """Renew one set-aside CSR across every node dir. Returns (outcome, keep the CSR)."""
     states: dict[Path, _Current] = {}
     try:
@@ -557,6 +591,12 @@ def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
             return ("deferred: no current certificate here; a cert linked from outside its "
                     "node dir does not count -- replace the link with the file"), True
         return "refused: no current certificate", False
+    if not any(proof_key in cur.keys for cur in states.values()):
+        # The proof's cert is CA-valid but not one the node holds NOW in any dir: an old
+        # key after a revoke-and-re-enrol, or a copy of something no longer current. (Any
+        # dir, not just the queueing one: a retry after a partly published renewal finds
+        # the new cert there and the proof's key still current in the others.)
+        return "refused: proof certificate is not the node's current certificate", False
     grants: NodeGrants | None = None
     for cur in states.values():
         grants = _intersect(grants, cur.grants)

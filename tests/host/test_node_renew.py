@@ -21,6 +21,28 @@ from blastbox.host.placement import fleet_grants
 GRANTS = pki.NodeGrants(engines=("williamtells",), tiers=(), credentials=False)
 
 
+#: SPKI DER -> private key, for every key a test made: the helpers prove possession with
+#: the key of the node's CURRENT cert, as a real node must.
+_KEYS: dict[bytes, object] = {}
+
+
+def _spki(pub) -> bytes:
+    return pub.public_bytes(serialization.Encoding.DER,
+                            serialization.PublicFormat.SubjectPublicKeyInfo)
+
+
+@pytest.fixture(autouse=True)
+def _register_issued_keys(monkeypatch):
+    real = pki.CertAuthority.issue_node
+
+    def issue_node(self, *a, **kw):
+        issued = real(self, *a, **kw)
+        k = serialization.load_pem_private_key(issued.key_pem, password=None)
+        _KEYS[_spki(k.public_key())] = k
+        return issued
+    monkeypatch.setattr(pki.CertAuthority, "issue_node", issue_node)
+
+
 def _ca_for(d: Path) -> pki.CertAuthority:
     """The CA that issued a test rig's certs: in ``d`` itself, or the split rig's ``ca/``."""
     for c in (Path(d), Path(d).parent / "ca"):
@@ -29,30 +51,55 @@ def _ca_for(d: Path) -> pki.CertAuthority:
     raise AssertionError(f"no test CA for {d}")
 
 
-def proof_for(ca, node_id: str, csr_pem: bytes, *, issued_at=None, key=None, cert=None):
-    """(cert_pem, issued_at, signature) proving possession of a CA-issued cert's key."""
+def proof_for(ca, node_id: str, csr_pem: bytes, *, issued_at=None, key=None, cert=None,
+              d=None):
+    """(cert_pem, issued_at, signature) proving possession of the node's CURRENT cert key
+    in ``d`` (any dir of the rig when None). A node with no current cert gets a fresh,
+    unrelated cert -- which the CA host must then refuse."""
     import time as _t
-    from cryptography.hazmat.primitives import serialization as _s
+    if key is None:
+        for c in sorted(Path(d).glob("*.crt")) if d is not None else []:
+            try:
+                pem = node_renew._read_capped(c, node_renew.MAX_CERT_BYTES, follow=True)
+                ident = pki.node_identity(ca, pem)
+            except Exception:  # noqa: BLE001 - FIFOs, junk, foreign certs: not the node's
+                continue
+            k = _KEYS.get(_spki(x509.load_pem_x509_certificate(pem).public_key()))
+            if ident.node_id == node_id and k is not None:
+                key, cert = k, pem
+                break
     if key is None:
         issued = ca.issue_node(node_id, grants=pki.NodeGrants())
-        key = _s.load_pem_private_key(issued.key_pem, password=None)
+        key = serialization.load_pem_private_key(issued.key_pem, password=None)
         cert = issued.cert_pem
     at = int(_t.time()) if issued_at is None else issued_at
     return cert, at, node_renew.sign_renew_proof(key, node_id, csr_pem.decode(), at)
 
 
 def queue_csr(d, node_id, csr_pem, **kw):
-    """Queue with a valid proof: most tests here are about the queue, not the proof."""
+    """Queue with a valid proof by the node's current key: most tests here are about the
+    queue, not the proof. A node with NO current cert here cannot pass the ingress any
+    more, so its entry is written as if queued before it was revoked."""
     ca = kw.pop("ca", None) or _ca_for(d)
-    cert, at, sig = proof_for(ca, node_id, csr_pem)
-    return _queue_csr(d, node_id, csr_pem, cert_pem=cert, issued_at=at, signature=sig,
-                      anchor=ca, **kw)
+    cert, at, sig = proof_for(ca, node_id, csr_pem, d=d)
+    try:
+        return _queue_csr(d, node_id, csr_pem, cert_pem=cert, issued_at=at, signature=sig,
+                          anchor=ca, **kw)
+    except RenewRefused as exc:
+        if "current certificate" not in str(exc):
+            raise
+    import json as _j
+    r = Path(d) / "renew"
+    r.mkdir(mode=0o700, exist_ok=True)
+    (r / f"{node_id}.csr").write_text(_j.dumps(
+        {"csr_pem": csr_pem.decode(), "cert_pem": cert.decode(), "issued_at": at,
+         "signature": sig}))
 
 
-def entry(ca, node_id: str, csr_pem: bytes, *, at=None, **over) -> bytes:
+def entry(ca, node_id: str, csr_pem: bytes, *, at=None, d=None, **over) -> bytes:
     """A raw queue entry, as the ingress writes it, with a valid proof unless overridden."""
     import json as _j
-    cert, at, sig = proof_for(ca, node_id, csr_pem, issued_at=at)
+    cert, at, sig = proof_for(ca, node_id, csr_pem, issued_at=at, d=d)
     doc = {"csr_pem": csr_pem.decode(), "cert_pem": cert.decode(), "issued_at": at,
            "signature": sig, **over}
     return _j.dumps(doc).encode()
@@ -60,6 +107,7 @@ def entry(ca, node_id: str, csr_pem: bytes, *, at=None, **over) -> bytes:
 
 def make_csr(cn: str, key=None) -> tuple[bytes, object]:
     key = key or ec.generate_private_key(ec.SECP256R1())
+    _KEYS[_spki(key.public_key())] = key
     csr = (x509.CertificateSigningRequestBuilder()
            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)]))
            .sign(key, hashes.SHA256()))
@@ -817,9 +865,9 @@ def test_a_cert_linked_from_outside_its_dir_defers_loudly_and_keeps_the_csr(tmp_
 
 def test_one_unreadable_file_does_not_stop_a_dirs_revocation(tmp_path):
     ca, ca_dir, i1, _i2 = _split(tmp_path)
+    queue_csr(i1, "n1", make_csr("n1")[0])
     (i1 / "aaa.crt").write_bytes(b"x")
     os.chmod(i1 / "aaa.crt", 0)
-    queue_csr(i1, "n1", make_csr("n1")[0])
     try:
         if os.access(i1 / "aaa.crt", os.R_OK):
             pytest.skip("running as root: mode 000 is still readable")

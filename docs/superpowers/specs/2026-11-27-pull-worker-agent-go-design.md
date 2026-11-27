@@ -428,7 +428,8 @@ blobs, a trivial engine, on linux (nsjail) and macos-14 arm64 (seatbelt) runners
   `signature` = base64 DER ECDSA-P256-SHA256 by the current cert's key over
   `b"blastbox/node-renew/v1" \x00 node_id \x00 sha256hex(utf8(csr_pem)) \x00 str(issued_at)`.
   The session alone is a bearer token and must not authorise a new key. The ingress checks the
-  cert, its CN against the session, the signature and `|now - issued_at| <= 300 s`; the CA-host
+  cert, its CN against the session, that its key is one of the node's CURRENT certs' keys, the
+  signature and `|now - issued_at| <= 300 s`; the CA-host
   timer re-checks everything against the real CA (`issued_at` within 24 h) because the ingress
   that holds the queue may be hostile. Vectors: `conformance/v1/renew_proof.json`. The ingress has no CA key, so it only queues the CSR. A
   CA-holding timer (`blastbox pki renew-pending`) signs queued CSRs with **the grants of the

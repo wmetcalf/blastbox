@@ -164,8 +164,10 @@ def test_ca_host_reverifies_against_the_real_ca_not_the_ingress(tmp_path):
     k = serialization.load_pem_private_key(issued.key_pem, password=None)
     csr, _ = make_csr("n1")
     at = int(time.time())
-    queue_csr(i1, "n1", csr, cert_pem=issued.cert_pem, issued_at=at, anchor=evil,
-              signature=sign_renew_proof(k, "n1", csr.decode(), at))
+    (i1 / "renew").mkdir(exist_ok=True)       # the hostile ingress writes what it likes
+    (i1 / "renew" / "n1.csr").write_text(json.dumps(
+        {"csr_pem": csr.decode(), "cert_pem": issued.cert_pem.decode(), "issued_at": at,
+         "signature": sign_renew_proof(k, "n1", csr.decode(), at)}))
     [(nid, outcome)] = sign_pending(ca, ca_dir, node_dirs=[i1])
     assert outcome.startswith("refused") and "proof" in outcome
 
@@ -175,7 +177,7 @@ def test_ca_host_refuses_a_proof_older_than_a_day(tmp_path):
     csr, _ = make_csr("n1")
     old = int(time.time()) - node_renew.RENEW_PROOF_MAX_AGE_S - 60
     (i1 / "renew").mkdir()
-    (i1 / "renew" / "n1.csr").write_bytes(entry(ca, "n1", csr, at=old))
+    (i1 / "renew" / "n1.csr").write_bytes(entry(ca, "n1", csr, at=old, d=i1))
     [(nid, outcome)] = sign_pending(ca, ca_dir, node_dirs=[i1])
     assert outcome.startswith("refused") and "issued_at" in outcome
     assert not pending(i1)
@@ -186,7 +188,7 @@ def test_ca_host_accepts_a_proof_a_few_hours_old(tmp_path):
     ca, ca_dir, i1, _i2 = _split(tmp_path)
     csr, _ = make_csr("n1")
     (i1 / "renew").mkdir()
-    (i1 / "renew" / "n1.csr").write_bytes(entry(ca, "n1", csr, at=int(time.time()) - 3 * 3600))
+    (i1 / "renew" / "n1.csr").write_bytes(entry(ca, "n1", csr, at=int(time.time()) - 3 * 3600, d=i1))
     assert sign_pending(ca, ca_dir, node_dirs=[i1]) == [("n1", "renewed")]
 
 
@@ -218,3 +220,39 @@ def test_ca_host_refuses_a_proof_cert_expired_by_processing_time(tmp_path, monke
     monkeypatch.setattr(pki, "_now", lambda: real() + datetime.timedelta(hours=2))
     [(nid, outcome)] = sign_pending(ca, ca_dir, node_dirs=[i1])
     assert outcome.startswith("refused")
+
+
+def test_a_revoked_and_reissued_nodes_old_key_cannot_renew(tmp_path):
+    """Revoke, then re-enrol under the same id with a NEW key: a proof by the OLD cert's
+    key (still unexpired, since revocation is deletion) must not authorise a renewal."""
+    d, ca, old_cert, old_key = _rig(tmp_path)
+    node_renew.revoke(d, "n1")
+    new_cert, _new_key = _node(ca, d)                     # re-enrolled
+    attacker_csr, _ = make_csr("n1")
+    at = int(time.time())
+    sig = sign_renew_proof(old_key, "n1", attacker_csr.decode(), at)
+    with pytest.raises(RenewRefused) as exc:              # the ingress refuses it ...
+        queue_csr(d, "n1", attacker_csr, cert_pem=old_cert, issued_at=at, signature=sig)
+    assert exc.value.identity
+    (d / "renew").mkdir(exist_ok=True)                    # ... and so does the CA host
+    (d / "renew" / "n1.csr").write_text(json.dumps(
+        {"csr_pem": attacker_csr.decode(), "cert_pem": old_cert.decode(),
+         "issued_at": at, "signature": sig}))
+    [(nid, outcome)] = sign_pending(ca, d)
+    assert outcome.startswith("refused") and "current" in outcome
+    assert (d / "node-n1.crt").read_bytes() == new_cert
+
+
+@pytest.mark.parametrize("at", [10 ** 400, -1, 2 ** 63])
+def test_an_absurd_issued_at_is_refused_not_a_crash(tmp_path, at):
+    d, ca, cert, key = _rig(tmp_path)
+    csr, _ = make_csr("n1")
+    with pytest.raises(RenewRefused):
+        queue_csr(d, "n1", csr, cert_pem=cert, issued_at=at, signature="AA==")
+    (d / "renew").mkdir(exist_ok=True)
+    (d / "renew" / "aaa.csr").write_text(json.dumps(
+        {"csr_pem": "x", "cert_pem": "y", "issued_at": at, "signature": "AA=="}))
+    queue_csr(d, "n1", csr, cert_pem=cert, issued_at=int(time.time()),
+              signature=sign_renew_proof(key, "n1", csr.decode(), int(time.time())))
+    out = dict(sign_pending(ca, d))
+    assert out["aaa"].startswith("refused") and out["n1"] == "renewed"
