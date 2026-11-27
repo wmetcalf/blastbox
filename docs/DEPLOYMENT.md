@@ -955,9 +955,10 @@ the ingress's to write.
 
 **PKI and node dirs must contain regular files; links are refused.** Renewal never follows a
 link. A dir with any `*.crt` entry that is not a regular file (a symlink, FIFO, directory...) is
-reported by name and nothing in it is read, written or followed: the renewal of every node it
-holds in a regular file (or that it queued) is deferred, and the run exits 2, until an operator
-replaces the links with regular files. The ingress likewise answers `/v1/nodes/renew` and
+reported by name, no cert entry in it is followed and no cert is written there: the renewal of
+every node it holds in a regular file (or that it queued) is deferred, and the run exits 2, until
+an operator replaces the links with regular files. (Its queue is still drained the usual way, so a
+stale or invalid entry there is refused as anywhere else.) The ingress likewise answers `/v1/nodes/renew` and
 `/v1/nodes/cert` with 503 while its PKI dir holds one, and `revoke-node` refuses such a dir
 (reported, exit 1) while revoking the others. A queue that cannot be read mid-run is reported and
 skipped; the rest still run. A symlinked queued CSR is refused. A run that cannot lock every dir within two minutes, or finds a node dir without `ca.crt`

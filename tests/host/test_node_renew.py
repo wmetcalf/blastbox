@@ -1079,7 +1079,29 @@ def test_revoke_refuses_a_dir_with_links_but_revokes_the_rest(tmp_path):
     assert (i2 / "x.crt").is_symlink()
 
 
-def test_renewal_never_follows_a_cert_link():
-    import inspect
-    src = inspect.getsource(node_renew)
-    assert "follow=True" not in src and "_links_out" not in src
+def test_a_cert_swapped_for_a_link_after_the_check_defers_not_drops(tmp_path, monkeypatch):
+    """Check-then-read: the read is O_NOFOLLOW, and a refusal there must count as the dir
+    holding a non-regular entry (defer), never as 'no cert here' (refuse and drop)."""
+    d, ca = rig(tmp_path)
+    queue_csr(d, "n1", make_csr("n1")[0])
+    real = node_renew._non_regular
+
+    def check_then_swap(dd):
+        out = real(dd)
+        if Path(dd) == d and not (d / "node-n1.crt").is_symlink():
+            keep = d / "kept.pem"
+            os.replace(d / "node-n1.crt", keep)
+            (d / "node-n1.crt").symlink_to(keep)      # swapped right after the check
+        return [] if Path(dd) == d else out           # ... so every check saw it clean
+    monkeypatch.setattr(node_renew, "_non_regular", check_then_swap)
+    [(nid, outcome)] = [r for r in sign_pending(ca, d) if r[0] == "n1"]
+    assert outcome.startswith("deferred") and pending(d) == ["n1"]
+
+
+def test_an_oversized_cert_defers_instead_of_dropping_out_of_the_intersection(tmp_path,
+                                                                              monkeypatch):
+    d, ca = rig(tmp_path)
+    queue_csr(d, "n1", make_csr("n1")[0])
+    monkeypatch.setattr(node_renew, "MAX_CERT_BYTES", 100)   # every real cert is "huge"
+    [(nid, outcome)] = sign_pending(ca, d)
+    assert outcome.startswith("deferred") and pending(d) == ["n1"]

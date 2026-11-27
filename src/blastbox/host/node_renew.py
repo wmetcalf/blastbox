@@ -363,8 +363,15 @@ def _find_current(pki_dir: Path, node_id: str,
         try:
             # Bounded, no-follow, FIFO-safe: the dir may be someone else's to write.
             pem = _read_capped(crt, MAX_CERT_BYTES)    # OSError propagates (transient)
+        except _TooLarge as exc:
+            # May be one of the node's certs: dropping it could widen the intersection.
+            raise OSError(errno.EFBIG, f"{crt}: {exc}; cannot judge the node") from None
         except _Unreadable:
-            continue                                    # not a regular file / huge: skip
+            if skip_irregular:
+                continue
+            # Regular at the check, not at the read (swapped meanwhile): the dir holds a
+            # non-regular entry after all -- never "no cert here".
+            raise NonRegularEntries(d, [crt]) from None
         try:
             ident = node_identity(anchor, pem)
         except Exception:                               # noqa: BLE001 - one bad file is not fatal
@@ -490,7 +497,8 @@ def sign_pending(ca: CertAuthority, pki_dir: Path, *, days: int = 7,
     results: list[tuple[str, str]] = []
     with _locked(every):
         # PKI and node dirs must contain regular files: a dir with any other *.crt entry is
-        # reported (the run exits 2) and nothing in it is followed, read or written.
+        # reported (the run exits 2); no cert entry in it is followed and no cert is written
+        # there. (Its queue is still drained, so invalid entries are refused as anywhere.)
         bad = frozenset(d for d in every if _non_regular(d))
         for d in sorted(bad, key=str):
             names = ", ".join(e.name for e in _non_regular(d))
