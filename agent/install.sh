@@ -57,6 +57,7 @@ while [ "$prefix" != / ] && [ "${prefix%/}" != "$prefix" ]; do prefix=${prefix%/
 tmp=$prefix/.current.tmp.$$
 ptmp=$prefix/.previous.tmp.$$
 stage=""
+newbin=""
 locked=0
 flipping=0   # 1 from recording .previous until current has been flipped to $flip_to
 flip_to=""
@@ -68,6 +69,7 @@ on_exit() {
     (restore_previous) 2>/dev/null || :
   fi
   rm -f "$tmp" "$ptmp"
+  if [ -n "$newbin" ]; then rm -f "$newbin"; fi
   if [ -n "$stage" ]; then rm -rf "$stage"; fi
   if [ "$locked" = 1 ]; then
     rmdir "$prefix/.lock" 2>/dev/null \
@@ -75,7 +77,9 @@ on_exit() {
   fi
 }
 trap on_exit EXIT
+trap 'exit 129' HUP
 trap 'exit 130' INT
+trap 'exit 131' QUIT
 trap 'exit 143' TERM
 
 os_name=$(uname -s)
@@ -269,10 +273,20 @@ grep -Fx -e "$sha  $bin" "$stage/SHA256SUMS" >/dev/null || die "SHA256SUMS has n
 
 # 4. install
 dest=$prefix/$version
-mkdir -p "$dest"
-cp "$stage/$bin" "$dest/blastbox-agent.new"
-chmod 0755 "$dest/blastbox-agent.new"
-mv -f "$dest/blastbox-agent.new" "$dest/blastbox-agent"
+if [ -e "$dest/blastbox-agent" ]; then
+  # A version's binary is never replaced in place: current may already run it, and
+  # no rollback target would remain. The same bytes again is a no-op.
+  [ "$(sha256_of "$dest/blastbox-agent")" = "$sha" ] \
+    || die "$version is already installed with different contents; remove $dest to replace it"
+  say "$version already installed with this sha256"
+else
+  mkdir -p "$dest"
+  newbin=$dest/blastbox-agent.new
+  cp "$stage/$bin" "$newbin"
+  chmod 0755 "$newbin"
+  mv -f "$newbin" "$dest/blastbox-agent"
+  newbin=""
+fi
 
 # 5. flip current atomically; remember what it pointed at
 cur=$(current_target || true)

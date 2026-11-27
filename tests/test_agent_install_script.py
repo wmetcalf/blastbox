@@ -426,6 +426,43 @@ def test_signal_after_flip_keeps_matching_previous(tmp_path):
     assert (pfx / ".previous").read_text().strip() == "2.0.0"
 
 
+def test_hup_between_record_and_flip_restores_previous(tmp_path):
+    if os.path.realpath(shutil.which("sh") or "/bin/sh").endswith("busybox"):
+        pytest.skip("busybox sh runs its own applets, bypassing PATH shims")
+    pfx = _two_versions(tmp_path)
+    rel, sha = make_release(tmp_path, b"bin 3")
+    shim = tmp_path / "hupshim"
+    shim.mkdir()
+    w = shim / "mv"
+    w.write_text(
+        "#!/bin/sh\nfor last; do :; done\n"
+        f'{shutil.which("mv")} "$@" || exit 1\n'
+        'case "$last" in */.previous) kill -HUP "$PPID" ;; esac\n'
+    )
+    w.chmod(0o755)
+    p = run(["--version", "3.0.0", "--sha256", sha, "--from", str(rel), "--prefix", str(pfx),
+             "--no-cosign"], path=f"{shim}:{os.environ['PATH']}")
+    assert p.returncode == 129
+    assert os.readlink(pfx / "current") == "2.0.0"
+    assert (pfx / ".previous").read_text().strip() == "1.0.0"
+    assert not (pfx / ".lock").exists()
+
+
+def test_same_version_different_bytes_refused(tmp_path):
+    pfx = tmp_path / "pfx"
+    rel, sha = make_release(tmp_path, b"old")
+    assert install(rel, sha, pfx, "1.0.0", "--no-cosign").returncode == 0
+    shutil.rmtree(rel)
+    rel, sha2 = make_release(tmp_path, b"new")
+    p = install(rel, sha2, pfx, "1.0.0", "--no-cosign")
+    assert p.returncode != 0 and "different contents" in p.stderr
+    assert (pfx / "1.0.0" / "blastbox-agent").read_bytes() == b"old"
+    # the identical bytes again is an idempotent no-op
+    shutil.rmtree(rel)
+    rel, sha = make_release(tmp_path, b"old")
+    assert install(rel, sha, pfx, "1.0.0", "--no-cosign").returncode == 0
+
+
 def test_dirs_readable_under_restrictive_umask(tmp_path):
     rel, sha = make_release(tmp_path)
     pfx = tmp_path / "pfx"
