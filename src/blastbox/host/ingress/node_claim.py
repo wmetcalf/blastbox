@@ -399,6 +399,39 @@ _REFUSED = "not authorised to claim this work"
 _LINKS_REFUSED = ("this ingress's PKI dir contains cert entries that are not regular files; "
                   "links are refused -- an operator must replace them with regular files")
 
+#: Who may make a node's job DONE. ``direct`` (the default, today's behaviour): the node
+#: itself, through POST /v1/nodes/jobs/{id} -- right for Python credential-less dispatcher
+#: nodes that run the trust gate themselves. ``finalizer-only``: a node may write ``status``
+#: only as ``queued`` (release) or ``failed``; DONE comes only from ``blastbox
+#: node-finalizer``, which trust-gates and signs the uploaded result. Pull-agent deployments
+#: MUST set ``finalizer-only``: with ``direct`` an untrusted node can mark its job DONE with
+#: no result, no trust gate and no receipt. An unrecognised value fails CLOSED.
+TERMINAL_WRITES_ENV = "BLASTBOX_NODE_TERMINAL_WRITES"
+TERMINAL_WRITES_FINALIZER_ONLY = "finalizer-only"
+TERMINAL_WRITES_DIRECT = "direct"
+
+
+def terminal_writes_mode(env: "dict[str, str] | None" = None) -> str:
+    raw = ((env if env is not None else os.environ).get(TERMINAL_WRITES_ENV) or "").strip()
+    if not raw:
+        return TERMINAL_WRITES_DIRECT
+    v = raw.lower()
+    if v in (TERMINAL_WRITES_DIRECT, TERMINAL_WRITES_FINALIZER_ONLY):
+        return v
+    _log.error("%s=%r is not one of %s|%s; treating it as %s", TERMINAL_WRITES_ENV, raw,
+               TERMINAL_WRITES_FINALIZER_ONLY, TERMINAL_WRITES_DIRECT,
+               TERMINAL_WRITES_FINALIZER_ONLY)
+    return TERMINAL_WRITES_FINALIZER_ONLY
+
+
+def terminal_writes_open_message(mode: str) -> "str | None":
+    """The startup complaint when a PKI is present and nodes may still write DONE."""
+    if mode == TERMINAL_WRITES_FINALIZER_ONLY:
+        return None
+    return (f"{TERMINAL_WRITES_ENV}={mode}: a node may mark its own job DONE through POST "
+            f"/v1/nodes/jobs/{{id}}, with no trust gate and no signed receipt. Pull-agent "
+            f"deployments must set {TERMINAL_WRITES_ENV}={TERMINAL_WRITES_FINALIZER_ONLY}.")
+
 
 class RenewRequest(BaseModel):
     """A fresh CSR, and proof that the holder of the node's current cert's key asked.
@@ -610,6 +643,11 @@ def register_node_claim_routes(
                   pki_dir if pki_dir is not None
                   else os.environ.get(PKI_ENV, DEFAULT_PKI_DIR))
         return False
+
+    terminal_mode = terminal_writes_mode()
+    _open = terminal_writes_open_message(terminal_mode)
+    if _open:
+        _log.warning("node_claim: %s", _open)
 
     from blastbox.host.pki import load_trust_anchor
 
@@ -1485,6 +1523,14 @@ def register_node_claim_routes(
         node_id = _node_from_token(x_blastbox_node_session)
         current = _owned_job(job_id, node_id, req.claim_id, req.receipt)
         fields = _vetted_fields(req.fields)
+        if terminal_mode == TERMINAL_WRITES_FINALIZER_ONLY and "status" in fields \
+                and fields["status"] not in (JobStatus.QUEUED, JobStatus.FAILED):
+            # DONE comes only from the node-finalizer, which trust-gates and signs the
+            # uploaded result; a node may only release (queued) or fail its claim.
+            _log.warning("node_claim: refused node=%s job=%s status=%s write (%s=%s)",
+                         node_id, job_id, getattr(fields["status"], "value", fields["status"]),
+                         TERMINAL_WRITES_ENV, terminal_mode)
+            raise HTTPException(status_code=403, detail=_REFUSED)
         if req.expect_status is not None:
             try:
                 expect = JobStatus(req.expect_status)

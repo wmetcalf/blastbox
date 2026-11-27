@@ -889,6 +889,16 @@ Three things an operator must know:
 * **A refusal never says why.** Wrong CA, unheld key, ungranted engine and expired challenge
   all return the same message, so a caller cannot map the fleet's grants by probing. The
   reason is in the ingress log (`node_claim: refused …`); look there, not at the response.
+* **Pull-agent deployments MUST set `BLASTBOX_NODE_TERMINAL_WRITES=finalizer-only` on every
+  ingress.** It decides who may make a node's job DONE. `direct` (the default, kept for
+  existing deployments) lets a node write `status: done` itself through
+  `POST /v1/nodes/jobs/{id}` — right only for Python credential-less dispatcher nodes that run
+  the trust gate themselves; for an untrusted pull agent it means DONE with no result, no trust
+  gate and no receipt. `finalizer-only` lets a node write `status` only as `queued` (release)
+  or `failed`; anything else is the usual 403 refusal, logged at WARNING, and DONE comes only
+  from `blastbox node-finalizer`. An unrecognised value is treated as `finalizer-only`. While
+  a PKI is present and the setting is not `finalizer-only`, the ingress logs a WARNING and the
+  node-finalizer an ERROR at startup.
 * **Set the engine param gate on the ingress too.** The claim's `run.params` is what a node
   passes its engine, and the ingress computes it with the dispatcher's own gate from
   `BLASTBOX_ENGINE_<NAME>_PARAM_KEYS` and `BLASTBOX_ENGINE_<NAME>_RESERVED_KEYS`, read from the
@@ -936,7 +946,14 @@ blastbox node-finalizer [--once] [--interval 1.0] [--no-receipts]
 * **Set `BLASTBOX_NODE_CLAIM_RECLAIM_AFTER_S`** on the ingress. Without it a claim whose node
   never uploads is never reclaimed; the finalizer logs an ERROR at startup when it is unset.
 * Receipts it signs carry `worker_tier: node-agent`, plus `node_id` and `node_cert_sha256` of
-  the uploading node, and no `net_*` fields.
+  the uploading node, and no `net_*` fields. **Known limit during certificate rotation:** a
+  node session names only the node id, not the certificate it was opened with, so
+  `node_cert_sha256` is the node's verifying certificate with the latest `not_after` at upload
+  time. While an old and a renewed certificate are both valid, a result uploaded on a session
+  opened with the old one is attributed to the new one. `node_id` is always right.
+* **A rejected result tar leaves the job RUNNING** (the 422 stores no outcome). The pull agent
+  sends its fail write (`status: failed`) after a first-time 422, so the job is terminalised
+  at once; a node that does not is reclaimed by `BLASTBOX_NODE_CLAIM_RECLAIM_AFTER_S`.
 
 **Step 3 RECURS.** `pki issue-node` defaults to a 7-day lifetime — that short lifetime is
 what makes "revocation is stop renewing" work without a CRL or any online check — and the

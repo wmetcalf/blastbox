@@ -851,10 +851,19 @@ def _node_finalizer_cmd(args: argparse.Namespace) -> int:
     if args.no_receipts:
         log.warning("node-finalizer running with --no-receipts: results from nodes will be "
                     "marked DONE with NO signed receipt")
+    from blastbox.host.ingress.node_claim import (
+        resolve_pki_dir,
+        terminal_writes_mode,
+        terminal_writes_open_message,
+    )
     from blastbox.host.ingress.node_reclaim import RECLAIM_AFTER_ENV
 
     if not (os.environ.get(RECLAIM_AFTER_ENV) or "").strip():
         log.error("%s is unset: a claim whose node never uploads is never reclaimed", RECLAIM_AFTER_ENV)
+    if resolve_pki_dir(None) is not None:
+        _open = terminal_writes_open_message(terminal_writes_mode())
+        if _open:
+            log.error("%s", _open)
     job_root = Path(os.environ.get("BLASTBOX_JOB_ROOT", "/var/lib/blastbox/jobs"))
     fin = NodeFinalizer(
         job_store=build_job_store_from_env(),
