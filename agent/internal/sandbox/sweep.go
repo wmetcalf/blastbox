@@ -58,11 +58,11 @@ func KillRun(rec RunRecord) error {
 				return errorf("cannot kill the run's process group %d: %v", rec.PID, err)
 			}
 			// SIGKILL is asynchronous: return only once the leader is gone.
-			for dl := time.Now().Add(killWait); !procGone(rec.PID); {
+			for dl := time.Now().Add(killWait); !leaderGone(rec); {
 				if time.Now().After(dl) {
 					return errorf("process %d still alive %s after SIGKILL", rec.PID, killWait)
 				}
-				time.Sleep(20 * time.Millisecond)
+				time.Sleep(100 * time.Millisecond)
 			}
 		}
 	case rec.Canary == "" && rec.NotAfter > 0 && time.Now().Unix() < rec.NotAfter:
@@ -77,6 +77,17 @@ func KillRun(rec RunRecord) error {
 	return nil
 }
 
-const killWait = 30 * time.Second
+// killWait bounds how long one KillRun waits for a SIGKILLed leader: recovery runs at startup,
+// before heartbeats, so a leader stuck in the kernel is retried by the next pass instead.
+const killWait = 5 * time.Second
+
+// leaderGone: the recorded leader no longer runs, or its pid now names another process.
+func leaderGone(rec RunRecord) bool {
+	if procGone(rec.PID) {
+		return true
+	}
+	id, ok := ProcIdentity(rec.PID)
+	return !ok || id != rec.Identity
+}
 
 func errorf(format string, a ...any) error { return fmt.Errorf("sandbox sweep: "+format, a...) }
