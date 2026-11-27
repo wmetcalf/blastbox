@@ -1,6 +1,7 @@
 # Pull worker agent in Go (design, for approval)
 
-> Status: DRAFT FOR WILL'S APPROVAL. Nothing here is built. Written 2026-11-27 against
+> Status: APPROVED 2026-11-27 (Will: "Whatever you think is best/cleanest production grade
+> implementation"). Decisions are recorded in §19 and override any open option above. Written 2026-11-27 against
 > blastbox `main` @ 18744a73 (0.1.52) and william-tells `main` @ 0985483. Line numbers are at
 > those commits.
 
@@ -620,3 +621,34 @@ still reaches the Mac. A third-party node would be a different pool with its own
   node from its own misconfiguration. It is no defence against a hostile node.
 * Results now cross the ingress. Upload caps and quarantine extraction are new attack surface
   on the control plane. They reuse the push path's extractor and limits rather than new code.
+
+## 19. Decisions (2026-11-27)
+
+These settle §17. Where they differ from an option discussed above, they win.
+
+1. **macOS floor = seatbelt deny-default**, applied by the agent via `/usr/bin/sandbox-exec`.
+   App Sandbox is an added layer only if a spike on the Mac (no sudo) proves it nests under
+   `sandbox-exec`; otherwise it is dropped. The spike result is recorded in the plan. Linux
+   floor = nsjail. A confinement probe must pass before the agent claims anything.
+2. **Finalisation runs in a separate `blastbox node-finalizer` service** on the control plane.
+   It holds DB, blobs and the attest key and never claims. The ingress quarantines the upload
+   and hands it over; the ingress never holds the attest key.
+3. **williamtells builds its envelope inside the sandbox** via a new `wtqrk-scan blastbox`
+   mode, in the william-tells repo as a separate PR.
+4. **Renewal is online:** `/v1/nodes/renew` queues a CSR, and a timer on the CA host
+   (`blastbox pki renew-pending`) signs it with the grants of the node's current cert. Certs
+   last 7 days.
+5. **Alerts** report into Loadout `/system/status` and Matrix `@loadout-bot`. Defaults: 90 s
+   for `node_silent`, 300 s for `engine_orphaned`. Both are configurable and visible.
+6. **Release signing:** cosign keyless from GitHub Actions, verified against a pinned workflow
+   identity, plus a pinned sha256 in the installer. Builds are reproducible (`-trimpath`,
+   `CGO_ENABLED=0`).
+7. **Node key:** a 0600 file owned by the agent user for v1. Secure Enclave is a documented
+   follow-up.
+8. **Code home:** `agent/` in the blastbox repo as its own Go module. Conformance vectors live
+   in-tree and run in CI on both the Python and Go sides.
+9. **Retire** the Mac's `legacy_agent.py` wrapper (launchd `io.blastbox.worker-agent`) after
+   the cutover is verified. `org.blastbox.operator` is left untouched.
+10. **Node-info v2**, with the WireGuard key optional.
+11. **Keep `wtwg0` until cutover.** Then move its toolz2 route pinning into its own
+    LaunchDaemon before retiring the tunnel.
