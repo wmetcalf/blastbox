@@ -1576,6 +1576,7 @@ def _pki_cmd(args: argparse.Namespace) -> int:
             return 1
         print(json.dumps({
             "node_id": ident.node_id, "wg_pubkey": ident.wg_pubkey,
+            "info_version": ident.info_version,
             "engines": list(ident.grants.engines), "tiers": list(ident.grants.tiers),
             "credentials": ident.grants.credentials,
             "not_after": ident.not_after.isoformat(), "expired": ident.expired,
@@ -1804,6 +1805,27 @@ def _egress_cmd(args: argparse.Namespace) -> int:
         return 1
 
 
+def _wg_key_to_node(ca, pki_dir: Path) -> dict[str, str]:
+    """WireGuard key -> node id from the valid node certs in ``pki_dir``.
+
+    Every cert in the directory, not just `node-*.crt`. `pki issue-node --out` lets an
+    operator name the file anything; globbing a prefix silently ignored those, and their
+    node then read as an UNAUTHORISED peer — a false accusation produced by a filename
+    convention. node_identity() is the filter: a transport cert simply fails it. A v2
+    cert with no WireGuard key has nothing to map and is skipped.
+    """
+    from blastbox.host.pki import node_identity
+    out: dict[str, str] = {}
+    for crt in sorted(pki_dir.glob("*.crt")):
+        try:
+            ident = node_identity(ca, crt.read_bytes())
+        except ValueError:
+            continue          # expired or invalid: it authorises nothing
+        if ident.wg_pubkey is not None:
+            out[ident.wg_pubkey] = ident.node_id
+    return out
+
+
 def _egress_cmd_inner(args: argparse.Namespace) -> int:
     """Node egress setup: bridges, exit mode, overlay transport.
 
@@ -1919,6 +1941,11 @@ def _egress_cmd_inner(args: argparse.Namespace) -> int:
                       f"--tier openvpn/--tier wireguard, or pass --force to register it "
                       f"anyway.", file=sys.stderr)
                 return 1
+            if ident.wg_pubkey is None:
+                print(f"error: {ident.node_id}'s certificate carries no WireGuard public "
+                      f"key (node-info v2), so it cannot be added as an overlay peer.",
+                      file=sys.stderr)
+                return 1
             name, pubkey = ident.node_id, ident.wg_pubkey
             expires = ident.not_after.isoformat()
             provenance = (f"identity and key verified against the CA "
@@ -1952,24 +1979,13 @@ def _egress_cmd_inner(args: argparse.Namespace) -> int:
         # The public half only: attestation VERIFIES, and this runs on the exit host,
         # which is the last machine that should hold the key that mints node identities.
         from blastbox.host.pki import load_trust_anchor, node_identity
-        key_to_node: dict[str, str] = {}
         pki_dir = Path(args.pki_dir)
         try:
             ca = load_trust_anchor(pki_dir)
         except Exception as exc:
             print(f"error: cannot load the CA from {pki_dir}: {exc}", file=sys.stderr)
             return 1
-        # Every cert in the directory, not just `node-*.crt`. `pki issue-node --out`
-        # lets an operator name the file anything; globbing a prefix silently ignored
-        # those, and their node then read as an UNAUTHORISED peer — a false accusation
-        # produced by a filename convention. node_identity() is the filter: a transport
-        # cert simply fails it.
-        for crt in sorted(pki_dir.glob("*.crt")):
-            try:
-                ident = node_identity(ca, crt.read_bytes())
-            except ValueError:
-                continue          # expired or invalid: it authorises nothing
-            key_to_node[ident.wg_pubkey] = ident.node_id
+        key_to_node = _wg_key_to_node(ca, pki_dir)
         working = {n: True for n in args.working}
         if not working:
             # FAIL-OPEN, and say so. With no working set, nothing can be contradicted:
@@ -2122,8 +2138,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="mint a NODE cert: identity + its WireGuard key + its grants")
     pk_node.add_argument("--node-id", required=True,
                          help="the machine's identity (lowercase, 1-63 chars)")
-    pk_node.add_argument("--wg-pubkey", required=True,
-                         help="the node's WireGuard PUBLIC key (printed by `egress peer`)")
+    pk_node.add_argument("--wg-pubkey", default=None,
+                         help="the node's WireGuard PUBLIC key (printed by `egress peer`); "
+                              "omit for a node that never joins the overlay (v2 cert)")
     pk_node.add_argument("--engine", action="append", default=[],
                          help="engine this node may be assigned (repeatable; default none)")
     pk_node.add_argument("--tier", action="append", default=[],

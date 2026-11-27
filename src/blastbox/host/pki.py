@@ -114,7 +114,10 @@ class NodeIdentity:
     """A verified node cert, parsed. Produced only by :func:`node_identity`."""
 
     node_id: str
-    wg_pubkey: str
+    #: None for a v2 cert issued without one — a node enrolled by CSR (the pull worker
+    #: agent) never joins the WireGuard overlay, so it has no key to certify. Every
+    #: consumer that needs a key must skip or refuse such an identity.
+    wg_pubkey: str | None
     grants: NodeGrants
     not_after: datetime.datetime
     #: The certificate's own start of validity. Carried because (not_after - not_before)
@@ -123,21 +126,29 @@ class NodeIdentity:
     #: the monotonic validity deadline, so a rolled-back clock cannot manufacture
     #: validity the CA never granted.
     not_before: datetime.datetime
+    #: node-info schema version (1 = WireGuard key mandatory, 2 = optional).
+    info_version: int = 1
 
     @property
     def expired(self) -> bool:
         return _now() >= self.not_after
 
 
-def _node_info_bytes(node_id: str, wg_pubkey: str, grants: NodeGrants) -> bytes:
-    return json.dumps({
-        "v": 1,
+def _node_info_bytes(node_id: str, wg_pubkey: str | None, grants: NodeGrants) -> bytes:
+    # A key keeps the original v1 encoding byte-for-byte, so certs (and anything that
+    # pinned their bytes) are unchanged. Only a key-less cert needs the v2 marker; "wg"
+    # is omitted rather than null so a v1-only reader fails on the version, not on a
+    # confusing null key.
+    info: dict[str, object] = {
+        "v": 1 if wg_pubkey is not None else 2,
         "node_id": node_id,
-        "wg": wg_pubkey,
         "engines": list(grants.engines),
         "tiers": list(grants.tiers),
         "credentials": grants.credentials,
-    }, separators=(",", ":"), sort_keys=True).encode()
+    }
+    if wg_pubkey is not None:
+        info["wg"] = wg_pubkey
+    return json.dumps(info, separators=(",", ":"), sort_keys=True).encode()
 _UTC = datetime.timezone.utc
 
 
@@ -235,32 +246,29 @@ class CertAuthority:
         cert = self._sign(cn, key.public_key(), [], server=False, client=True, days=days)
         return IssuedCert(cert.public_bytes(serialization.Encoding.PEM), _key_pem(key))
 
-    def issue_node(self, node_id: str, *, wg_pubkey: str,
-                   grants: NodeGrants | None = None, days: int = 7) -> IssuedCert:
-        """A NODE cert: identity + its WireGuard public key + its grants.
+    def _build_node_cert(self, node_id: str, public_key: ec.EllipticCurvePublicKey,
+                         wg_pubkey: str | None, grants: NodeGrants | None,
+                         days: int) -> x509.Certificate:
+        """Validate and sign a node cert for ``public_key``.
 
-        ``days`` is short on purpose. Revocation for federation is "stop renewing", which
-        needs no CRL distribution and no online check on the hot path — but that only
-        bounds exposure if the lifetime is short. A week is the upper end of sensible.
-
-        The cert carries a PRIVATE extended key usage, never ``clientAuth`` — see
-        :data:`OID_NODE_AUTH` for why that distinction is load-bearing. It is not a
-        server cert and carries no SANs.
+        Split from :meth:`issue_node` so a CSR-enrolment path can reuse the exact same
+        extension set and checks with a node-supplied key instead of a generated one.
         """
         if not _NODE_ID_RE.match(node_id):
             raise ValueError(
                 f"invalid node id {node_id!r}: lowercase letters, digits, dot, dash, "
                 "underscore; 1-63 chars")
-        if not _is_wg_key(wg_pubkey):
-            raise ValueError(
-                "wg_pubkey is not a 32-byte base64 WireGuard public key")
+        if wg_pubkey is not None:
+            if not _is_wg_key(wg_pubkey):
+                raise ValueError(
+                    "wg_pubkey is not a 32-byte base64 WireGuard public key")
+            wg_pubkey = wg_pubkey.strip()
         grants = grants or NodeGrants()
-        key = ec.generate_private_key(ec.SECP256R1())
         builder = (
             x509.CertificateBuilder()
             .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, node_id)]))
             .issuer_name(self._cert.subject)
-            .public_key(key.public_key())
+            .public_key(public_key)
             .serial_number(x509.random_serial_number())
             .not_valid_before(_now() - datetime.timedelta(minutes=5))
             .not_valid_after(_now() + datetime.timedelta(days=days))
@@ -271,10 +279,28 @@ class CertAuthority:
             .add_extension(x509.ExtendedKeyUsage([OID_NODE_AUTH]), critical=True)
             .add_extension(
                 x509.UnrecognizedExtension(
-                    OID_NODE_INFO, _node_info_bytes(node_id, wg_pubkey.strip(), grants)),
+                    OID_NODE_INFO, _node_info_bytes(node_id, wg_pubkey, grants)),
                 critical=False)
         )
-        cert = builder.sign(self._key, hashes.SHA256())
+        return builder.sign(self._key, hashes.SHA256())
+
+    def issue_node(self, node_id: str, *, wg_pubkey: str | None = None,
+                   grants: NodeGrants | None = None, days: int = 7) -> IssuedCert:
+        """A NODE cert: identity + (optionally) its WireGuard public key + its grants.
+
+        ``wg_pubkey=None`` issues a v2 cert with no key, for nodes that never join the
+        WireGuard overlay.
+
+        ``days`` is short on purpose. Revocation for federation is "stop renewing", which
+        needs no CRL distribution and no online check on the hot path — but that only
+        bounds exposure if the lifetime is short. A week is the upper end of sensible.
+
+        The cert carries a PRIVATE extended key usage, never ``clientAuth`` — see
+        :data:`OID_NODE_AUTH` for why that distinction is load-bearing. It is not a
+        server cert and carries no SANs.
+        """
+        key = ec.generate_private_key(ec.SECP256R1())
+        cert = self._build_node_cert(node_id, key.public_key(), wg_pubkey, grants, days)
         return IssuedCert(cert.public_bytes(serialization.Encoding.PEM), _key_pem(key))
 
     def sign_csr(self, csr_pem: bytes, *, days: int = 2) -> bytes:
@@ -426,8 +452,9 @@ def node_identity(ca: "CertAuthority | TrustAnchor", cert_pem: bytes,
         info = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ValueError(f"node-info extension is not valid JSON: {exc}") from exc
-    if info.get("v") != 1:
-        raise ValueError(f"unsupported node-info version {info.get('v')!r}")
+    version = info.get("v")
+    if version not in (1, 2):
+        raise ValueError(f"unsupported node-info version {version!r}")
 
     cn = next((str(a.value) for a in cert.subject
                if a.oid == NameOID.COMMON_NAME), None)
@@ -435,11 +462,15 @@ def node_identity(ca: "CertAuthority | TrustAnchor", cert_pem: bytes,
     if cn != node_id:
         raise ValueError(
             f"subject CN {cn!r} does not match the node id {node_id!r} in the extension")
-    wg = str(info.get("wg", ""))
-    if not _is_wg_key(wg):
-        raise ValueError("node-info extension carries no valid WireGuard public key")
+    wg: str | None
+    if version == 2 and "wg" not in info:
+        wg = None          # v2 may omit the key; if present it is still validated
+    else:
+        wg = str(info.get("wg", ""))
+        if not _is_wg_key(wg):
+            raise ValueError("node-info extension carries no valid WireGuard public key")
     return NodeIdentity(
-        node_id=node_id, wg_pubkey=wg, not_after=not_after, not_before=not_before,
+        node_id=node_id, wg_pubkey=wg, info_version=version, not_after=not_after, not_before=not_before,
         grants=NodeGrants(
             engines=tuple(info.get("engines") or ()),
             tiers=tuple(info.get("tiers") or ()),
