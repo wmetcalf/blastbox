@@ -890,6 +890,37 @@ Three things an operator must know:
   all return the same message, so a caller cannot map the fleet's grants by probing. The
   reason is in the ingress log (`node_claim: refused …`); look there, not at the response.
 
+#### node-finalizer (seals what pull nodes upload)
+
+A credential-less node uploads its result tar to the ingress, which only *quarantines* it: the
+tar is safely extracted into a spool and a marker is written. It is never trust-gated, signed or
+marked DONE there. A separate service does that, with the exact cold-path code (size cap, trust
+gate, host re-seal, signed receipt, blob upload, claim-fenced CAS to DONE):
+
+```sh
+blastbox node-finalizer [--once] [--interval 1.0] [--no-receipts]
+```
+
+* **It holds the DB, the blob store and the attest key, and never claims work.** Run one or
+  more replicas; a per-directory `flock` (`.finalize.lock`) stops two replicas finalising the
+  same result.
+* **Shared results volume.** The ingress and the finalizer must see the same spool: mount one
+  volume at the same path in both and set `BLASTBOX_NODE_RESULTS_DIR` to it in both (default
+  `$BLASTBOX_JOB_ROOT/.node-results`). The ingress writes it; the finalizer reads, finalises,
+  and writes `outcome.json`, which the node's replayed `PUT /jobs/{id}/result` reads back.
+* **The attest key (`BLASTBOX_ATTEST_KEY`) is mounted ONLY into the finalizer. The ingress
+  never gets it.** A bug in tar handling on the ingress must not be able to reach the signing
+  key. The finalizer refuses to start without a key unless `--no-receipts` is given, which logs
+  a loud warning and marks node results DONE with no signed receipt.
+* **Env.** `BLASTBOX_DB` / job store and blob-store settings exactly as for `blastbox dispatch`
+  (same `BLASTBOX_JOB_ROOT`), `BLASTBOX_ATTEST_KEY`, and `BLASTBOX_NODE_RESULTS_RETAIN_S`
+  (default `3600`): the extracted tree is removed right after finalisation, and a whole
+  (job, claim) directory is removed once its outcome is older than that.
+* **Set `BLASTBOX_NODE_CLAIM_RECLAIM_AFTER_S`** on the ingress. Without it a claim whose node
+  never uploads is never reclaimed; the finalizer logs an ERROR at startup when it is unset.
+* Receipts it signs carry `worker_tier: node-agent`, plus `node_id` and `node_cert_sha256` of
+  the uploading node, and no `net_*` fields.
+
 **Step 3 RECURS.** `pki issue-node` defaults to a 7-day lifetime — that short lifetime is
 what makes "revocation is stop renewing" work without a CRL or any online check — and the
 exit host's `prune_expired_peers` runs on every `apply`, which now includes the reconcile
