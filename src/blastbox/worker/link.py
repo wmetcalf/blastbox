@@ -2268,8 +2268,13 @@ def _dispatch(args: argparse.Namespace) -> int:
     if action == "status" and getattr(args, "check", False):
         # Alarm mode: only WireGuard handshake freshness, exit 0/2/1. Same reader on both
         # roles; the host module is the one that owns it.
+        iface = args.iface
+        if not iface and _role(args) == "host":
+            # The host's link interface is configurable; read it the way every other host
+            # action does rather than assuming the default name.
+            iface = _host_cfg(args, base_required=False).wg_iface
         code, lines = _host_mod().check_handshakes(
-            args.iface or DEFAULT_IFACE, args.max_handshake_age)
+            iface or DEFAULT_IFACE, args.max_handshake_age)
         for ln in lines:
             print(ln, file=sys.stderr if code == 1 else sys.stdout)
         return code

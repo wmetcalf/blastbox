@@ -99,3 +99,18 @@ def test_a_handshake_far_in_the_future_is_stale():
     code, _ = wla.check_handshakes(
         "wg-test", 180, now=NOW, run=_runner(_dump(("AAAAAAAAAAAA=", int(NOW) + 5))))
     assert code == 0
+
+
+def test_cli_check_on_a_host_reads_the_configured_interface(monkeypatch):
+    import argparse
+
+    from blastbox.host.worker_link import WorkerLinkConfig
+    p = argparse.ArgumentParser()
+    link.add_parser(p.add_subparsers())
+    args = p.parse_args(["worker-link", "status", "--check", "--role", "host"])
+    monkeypatch.setattr(wla, "load_config", lambda **_: WorkerLinkConfig(wg_iface="customwg0"))
+    seen = []
+    monkeypatch.setattr(wla, "check_handshakes",
+                        lambda iface, age, **_: seen.append(iface) or (0, ["ok"]))
+    assert args.func(args) == 0
+    assert seen == ["customwg0"]
