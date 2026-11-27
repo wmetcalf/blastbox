@@ -282,13 +282,13 @@ def test_a_garbled_node_dir_ca_crt_does_not_decide_anything(tmp_path):
 def test_unreadable_cert_file_defers_instead_of_dropping(tmp_path, monkeypatch):
     d, ca = rig(tmp_path)
     queue_csr(d, "n1", make_csr("n1")[0])
-    real = Path.read_bytes
+    real = node_renew._read_capped
 
-    def flaky(self):
-        if self.name == "node-n1.crt":
+    def flaky(path, limit):
+        if path.name == "node-n1.crt":
             raise OSError("EIO")
-        return real(self)
-    monkeypatch.setattr(Path, "read_bytes", flaky)
+        return real(path, limit)
+    monkeypatch.setattr(node_renew, "_read_capped", flaky)
     [(nid, outcome)] = sign_pending(ca, d)
     assert outcome.startswith("deferred:")
     monkeypatch.undo()
@@ -453,10 +453,12 @@ def test_a_node_dir_without_ca_crt_fails_the_run_loudly(tmp_path):
     queue_csr(i1, "n1", make_csr("n1")[0])
     with pytest.raises(OSError):
         sign_pending(ca, ca_dir, node_dirs=[i1, i2])
-    with pytest.raises(OSError):
-        node_renew.revoke(ca_dir, "n1", node_dirs=[i1, i2])
     assert pending(i1) == ["n1"]
     assert (i1 / "node-n1.crt").exists()
+    with pytest.raises(node_renew.PartialRevoke) as exc:   # revoke does what it can
+        node_renew.revoke(ca_dir, "n1", node_dirs=[i1, i2])
+    assert exc.value.failed and exc.value.failed[0][0] == i2
+    assert not (i1 / "node-n1.crt").exists()
 
 
 def test_two_spellings_of_one_dir_do_not_self_deadlock(tmp_path):
@@ -652,3 +654,70 @@ def test_cli_revoke_node(tmp_path, capsys):
     assert main(["pki", "--dir", str(d), "revoke-node", "--node-id", "n1"]) == 0
     assert node_renew.current_cert(d, "n1") is None
     assert "node-n1.crt" in capsys.readouterr().out
+
+
+def test_a_kept_csr_stays_set_aside_and_is_never_renamed_back(tmp_path, monkeypatch):
+    d, ca = rig(tmp_path)
+    queue_csr(d, "n1", make_csr("n1")[0])
+    monkeypatch.setattr(node_renew, "_replace_file",
+                        lambda *a: (_ for _ in ()).throw(OSError("disk full")))
+    sign_pending(ca, d)
+    sign_pending(ca, d)                             # retried, still kept
+    names = sorted(p.name for p in (d / "renew").glob("*.csr*"))
+    assert names == ["n1.csr.signing"]              # the ingress's name is never written
+    monkeypatch.undo()
+    node_renew.revoke(d, "n1")
+    assert not list((d / "renew").glob("*.csr*"))
+
+
+def test_cli_renew_pending_exits_2_when_a_renewal_is_deferred(tmp_path, monkeypatch, capsys):
+    from blastbox.host.cli import main
+    d, _ = rig(tmp_path)
+    queue_csr(d, "n1", make_csr("n1")[0])
+    monkeypatch.setattr(node_renew, "_replace_file",
+                        lambda *a: (_ for _ in ()).throw(OSError(30, "Read-only file system")))
+    assert main(["pki", "--dir", str(d), "renew-pending"]) == 2
+    assert "deferred" in capsys.readouterr().out
+
+
+def test_oversized_and_fifo_files_in_a_node_dir_are_skipped(tmp_path):
+    import signal
+    ca, ca_dir, i1, _i2 = _split(tmp_path)
+    with open(i1 / "zz.crt", "wb") as fh:           # sparse, huge
+        fh.truncate(3 << 30)
+    os.mkfifo(i1 / "fifo.crt")
+    (i1 / "renew").mkdir(exist_ok=True)
+    os.mkfifo(i1 / "renew" / "n2.csr.signing")
+    queue_csr(i1, "n1", make_csr("n1")[0])
+    signal.signal(signal.SIGALRM, lambda *a: (_ for _ in ()).throw(TimeoutError()))
+    signal.alarm(20)
+    try:
+        assert sign_pending(ca, ca_dir, node_dirs=[i1]) == [("n1", "renewed")]
+        assert node_renew.revoke(ca_dir, "n1", node_dirs=[i1])
+    finally:
+        signal.alarm(0)
+
+
+def test_oversized_queued_csr_is_refused_without_reading_it(tmp_path, monkeypatch):
+    d, ca = rig(tmp_path)
+    (d / "renew").mkdir()
+    with open(d / "renew" / "n1.csr", "wb") as fh:
+        fh.truncate(3 << 30)
+    [(nid, outcome)] = sign_pending(ca, d)
+    assert outcome.startswith("refused")
+    assert pending(d) == []
+
+
+def test_revoke_proceeds_past_a_dir_whose_lock_is_held(tmp_path, monkeypatch):
+    ca, ca_dir, i1, i2 = _split(tmp_path)
+    monkeypatch.setattr(node_renew, "LOCK_TIMEOUT_S", 0.3)
+    holder = open(i2 / ".renew.lock", "a+")
+    fcntl.flock(holder, fcntl.LOCK_EX)              # a hostile ingress never lets go
+    try:
+        with pytest.raises(node_renew.PartialRevoke) as exc:
+            node_renew.revoke(ca_dir, "n1", node_dirs=[i1, i2])
+    finally:
+        holder.close()
+    for d in (ca_dir, i1, i2):                      # revoked everywhere regardless
+        assert node_renew.current_cert(d, "n1") is None
+    assert exc.value.unlocked == [i2]

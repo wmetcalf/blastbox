@@ -938,7 +938,10 @@ certificate until it expires.
 
 **Revoke with `blastbox pki revoke-node --node-id <id> [--node-dir …]`.** It deletes the node's
 certificates and any queued renewal from every dir under the same lock `renew-pending` holds, so a
-renewal in flight cannot write a certificate back. Deleting the file by hand still revokes, but
+renewal in flight cannot write a certificate back. It cannot be blocked: a dir whose lock is held is
+revoked anyway, and one it cannot reach is reported; it exits 1 unless every dir was revoked.
+`renew-pending` exits 2 when any renewal was deferred, so a fault that repeats every run (a
+read-only mount) turns the timer unit red instead of letting the node's certificate run out. Deleting the file by hand still revokes, but
 can race a renewal that is signing at that moment.
 
 `--name`/`--public-key` still work for nodes not yet enrolled, and say plainly that the key

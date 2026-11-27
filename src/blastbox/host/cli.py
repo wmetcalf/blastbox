@@ -1512,10 +1512,16 @@ def _pki_cmd(args: argparse.Namespace) -> int:
         return 0
     if args.pki_action == "revoke-node":
         from blastbox.host.node_renew import revoke
+        from blastbox.host.node_renew import PartialRevoke
         try:
             removed = revoke(pki_dir, args.node_id,
                              node_dirs=[Path(p) for p in args.node_dir] or None)
-        except (OSError, ValueError) as exc:   # bad id, unreadable CA, unreachable dir
+        except PartialRevoke as exc:         # the rest WAS revoked; say what was not
+            for path in exc.removed:
+                print(f"removed {path}")
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except (OSError, ValueError) as exc:   # bad id, unreadable CA
             print(f"error: {exc}", file=sys.stderr)
             return 1
         for path in removed:
@@ -1541,7 +1547,9 @@ def _pki_cmd(args: argparse.Namespace) -> int:
             return 1
         for node_id, outcome in outcomes:
             print(f"{node_id}: {outcome}")
-        return 0
+        # A deferral repeats every run until someone fixes its cause; exit 2 so the timer
+        # unit shows it, instead of staying green while the node's cert runs out.
+        return 2 if any(o.startswith("deferred") for _, o in outcomes) else 0
     ca = ensure_ca(pki_dir)  # generate-or-load the CA
     if args.pki_action == "init":
         crt, key = ca.issue_client("dispatcher", days=args.days).write(

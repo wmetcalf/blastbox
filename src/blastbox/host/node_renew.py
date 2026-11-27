@@ -19,6 +19,7 @@ import errno
 import fcntl
 import os
 import re
+import stat
 import tempfile
 import time
 from pathlib import Path
@@ -98,6 +99,50 @@ def queue_csr(pki_dir: Path, node_id: str, csr_pem: bytes) -> None:
         Path(tmp).unlink(missing_ok=True)
 
 
+#: Upper bound on a cert file the CA host reads from a node dir (they are ~1 KiB).
+MAX_CERT_BYTES = 64 * 1024
+
+
+class _Unreadable(ValueError):
+    """Not a file this code will read: a FIFO, device, link, or oversized."""
+
+    def __init__(self, msg: str, *, regular: bool = False) -> None:
+        super().__init__(msg)
+        self.regular = regular
+
+
+def _read_capped(path: Path, limit: int) -> bytes:
+    """Read a small REGULAR file without following a link or blocking on a FIFO.
+
+    A node dir is the ingress's to write, so the CA host checks what it opened (fstat on
+    the same descriptor, no check-then-open window) and never reads more than ``limit``.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise _Unreadable(f"{path.name} is a symlink") from None
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise _Unreadable(f"{path.name} is not a regular file")
+        if st.st_size > limit:
+            raise _Unreadable(f"{path.name} is over {limit} bytes", regular=True)
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(fd, limit + 1 - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > limit:
+                raise _Unreadable(f"{path.name} is over {limit} bytes", regular=True)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
 def _intersect(a: NodeGrants | None, b: NodeGrants) -> NodeGrants:
     if a is None:
         return b
@@ -146,9 +191,13 @@ def _find_current(pki_dir: Path, node_id: str,
             return None
     found: list[tuple[Path, bytes, NodeIdentity]] = []
     for crt in sorted(d.glob("*.crt")):
-        if strict and (crt.is_symlink() or not crt.is_file()):
+        if strict and crt.is_symlink():
             continue
-        pem = crt.read_bytes()                          # OSError propagates (transient)
+        try:
+            # OSError propagates (transient). Strict: the dir is someone else's to write.
+            pem = _read_capped(crt, MAX_CERT_BYTES) if strict else crt.read_bytes()
+        except _Unreadable:
+            continue                                    # FIFO, device, huge: not a cert
         try:
             ident = node_identity(anchor, pem)
         except Exception:                               # noqa: BLE001 - one bad file is not fatal
@@ -291,9 +340,14 @@ def _drain(ca: CertAuthority, qdir: Path, days: int,
         try:
             if csr_path.exists() and not csr_path.is_symlink():
                 os.replace(csr_path, aside)     # newest wins over a kept older one
-            if aside.is_symlink() or not aside.is_file():
+            if aside.is_symlink():
                 continue                        # never read a file through a link
-            csr_pem = aside.read_bytes()
+            csr_pem = _read_capped(aside, MAX_CSR_BYTES)
+        except _Unreadable as exc:
+            if exc.regular:                     # an oversized CSR: refuse it, like queue_csr
+                aside.unlink(missing_ok=True)
+                results.append((node_id, f"refused: {exc}"))
+            continue
         except OSError:
             continue
         outcome, keep = _renew_one(ca, qdir, every, node_id, csr_pem, days)
@@ -306,9 +360,11 @@ def _drain(ca: CertAuthority, qdir: Path, days: int,
 def _swap_if_unchanged(path: Path, expected: bytes, new: bytes) -> str | None:
     """Replace ``path`` with ``new`` if it still holds ``expected``; else say why not."""
     try:
-        still = path.read_bytes()
+        still = _read_capped(path, MAX_CERT_BYTES)
     except FileNotFoundError:
         return "removed"
+    except _Unreadable:
+        return "changed"
     if still != expected:
         return "changed"
     _replace_file(path, new)
@@ -350,44 +406,80 @@ def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
             # grants when the renewed one lapsed.
             for path, pem in cur.others:
                 try:
-                    if path.read_bytes() == pem:
+                    if _read_capped(path, MAX_CERT_BYTES) == pem:
                         path.unlink()
-                except FileNotFoundError:
+                except (FileNotFoundError, _Unreadable):
                     pass
     except OSError as exc:
         return f"deferred: {exc}", True
     return "renewed", False
 
 
+class PartialRevoke(OSError):
+    """Revocation did what it could but not everything: see ``unlocked`` / ``failed``."""
+
+    def __init__(self, removed: list[Path], unlocked: list[Path],
+                 failed: list[tuple[Path, str]]) -> None:
+        bits = [f"{d}: revoked WITHOUT its lock (held by someone else)" for d in unlocked]
+        bits += [f"{d}: NOT revoked: {why}" for d, why in failed]
+        super().__init__(errno.EIO, "; ".join(bits))
+        self.removed, self.unlocked, self.failed = removed, unlocked, failed
+
+
 def revoke(pki_dir: Path, node_id: str, *, node_dirs: list[Path] | None = None) -> list[Path]:
     """Revoke ``node_id``: delete its certs and queued CSRs in every node dir.
 
-    Under the same locks as :func:`sign_pending`, so a renewal in flight cannot write a
-    cert back after it. Certs are matched by verifying them (expired ones too) against
-    ``pki_dir``'s CA, never a node dir's own ``ca.crt``. Returns the cert files removed.
-    Raises ValueError for a malformed node id, OSError for an unreadable CA or dir.
+    Under each dir's renewal lock where it can be had, so a renewal in flight cannot write
+    a cert back after it. But revocation must not be blockable: a dir whose lock is held
+    (a hostile ingress can hold its own) is revoked anyway -- no renewal can run while it
+    is held, since a run needs every lock -- and a dir that cannot be revoked at all is
+    skipped; either way the others are still revoked and :class:`PartialRevoke` says what
+    happened. Certs are matched by verifying them (expired ones too) against ``pki_dir``'s
+    CA, never a node dir's own ``ca.crt``. Returns the cert files removed.
+    Raises ValueError for a malformed node id, OSError for an unreadable CA.
     """
     if not _PKI_NODE_ID.match(node_id):
         raise ValueError(f"invalid node id {node_id!r}")
     anchor = load_trust_anchor(Path(pki_dir))
-    every = _dirs(pki_dir, node_dirs)
+    out: dict[str, Path] = {}
+    for p in [Path(pki_dir), *(Path(p) for p in node_dirs or [])]:
+        out.setdefault(os.path.realpath(p), p)
     removed: list[Path] = []
-    with _locked(every):
-        for d in every:
-            for crt in sorted(d.glob("*.crt")):
-                if crt.is_symlink() or not crt.is_file():
-                    continue
-                try:
-                    if node_identity(anchor, crt.read_bytes(),
-                                     allow_expired=True).node_id != node_id:
-                        continue
-                except ValueError:
-                    continue
-                crt.unlink()
-                removed.append(crt)
-            q = _renew_dir(d)
-            if q.is_symlink():
+    unlocked: list[Path] = []
+    failed: list[tuple[Path, str]] = []
+    with contextlib.ExitStack() as stack:
+        for d in sorted(out.values(), key=lambda p: os.path.realpath(p)):
+            if not (d / "ca.crt").is_file():
+                failed.append((d, "not a PKI dir (no ca.crt) -- unmounted?"))
                 continue
-            for name in (f"{node_id}.csr", f"{node_id}.csr.signing"):
-                (q / name).unlink(missing_ok=True)
+            try:
+                stack.enter_context(_locked([d]))
+            except OSError:
+                unlocked.append(d)
+            try:
+                removed += _revoke_in(anchor, d, node_id)
+            except OSError as exc:
+                failed.append((d, str(exc)))
+    if unlocked or failed:
+        raise PartialRevoke(removed, unlocked, failed)
+    return removed
+
+
+def _revoke_in(anchor: TrustAnchor, d: Path, node_id: str) -> list[Path]:
+    removed: list[Path] = []
+    for crt in sorted(d.glob("*.crt")):
+        if crt.is_symlink():
+            continue
+        try:
+            pem = _read_capped(crt, MAX_CERT_BYTES)
+            if node_identity(anchor, pem, allow_expired=True).node_id != node_id:
+                continue
+        except ValueError:                  # _Unreadable included: not a cert
+            continue
+        crt.unlink()
+        removed.append(crt)
+    q = _renew_dir(d)
+    if q.is_dir() and not q.is_symlink():
+        for name in (f"{node_id}.csr", f"{node_id}.csr.signing"):
+            (q / name).unlink(missing_ok=True)
     return removed
