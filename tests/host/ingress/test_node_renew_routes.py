@@ -77,8 +77,10 @@ def test_cert_route_returns_latest(tmp_path, monkeypatch):
     import datetime
     assert datetime.datetime.fromisoformat(body["not_after"]) > (
         pki.node_identity(pki.load_trust_anchor(d), short).not_after)
-    # never another node's cert
-    assert "n2" not in body["cert_pem"]
+    # never another node's cert (parse it: "n2" can occur in random base64)
+    ident = pki.node_identity(pki.load_trust_anchor(d), body["cert_pem"].encode())
+    assert ident.node_id == "n1"
+    assert body["cert_pem"] != (d / "node-n2.crt").read_text()
 
 
 def test_old_cert_session_still_works_until_it_expires(tmp_path, monkeypatch):
