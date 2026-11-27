@@ -68,7 +68,12 @@ flip_current() {
   ln -s "$1" "$tmp"
   case "$os_name" in
     Darwin) mv -fh "$tmp" "$prefix/current" ;;
-    *) mv -fT "$tmp" "$prefix/current" ;;
+    *)
+      # GNU mv -T; busybox lacks it, so fall back to ln -sfn (replaces the
+      # link in place without dereferencing; not a rename, but never nests).
+      if mv -fT "$tmp" "$prefix/current" 2>/dev/null; then :; else
+        ln -sfn "$1" "$prefix/current"; rm -f "$tmp"
+      fi ;;
   esac
 }
 
@@ -125,14 +130,16 @@ base="https://github.com/$REPO/releases/download/$tag"
 
 mkdir -p "$prefix"
 stage=$(mktemp -d "$prefix/.stage.XXXXXX")
-trap 'rm -rf "$stage"' EXIT INT TERM
+trap 'rm -rf "$stage"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 fetch() {
   if [ -n "$from" ]; then
     [ -f "$from/$1" ] || die "missing $from/$1"
     cp "$from/$1" "$stage/$1"
   else
-    curl --proto '=https' --tlsv1.2 -fsSL -o "$stage/$1" "$base/$1" || die "download failed: $base/$1"
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -o "$stage/$1" "$base/$1" || die "download failed: $base/$1"
   fi
 }
 fetch "$bin"

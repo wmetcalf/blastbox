@@ -9,9 +9,9 @@ on:
     tags:
       - "agent-v*"
 
+# Least privilege: read-only by default; only the `release` job gets more.
 permissions:
-  contents: write   # gh release create
-  id-token: write   # cosign keyless (Sigstore OIDC)
+  contents: read
 
 env:
   GO_VERSION: "1.22.12"
@@ -19,6 +19,8 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       fail-fast: true
       matrix:
@@ -29,10 +31,11 @@ jobs:
         run: |
           set -eu
           case "${GITHUB_REF_NAME}" in
-            agent-v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "bad tag ${GITHUB_REF_NAME}" >&2; exit 1 ;;
+            agent-v*[!0-9.]*|agent-v.*|agent-v*.|agent-v*..*) echo "bad tag ${GITHUB_REF_NAME}" >&2; exit 1 ;;
           esac
-          echo "VERSION=${GITHUB_REF_NAME#agent-v}" >> "$GITHUB_ENV"
+          v=${GITHUB_REF_NAME#agent-v}
+          [ "$(printf '%s' "$v" | tr -cd '.' | wc -c)" = 2 ] || { echo "bad tag ${GITHUB_REF_NAME}" >&2; exit 1; }
+          echo "VERSION=$v" >> "$GITHUB_ENV"
       # Two separate clean checkouts; both must build byte-identical output.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -76,14 +79,29 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # gh release create
+      id-token: write   # cosign keyless (Sigstore OIDC)
     steps:
       - name: Derive version from tag
         run: |
           set -eu
-          echo "VERSION=${GITHUB_REF_NAME#agent-v}" >> "$GITHUB_ENV"
+          case "${GITHUB_REF_NAME}" in
+            agent-v*[!0-9.]*|agent-v.*|agent-v*.|agent-v*..*) echo "bad tag ${GITHUB_REF_NAME}" >&2; exit 1 ;;
+          esac
+          v=${GITHUB_REF_NAME#agent-v}
+          [ "$(printf '%s' "$v" | tr -cd '.' | wc -c)" = 2 ] || { echo "bad tag ${GITHUB_REF_NAME}" >&2; exit 1; }
+          echo "VERSION=$v" >> "$GITHUB_ENV"
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          fetch-depth: 0
           persist-credentials: false
+      - name: Refuse a tag that is not on main
+        run: |
+          set -eu
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main \
+            || { echo "tagged commit ${GITHUB_SHA} is not an ancestor of origin/main" >&2; exit 1; }
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -94,6 +112,8 @@ jobs:
           pattern: bin-*
           merge-multiple: true
       - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: "v3.1.6"
       - name: Checksums, SBOM, conformance digest
         working-directory: dist
         run: |

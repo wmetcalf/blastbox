@@ -133,6 +133,16 @@ def test_cosign_called_with_pinned_identity(tmp_path):
     assert os.readlink(pfx / "current") == "1.2.3"
 
 
+def test_cosign_not_invoked_on_sha_mismatch(tmp_path):
+    rel, _ = make_release(tmp_path)
+    log = tmp_path / "cosign.log"
+    fake = f'#!/bin/sh\necho called > {log}\nexit 0\n'
+    p = run(["--version", "1.0.0", "--sha256", "0" * 64, "--from", str(rel),
+             "--prefix", str(tmp_path / "pfx")], path=stripped_path(tmp_path, fake))
+    assert p.returncode != 0 and "sha256 mismatch" in p.stderr
+    assert not log.exists()
+
+
 def test_cosign_failure_blocks_install(tmp_path):
     rel, sha = make_release(tmp_path)
     pfx = tmp_path / "pfx"
@@ -170,7 +180,7 @@ def test_no_env_or_secrets_printed(tmp_path):
 def test_static_no_curl_pipe_sh():
     text = INSTALL.read_text()
     assert "| sh" not in text and "|sh" not in text and "| bash" not in text
-    assert "--proto '=https' --tlsv1.2 -fsSL" in text
+    assert "--proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL" in text
     assert text.startswith("#!/bin/sh") and "set -eu" in text
 
 

@@ -43,9 +43,15 @@ def test_release_triggers_only_on_agent_tags():
 
 def test_release_permissions_minimal():
     doc = load(RELEASE)
-    assert doc["permissions"] == {"contents": "write", "id-token": "write"}
-    for job in doc["jobs"].values():
-        assert "permissions" not in job or job["permissions"] == doc["permissions"]
+    assert doc["permissions"] == {"contents": "read"}
+    assert doc["jobs"]["build"].get("permissions", {"contents": "read"}) == {"contents": "read"}
+    assert doc["jobs"]["release"]["permissions"] == {"contents": "write", "id-token": "write"}
+
+
+def test_cosign_pinned_and_main_ancestry_checked():
+    text = RELEASE.read_text()
+    assert re.search(r'cosign-release: "v[23]\.\d+\.\d+"', text)
+    assert "merge-base --is-ancestor" in text and "fetch-depth: 0" in text
 
 
 def test_actions_pinned_by_sha():
