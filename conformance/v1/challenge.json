@@ -81,14 +81,6 @@
       "verify_at": 1e+22
     },
     {
-      "challenge": "1e+22:0cc2598b5f864a863c460e5cfd653b1714f415b8b01781d363bda8363ca8a2a3",
-      "expiry_repr": "1e+22",
-      "minted_scope": "claim-next",
-      "scope": "claim-next",
-      "verdict": "ok",
-      "verify_at": 1e+22
-    },
-    {
       "challenge": "1700000060.0:e88956c6b85d793a9c3e20025fbe965ef1ffb7c0e11b531d9044af68dcd8039e",
       "expiry_repr": "1700000060.0",
       "minted_scope": "claim-next",

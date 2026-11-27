@@ -113,7 +113,8 @@ def gen_challenge() -> dict[str, Any]:
         add(scope, challenge, now + 1.0, "ok", minted_scope=scope, expiry_repr=expiry_repr)
         # boundary: exactly the expiry is still valid, a hair after is not
         expiry = float(expiry_repr)
-        add(scope, challenge, expiry, "ok", minted_scope=scope, expiry_repr=expiry_repr)
+        if label != "large_exponent":      # there now+1 == expiry, so it would be a duplicate
+            add(scope, challenge, expiry, "ok", minted_scope=scope, expiry_repr=expiry_repr)
         if label != "large_exponent":      # nextafter(1e22) is no longer a "+1 second" story
             add(scope, challenge, expiry + 0.001, "expired",
                 minted_scope=scope, expiry_repr=expiry_repr)
@@ -570,6 +571,39 @@ def build_node_certs() -> dict[str, bytes]:
     return files
 
 
+def add_node_cert_negatives(certs: Path) -> bool:
+    """Append negatives added AFTER the first commit, signed by the EXISTING test CA.
+
+    Additive only: nothing already committed is regenerated, so a Go agent's recorded
+    verdicts and ``go_signed`` stay valid. Returns True if ``cases.json`` changed.
+    """
+    doc = json.loads((certs / "cases.json").read_text())
+    names = {c["name"] for c in doc["cases"]}
+    if "node_plus_client_auth_eku" in names:
+        return False
+    ca_cert = x509.load_pem_x509_certificate((certs / "ca.crt").read_bytes())
+    raw = (certs / "ca.key").read_bytes()
+    ca_key = serialization.load_pem_private_key(
+        b"-----BEGIN" + raw.partition(b"-----BEGIN")[2], password=None)   # skip TEST ONLY line
+    assert isinstance(ca_key, ec.EllipticCurvePrivateKey)
+    ca = pki.CertAuthority(ca_cert, ca_key)
+    key = ec.generate_private_key(ec.SECP256R1())
+    nb = CERT_ISSUED - datetime.timedelta(minutes=5)
+    na = CERT_ISSUED + datetime.timedelta(days=CERT_DAYS)
+    cert = _node_like(ca, "node-dual", key.public_key(),
+                      ekus=[pki.OID_NODE_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH],
+                      info=_info("node-dual"), not_before=nb, not_after=na)
+    (certs / "node_plus_client_auth_eku.crt").write_bytes(cert)
+    (certs / "node_plus_client_auth_eku.key").write_bytes(_TEST_ONLY + _pem_key(key))
+    doc["cases"].append({
+        "name": "node_plus_client_auth_eku", "node_id": "node-dual", "verdict": "refused",
+        "why": "node EKU plus clientAuth: a node cert must never double as a transport cert",
+        "cert": "node_plus_client_auth_eku.crt", "key": "node_plus_client_auth_eku.key",
+        "admit": {"verdict": "refused", **_admit_claim(key, "node-dual")}})
+    (certs / "cases.json").write_bytes(_dumps(doc))
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Committed-once: ecdsa_cross.json python_signed
 # ---------------------------------------------------------------------------
@@ -586,6 +620,36 @@ def build_ecdsa_python_signed() -> list[dict[str, str]]:
                     "payload_hex": node_auth.signing_payload(chal, scope, node_id).hex(),
                     "signature_b64": _b64(sig)})
     return out
+
+
+def add_ecdsa_negative(cross: Path) -> bool:
+    """Append a tampered-signature entry (``"valid": false``) if none is committed yet.
+
+    Additive: existing entries are untouched. The signature is over the REAL payload with
+    ``r`` bumped, so it is well-formed DER that must fail verification (not a parse error).
+    """
+    from cryptography.hazmat.primitives.asymmetric.utils import (
+        decode_dss_signature,
+        encode_dss_signature,
+    )
+
+    doc = json.loads(cross.read_text())
+    if any(e.get("valid") is False for e in doc["python_signed"]):
+        return False
+    key = ec.generate_private_key(ec.SECP256R1())
+    scope, node_id = node_auth.SCOPE_CLAIM_NEXT, "node-tampered"
+    chal = node_auth.challenge_for(scope, secret=SECRET, now=T0)
+    payload = node_auth.signing_payload(chal, scope, node_id)
+    r, s_ = decode_dss_signature(key.sign(payload, ec.ECDSA(hashes.SHA256())))
+    order = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+    bad = encode_dss_signature((r % (order - 1)) + 1 if (r % (order - 1)) + 1 != r else 1, s_)
+    pub_pem = key.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+    doc["python_signed"].append({
+        "valid": False, "challenge": chal, "scope": scope, "node_id": node_id,
+        "public_key_pem": pub_pem, "payload_hex": payload.hex(), "signature_b64": _b64(bad)})
+    cross.write_bytes(_dumps(doc))
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -642,14 +706,31 @@ def verify_committed_once(out: Path = OUT) -> list[str]:
         return problems + [f"ecdsa_cross.json unreadable: {exc}"]
     if not cross.get("python_signed"):
         problems.append("ecdsa_cross.json: python_signed is empty")
-    for entry in cross.get("python_signed", []) + cross.get("go_signed", []):
-        pub = serialization.load_pem_public_key(entry["public_key_pem"].encode())
-        try:
-            assert isinstance(pub, ec.EllipticCurvePublicKey)
-            pub.verify(base64.b64decode(entry["signature_b64"]),
-                       bytes.fromhex(entry["payload_hex"]), ec.ECDSA(hashes.SHA256()))
-        except Exception as exc:  # noqa: BLE001
-            problems.append(f"ecdsa_cross.json: a signature does not verify ({type(exc).__name__})")
+    if not any(e.get("valid") is False for e in cross.get("python_signed", [])):
+        problems.append("ecdsa_cross.json: no negative (valid: false) entry")
+    for listname in ("python_signed", "go_signed"):
+        for entry in cross.get(listname, []):
+            expect_valid = entry.get("valid", True)
+            if listname == "go_signed" and not expect_valid:
+                problems.append("ecdsa_cross.json: go_signed entries must verify")
+            if "challenge" in entry:           # inputs recorded: payload must be the real one
+                real = node_auth.signing_payload(
+                    entry["challenge"], entry["scope"], entry["node_id"]).hex()
+                if real != entry["payload_hex"]:
+                    problems.append(
+                        "ecdsa_cross.json: payload_hex is not the signing payload of its inputs")
+            pub = serialization.load_pem_public_key(entry["public_key_pem"].encode())
+            try:
+                assert isinstance(pub, ec.EllipticCurvePublicKey)
+                pub.verify(base64.b64decode(entry["signature_b64"]),
+                           bytes.fromhex(entry["payload_hex"]), ec.ECDSA(hashes.SHA256()))
+                verified = True
+            except Exception:  # noqa: BLE001
+                verified = False
+            if verified != expect_valid:
+                problems.append(
+                    f"ecdsa_cross.json: a {listname} signature verdict is "
+                    f"{'valid' if verified else 'invalid'}, entry says {expect_valid}")
     return problems
 
 
@@ -681,6 +762,8 @@ def write_all(out: Path = OUT, *, regen_certs: bool = False, regen_signed: bool 
             go_signed = []                 # their signatures were over a different key set
         _write(out, "ecdsa_cross.json",
                _dumps({"python_signed": build_ecdsa_python_signed(), "go_signed": go_signed}))
+    add_node_cert_negatives(certs)
+    add_ecdsa_negative(cross)
     problems = verify_committed_once(out)
     if problems:
         raise SystemExit("committed-once artifacts do not verify:\n  " + "\n  ".join(problems))
@@ -719,7 +802,7 @@ edit of `v1/`.**
 | `session_token.json` | `issue` (inputs -> token) and `verify` (token, time -> `ok`/`expired`/`forged`/`malformed`) | `issue_session`, `verify_session` |
 | `receipt.json` | `issue` (inputs -> receipt) and `check` (-> `ok`/`refused`) | `claim_receipt`, `check_claim_receipt` |
 | `canonical_json.json` | `{input, canonical_hex}` or `{input_repr, error: "float"}` | `attest_wire.canonical` |
-| `ecdsa_cross.json` | P-256/SHA-256 DER signatures, base64. `python_signed` is written by Python; the Go agent appends `go_signed`. Both lists must verify | `node_auth.sign_claim` |
+| `ecdsa_cross.json` | P-256/SHA-256 DER signatures, base64. `python_signed` is written by Python; the Go agent appends `go_signed`. Every entry must verify unless it has `"valid": false` (absent means true; python_signed only), which is a tampered signature that must be rejected | `node_auth.sign_claim` |
 | `node_certs/` | TEST CA, v1 (WireGuard key) and v2 (no key) node certs, and negatives; `cases.json` gives each verdict at the frozen `now` | `pki.node_identity`, `node_auth.admit_identity` |
 | `sandbox/seatbelt/*.json` | `request` -> exact SBPL `profile` + `-D` `params` | `seatbelt.build_profile` |
 | `sandbox/nsjail/*.json` | `request` -> exact `argv`, with `host_pins` for the host probes that were fixed | `NsjailSandbox._build_argv` |
@@ -733,6 +816,8 @@ Notes for consumers:
 * Times are explicit (`verify_at`, `now`) -- nothing here reads a clock.
 * Certificate verdicts are evaluated at `node_certs/cases.json` `now`. Ten-year validity
   except the deliberately `expired` case.
+* `canonical_json.json` inputs must be decoded with exact integers (Go: `json.Decoder.UseNumber`), or integers beyond 2^53 lose precision.
+* `node_plus_client_auth_eku` (node EKU plus clientAuth) is refused: a node cert must never double as a transport cert.
 * `rsa_key` verifies as an identity but its `admit` verdict is `refused` (EC keys only).
 
 Regenerate / check:
@@ -740,7 +825,7 @@ Regenerate / check:
 ```text
 python scripts/gen_conformance.py            # rewrite generated files + SHA256SUMS
 python scripts/gen_conformance.py --check    # exit 1 on drift (CI)
-python scripts/gen_conformance.py --regen-certs   # new test CA + certs (invalidates go_signed claims)
+python scripts/gen_conformance.py --regen-certs   # new test CA + certs (a Go agent's recorded cert verdicts go stale; go_signed is kept)
 python scripts/gen_conformance.py --regen-signed  # new python_signed (drops go_signed)
 ```
 

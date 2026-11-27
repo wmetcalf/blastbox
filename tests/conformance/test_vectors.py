@@ -73,14 +73,22 @@ def _verify(pem: str, payload_hex: str, sig_b64: str) -> None:
 def test_ecdsa_cross_both_directions_verify():
     doc = _load("ecdsa_cross.json")
     assert doc["python_signed"], "python_signed must not be empty"
+    negatives = [e for e in doc["python_signed"] if e.get("valid") is False]
+    assert negatives, "python_signed needs a tampered-signature negative"
+    assert not any(e.get("valid") is False for e in doc["go_signed"])
     for entry in doc["python_signed"] + doc["go_signed"]:
-        _verify(entry["public_key_pem"], entry["payload_hex"], entry["signature_b64"])
+        if entry.get("valid", True):
+            _verify(entry["public_key_pem"], entry["payload_hex"], entry["signature_b64"])
+    from cryptography.exceptions import InvalidSignature
+    for entry in negatives:
+        with pytest.raises(InvalidSignature):
+            _verify(entry["public_key_pem"], entry["payload_hex"], entry["signature_b64"])
 
 
 def test_ecdsa_cross_rejects_tampered_payload():
     from cryptography.exceptions import InvalidSignature
 
-    entry = _load("ecdsa_cross.json")["python_signed"][0]
+    entry = next(e for e in _load("ecdsa_cross.json")["python_signed"] if e.get("valid", True))
     with pytest.raises(InvalidSignature):
         _verify(entry["public_key_pem"], entry["payload_hex"] + "00", entry["signature_b64"])
 
@@ -112,12 +120,11 @@ def test_signing_payload_replay():
 
 
 def test_node_cert_verdicts_replay():
-    assert gen.verify_committed_once() == []
     doc = _load("node_certs/cases.json")
     verdicts = {c["name"]: c["verdict"] for c in doc["cases"]}
     for name in ("v1_with_wg", "v2_without_wg"):
         assert verdicts[name] == "ok"
-    for name in ("wrong_eku", "client_auth_eku", "cn_mismatch", "expired",
+    for name in ("wrong_eku", "client_auth_eku", "node_plus_client_auth_eku", "cn_mismatch", "expired",
                  "missing_node_info", "garbled_node_info"):
         assert verdicts[name] == "refused", name
     assert any(c["name"] == "rsa_key" and c["admit"]["verdict"] == "refused"

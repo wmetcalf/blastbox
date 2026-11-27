@@ -132,6 +132,21 @@
       "node_id": "node-v1",
       "verdict": "ok",
       "why": "valid cert, claim signed by someone else's key"
+    },
+    {
+      "admit": {
+        "challenge": "1811808060.0:22718422e3688308c1ff4a1273cf916b061848be0edfaa6bac71cc31a149c320",
+        "scope": "claim-next",
+        "signature_b64": "MEUCIQD7/A89UB9EGCvxSyOgyFM42ZjZK+khMeKZesVg7MqNHgIgYK2e6u0Nxg2/vDB3QYVuLWnFDQrnMpo8KzUVNEZeAJM=",
+        "verdict": "refused",
+        "verify_at": 1811808005.0
+      },
+      "cert": "node_plus_client_auth_eku.crt",
+      "key": "node_plus_client_auth_eku.key",
+      "name": "node_plus_client_auth_eku",
+      "node_id": "node-dual",
+      "verdict": "refused",
+      "why": "node EKU plus clientAuth: a node cert must never double as a transport cert"
     }
   ],
   "now": "2027-06-01T00:00:00+00:00",
