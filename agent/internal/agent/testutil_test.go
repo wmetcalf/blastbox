@@ -113,6 +113,10 @@ type ingress struct {
 	updCount    map[string]int
 	dispStatus  map[string]string // job id -> disposition status (absent: no job)
 	dispCount   map[string]int
+	holdIssue   bool                         // renew queues but /cert keeps serving nothing
+	renewHook   func(n int, in *ingress) int // optional: status override for the n-th renew (called unlocked)
+	renews      int
+	calls       []string // renew/cert request order
 }
 
 func newIngress(t *testing.T, ca *pki) *ingress {
@@ -175,6 +179,17 @@ func (in *ingress) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(code)
 		io.WriteString(w, b)
 	case p == "/v1/nodes/renew":
+		in.mu.Lock()
+		in.calls = append(in.calls, "renew")
+		in.renews++
+		n, hook := in.renews, in.renewHook
+		in.mu.Unlock()
+		if hook != nil {
+			if code := hook(n, in); code != 0 {
+				w.WriteHeader(code)
+				return
+			}
+		}
 		var m struct {
 			CSR       string  `json:"csr_pem"`
 			Cert      string  `json:"cert_pem"`
@@ -215,12 +230,15 @@ func (in *ingress) serve(w http.ResponseWriter, r *http.Request) {
 		in.mu.Lock()
 		in.renewBodies = append(in.renewBodies, map[string]any{"cert_pem": m.Cert, "csr_pem": m.CSR, "issued_at": m.IssuedAt})
 		in.csrs = append(in.csrs, []byte(m.CSR))
-		in.issued = in.ca.issueNode(in.t, csr.Subject.CommonName, csr.PublicKey.(*ecdsa.PublicKey),
-			time.Now().Add(-time.Minute), time.Now().Add(7*24*time.Hour))
+		if !in.holdIssue {
+			in.issued = in.ca.issueNode(in.t, csr.Subject.CommonName, csr.PublicKey.(*ecdsa.PublicKey),
+				time.Now().Add(-time.Minute), time.Now().Add(7*24*time.Hour))
+		}
 		in.mu.Unlock()
 		w.WriteHeader(202)
 	case p == "/v1/nodes/cert":
 		in.mu.Lock()
+		in.calls = append(in.calls, "cert")
 		c := in.issued
 		in.mu.Unlock()
 		if c == nil {

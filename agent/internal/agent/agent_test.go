@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -1079,5 +1081,143 @@ func TestPrereleaseIsBelowItsRelease(t *testing.T) {
 		if got := semverLess(c.a, c.b); got != c.less {
 			t.Errorf("semverLess(%q, %q) = %v, want %v", c.a, c.b, got, c.less)
 		}
+	}
+}
+
+func renewer(t *testing.T, e *env) *Renewer {
+	t.Helper()
+	cl, err := wire.New(e.cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Session(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return &Renewer{Cfg: e.cfg, Client: cl}
+}
+
+func (in *ingress) callLog() []string {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	return append([]string(nil), in.calls...)
+}
+
+// A retry resends the SAME CSR (persisted as key.next.csr, 0600), also from a fresh process,
+// and polls /cert before it re-POSTs.
+func TestRenewRetryReusesTheSameCSR(t *testing.T) {
+	e := newEnv(t, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	e.in.holdIssue = true
+	ctx := context.Background()
+	if st, err := renewer(t, e).Step(ctx, true); err != nil || st != RenewSubmitted {
+		t.Fatalf("%v %v", st, err)
+	}
+	csrPath := e.cfg.KeyFile + ".next.csr"
+	fi, err := os.Stat(csrPath)
+	if err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("persisted CSR: %v %v", err, fi)
+	}
+	saved, _ := os.ReadFile(csrPath)
+	// A new process (no in-memory state) retries.
+	if st, err := renewer(t, e).Step(ctx, true); err != nil || st != RenewSubmitted {
+		t.Fatalf("%v %v", st, err)
+	}
+	e.in.mu.Lock()
+	csrs := e.in.csrs
+	e.in.mu.Unlock()
+	if len(csrs) != 2 || !bytes.Equal(csrs[0], csrs[1]) || !bytes.Equal(csrs[0], saved) {
+		t.Fatalf("CSR changed across a retry (%d posts)", len(csrs))
+	}
+	if got := strings.Join(e.in.callLog(), ","); got != "renew,cert,renew" {
+		t.Fatalf("call order %s: /cert must be polled before the re-POST", got)
+	}
+}
+
+// The old key (and cert) stay in place, with key.next, until /cert serves a cert for key.next.
+func TestRenewKeepsOldKeyUntilAdoption(t *testing.T) {
+	e := newEnv(t, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	e.in.holdIssue = true
+	oldKey, _ := os.ReadFile(e.cfg.KeyFile)
+	ctx := context.Background()
+	r := renewer(t, e)
+	if _, err := r.Step(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	e.in.mu.Lock()
+	e.in.issued = e.cert // /cert still serves the OLD certificate
+	e.in.mu.Unlock()
+	if st, err := r.Step(ctx, false); err != nil || st == RenewInstalled {
+		t.Fatalf("%v %v: adopted a cert that is not for key.next", st, err)
+	}
+	if k, _ := os.ReadFile(e.cfg.KeyFile); !bytes.Equal(k, oldKey) {
+		t.Fatal("old key replaced before adoption")
+	}
+	for _, p := range []string{e.cfg.KeyFile + ".next", e.cfg.KeyFile + ".next.csr"} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("%s gone before adoption: %v", p, err)
+		}
+	}
+}
+
+// A 403 from /renew after a renewal was queued means the timer published the new cert, so the
+// old key is no longer current: poll /cert and adopt it.
+func TestRenew403AfterQueueAdoptsTheCert(t *testing.T) {
+	e := newEnv(t, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	e.in.holdIssue = true
+	ctx := context.Background()
+	r := renewer(t, e)
+	if st, err := r.Step(ctx, true); err != nil || st != RenewSubmitted {
+		t.Fatalf("%v %v", st, err)
+	}
+	e.in.renewHook = func(n int, in *ingress) int {
+		in.mu.Lock()
+		defer in.mu.Unlock()
+		blk, _ := pem.Decode(in.csrs[0])
+		csr, _ := x509.ParseCertificateRequest(blk.Bytes)
+		in.issued = in.ca.issueNode(in.t, "node-a", csr.PublicKey.(*ecdsa.PublicKey),
+			time.Now().Add(-time.Minute), time.Now().Add(7*24*time.Hour))
+		return 403 // the old key is no longer current
+	}
+	st, err := r.Step(ctx, true)
+	if err != nil || st != RenewInstalled {
+		t.Fatalf("%v %v", st, err)
+	}
+	raw, _ := os.ReadFile(e.cfg.CertFile)
+	pub, _, _ := certPub(raw)
+	if !keyMatches(e.cfg.KeyFile, pub) {
+		t.Fatal("pair not swapped")
+	}
+	for _, p := range []string{e.cfg.KeyFile + ".next", e.cfg.KeyFile + ".next.csr"} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("%s left behind", p)
+		}
+	}
+	// A 403 that has no cert behind it is still not fatal once queued: stay pending.
+	e2 := newEnv(t, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	e2.in.holdIssue = true
+	r2 := renewer(t, e2)
+	if _, err := r2.Step(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	e2.in.renewHook = func(int, *ingress) int { return 403 }
+	if st, err := r2.Step(ctx, true); err != nil || st != RenewPending {
+		t.Fatalf("%v %v", st, err)
+	}
+}
+
+// issued_at is integer unix seconds on the skew-corrected clock.
+func TestRenewIssuedAtUsesServerClock(t *testing.T) {
+	e := newEnv(t, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	e.in.mu.Lock()
+	e.in.dateOffset = 200 * time.Second
+	e.in.mu.Unlock()
+	if _, err := renewer(t, e).Step(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	e.in.mu.Lock()
+	at := e.in.renewBodies[0]["issued_at"].(float64)
+	e.in.mu.Unlock()
+	want := time.Now().Add(200 * time.Second).Unix()
+	if at != float64(int64(at)) || int64(at) < want-3 || int64(at) > want+3 {
+		t.Fatalf("issued_at %v, want ~%d", at, want)
 	}
 }

@@ -79,6 +79,7 @@ func RecoverPair(cfg *config.Config, now time.Time) (bool, error) {
 		if err := os.Rename(nextKey, cfg.KeyFile); err != nil {
 			return false, err
 		}
+		os.Remove(nextKey + ".csr")
 	case keyMatches(cfg.KeyFile, pub):
 	default:
 		return false, nil
@@ -86,6 +87,7 @@ func RecoverPair(cfg *config.Config, now time.Time) (bool, error) {
 	if err := os.Rename(nextCert, cfg.CertFile); err != nil {
 		return false, err
 	}
+	os.Remove(nextKey + ".csr")
 	syncDir(filepath.Dir(cfg.CertFile))
 	return true, nil
 }
@@ -135,8 +137,9 @@ func (r *Renewer) Due() (bool, time.Time, error) {
 }
 
 // Step does one renewal action. A pending key.next means a CSR is outstanding (or was, in an
-// earlier run): FetchCert is tried first, and the CSR is re-sent only if the certificate is
-// still due and none was sent in the last hour (or force).
+// earlier run): FetchCert is tried first, and the same persisted CSR (key.next.csr) is re-sent
+// only if the certificate is still due and none was sent in the last hour (or force). The old
+// key and cert stay current until /cert serves a cert for key.next.
 func (r *Renewer) Step(ctx context.Context, force bool) (RenewState, error) {
 	due, _, err := r.Due()
 	if err != nil {
@@ -152,6 +155,7 @@ func (r *Renewer) Step(ctx context.Context, force bool) (RenewState, error) {
 			if rerr := os.Remove(nextKey); rerr != nil {
 				return RenewPending, fmt.Errorf("unreadable %s (%v) and cannot be removed: %w", nextKey, err, rerr)
 			}
+			os.Remove(nextKey + ".csr")
 			pendingKey, r.submitted = false, time.Time{}
 		}
 	}
@@ -177,18 +181,88 @@ func (r *Renewer) Step(ctx context.Context, force bool) (RenewState, error) {
 	if err != nil {
 		return RenewNotDue, err
 	}
-	csr, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
-		Subject:            pkix.Name{CommonName: r.Client.NodeID()},
-		SignatureAlgorithm: x509.ECDSAWithSHA256,
-	}, key)
+	csrPath := nextKey + ".csr"
+	_, cerr := os.Lstat(csrPath)
+	queued := !r.submitted.IsZero() || cerr == nil // an earlier attempt (maybe an earlier run) POSTed it
+	csrPEM, err := ensureNextCSR(csrPath, key, r.Client.NodeID())
 	if err != nil {
 		return RenewNotDue, err
 	}
-	if err := r.Client.Renew(ctx, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csr})); err != nil {
+	if err := r.Client.Renew(ctx, csrPEM); err != nil {
+		if queued && errors.Is(err, wire.ErrRefused) {
+			// A 403 after a renewal was queued: the CA timer may have published the new cert, so
+			// the current key (the old one) is no longer current. Adopt the cert if it is ours.
+			ok, ierr := r.tryInstall(ctx)
+			if ierr != nil {
+				return RenewPending, ierr
+			}
+			if ok {
+				return RenewInstalled, nil
+			}
+			r.submitted = r.now()
+			return RenewPending, nil
+		}
 		return RenewNotDue, err
 	}
 	r.submitted = r.now()
 	return RenewSubmitted, nil
+}
+
+// ensureNextCSR returns the CSR for key persisted at path (0600, atomically, before it is ever
+// sent), so a retry resends the SAME CSR. A leftover that is unreadable, or is not for key and
+// this node, is replaced.
+func ensureNextCSR(path string, key *ecdsa.PrivateKey, nodeID string) ([]byte, error) {
+	if raw, err := os.ReadFile(path); err == nil {
+		if blk, _ := pem.Decode(raw); blk != nil && blk.Type == "CERTIFICATE REQUEST" {
+			if req, err := x509.ParseCertificateRequest(blk.Bytes); err == nil && req.CheckSignature() == nil &&
+				req.Subject.CommonName == nodeID {
+				if pub, ok := req.PublicKey.(*ecdsa.PublicKey); ok && pub.Equal(&key.PublicKey) {
+					return raw, nil
+				}
+			}
+		}
+	}
+	der, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
+		Subject:            pkix.Name{CommonName: nodeID},
+		SignatureAlgorithm: x509.ECDSAWithSHA256,
+	}, key)
+	if err != nil {
+		return nil, err
+	}
+	blob := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der})
+	if err := writeFileAtomic(path, blob, 0o600); err != nil {
+		return nil, err
+	}
+	return blob, nil
+}
+
+// writeFileAtomic replaces path with blob durably (temp file, fsync, rename, dir fsync).
+func writeFileAtomic(path string, blob []byte, mode os.FileMode) error {
+	tmp := fmt.Sprintf("%s.tmp-%d", path, time.Now().UnixNano())
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(blob); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	syncDir(filepath.Dir(path))
+	return nil
 }
 
 // ensureNextKey returns the P-256 key at path, creating it (0600, exclusively) if absent.
@@ -298,6 +372,7 @@ func (r *Renewer) tryInstall(ctx context.Context) (bool, error) {
 	if err := os.Rename(nextCert, r.Cfg.CertFile); err != nil {
 		return false, err // RecoverPair finishes this at the next start
 	}
+	os.Remove(nextKey + ".csr")
 	syncDir(filepath.Dir(r.Cfg.CertFile))
 	r.submitted = time.Time{}
 	return true, nil
