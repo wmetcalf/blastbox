@@ -12,6 +12,7 @@ set -eu
 # Installed dirs and files must be readable by a non-root service user even when the
 # caller runs with a restrictive umask (077 is common for root).
 umask 022
+unset CDPATH
 
 REPO="wmetcalf/blastbox"
 OIDC_ISSUER="https://token.actions.githubusercontent.com"
@@ -49,6 +50,12 @@ if [ -z "$prefix" ]; then
   fi
 fi
 
+# One spelling of the prefix: no trailing slashes (readlink output is compared to it).
+case "$prefix" in
+  /) ;;
+  *) while [ "${prefix%/}" != "$prefix" ]; do prefix=${prefix%/}; done ;;
+esac
+
 # Temp names in <prefix>; the EXIT trap removes them (and the stage dir) on any exit.
 tmp=$prefix/.current.tmp.$$
 ptmp=$prefix/.previous.tmp.$$
@@ -77,15 +84,18 @@ flip_current() {
   if [ -e "$prefix/current" ] && [ ! -L "$prefix/current" ]; then
     die "$prefix/current exists and is not a symlink; move it aside"
   fi
-  rm -f "$tmp"
-  ln -s "$1" "$tmp"
+  # Callers run this as `if ! flip_current`, where set -e is off, so every step
+  # returns its failure explicitly.
+  rm -f "$tmp" || return 1
+  ln -s "$1" "$tmp" || return 1
   case "$os_name" in
-    Darwin) mv -fh "$tmp" "$prefix/current" ;;
+    Darwin) mv -fh "$tmp" "$prefix/current" || return 1 ;;
     *)
       # GNU mv -T; busybox lacks it, so fall back to ln -sfn (replaces the
       # link in place without dereferencing; not a rename, but never nests).
       if mv -fT "$tmp" "$prefix/current" 2>/dev/null; then :; else
-        ln -sfn "$1" "$prefix/current"; rm -f "$tmp"
+        ln -sfn "$1" "$prefix/current" || return 1
+        rm -f "$tmp"
       fi ;;
   esac
 }
@@ -103,26 +113,47 @@ valid_version() {
 
 # Record what current points at now ($1) as <prefix>/.previous, unless it is the version
 # $2 we are about to point it at. This runs BEFORE the flip, so a failed write never
-# leaves current moved with a stale .previous; it writes a temp file and renames it.
+# leaves current moved with a stale .previous; it writes a temp file and renames it. If
+# the flip then fails, restore_previous puts the old .previous back.
 # An absolute link into <prefix> is reduced to its version. Any other target (a link
 # outside <prefix>, a non-version name, a version that is not installed) cannot be
 # rolled back to, so .previous is removed rather than left naming an older version that
 # was not the one active.
+saved_prev=""   # "" = nothing to restore, "none" = there was no .previous, "v:X.Y.Z"
 record_previous() {
   rp=$1
-  case "$rp" in "$prefix"/*) rp=${rp#"$prefix"/}; rp=${rp%/} ;; esac
+  pl=$(cd "$prefix" 2>/dev/null && pwd -L) || pl=$prefix
+  pp=$(cd "$prefix" 2>/dev/null && pwd -P) || pp=$prefix
+  for b in "$prefix" "$pl" "$pp"; do
+    case "$rp" in "$b"/*) rp=${rp#"$b"/}; break ;; esac
+  done
+  rp=${rp%/}
   [ "$rp" != "$2" ] || return 0
   if [ -e "$prefix/.previous" ] || [ -L "$prefix/.previous" ]; then
     [ -f "$prefix/.previous" ] && [ ! -L "$prefix/.previous" ] \
       || die "$prefix/.previous is not a regular file"
+    saved_prev="v:$(cat "$prefix/.previous")"
+  else
+    saved_prev=none
   fi
   if ! valid_version "$rp" || [ ! -x "$prefix/$rp/blastbox-agent" ]; then
     rm -f "$prefix/.previous"
     return 0
   fi
+  write_previous "$rp"
+}
+
+write_previous() {
   rm -f "$ptmp"
-  printf '%s\n' "$rp" > "$ptmp"
+  printf '%s\n' "$1" > "$ptmp"
   mv -f "$ptmp" "$prefix/.previous"
+}
+
+restore_previous() {
+  case "$saved_prev" in
+    none) rm -f "$prefix/.previous" ;;
+    v:*) write_previous "${saved_prev#v:}" ;;
+  esac
 }
 
 if [ "$rollback" = 1 ]; then
@@ -132,7 +163,7 @@ if [ "$rollback" = 1 ]; then
   [ -x "$prefix/$prev/blastbox-agent" ] || die "previous version $prev is not installed"
   cur=$(current_target || true)
   if [ -n "$cur" ]; then record_previous "$cur" "$prev"; fi
-  flip_current "$prev"
+  if ! flip_current "$prev"; then restore_previous; die "could not repoint $prefix/current"; fi
   say "rolled back to $prev (was ${cur:-none})"
   exit 0
 fi
@@ -209,5 +240,5 @@ mv -f "$dest/blastbox-agent.new" "$dest/blastbox-agent"
 # 5. flip current atomically; remember what it pointed at
 cur=$(current_target || true)
 if [ -n "$cur" ]; then record_previous "$cur" "$version"; fi
-flip_current "$version"
+if ! flip_current "$version"; then restore_previous; die "could not repoint $prefix/current"; fi
 say "installed $version to $dest (current -> $version)"

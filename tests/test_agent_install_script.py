@@ -216,7 +216,7 @@ def test_current_real_directory_refused(tmp_path):
     assert not (pfx / "1.0.0").exists()  # refused before anything is staged or copied
 
 
-def test_non_version_current_target_not_recorded(tmp_path):
+def test_absolute_link_into_prefix_recorded_as_version(tmp_path):
     pfx = tmp_path / "pfx"
     rel, sha = make_release(tmp_path, b"bin 1")
     assert install(rel, sha, pfx, "1.0.0", "--no-cosign").returncode == 0
@@ -225,8 +225,85 @@ def test_non_version_current_target_not_recorded(tmp_path):
     (pfx / "current").symlink_to(pfx / "1.0.0")  # absolute, hand-made
     rel, sha = make_release(tmp_path, b"bin 2")
     assert install(rel, sha, pfx, "2.0.0", "--no-cosign").returncode == 0
-    prev = pfx / ".previous"
-    assert not prev.exists() or prev.read_text().strip() == "1.0.0"
+    assert (pfx / ".previous").read_text().strip() == "1.0.0"
+
+
+@pytest.mark.parametrize("target", ["latest", "OUTSIDE/1.0.0"])
+def test_unusable_current_target_clears_previous(tmp_path, target):
+    pfx = _two_versions(tmp_path)  # .previous = 1.0.0
+    outside = tmp_path / "elsewhere"
+    (outside / "1.0.0").mkdir(parents=True)
+    (pfx / "current").unlink()
+    (pfx / "current").symlink_to(target.replace("OUTSIDE", str(outside)))
+    rel, sha = make_release(tmp_path, b"bin 3.0.0")
+    assert install(rel, sha, pfx, "3.0.0", "--no-cosign").returncode == 0
+    assert not (pfx / ".previous").exists()
+
+
+def test_trailing_slash_prefix_still_normalises_absolute_link(tmp_path):
+    pfx = _two_versions(tmp_path)
+    (pfx / "current").unlink()
+    (pfx / "current").symlink_to(pfx / "2.0.0")
+    rel, sha = make_release(tmp_path, b"bin 3.0.0")
+    p = run(["--version", "3.0.0", "--sha256", sha, "--from", str(rel),
+             "--prefix", str(pfx) + "//", "--no-cosign"])
+    assert p.returncode == 0, p.stderr
+    assert (pfx / ".previous").read_text().strip() == "2.0.0"
+
+
+def shim_path(tmp_path: Path, tool: str, fail_if: str) -> str:
+    """PATH with a wrapper for `tool` that fails when its last argument matches `fail_if`."""
+    if os.path.realpath(shutil.which("sh") or "/bin/sh").endswith("busybox"):
+        pytest.skip("busybox sh runs its own applets, bypassing PATH shims")
+    d = tmp_path / "shim"
+    d.mkdir(exist_ok=True)
+    real = shutil.which(tool)
+    w = d / tool
+    w.write_text(
+        "#!/bin/sh\n"
+        'for last; do :; done\n'
+        f'case "$last" in {fail_if}) echo "shim: {tool} refused" >&2; exit 1 ;; esac\n'
+        f'exec {real} "$@"\n'
+    )
+    w.chmod(0o755)
+    return f"{d}:{os.environ['PATH']}"
+
+
+def test_failed_previous_rename_leaves_no_temp_and_no_flip(tmp_path):
+    pfx = _two_versions(tmp_path)
+    rel, sha = make_release(tmp_path, b"bin 3.0.0")
+    p = run(["--version", "3.0.0", "--sha256", sha, "--from", str(rel), "--prefix", str(pfx),
+             "--no-cosign"], path=shim_path(tmp_path, "mv", "*/.previous"))
+    assert p.returncode != 0 and "shim: mv refused" in p.stderr
+    assert list(pfx.glob(".previous.tmp.*")) == []
+    assert os.readlink(pfx / "current") == "2.0.0"
+    assert (pfx / ".previous").read_text().strip() == "1.0.0"
+
+
+def test_failed_flip_restores_previous_and_leaves_no_temp(tmp_path):
+    pfx = _two_versions(tmp_path)  # current -> 2.0.0, .previous = 1.0.0
+    rel, sha = make_release(tmp_path, b"bin 3.0.0")
+    p = run(["--version", "3.0.0", "--sha256", sha, "--from", str(rel), "--prefix", str(pfx),
+             "--no-cosign"], path=shim_path(tmp_path, "ln", "*/.current.tmp.*"))
+    assert p.returncode != 0 and "shim: ln refused" in p.stderr
+    assert os.readlink(pfx / "current") == "2.0.0"
+    assert (pfx / ".previous").read_text().strip() == "1.0.0"
+    assert list(pfx.glob(".current.tmp.*")) == [] and list(pfx.glob(".previous.tmp.*")) == []
+
+
+def test_failed_flip_temp_link_removed(tmp_path):
+    # the temp link exists but the rename onto current fails: the EXIT trap must remove it
+    pfx = _two_versions(tmp_path)
+    rel, sha = make_release(tmp_path, b"bin 3.0.0")
+    path = shim_path(tmp_path, "mv", "*/current")
+    if platform.system() != "Darwin":
+        path = shim_path(tmp_path, "ln", "*/current")  # the busybox fallback must fail too
+    p = run(["--version", "3.0.0", "--sha256", sha, "--from", str(rel), "--prefix", str(pfx),
+             "--no-cosign"], path=path)
+    assert p.returncode != 0
+    assert os.readlink(pfx / "current") == "2.0.0"
+    assert list(pfx.glob(".current.tmp.*")) == []
+    assert (pfx / ".previous").read_text().strip() == "1.0.0"
 
 
 def test_uninstalled_current_target_does_not_clobber_previous(tmp_path):
@@ -259,15 +336,6 @@ def test_reinstall_same_version_via_absolute_link_keeps_previous(tmp_path):
     rel, sha = make_release(tmp_path, b"bin 2.0.0")
     assert install(rel, sha, pfx, "2.0.0", "--no-cosign").returncode == 0
     assert (pfx / ".previous").read_text().strip() == "1.0.0"
-
-
-def test_failed_previous_write_leaves_no_temp(tmp_path):
-    pfx = _two_versions(tmp_path)
-    (pfx / ".previous").unlink()
-    (pfx / ".previous").mkdir()
-    rel, sha = make_release(tmp_path, b"bin 3.0.0")
-    assert install(rel, sha, pfx, "3.0.0", "--no-cosign").returncode != 0
-    assert not list(pfx.glob(".previous.tmp.*")) and not list(pfx.glob(".current.tmp.*"))
 
 
 def test_dirs_readable_under_restrictive_umask(tmp_path):
