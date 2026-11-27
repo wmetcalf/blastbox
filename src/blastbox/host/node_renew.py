@@ -99,12 +99,17 @@ def queue_csr(pki_dir: Path, node_id: str, csr_pem: bytes) -> None:
         Path(tmp).unlink(missing_ok=True)
 
 
-#: Upper bound on a cert file the CA host reads from a node dir (they are ~1 KiB).
-MAX_CERT_BYTES = 64 * 1024
+#: Upper bound on a cert file the CA host reads from a node dir. Real ones are ~1 KiB,
+#: but grants make them grow, so this is generous; revoke REPORTS anything larger.
+MAX_CERT_BYTES = 1024 * 1024
 
 
 class _Unreadable(ValueError):
     """Not a file this code will read: a FIFO, device, link, or oversized."""
+
+
+class _TooLarge(_Unreadable):
+    """A regular file over the read cap: possibly a real cert, so never silently ignored."""
 
 
 
@@ -126,7 +131,7 @@ def _read_capped(path: Path, limit: int, *, follow: bool = False) -> bytes:
         if not stat.S_ISREG(st.st_mode):
             raise _Unreadable(f"{path.name} is not a regular file")
         if st.st_size > limit:
-            raise _Unreadable(f"{path.name} is over {limit} bytes")
+            raise _TooLarge(f"{path.name} is over {limit} bytes")
         chunks, total = [], 0
         while True:
             chunk = os.read(fd, limit + 1 - total)
@@ -135,7 +140,7 @@ def _read_capped(path: Path, limit: int, *, follow: bool = False) -> bytes:
             chunks.append(chunk)
             total += len(chunk)
             if total > limit:
-                raise _Unreadable(f"{path.name} is over {limit} bytes")
+                raise _TooLarge(f"{path.name} is over {limit} bytes")
         return b"".join(chunks)
     finally:
         os.close(fd)
@@ -442,12 +447,14 @@ class PartialRevoke(OSError):
 def revoke(pki_dir: Path, node_id: str, *, node_dirs: list[Path] | None = None) -> list[Path]:
     """Revoke ``node_id``: delete its certs and queued CSRs in every node dir.
 
-    Under each dir's renewal lock where it can be had, so a renewal in flight cannot write
-    a cert back after it. But revocation must not be blockable: a dir whose lock is held
-    (a hostile ingress can hold its own) is revoked anyway -- no renewal can run while it
-    is held, since a run needs every lock -- and a dir that cannot be revoked at all is
-    skipped; either way the others are still revoked and :class:`PartialRevoke` says what
-    happened. Certs are matched by verifying them (expired ones too) against ``pki_dir``'s
+    Revocation must not be blockable, and must not lose to a renewal in flight. So each
+    dir is revoked at once -- under its lock if that comes within
+    :data:`REVOKE_LOCK_WAIT_S`, else without it -- and every dir revoked without its lock
+    is then revoked AGAIN once its lock is had (waiting up to :data:`LOCK_TIMEOUT_S`): if
+    the holder was a renewal that wrote the cert back, the second pass removes it. A dir
+    whose lock never comes (a hostile ingress can hold its own; it can also rewrite its
+    own dir at will) or that cannot be revoked at all is reported by
+    :class:`PartialRevoke`; the others are revoked regardless. Certs are matched by verifying them (expired ones too) against ``pki_dir``'s
     CA, never a node dir's own ``ca.crt``. Returns the cert files removed.
     Raises ValueError for a malformed node id, OSError for an unreadable CA.
     """
@@ -472,6 +479,15 @@ def revoke(pki_dir: Path, node_id: str, *, node_dirs: list[Path] | None = None) 
             gone, errors = _revoke_in(anchor, d, node_id)
             removed += gone
             failed += [(d, why) for why in errors]
+        for d in list(unlocked):                  # second pass, under the lock
+            try:
+                stack.enter_context(_locked([d]))
+            except OSError:
+                continue
+            unlocked.remove(d)
+            gone, errors = _revoke_in(anchor, d, node_id)
+            removed += [g for g in gone if g not in removed]
+            failed += [(d, why) for why in errors if (d, why) not in failed]
     if unlocked or failed:
         raise PartialRevoke(removed, unlocked, failed)
     return removed
@@ -494,6 +510,8 @@ def _revoke_in(anchor: TrustAnchor, d: Path, node_id: str) -> tuple[list[Path], 
                 continue
             crt.unlink()
             removed.append(crt)
+        except _TooLarge as exc:                 # may be the node's: say so, never skip
+            errors.append(f"{exc} (not checked)")
         except (ValueError, FileNotFoundError):  # not a cert / a dangling link
             continue
         except OSError as exc:                   # cannot tell: it MAY be the node's

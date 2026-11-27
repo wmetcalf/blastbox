@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import datetime
 import fcntl
 import os
@@ -696,7 +697,10 @@ def test_oversized_and_fifo_files_in_a_node_dir_are_skipped(tmp_path):
     try:
         out = dict(sign_pending(ca, ca_dir, node_dirs=[i1]))
         assert out["n1"] == "renewed" and out["n2"].startswith("refused")
-        assert node_renew.revoke(ca_dir, "n1", node_dirs=[i1])
+        with pytest.raises(node_renew.PartialRevoke) as exc:   # the huge one is reported
+            node_renew.revoke(ca_dir, "n1", node_dirs=[i1])
+        assert any("zz.crt" in why for _d, why in exc.value.failed)
+        assert not (i1 / "node-n1.crt").exists()
     finally:
         signal.alarm(0)
 
@@ -789,19 +793,28 @@ def test_one_unreadable_file_does_not_stop_a_dirs_revocation(tmp_path):
     assert any("aaa.crt" in why for _d, why in exc.value.failed)
 
 
-def test_revoke_does_not_wait_the_renewal_lock_timeout(tmp_path, monkeypatch):
-    import time as _t
+def test_revoke_removes_at_once_and_reports_a_lock_that_never_comes(tmp_path, monkeypatch):
     ca, ca_dir, i1, i2 = _split(tmp_path)
-    monkeypatch.setattr(node_renew, "LOCK_TIMEOUT_S", 60.0)
+    monkeypatch.setattr(node_renew, "REVOKE_LOCK_WAIT_S", 0.1)
+    monkeypatch.setattr(node_renew, "LOCK_TIMEOUT_S", 0.5)
     holder = open(i2 / ".renew.lock", "a+")
     fcntl.flock(holder, fcntl.LOCK_EX)
-    t0 = _t.monotonic()
+    seen = []
+    real = node_renew._locked
+
+    @contextlib.contextmanager
+    def spy(dirs, timeout=None):
+        seen.append(node_renew.current_cert(i2, "n1") is None)  # state at each wait
+        with real(dirs, timeout=timeout):
+            yield
+    monkeypatch.setattr(node_renew, "_locked", spy)
     try:
-        with pytest.raises(node_renew.PartialRevoke):
+        with pytest.raises(node_renew.PartialRevoke) as exc:
             node_renew.revoke(ca_dir, "n1", node_dirs=[i1, i2])
     finally:
         holder.close()
-    assert _t.monotonic() - t0 < 30
+    assert exc.value.unlocked == [i2]
+    assert seen[-1] is True             # already revoked before the long second wait
     assert node_renew.current_cert(i2, "n1") is None
 
 
@@ -818,3 +831,35 @@ def test_an_unreadable_queued_csr_is_reported_deferred(tmp_path, monkeypatch):
     [(nid, outcome)] = sign_pending(ca, d)
     assert outcome.startswith("deferred")
     assert pending(d) == ["n1"]
+
+
+def test_revoke_redoes_a_dir_once_an_in_flight_renewal_lets_go(tmp_path, monkeypatch):
+    """A held lock may be a renewal mid-write: revoke must not let it write the cert back."""
+    import threading
+    import time as _t
+    ca, ca_dir, i1, _i2 = _split(tmp_path)
+    monkeypatch.setattr(node_renew, "REVOKE_LOCK_WAIT_S", 0.2)
+    monkeypatch.setattr(node_renew, "LOCK_TIMEOUT_S", 10.0)
+    cert = (i1 / "node-n1.crt").read_bytes()
+    holder = open(i1 / ".renew.lock", "a+")
+    fcntl.flock(holder, fcntl.LOCK_EX)
+
+    def renewal_finishing():
+        _t.sleep(0.8)                               # revoke has gone ahead unlocked by now
+        (i1 / "node-n1.crt").write_bytes(cert)      # ... and the renewal writes it back
+        holder.close()                              # then releases its lock
+    t = threading.Thread(target=renewal_finishing)
+    t.start()
+    try:
+        node_renew.revoke(ca_dir, "n1", node_dirs=[i1])
+    finally:
+        t.join()
+    assert node_renew.current_cert(i1, "n1") is None
+
+
+def test_revoke_reports_a_cert_too_large_to_check(tmp_path, monkeypatch):
+    ca, ca_dir, i1, _i2 = _split(tmp_path)
+    monkeypatch.setattr(node_renew, "MAX_CERT_BYTES", 100)   # every real cert is "huge"
+    with pytest.raises(node_renew.PartialRevoke) as exc:
+        node_renew.revoke(ca_dir, "n1", node_dirs=[i1])
+    assert any("node-n1.crt" in why for _d, why in exc.value.failed)
