@@ -354,6 +354,20 @@ def test_concurrent_install_refused_while_locked(tmp_path):
     assert not (pfx / ".lock").exists()
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_unwritable_prefix_not_reported_as_held_lock(tmp_path):
+    pfx = tmp_path / "ro"
+    pfx.mkdir()
+    pfx.chmod(0o555)
+    try:
+        rel, sha = make_release(tmp_path)
+        p = install(rel, sha, pfx, "1.0.0", "--no-cosign")
+        assert p.returncode != 0
+        assert "another install.sh" not in p.stderr and "cannot create" in p.stderr
+    finally:
+        pfx.chmod(0o755)
+
+
 def test_dirs_readable_under_restrictive_umask(tmp_path):
     rel, sha = make_release(tmp_path)
     pfx = tmp_path / "pfx"

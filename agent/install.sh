@@ -51,10 +51,7 @@ if [ -z "$prefix" ]; then
 fi
 
 # One spelling of the prefix: no trailing slashes (readlink output is compared to it).
-case "$prefix" in
-  /) ;;
-  *) while [ "${prefix%/}" != "$prefix" ]; do prefix=${prefix%/}; done ;;
-esac
+while [ "$prefix" != / ] && [ "${prefix%/}" != "$prefix" ]; do prefix=${prefix%/}; done
 
 # Temp names in <prefix>; the EXIT trap removes them (and the stage dir) on any exit.
 tmp=$prefix/.current.tmp.$$
@@ -106,8 +103,11 @@ flip_current() {
 # removed by hand.
 acquire_lock() {
   mkdir -p "$prefix"
-  mkdir "$prefix/.lock" 2>/dev/null \
-    || die "another install.sh holds $prefix/.lock (remove it if none is running)"
+  if ! mkdir "$prefix/.lock" 2>/dev/null; then
+    [ -d "$prefix/.lock" ] \
+      && die "another install.sh holds $prefix/.lock (remove it if none is running)"
+    die "cannot create $prefix/.lock (is $prefix writable?)"
+  fi
   locked=1
 }
 
@@ -136,6 +136,7 @@ record_previous() {
   pl=$(cd "$prefix" 2>/dev/null && pwd -L) || pl=$prefix
   pp=$(cd "$prefix" 2>/dev/null && pwd -P) || pp=$prefix
   for b in "$prefix" "$pl" "$pp"; do
+    b=${b%/}   # "/" -> "", so the pattern below is "/*"
     case "$rp" in "$b"/*) rp=${rp#"$b"/}; break ;; esac
   done
   rp=${rp%/}
