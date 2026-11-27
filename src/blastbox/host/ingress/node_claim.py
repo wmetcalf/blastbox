@@ -410,10 +410,10 @@ TERMINAL_WRITES_ENV = "BLASTBOX_NODE_TERMINAL_WRITES"
 TERMINAL_WRITES_FINALIZER_ONLY = "finalizer-only"
 TERMINAL_WRITES_DIRECT = "direct"
 #: Under finalizer-only, the union of the two write shapes a node may send (spec 6.5):
-#: release {status: queued, claim_id: null}; fail {status: failed, error, finished_at,
-#: expires_at}.
+#: release {status: queued, claim_id: null}; fail {status: failed, error?, finished_at}.
+#: The fail write's expires_at is the control plane's (BLASTBOX_JOB_RETENTION_SECONDS).
 _RELEASE_FIELDS = frozenset({"status", "claim_id"})
-_FAIL_FIELDS = frozenset({"status", "error", "finished_at", "expires_at"})
+_FAIL_FIELDS = frozenset({"status", "error", "finished_at"})   # expires_at: server-set
 _FINALIZER_ONLY_FIELDS = _RELEASE_FIELDS | _FAIL_FIELDS
 
 
@@ -651,6 +651,12 @@ def register_node_claim_routes(
         return False
 
     terminal_mode = terminal_writes_mode()
+    try:
+        node_fail_retention_s = max(0, int(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0"))
+    except ValueError:
+        _log.error("BLASTBOX_JOB_RETENTION_SECONDS is not an integer; node fail writes keep "
+                   "their rows (expires_at unset)")
+        node_fail_retention_s = 0
     _open = terminal_writes_open_message(terminal_mode)
     if _open:
         _log.warning("node_claim: %s", _open)
@@ -1539,6 +1545,10 @@ def register_node_claim_routes(
             # Exactly the agent's two write shapes (spec 6.5): release and fail. Nothing else:
             # input_sha256 is what the finalizer gates on and signs, and worker_tier/runtime,
             # started_at and security_warnings would narrate a run onto the row.
+            if "expires_at" in req.fields:
+                # retention is the operator's policy, not the node's: it is set below
+                raise HTTPException(status_code=400,
+                                    detail="expires_at is set by the control plane")
             why = None
             # what the NODE sent (_vetted_fields adds server-derived keys to a release)
             extra = sorted(set(req.fields) - _FINALIZER_ONLY_FIELDS)
@@ -1554,12 +1564,9 @@ def register_node_claim_routes(
                 why = f"release with {', '.join(sorted(set(req.fields) - _RELEASE_FIELDS))}"
             elif fields["status"] == JobStatus.FAILED and set(req.fields) != _FAIL_FIELDS \
                     and set(req.fields) != _FAIL_FIELDS - {"error"}:
-                # finished_at and expires_at are required: without expires_at the FAILED row
-                # (and anything stored for it) is never retention-purged
                 why = f"fail write with {', '.join(sorted(req.fields))}"
-            elif fields["status"] == JobStatus.FAILED and (fields.get("finished_at") is None
-                                                           or fields.get("expires_at") is None):
-                why = "fail write with a null finished_at or expires_at"
+            elif fields["status"] == JobStatus.FAILED and fields.get("finished_at") is None:
+                why = "fail write with a null finished_at"
             elif req.expect_status is not None and req.expect_status != JobStatus.RUNNING.value:
                 why = f"expect_status={req.expect_status}"
             if why is not None:
@@ -1577,6 +1584,10 @@ def register_node_claim_routes(
                 if fields.get("finished_at") is not None and started is not None \
                         and fields["finished_at"] < started:
                     fields["finished_at"] = started
+                # the expiry the dispatcher's _fail_job stamps: now + retention, or None
+                # (keep) when BLASTBOX_JOB_RETENTION_SECONDS is 0/unset
+                fields["expires_at"] = (time.time() + node_fail_retention_s
+                                        if node_fail_retention_s > 0 else None)
             # The RUNNING check above read a snapshot; the finalizer may make the job DONE
             # before this write lands. The CAS is on RUNNING, whatever the caller expected.
             if not job_store.update_if_status(job_id, JobStatus.RUNNING,

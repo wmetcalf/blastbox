@@ -895,10 +895,12 @@ Three things an operator must know:
   `POST /v1/nodes/jobs/{id}` — right only for Python credential-less dispatcher nodes that run
   the trust gate themselves; for an untrusted pull agent it means DONE with no result, no trust
   gate and no receipt. `finalizer-only` accepts exactly the agent's two writes, release
-  `{status: queued, claim_id: null}` and fail `{status: failed, error, finished_at,
-  expires_at}` (`error` optional; `finished_at` and `expires_at` required and non-null, so the FAILED row
-  is retention-purged; the error is scrubbed like a dispatcher's and `finished_at` is never
-  earlier than the run's start), each shape checked on its own and only while the job is
+  `{status: queued, claim_id: null}` and fail `{status: failed, error, finished_at}`
+  (`error` optional, `finished_at` required and non-null and never earlier than the run's
+  start; the error is scrubbed like a dispatcher's). Retention is the operator's: the fail
+  write's `expires_at` is set by the ingress from `BLASTBOX_JOB_RETENTION_SECONDS` (now +
+  retention, or unset when 0, exactly as a dispatcher's own fail), so set it on the ingress
+  too; a node that sends `expires_at` gets a 400. Each shape is checked on its own and only while the job is
   RUNNING (the write's CAS is always on RUNNING); any other
   field (`input_sha256`, `result_summary`, `worker_tier`, …) or status is the usual 403
   refusal, logged at WARNING, and DONE comes only from `blastbox node-finalizer`. An unrecognised value is treated as `finalizer-only`. While

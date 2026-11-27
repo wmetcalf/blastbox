@@ -59,8 +59,8 @@ def test_finalizer_only_allows_fail(tmp_path, pki_dir, monkeypatch):  # noqa: F8
     import time as _t
 
     now = _t.time()
-    r = _post(c, hdr, {"status": "failed", "error": "sandbox would not start", "finished_at": now,
-                       "expires_at": now + 60}, expect="running")
+    r = _post(c, hdr, {"status": "failed", "error": "sandbox would not start", "finished_at": now},
+              expect="running")
     assert r.status_code == 200, r.text
     assert store.get("job-1").status == JobStatus.FAILED
 
@@ -85,7 +85,7 @@ def test_finalizer_only_allows_release(tmp_path, pki_dir, monkeypatch):  # noqa:
 def test_finalizer_only_accepts_only_the_agents_two_write_shapes(tmp_path, pki_dir, monkeypatch,  # noqa: F811
                                                                  fields):
     """Release {status: queued, claim_id: null} and fail {status: failed, error, finished_at,
-    expires_at} (spec 6.5), nothing else: input_sha256 is what the finalizer gates on and
+    expires_at is server-set} (spec 6.5), nothing else: input_sha256 is what the finalizer gates on and
     signs, and the rest describe a run the node does not get to narrate onto the row."""
     monkeypatch.setenv(ENV, "finalizer-only")
     store, c, hdr = _setup(tmp_path, pki_dir)
@@ -100,8 +100,8 @@ def test_finalizer_only_fail_shape_with_all_its_fields(tmp_path, pki_dir, monkey
     monkeypatch.setenv(ENV, "finalizer-only")
     store, c, hdr = _setup(tmp_path, pki_dir)
     now = _t.time()
-    r = _post(c, hdr, {"status": "failed", "error": "killed at deadline", "finished_at": now,
-                       "expires_at": now + 3600}, expect="running")
+    r = _post(c, hdr, {"status": "failed", "error": "killed at deadline", "finished_at": now},
+              expect="running")
     assert r.status_code == 200, r.text
     assert store.get("job-1").status == JobStatus.FAILED
 
@@ -234,12 +234,9 @@ def test_finalizer_only_result_summary_is_the_finalizers(tmp_path, pki_dir, monk
 @pytest.mark.parametrize("fields", [
     {"status": "queued", "claim_id": None, "error": "x"},
     {"status": "queued", "claim_id": None, "finished_at": 1.0},
-    {"status": "queued", "claim_id": None, "expires_at": "<soon>"},
-    {"status": "failed"},                                     # no retention clock: never purged
-    {"status": "failed", "error": "x", "finished_at": 1.0},   # no expires_at
-    {"status": "failed", "finished_at": None, "expires_at": None},       # null clocks
-    {"status": "failed", "finished_at": 1.0, "expires_at": None},
-    {"status": "failed", "finished_at": None, "expires_at": "<soon>"},
+    {"status": "failed"},                                     # no finished_at
+    {"status": "failed", "error": "x"},
+    {"status": "failed", "error": "x", "finished_at": None},  # null clock
 ])
 def test_finalizer_only_each_shape_is_checked_on_its_own(tmp_path, pki_dir, monkeypatch,  # noqa: F811
                                                          fields):
@@ -256,14 +253,66 @@ def test_finalizer_only_each_shape_is_checked_on_its_own(tmp_path, pki_dir, monk
 
 def test_finalizer_only_fail_error_is_sanitised_and_finish_not_before_start(tmp_path, pki_dir,  # noqa: F811
                                                                             monkeypatch):
-    import time as _t
-
     monkeypatch.setenv(ENV, "finalizer-only")
     store, c, hdr = _setup(tmp_path, pki_dir)
     started = store.get("job-1").started_at
     r = _post(c, hdr, {"status": "failed", "error": "boom /var/lib/blastbox/jobs/x postgres://u:pw@h/db",
-                       "finished_at": 1.0, "expires_at": _t.time() + 60}, expect="running")
+                       "finished_at": 1.0}, expect="running")
     assert r.status_code == 200, r.text
     j = store.get("job-1")
     assert "/var/lib" not in j.error and "pw@" not in j.error
     assert j.finished_at is not None and started is not None and j.finished_at >= started
+
+
+@pytest.mark.parametrize("fields", [
+    {"status": "failed", "error": "x", "finished_at": "<now>", "expires_at": "<soon>"},
+    {"status": "failed", "finished_at": "<now>", "expires_at": None},
+    {"status": "queued", "claim_id": None, "expires_at": "<soon>"},
+])
+def test_finalizer_only_a_node_supplied_expiry_is_400(tmp_path, pki_dir, monkeypatch, fields):  # noqa: F811
+    """Retention is the operator's policy, not the node's."""
+    import time as _t
+
+    sub = {"<now>": _t.time(), "<soon>": _t.time() + 600}
+    fields = {k: sub.get(v, v) if isinstance(v, str) else v for k, v in fields.items()}
+    monkeypatch.setenv(ENV, "finalizer-only")
+    store, c, hdr = _setup(tmp_path, pki_dir)
+    before = store.get("job-1")
+    assert _post(c, hdr, fields, expect="running").status_code == 400
+    assert store.get("job-1") == before
+
+
+@pytest.mark.parametrize("retention,expect_expiry", [("60", True), ("0", False), (None, False)])
+def test_finalizer_only_fail_expiry_is_the_operators_retention(tmp_path, pki_dir, monkeypatch,  # noqa: F811
+                                                               retention, expect_expiry):
+    """The same expires_at the dispatcher's _fail_job stamps: now + retention, or None (keep)
+    when BLASTBOX_JOB_RETENTION_SECONDS is 0/unset."""
+    import time as _t
+
+    monkeypatch.setenv(ENV, "finalizer-only")
+    if retention is None:
+        monkeypatch.delenv("BLASTBOX_JOB_RETENTION_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("BLASTBOX_JOB_RETENTION_SECONDS", retention)
+    store, c, hdr = _setup(tmp_path, pki_dir)
+    t0 = _t.time()
+    r = _post(c, hdr, {"status": "failed", "error": "x", "finished_at": t0}, expect="running")
+    assert r.status_code == 200, r.text
+    exp = store.get("job-1").expires_at
+    if expect_expiry:
+        assert exp is not None and t0 + 55 <= exp <= _t.time() + 65
+    else:
+        assert exp is None
+
+
+def test_direct_mode_still_takes_the_nodes_expiry(tmp_path, pki_dir, monkeypatch):  # noqa: F811
+    import time as _t
+
+    monkeypatch.delenv(ENV, raising=False)
+    monkeypatch.setenv("BLASTBOX_JOB_RETENTION_SECONDS", "60")
+    store, c, hdr = _setup(tmp_path, pki_dir)
+    want = _t.time() + 3000
+    r = _post(c, hdr, {"status": "failed", "finished_at": _t.time(), "expires_at": want},
+              expect="running")
+    assert r.status_code == 200, r.text
+    assert abs(store.get("job-1").expires_at - want) < 1
