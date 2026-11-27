@@ -32,7 +32,7 @@ def ident(engines=("clamav",), not_after=T0 + 10 * 86400):
 def lv(hb, engines=(("clamav", True),), claim=None):
     body = {"agent_version": "1.0",
             "engines": [{"name": n, "selftest_ok": ok} for n, ok in engines]}
-    return NodeLiveness("n", hb, claim, None, body)
+    return NodeLiveness("n", hb, claim, None, body, {"": claim} if claim is not None else {})
 
 
 def kinds(alerts):
@@ -367,3 +367,51 @@ def test_queue_ages_are_cached_between_scrapes(tmp_path):
     now[0] += 11
     m.view()
     assert len(calls) == 2
+
+
+# --- review round 2 -------------------------------------------------------------------------
+
+def _claimed(hb, claims, engines=(("clamav", True), ("boxjs", True))):
+    body = {"engines": [{"name": n, "selftest_ok": ok} for n, ok in engines]}
+    last = max(claims.values()) if claims else None
+    return NodeLiveness("n", hb, last, None, body, claims)
+
+
+def test_a_claim_for_one_engine_does_not_serve_another():
+    e = {"n": ident(("clamav", "boxjs"))}
+    q = {"clamav": T0 - 400}
+    got = run(T0, e, {"n": _claimed(T0, {"boxjs": T0 - 2})}, q)
+    assert ("engine_orphaned", "clamav") in kinds(got)
+    assert run(T0, e, {"n": _claimed(T0, {"clamav": T0 - 2})}, q) == []
+    assert run(T0, e, {"n": _claimed(T0, {"": T0 - 2})}, q) == []     # unscoped: every grant
+
+
+def test_a_node_that_claims_but_never_heartbeats_is_alive_and_serves():
+    """A Python pull node (HttpJobStore) has no heartbeat client: its claims are its liveness."""
+    e = {"n": ident(("clamav",))}
+    q = {"clamav": T0 - 400}
+    claim_only = NodeLiveness("n", None, T0 - 2, None, None, {"": T0 - 2})
+    assert run(T0, e, {"n": claim_only}, q) == []
+    stale = NodeLiveness("n", None, T0 - 200, None, None, {"": T0 - 200})
+    assert kinds(run(T0, e, {"n": stale}, q)) == [("engine_orphaned", "clamav"),
+                                                   ("node_silent", "n")]
+
+
+def test_queue_fallback_sees_every_engine_not_a_10k_prefix():
+    class Jobs:
+        def list(self, status=None, *, limit=None, **_kw):
+            jobs = [SimpleNamespace(engine="a", created_at=float(i)) for i in range(10_001)]
+            jobs.append(SimpleNamespace(engine="b", created_at=20_000.0))
+            return jobs[:limit] if limit else jobs
+    assert oldest_queued(Jobs()) == {"a": 0.0, "b": 20_000.0}
+
+
+def test_evaluation_and_memo_update_are_one_critical_section(tmp_path, monkeypatch):
+    from blastbox.host import node_liveness as nl
+    m = LivenessMonitor(liveness=InMemoryLivenessStore(), job_store=InMemoryJobStore(),
+                        pki_dir=tmp_path, clock=lambda: T0)
+    held = []
+    real = nl.evaluate
+    monkeypatch.setattr(nl, "evaluate", lambda **kw: held.append(m._lock.locked()) or real(**kw))
+    m.view()
+    assert held == [True]

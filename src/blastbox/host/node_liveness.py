@@ -32,7 +32,7 @@ __all__ = [
     "RedisLivenessStore", "build_liveness_store",
     "safe_record_heartbeat", "safe_record_claim",
     "LivenessConfig", "Alert", "evaluate", "enrolled_nodes", "oldest_queued",
-    "LivenessMonitor", "LivenessCollector", "MAX_QUEUED_SCAN", "heartbeat_interval_s",
+    "LivenessMonitor", "LivenessCollector", "heartbeat_interval_s",
 ]
 
 _log = logging.getLogger("blastbox.node_liveness")
@@ -45,6 +45,10 @@ class NodeLiveness:
     last_claim_at: float | None = None
     last_claim_engine: str | None = None   # not persisted by the SQL backend
     body: dict[str, Any] | None = None     # the node's own claim; never trusted
+    #: engine -> last claim attempt for it ("" = an unscoped claim, i.e. every grant). A claim
+    #: is evidence of serving THAT engine only: a node polling one engine says nothing about
+    #: another whose claim loop is wedged.
+    claims: Mapping[str, float] = field(default_factory=dict)
 
 
 class LivenessStore(Protocol):
@@ -99,14 +103,13 @@ class InMemoryLivenessStore:
     def record_heartbeat(self, node_id: str, body: dict, at: float) -> None:
         with self._lock:
             old = self._rows.get(node_id) or NodeLiveness(node_id)
-            self._rows[node_id] = NodeLiveness(node_id, at, old.last_claim_at,
-                                               old.last_claim_engine, dict(body))
+            self._rows[node_id] = replace(old, last_heartbeat_at=at, body=dict(body))
 
     def record_claim(self, node_id: str, engine: str | None, at: float) -> None:
         with self._lock:
             old = self._rows.get(node_id) or NodeLiveness(node_id)
-            self._rows[node_id] = NodeLiveness(node_id, old.last_heartbeat_at, at,
-                                               engine, old.body)
+            self._rows[node_id] = replace(old, last_claim_at=at, last_claim_engine=engine,
+                                          claims={**old.claims, engine or "": at})
 
     def snapshot(self) -> dict[str, NodeLiveness]:
         with self._lock:
@@ -128,6 +131,12 @@ class SqlLivenessStore:
                 f" last_heartbeat_at {real},"
                 f" last_claim_at {real},"
                 " body TEXT)")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS node_liveness_claims ("
+                " node_id TEXT NOT NULL,"
+                " engine TEXT NOT NULL,"
+                f" at {real} NOT NULL,"
+                " PRIMARY KEY (node_id, engine))")
 
     def record_heartbeat(self, node_id: str, body: dict, at: float) -> None:
         p = self._store.param_style
@@ -142,13 +151,20 @@ class SqlLivenessStore:
         sql = (f"INSERT INTO node_liveness (node_id, last_heartbeat_at, last_claim_at, body) "
                f"VALUES ({p}, NULL, {p}, NULL) ON CONFLICT (node_id) DO UPDATE SET "
                f"last_claim_at = EXCLUDED.last_claim_at")
+        per = (f"INSERT INTO node_liveness_claims (node_id, engine, at) VALUES ({p}, {p}, {p}) "
+               f"ON CONFLICT (node_id, engine) DO UPDATE SET at = EXCLUDED.at")
         with self._store.connection() as conn:
             conn.execute(sql, (node_id, at))
+            conn.execute(per, (node_id, engine or "", at))
 
     def snapshot(self) -> dict[str, NodeLiveness]:
         with self._store.connection() as conn:
             rows = conn.execute("SELECT node_id, last_heartbeat_at, last_claim_at, body "
                                 "FROM node_liveness").fetchall()
+            per = conn.execute("SELECT node_id, engine, at FROM node_liveness_claims").fetchall()
+        claims: dict[str, dict[str, float]] = {}
+        for node_id, eng, at in per:
+            claims.setdefault(node_id, {})[eng] = float(at)
         out: dict[str, NodeLiveness] = {}
         for node_id, hb, cl, raw in rows:
             body = None
@@ -158,7 +174,7 @@ class SqlLivenessStore:
                     body = parsed if isinstance(parsed, dict) else None
                 except ValueError:
                     body = None
-            out[node_id] = NodeLiveness(node_id, hb, cl, None, body)
+            out[node_id] = NodeLiveness(node_id, hb, cl, None, body, claims.get(node_id, {}))
         return out
 
 
@@ -167,6 +183,7 @@ class RedisLivenessStore:
     exactly the row an alert needs to keep seeing."""
 
     PREFIX = "blastbox:liveness:"
+    CLAIM = "claim:"            # per-engine claim field prefix ("claim:" alone = unscoped)
 
     def __init__(self, client) -> None:
         self._r = client
@@ -179,7 +196,8 @@ class RedisLivenessStore:
     def record_claim(self, node_id: str, engine: str | None, at: float) -> None:
         key = self.PREFIX + node_id
         self._r.hset(key, mapping={"last_claim_at": repr(float(at)),
-                                   "last_claim_engine": engine or ""})
+                                   "last_claim_engine": engine or "",
+                                   self.CLAIM + (engine or ""): repr(float(at))})
         # "" reads back as None (snapshot's `or None`), i.e. engine=None overwrites the prior
         # engine exactly as the memory store does.
 
@@ -205,7 +223,9 @@ class RedisLivenessStore:
                 node_id,
                 float(h["last_heartbeat_at"]) if h.get("last_heartbeat_at") else None,
                 float(h["last_claim_at"]) if h.get("last_claim_at") else None,
-                h.get("last_claim_engine") or None, body)
+                h.get("last_claim_engine") or None, body,
+                {k[len(self.CLAIM):]: float(v) for k, v in h.items()
+                 if k.startswith(self.CLAIM)})
         return out
 
 
@@ -229,9 +249,6 @@ def build_liveness_store(store=None) -> LivenessStore:
 # ---------------------------------------------------------------------------------------------
 # Alert evaluation (C2)
 # ---------------------------------------------------------------------------------------------
-
-#: Bound on the fallback queue scan used by stores without ``oldest_queued_by_engine``.
-MAX_QUEUED_SCAN = 10_000
 
 AlertKind = Literal["node_silent", "node_unhealthy", "engine_orphaned", "cert_expiring",
                     "cert_expired"]
@@ -305,29 +322,50 @@ def _engines_of(live: "NodeLiveness | None") -> list[dict[str, Any]]:
     return [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
 
 
+def _within(ts: float | None, now: float, cfg: LivenessConfig) -> bool:
+    """``ts`` is inside the silence window. One further ahead of ``now`` than the window itself
+    is NOT: after a backward clock step a live node rewrites its row on its next request, so
+    only a dead node keeps a future timestamp -- and it must not read as alive."""
+    return ts is not None and abs(now - ts) <= cfg.silent_after_s
+
+
 def _fresh(live: "NodeLiveness | None", now: float, cfg: LivenessConfig) -> bool:
-    """A heartbeat within the silence window. One further ahead of ``now`` than the window
-    itself is NOT fresh: after a backward clock step a live node rewrites its row on the next
-    beat, so only a dead node keeps a future timestamp -- and it must not read as alive."""
-    if live is None or live.last_heartbeat_at is None:
-        return False
-    return abs(now - live.last_heartbeat_at) <= cfg.silent_after_s
+    return live is not None and _within(live.last_heartbeat_at, now, cfg)
+
+
+def _claim_only(live: "NodeLiveness | None") -> bool:
+    """A node with no heartbeat client (the Python ``HttpJobStore`` pull node): it has never
+    heartbeated, so its claims are the only liveness it has."""
+    return live is not None and live.last_heartbeat_at is None
+
+
+def _alive(live: "NodeLiveness | None", now: float, cfg: LivenessConfig) -> bool:
+    if _fresh(live, now, cfg):
+        return True
+    return _claim_only(live) and _within(live.last_claim_at if live else None, now, cfg)
+
+
+def _claimed(live: NodeLiveness, eng: str, now: float, cfg: LivenessConfig) -> bool:
+    return _within(live.claims.get(eng), now, cfg) or _within(live.claims.get(""), now, cfg)
 
 
 def _serves(live: "NodeLiveness | None", eng: str, now: float, cfg: LivenessConfig) -> bool:
-    """Fresh, a passing selftest for ``eng``, AND evidence of taking work: a claim attempt
-    within the silence window, or a busy slot on that engine. A shadow agent (claim=false)
-    heartbeats a passing selftest and never claims, so it must not hide orphaned work."""
+    """Evidence of taking ``eng``'s work: a claim attempt FOR IT (or an unscoped one) within the
+    silence window, or a busy slot on it -- plus, for a heartbeating node, a fresh heartbeat
+    with a passing selftest for it. A shadow agent (claim=false) heartbeats a passing selftest
+    and never claims, so it must not hide orphaned work; a node polling one engine says nothing
+    about another."""
+    if live is None:
+        return False
+    if _claim_only(live):
+        return _claimed(live, eng, now, cfg)
     if not _fresh(live, now, cfg):
         return False
-    assert live is not None
     mine = [e for e in _engines_of(live) if e.get("name") == eng and e.get("selftest_ok")]
     if not mine:
         return False
-    claimed = (live.last_claim_at is not None
-               and abs(now - live.last_claim_at) <= cfg.silent_after_s)
     busy = any(isinstance(e.get("busy"), int) and e.get("busy", 0) > 0 for e in mine)
-    return claimed or busy
+    return busy or _claimed(live, eng, now, cfg)
 
 
 def evaluate(*, now: float, enrolled: "Mapping[str, NodeIdentity]", live: dict[str, NodeLiveness],
@@ -347,7 +385,9 @@ def evaluate(*, now: float, enrolled: "Mapping[str, NodeIdentity]", live: dict[s
             alerts.append(Alert("cert_expired", node_id, not_after,
                                 f"certificate expired {now - not_after:.0f}s ago"))
             continue
-        if lv is not None and _fresh(lv, now, cfg):
+        if lv is not None and _claim_only(lv) and _alive(lv, now, cfg):
+            pass                                # claiming, no heartbeat client: alive
+        elif lv is not None and _fresh(lv, now, cfg):
             engines = _engines_of(lv)
             bad = sorted(str(e.get("name", "")) for e in engines if not e.get("selftest_ok"))
             if not engines:
@@ -358,9 +398,14 @@ def evaluate(*, now: float, enrolled: "Mapping[str, NodeIdentity]", live: dict[s
                                     "selftest failing for: " + ", ".join(bad)))
         else:
             hb = lv.last_heartbeat_at if lv else None
-            since = hb if hb is not None else ident.not_before.timestamp()
-            detail = ("never heartbeated" if hb is None
-                      else f"no heartbeat for {now - hb:.0f}s (limit {cfg.silent_after_s:g}s)")
+            cl = lv.last_claim_at if lv else None
+            seen = hb if hb is not None else cl
+            since = seen if seen is not None else ident.not_before.timestamp()
+            detail = ("never heartbeated or claimed" if seen is None
+                      else f"no heartbeat for {now - hb:.0f}s (limit {cfg.silent_after_s:g}s)"
+                      if hb is not None
+                      else f"no heartbeat, and no claim for {now - seen:.0f}s "
+                           f"(limit {cfg.silent_after_s:g}s)")
             alerts.append(Alert("node_silent", node_id, since, detail))
         if not_after - now < cfg.cert_expiring_s:
             alerts.append(Alert("cert_expiring", node_id, not_after - cfg.cert_expiring_s,
@@ -436,15 +481,17 @@ def enrolled_nodes(pki_dir: "Path | str", *, now: float | None = None) -> "dict[
 
 def oldest_queued(job_store: Any) -> dict[str, float]:
     """Engine -> ``created_at`` of its oldest QUEUED job. One GROUP BY on SQL stores
-    (``oldest_queued_by_engine``); a scan bounded at :data:`MAX_QUEUED_SCAN` otherwise."""
+    (``oldest_queued_by_engine``); a full QUEUED scan otherwise. NOT a bounded prefix: the
+    oldest N jobs globally can all belong to one engine and hide every other engine's backlog
+    (Redis and memory stores scan every key before any limit anyway). The monitor caches the
+    result, so this runs at most once per ``QUEUED_TTL_S``."""
     fast = getattr(job_store, "oldest_queued_by_engine", None)
     try:
         if callable(fast):
             return dict(fast())
         from blastbox.host.jobs.base import JobStatus
         out: dict[str, float] = {}
-        for j in job_store.list(JobStatus.QUEUED, limit=MAX_QUEUED_SCAN,
-                                sort="created_at", order="asc"):
+        for j in job_store.list(JobStatus.QUEUED):
             if j.created_at is not None and (j.engine not in out or j.created_at < out[j.engine]):
                 out[j.engine] = j.created_at
         return out
@@ -512,28 +559,34 @@ class LivenessMonitor:
         return got
 
     def view(self) -> _View:
+        # ONE critical section from the clock read to the memo update: the 15 s loop, /metrics
+        # and /v1/fleet/liveness call this concurrently, and a view evaluated earlier but
+        # applied later would re-raise an alert a newer view had cleared (and race the caches).
+        with self._lock:
+            return self._view_locked()
+
+    def _view_locked(self) -> _View:
         now = self._clock()
         enrolled = self._enrolled(now)
         live = self._liveness.snapshot()
         queued = self._queued(now)
         alerts = evaluate(now=now, enrolled=enrolled, live=live, oldest_queued=queued,
                           cfg=self.cfg)
-        with self._lock:
-            seen: set[tuple[str, str]] = {(a.kind, a.subject) for a in alerts}
-            stable: list[Alert] = []
-            for a in alerts:
-                key = (a.kind, a.subject)
-                prior = self._memo.get(key)
-                if prior is None:
-                    _log.error("ALERT %s subject=%s: %s", a.kind, a.subject, a.detail)
-                else:
-                    a = replace(a, since=prior.since)   # `since` is when it began, not last seen
-                self._memo[key] = a
-                stable.append(a)
-            for gone_key in [k for k in self._memo if k not in seen]:
-                gone = self._memo.pop(gone_key)
-                _log.info("CLEARED %s subject=%s (was: %s)", gone_key[0], gone_key[1],
-                          gone.detail)
+        seen: set[tuple[str, str]] = {(a.kind, a.subject) for a in alerts}
+        stable: list[Alert] = []
+        for a in alerts:
+            key = (a.kind, a.subject)
+            prior = self._memo.get(key)
+            if prior is None:
+                _log.error("ALERT %s subject=%s: %s", a.kind, a.subject, a.detail)
+            else:
+                a = replace(a, since=prior.since)   # `since` is when it began, not last seen
+            self._memo[key] = a
+            stable.append(a)
+        for gone_key in [k for k in self._memo if k not in seen]:
+            gone = self._memo.pop(gone_key)
+            _log.info("CLEARED %s subject=%s (was: %s)", gone_key[0], gone_key[1],
+                      gone.detail)
         return _View(now, self.cfg, enrolled, live, queued, stable)
 
     def as_json(self) -> dict[str, Any]:

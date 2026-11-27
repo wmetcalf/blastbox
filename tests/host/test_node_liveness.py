@@ -92,3 +92,21 @@ def test_memory_fallback_warns(caplog):
     with caplog.at_level(logging.WARNING, logger="blastbox.node_liveness"):
         build_liveness_store(InMemoryJobStore())
     assert any("in memory only" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("kind", ["mem", "sql", "redis"])
+def test_claims_are_kept_per_engine_on_every_backend(kind, tmp_path):
+    if kind == "mem":
+        s = InMemoryLivenessStore()
+    elif kind == "sql":
+        from blastbox.host.jobs.sql_store import SqlJobStore
+        s = SqlLivenessStore(SqlJobStore(f"sqlite:///{tmp_path}/t.db"))
+    else:
+        s = RedisLivenessStore(FakeRedis())
+    s.record_claim("a", "clamav", 10.0)
+    s.record_claim("a", "boxjs", 12.0)
+    s.record_claim("a", None, 14.0)
+    s.record_claim("a", "clamav", 16.0)
+    r = s.snapshot()["a"]
+    assert dict(r.claims) == {"clamav": 16.0, "boxjs": 12.0, "": 14.0}
+    assert r.last_claim_at == 16.0
