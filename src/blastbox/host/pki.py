@@ -303,6 +303,28 @@ class CertAuthority:
         cert = self._build_node_cert(node_id, key.public_key(), wg_pubkey, grants, days)
         return IssuedCert(cert.public_bytes(serialization.Encoding.PEM), _key_pem(key))
 
+    def sign_node_csr(self, csr_pem: bytes, *, node_id: str, grants: NodeGrants,
+                      days: int = 7) -> bytes:
+        """Sign a node-generated CSR into a NODE cert (v2, no WireGuard key).
+
+        Only the public key and proof-of-possession are taken from the CSR. Every CSR
+        extension and attribute (requested EKU, node-info, SANs...) is ignored: grants
+        come from ``grants`` and the EKU is always the critical node one. The key must
+        be EC P-256 and the CSR CN must equal ``node_id``.
+        """
+        csr = x509.load_pem_x509_csr(csr_pem)
+        if not csr.is_signature_valid:
+            raise ValueError("CSR signature is invalid")
+        pub = csr.public_key()
+        if not isinstance(pub, ec.EllipticCurvePublicKey) or not isinstance(
+                pub.curve, ec.SECP256R1):
+            raise ValueError("CSR key must be EC P-256")
+        cns = csr.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+        if len(cns) != 1 or str(cns[0].value) != node_id:
+            raise ValueError(f"CSR common name does not match node id {node_id!r}")
+        cert = self._build_node_cert(node_id, pub, None, grants, days)
+        return cert.public_bytes(serialization.Encoding.PEM)
+
     def sign_csr(self, csr_pem: bytes, *, days: int = 2) -> bytes:
         """Sign a worker-generated CSR (Phase 2: the worker's key never leaves the box). SANs are taken
         from the CSR; a bad signature is rejected. Returns the server cert PEM."""

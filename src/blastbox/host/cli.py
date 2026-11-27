@@ -1567,6 +1567,35 @@ def _pki_cmd(args: argparse.Namespace) -> int:
         print(f"  grants: engines={list(grants.engines)} tiers={list(grants.tiers)} "
               f"credentials={grants.credentials}")
         return 0
+    if args.pki_action == "sign-node-csr":
+        from cryptography import x509 as _x509
+
+        from blastbox.host.pki import NodeGrants
+        grants = NodeGrants(engines=tuple(args.engine), tiers=tuple(args.tier),
+                            credentials=bool(args.credentials))
+        try:
+            cert_pem = ca.sign_node_csr(Path(args.csr).read_bytes(), node_id=args.node_id,
+                                        grants=grants, days=args.days)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        out = Path(args.out) if args.out else pki_dir / f"node-{args.node_id}.crt"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_name(out.name + f".{os.getpid()}.tmp")
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(cert_pem)
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, out)
+        finally:
+            tmp.unlink(missing_ok=True)
+        not_after = _x509.load_pem_x509_certificate(cert_pem).not_valid_after_utc
+        print(f"node cert for {args.node_id} -> {out}")
+        print(f"  not_after: {not_after.isoformat()}")
+        print(f"  grants: engines={list(grants.engines)} tiers={list(grants.tiers)} "
+              f"credentials={grants.credentials}")
+        return 0
     if args.pki_action == "show-node":
         from blastbox.host.pki import node_identity
         try:
@@ -2156,6 +2185,21 @@ def build_parser() -> argparse.ArgumentParser:
              "stripped, so --out /tmp/toolz3.crt writes /tmp/toolz3.crt and .key rather "
              "than toolz3.crt.crt. Default: <pki-dir>/node-<node-id>.{crt,key} — this "
              "command ALWAYS writes a private key to disk, it never prints to stdout")
+    pk_sc = pks.add_parser(
+        "sign-node-csr",
+        help="sign a node-generated CSR into a node cert (the key never leaves the node)")
+    pk_sc.add_argument("--csr", required=True, help="path to the node's CSR PEM")
+    pk_sc.add_argument("--node-id", required=True,
+                       help="must equal the CSR common name")
+    pk_sc.add_argument("--engine", action="append", default=[],
+                       help="engine this node may be assigned (repeatable)")
+    pk_sc.add_argument("--tier", action="append", default=[],
+                       help="netpolicy tier this node may be assigned (repeatable)")
+    pk_sc.add_argument("--credentials", action="store_true",
+                       help="this node may hold provider credentials")
+    pk_sc.add_argument("--days", type=int, default=7)
+    pk_sc.add_argument("--out", default=None,
+                       help="cert path to write (default: <pki-dir>/node-<node-id>.crt)")
     pk_ns = pks.add_parser(
         "node-status",
         help="what THIS node's environment resolves to: is the grants gate armed, does "
