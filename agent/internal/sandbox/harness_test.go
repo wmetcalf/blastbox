@@ -97,6 +97,7 @@ func TestCommandNeverAllowsEgress(t *testing.T) {
 	cmd, err := Command(context.Background(), Nsjail, Request{
 		ExecPaths: []string{"/usr/bin/true"}, Scratch: "/tmp/s", Nonce: "n", AgentBin: "/x/agent",
 		NsjailPath: "/usr/local/bin/nsjail", Pins: &pins,
+		SeccompPolicy: "/x/seccomp.kafel", AttachAppArmor: true,
 	}, []string{"/usr/bin/true"}, Limits{TimeoutS: 5})
 	if err != nil {
 		t.Fatal(err)
@@ -111,5 +112,39 @@ func TestCommandNeverAllowsEgress(t *testing.T) {
 	}
 	if cmd.SysProcAttr == nil || cmd.SysProcAttr.Setpgid != true {
 		t.Error("Setpgid not set")
+	}
+}
+
+func TestCommandRefusesInsecureNsjailHost(t *testing.T) {
+	pins := HostPins{AppArmorProfile: "p", Exists: map[string]bool{"/usr": true}, Symlinks: map[string]bool{}}
+	base := Request{
+		ExecPaths: []string{"/usr/bin/true"}, Scratch: "/tmp/s", Nonce: "n", AgentBin: "/x/agent",
+		NsjailPath: "/usr/local/bin/nsjail", Pins: &pins, SeccompPolicy: "/x/seccomp.kafel", AttachAppArmor: true,
+	}
+	build := func(r Request) error {
+		_, err := Command(context.Background(), Nsjail, r, []string{"/usr/bin/true"}, Limits{TimeoutS: 5})
+		return err
+	}
+	if err := build(base); err != nil {
+		t.Fatalf("secure request refused: %v", err)
+	}
+	noSeccomp := base
+	noSeccomp.SeccompPolicy = ""
+	if err := build(noSeccomp); err == nil || !strings.Contains(err.Error(), "seccomp") {
+		t.Errorf("empty seccomp policy must be refused: %v", err)
+	}
+	noAA := base
+	noAA.AttachAppArmor = false
+	if err := build(noAA); err == nil || !strings.Contains(err.Error(), "AppArmor") {
+		t.Errorf("unattached AppArmor must be refused: %v", err)
+	}
+	noAA.AllowMissingAppArmor = true
+	if err := build(noAA); err != nil {
+		t.Errorf("explicit opt-out must be accepted: %v", err)
+	}
+	// seatbelt is unaffected by the nsjail layer checks.
+	if _, err := Command(context.Background(), Seatbelt, Request{Scratch: "/tmp/s", Nonce: "n", AgentBin: "/x/agent"},
+		[]string{"/usr/bin/true"}, Limits{}); err != nil {
+		t.Errorf("seatbelt: %v", err)
 	}
 }

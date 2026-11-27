@@ -173,6 +173,13 @@ func Command(ctx context.Context, sb Kind, req Request, argv []string, lim Limit
 		if req.NsjailPath == "" {
 			return nil, errors.New("nsjail path is required")
 		}
+		// Command itself refuses an insecure nsjail host, whatever the caller checked.
+		if req.SeccompPolicy == "" {
+			return nil, errors.New("nsjail: seccomp policy is required (seccomp_policy_missing)")
+		}
+		if !req.AttachAppArmor && !req.AllowMissingAppArmor {
+			return nil, errors.New("nsjail: AppArmor profile is not attached and allow_missing_apparmor is not set (apparmor_missing)")
+		}
 		inner, err = BuildNsjailArgv(nreq, req.NsjailPath, req.SeccompPolicy, pins)
 		if err != nil {
 			return nil, err

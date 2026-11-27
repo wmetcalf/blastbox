@@ -71,6 +71,9 @@ type Request struct {
 	// profile attaches (Host does); otherwise the layer is absent and reported as such.
 	AppArmorProfile string
 	AttachAppArmor  bool
+	// AllowMissingAppArmor is the operator's explicit opt-out: without it, Command refuses an
+	// nsjail run whose AppArmor profile is not attached.
+	AllowMissingAppArmor bool
 }
 
 // BuildSeatbeltProfile is an exact port of seatbelt.build_profile.

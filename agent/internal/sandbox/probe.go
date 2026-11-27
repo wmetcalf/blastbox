@@ -149,6 +149,9 @@ func RunProbe(args []string, w io.Writer) int {
 	return 1
 }
 
+// AttachAppArmor reports whether the declared AppArmor profile is proven to attach on this host.
+func (h Host) AttachAppArmor() bool { ok, _ := h.apparmorAttaches(); return ok }
+
 func (h Host) agentBin() (string, error) {
 	if h.AgentBin != "" {
 		return h.AgentBin, nil
@@ -203,7 +206,7 @@ func (h Host) request(eng config.Engine, scratch, argv0 string) (Request, error)
 		Scratch: scratch, Canary: "bb.canary." + hex.EncodeToString(nonce[:8]),
 		Nonce: hex.EncodeToString(nonce), AgentBin: agent,
 		NsjailPath: h.NsjailPath, SeccompPolicy: h.SeccompPolicy,
-		AppArmorProfile: h.AppArmorProfile,
+		AppArmorProfile: h.AppArmorProfile, AllowMissingAppArmor: h.AllowMissingAppArmor,
 	}, nil
 }
 
