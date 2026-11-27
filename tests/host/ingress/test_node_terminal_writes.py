@@ -149,3 +149,28 @@ def test_finalizer_is_quiet_without_a_pki(tmp_path, monkeypatch, caplog):
     with caplog.at_level(logging.WARNING):
         assert cli.main(["node-finalizer", "--once", "--no-receipts"]) == 0
     assert not [r for r in caplog.records if ENV in r.getMessage()]
+
+
+@pytest.mark.parametrize("fields", [{"status": "queued", "claim_id": None},
+                                    {"status": "failed", "error": "x"},
+                                    {"result_summary": {"forged": 1}},
+                                    {"security_warnings": ["x"]}])
+def test_finalizer_only_a_finalized_job_is_closed_to_its_node(tmp_path, pki_dir, monkeypatch,  # noqa: F811
+                                                              fields):
+    """DONE keeps the claim id, so the node's receipt still authenticates: without this a node
+    could release a finished job to be detonated again, or flip or forge its sealed result."""
+    monkeypatch.setenv(ENV, "finalizer-only")
+    store, c, hdr = _setup(tmp_path, pki_dir)
+    store.update_if_status("job-1", JobStatus.RUNNING, expect_claim_id=hdr["x-blastbox-claim-id"],
+                           status=JobStatus.DONE, result_summary={"sealed": 1})
+    before = store.get("job-1")
+    assert _post(c, hdr, fields).status_code == 403
+    assert _post(c, hdr, fields, expect="done").status_code == 403
+    assert store.get("job-1") == before
+
+
+def test_finalizer_only_result_summary_is_the_finalizers(tmp_path, pki_dir, monkeypatch):  # noqa: F811
+    monkeypatch.setenv(ENV, "finalizer-only")
+    store, c, hdr = _setup(tmp_path, pki_dir)
+    assert _post(c, hdr, {"result_summary": {"forged": 1}}).status_code == 403
+    assert store.get("job-1").result_summary in (None, {})

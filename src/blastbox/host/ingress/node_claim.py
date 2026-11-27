@@ -1523,14 +1523,25 @@ def register_node_claim_routes(
         node_id = _node_from_token(x_blastbox_node_session)
         current = _owned_job(job_id, node_id, req.claim_id, req.receipt)
         fields = _vetted_fields(req.fields)
-        if terminal_mode == TERMINAL_WRITES_FINALIZER_ONLY and "status" in fields \
-                and fields["status"] not in (JobStatus.QUEUED, JobStatus.FAILED):
+        if terminal_mode == TERMINAL_WRITES_FINALIZER_ONLY:
             # DONE comes only from the node-finalizer, which trust-gates and signs the
-            # uploaded result; a node may only release (queued) or fail its claim.
-            _log.warning("node_claim: refused node=%s job=%s status=%s write (%s=%s)",
-                         node_id, job_id, getattr(fields["status"], "value", fields["status"]),
-                         TERMINAL_WRITES_ENV, terminal_mode)
-            raise HTTPException(status_code=403, detail=_REFUSED)
+            # uploaded result; a node may only release (queued) or fail its RUNNING claim.
+            # DONE keeps the claim id, so the receipt still authenticates after finalisation:
+            # without the RUNNING check a node could release a finished job to be detonated
+            # again, or flip it to FAILED. result_summary is the finalizer's (it is derived
+            # from the sealed envelope), never the node's.
+            why = None
+            if current.status != JobStatus.RUNNING:
+                why = f"job is {current.status.value}"
+            elif "status" in fields and fields["status"] not in (JobStatus.QUEUED,
+                                                                 JobStatus.FAILED):
+                why = f"status={getattr(fields['status'], 'value', fields['status'])}"
+            elif "result_summary" in fields:
+                why = "result_summary"
+            if why is not None:
+                _log.warning("node_claim: refused node=%s job=%s write (%s) under %s=%s",
+                             node_id, job_id, why, TERMINAL_WRITES_ENV, terminal_mode)
+                raise HTTPException(status_code=403, detail=_REFUSED)
         if req.expect_status is not None:
             try:
                 expect = JobStatus(req.expect_status)
