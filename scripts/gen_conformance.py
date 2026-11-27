@@ -991,7 +991,8 @@ def server_verdict_for_tar(data: bytes) -> str:
     max_members = lim.max_artifacts + 64
     try:
         fh = io.BytesIO(data)
-        nr.vet_tar(fh, max_members=max_members, max_total_bytes=lim.max_total_artifact_bytes)
+        nr.vet_tar(fh, max_members=max_members, max_total_bytes=lim.max_total_artifact_bytes,
+                   max_metadata_bytes=lim.max_metadata_bytes)
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "out"
             out.mkdir()

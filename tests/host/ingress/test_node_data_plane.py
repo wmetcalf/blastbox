@@ -484,3 +484,71 @@ def test_lock_loser_with_no_outcome_gets_503_retry_not_202(tmp_path, pki_dir, mo
     assert r.headers["retry-after"] == "2"
     assert spool_dirs(tmp_path) == []
     assert put(c, hdr, make_tar([])).status_code == 202   # a retry succeeds
+
+
+# ---------------------------------------------------------------- vet_tar: expansion / header bombs
+
+def _gnu_sparse_tar(realsize: int) -> bytes:
+    """An old-GNU sparse member: a 0-byte payload that tarfile expands to ``realsize`` bytes."""
+    ti = tarfile.TarInfo("big.bin")
+    ti.size = 0
+    ti.type = tarfile.GNUTYPE_SPARSE
+    b = bytearray(ti.tobuf(tarfile.GNU_FORMAT, "utf-8", "surrogateescape"))
+    b[482] = 0
+    b[483:495] = ("%011o" % realsize).encode() + b"\0"
+    b[148:156] = b"        "
+    b[148:156] = ("%06o\0 " % sum(b)).encode()
+    buf = io.BytesIO()
+    buf.write(bytes(b))
+    tf = tarfile.TarFile(fileobj=buf, mode="w")
+    meta = tarfile.TarInfo("metadata.json")
+    meta.size = 2
+    tf.addfile(meta, io.BytesIO(b"{}"))
+    tf.close()
+    return buf.getvalue()
+
+
+def test_sparse_member_refused_before_expansion(tmp_path, pki_dir):  # noqa: F811
+    data = _gnu_sparse_tar(50 << 20)
+    assert len(data) < 16384
+    with pytest.raises(node_results.TarRejected, match="sparse"):
+        node_results.vet_tar(io.BytesIO(data), max_members=100, max_total_bytes=500 << 20)
+    _, c, hdr = _setup(tmp_path, pki_dir)
+    assert put(c, hdr, data).status_code == 422
+    assert spool_dirs(tmp_path) == []
+
+
+@pytest.mark.parametrize("typ", [b"x", b"g", b"L", b"K"])
+def test_oversized_extended_header_refused_without_reading_it(typ, monkeypatch):
+    """tarfile reads a pax/GNU long-name record WHOLE into memory: refuse a big one first."""
+    size = 8 << 20
+    ti = tarfile.TarInfo("././@Long")
+    ti.size = size
+    ti.type = typ
+    head = bytearray(ti.tobuf(tarfile.GNU_FORMAT, "utf-8", "surrogateescape"))
+    data = bytes(head) + b"\0" * size + b"\0" * 1024
+
+    def boom(*a, **k):
+        raise AssertionError("tarfile must not parse an oversized extended header")
+
+    monkeypatch.setattr(node_results.tarfile, "open", boom)
+    with pytest.raises(node_results.TarRejected, match="extended header"):
+        node_results.vet_tar(io.BytesIO(data), max_members=100, max_total_bytes=500 << 20)
+
+
+def test_metadata_not_counted_against_the_artifact_total(tmp_path, pki_dir, monkeypatch):  # noqa: F811
+    """Matches _safe_extract_tar and the cold trust gate: metadata has its own cap."""
+    monkeypatch.setenv("BLASTBOX_MAX_TOTAL_ARTIFACTS", "100")
+    monkeypatch.setenv("BLASTBOX_MAX_METADATA", "1000")
+    meta = b'{"pad": "' + b"p" * 500 + b'"}'
+    body = make_tar([("metadata.json", meta), ("a", b"x" * 100)], metadata=False)
+    _, c, hdr = _setup(tmp_path, pki_dir)
+    r = put(c, hdr, body)
+    assert r.status_code == 202, r.text
+
+
+def test_metadata_over_its_own_cap_refused_by_vet():
+    body = make_tar([("metadata.json", b"x" * 200)], metadata=False)
+    with pytest.raises(node_results.TarRejected, match="metadata"):
+        node_results.vet_tar(io.BytesIO(body), max_members=10, max_total_bytes=10_000,
+                             max_metadata_bytes=100)

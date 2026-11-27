@@ -129,13 +129,64 @@ def pending(root: Path) -> Iterator[Path]:
                 yield cd
 
 
-def vet_tar(fileobj: Any, *, max_members: int, max_total_bytes: int) -> None:
+# A pax ('x'/'g') or GNU long-name/long-link ('L'/'K') record is read WHOLE into memory by
+# tarfile before any member is yielded, so its size must be bounded before tarfile sees it.
+MAX_EXTENDED_HEADER = 64 * 1024
+_EXTENDED_TYPES = frozenset(b"xgLK")
+_SPARSE_TYPE = ord("S")
+
+
+def _header_size(field: bytes) -> int:
+    if field[0] & 0x80:                       # GNU base-256
+        n = field[0] & 0x7F
+        for b in field[1:]:
+            n = (n << 8) | b
+        return n
+    txt = field.split(b"\0", 1)[0].strip()
+    return int(txt, 8) if txt else 0
+
+
+def _prescan_headers(fileobj: Any, *, max_headers: int) -> None:
+    """Walk the raw 512-byte header chain without tarfile: refuse a GNU sparse member and any
+    extended header record larger than MAX_EXTENDED_HEADER. Leaves fileobj at offset 0."""
+    fileobj.seek(0)
+    off = 0
+    seen = 0
+    try:
+        while True:
+            fileobj.seek(off)
+            block = fileobj.read(512)
+            if len(block) < 512 or not block.strip(b"\0"):
+                break                         # EOF or the end-of-archive zero block
+            seen += 1
+            if seen > max_headers:
+                raise TarRejected(f"more than {max_headers} headers")
+            try:
+                size = _header_size(block[124:136])
+            except ValueError:
+                raise TarRejected("unreadable tar: bad size field") from None
+            typ = block[156]
+            if typ == _SPARSE_TYPE:
+                raise TarRejected("sparse member refused")
+            if typ in _EXTENDED_TYPES and size > MAX_EXTENDED_HEADER:
+                raise TarRejected(f"extended header record of {size} bytes refused")
+            off += 512 + ((size + 511) // 512) * 512
+    finally:
+        fileobj.seek(0)
+
+
+def vet_tar(fileobj: Any, *, max_members: int, max_total_bytes: int,
+            max_metadata_bytes: int | None = None) -> None:
     """Reject the WHOLE tar on anything that is not a plain file or directory.
 
     ``_safe_extract_tar`` skips symlinks, devices and traversal members rather than refusing
     them; a result that tries those is hostile, so it is refused up front. Also requires a
-    root ``metadata.json``, no duplicate names, and bounded member count / declared bytes.
+    root ``metadata.json``, no duplicate names, no sparse members (a tiny upload that expands
+    to the whole byte budget on disk), bounded extended headers, and bounded member count /
+    declared bytes. ``metadata.json`` has its own cap and does not count toward the artifact
+    total, exactly as ``_safe_extract_tar`` and the cold trust gate count it.
     """
+    _prescan_headers(fileobj, max_headers=2 * max_members + 16)
     seen: set[str] = set()
     meta_regular = False
     count = 0
@@ -146,6 +197,8 @@ def vet_tar(fileobj: Any, *, max_members: int, max_total_bytes: int) -> None:
                 count += 1
                 if count > max_members:
                     raise TarRejected(f"more than {max_members} members")
+                if m.issparse():
+                    raise TarRejected(f"sparse member refused: {m.name!r}")
                 if m.issym() or m.islnk() or m.isdev() or m.isfifo() or not (m.isfile() or m.isdir()):
                     raise TarRejected(f"disallowed member type: {m.name!r}")
                 name = m.name
@@ -162,7 +215,9 @@ def vet_tar(fileobj: Any, *, max_members: int, max_total_bytes: int) -> None:
                 seen.add(norm)
                 if norm == "metadata.json" and m.isfile():
                     meta_regular = True
-                if m.isfile():
+                    if max_metadata_bytes is not None and m.size > max_metadata_bytes:
+                        raise TarRejected("metadata.json exceeds the metadata cap")
+                elif m.isfile():
                     total += m.size
                     if total > max_total_bytes:
                         raise TarRejected("declared size exceeds the byte cap")

@@ -1709,7 +1709,8 @@ def register_node_claim_routes(
                     os.chmod(partial, 0o700)
                     max_members = lim.max_artifacts + 64
                     nr.vet_tar(spool, max_members=max_members,
-                               max_total_bytes=lim.max_total_artifact_bytes)
+                               max_total_bytes=lim.max_total_artifact_bytes,
+                               max_metadata_bytes=lim.max_metadata_bytes)
                     out = partial / nr.OUT
                     out.mkdir(mode=0o700)
                     _safe_extract_tar(spool, out, max_total_bytes=lim.max_total_artifact_bytes,
