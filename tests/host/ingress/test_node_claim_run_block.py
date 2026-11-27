@@ -63,6 +63,29 @@ def test_claim_job_has_no_result_dir(tmp_path, pki_dir):  # noqa: F811
 
 
 def test_http_store_still_parses_claim(tmp_path, pki_dir):  # noqa: F811
+    """Drive the Python credential-less node's real claim path against the app."""
+    from blastbox.host.jobs.factory import build_job_store_from_env
+    from blastbox.host.jobs.http_store import HttpJobStore
+
     _, _, c = _setup(tmp_path, pki_dir)
-    job = Job.from_dict(_claim(c, pki_dir, "alpha", engine="clamav").json()["job"])
-    assert job.job_id == "job-1" and job.result_dir is None
+    store = build_job_store_from_env({
+        "BLASTBOX_DATABASE_URL": "https://control-plane.example",
+        "BLASTBOX_NODE_CERT": str(pki_dir / "node-alpha.crt"),
+    })
+    assert isinstance(store, HttpJobStore)
+    store._transport = lambda method, path, *, json=None, params=None, headers=None: (
+        lambda r: (r.status_code, r.json() if r.content else None))(
+            c.request(method, path, json=json, params=params, headers=headers or {}))
+    job = store.claim_next(engine="clamav")
+    assert job is not None and job.job_id == "job-1"
+    assert job.result_dir is None
+
+
+def test_run_network_carries_resolved_tier(tmp_path, pki_dir, monkeypatch):  # noqa: F811
+    from blastbox.host.ingress import node_claim
+
+    monkeypatch.setattr(node_claim, "_job_requirements",
+                        lambda job: ("socks", False, True))
+    _, _, c = _setup(tmp_path, pki_dir)
+    run = _claim(c, pki_dir, "alpha", engine="clamav").json()["run"]
+    assert run["network"] == "socks"
