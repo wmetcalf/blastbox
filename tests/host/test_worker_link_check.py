@@ -76,3 +76,16 @@ def test_cli_check_exit_codes(monkeypatch, capsys):
                         lambda iface, age, **_: (2, [f"STALE {iface} {age}"]))
     assert args.func(args) == 2
     assert "STALE wg-test 60.0" in capsys.readouterr().out
+
+
+def test_nan_max_age_is_refused_not_silently_ok():
+    code, _ = wla.check_handshakes(
+        "wg-test", float("nan"), now=NOW, run=_runner(_dump(("AAAAAAAAAAAA=", 1))))
+    assert code == 1
+
+
+def test_an_unparseable_peer_line_is_an_error_not_an_ok():
+    out = _dump(("AAAAAAAAAAAA=", int(NOW) - 10)) + f"BBBBBBBBBBBB=\t{PSK}\te\t10.0.0.3/32\tX\t1\t1\toff\n"
+    code, lines = wla.check_handshakes("wg-test", 180, now=NOW, run=_runner(out))
+    assert code == 1
+    assert PSK not in "\n".join(lines) and PRIV not in "\n".join(lines)
