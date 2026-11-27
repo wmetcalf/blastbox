@@ -1560,8 +1560,12 @@ def _pki_cmd(args: argparse.Namespace) -> int:
         from blastbox.host.pki import NodeGrants
         grants = NodeGrants(engines=tuple(args.engine), tiers=tuple(args.tier),
                             credentials=bool(args.credentials))
-        issued = ca.issue_node(args.node_id, wg_pubkey=args.wg_pubkey,
-                               grants=grants, days=args.days)
+        try:
+            issued = ca.issue_node(args.node_id, wg_pubkey=args.wg_pubkey,
+                                   grants=grants, days=args.days)
+        except ValueError as exc:     # bad id, bad wg key, lifetime outside 1..30 days
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
         if args.out:
             # `write` appends the suffixes, so an --out the operator spelled with one
             # produced toolz3.crt.crt and toolz3.crt.key — findable only by looking.

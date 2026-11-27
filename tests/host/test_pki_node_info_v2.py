@@ -113,3 +113,12 @@ def test_worker_link_skips_wg_less_node(ca, tmp_path):
     ca.issue_node("nokey").write(pki_dir, "nokey")
     ta = pki.load_trust_anchor(pki_dir)
     assert cli._wg_key_to_node(ta, pki_dir) == {WG: "withkey"}
+
+
+@pytest.mark.parametrize("extra", [["--days", "90"], ["--days", "0"]])
+def test_cli_issue_node_out_of_range_days_is_a_clean_error(tmp_path, capsys, extra):
+    from blastbox.host.cli import main
+    d = tmp_path / "pki"
+    assert main(["pki", "--dir", str(d), "issue-node", "--node-id", "n1", *extra]) == 1
+    assert "error:" in capsys.readouterr().err
+    assert not list(d.glob("node-n1.*"))
