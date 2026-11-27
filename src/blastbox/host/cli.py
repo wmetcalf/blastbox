@@ -94,9 +94,8 @@ def _serve_tls_sans(host: str) -> list[str]:
                 ip = str(info[4][0])
                 if ip and not ip.startswith(("127.", "::1")) and ip not in sans:
                     sans.append(ip)
-        except OSError as exc:      # say so: the warnings are the only evidence
-            print(f"warning: could not check node dirs for unreadable cert links: {exc}",
-                  file=sys.stderr)
+        except OSError:
+            pass
     sans += ["localhost", "127.0.0.1"]
     seen: list[str] = []
     for x in sans:

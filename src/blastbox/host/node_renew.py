@@ -641,7 +641,8 @@ def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
     # nothing but a link to a copy is not one of its authorisers here, and must not be able
     # to hold the renewal hostage.
     linked = [d for d in every
-              if (d in states or d == qdir) and _links_out_for(d, node_id, ca)]
+              if (d in states or d == qdir)
+              and (_links_out_for(d, node_id, ca) or _unreadable_named_link(d, node_id))]
     if linked:
         # The ingress follows a cert link out of its dir; renewal will not (resolved here,
         # it can reach what that ingress never sees). Signing without it could drop the

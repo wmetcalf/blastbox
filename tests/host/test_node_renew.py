@@ -1212,3 +1212,27 @@ def test_every_unreadable_link_is_warned_including_other_nodes(tmp_path):
     (i1 / "junk.crt").symlink_to("/nonexistent/x.crt")
     names = {p.name for p in node_renew.unreadable_links(ca_dir, [i1, i2])}
     assert names == {"node-n2.crt", "junk.crt"}
+
+
+def test_serve_tls_sans_does_not_print_a_pki_warning(monkeypatch, capsys):
+    """Regression: a search-and-replace once put the renew-pending warning here."""
+    import socket
+
+    from blastbox.host import cli
+
+    def boom(*_a, **_k):
+        raise socket.gaierror(-2, "Name or service not known")
+    monkeypatch.setattr(socket, "getaddrinfo", boom)
+    cli._serve_tls_sans("0.0.0.0")
+    assert "unreadable cert links" not in capsys.readouterr().err
+
+
+def test_an_unreadable_node_named_link_beside_a_real_cert_defers(tmp_path):
+    """The ingress may intersect the real cert with what the link points at; the CA host
+    cannot see it, so it must not sign the real cert's grants alone."""
+    d, ca = rig(tmp_path)
+    os.replace(d / "node-n1.crt", d / "n1-real.crt")
+    (d / "node-n1.crt").symlink_to("/mnt/ingress-only/n1-narrow.crt")
+    queue_csr(d, "n1", make_csr("n1")[0])
+    [(nid, outcome)] = sign_pending(ca, d)
+    assert outcome.startswith("deferred") and pending(d) == ["n1"]
