@@ -546,3 +546,21 @@ def test_failed_but_cas_lost_is_recorded_as_claim_lost(tmp_path, monkeypatch):
     monkeypatch.setattr(fin._dispatcher, "finalise_output", lost)
     assert fin.run_once() == 1
     assert nr.read_outcome(d) == {"status": "failed", "reason": "claim lost"}
+
+
+def test_sweep_removes_crash_orphaned_partials_and_upload_spools(tmp_path):
+    store, job, fin, _ = build(tmp_path)
+    root = nr.results_root(tmp_path / "jobs")
+    partial = root / "job-1" / "abcd.partial-xyz"
+    (partial / "out").mkdir(parents=True)
+    (partial / "out" / "f").write_bytes(b"x" * 1000)
+    spool_tmp = root / ".upload-123.tar"
+    spool_tmp.write_bytes(b"x")
+    fresh = root / "job-1" / "ffff.partial-new"
+    fresh.mkdir()
+    old = time.time() - 2 * 3600
+    for p in (partial, spool_tmp):
+        os.utime(p, (old, old))
+    fin.run_once()
+    assert not partial.exists() and not spool_tmp.exists()
+    assert fresh.exists()                    # a live extraction is left alone

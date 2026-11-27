@@ -22,6 +22,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import shutil
 import tarfile
 import time
 from collections.abc import Iterator
@@ -86,6 +87,84 @@ def _atomic_write(path: Path, data: dict[str, Any]) -> None:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
+
+
+def fsync_tree(top: Path) -> None:
+    """fsync every regular file and directory under ``top`` (and ``top`` itself), so a tree
+    the ingress is about to acknowledge survives a crash. Never follows symlinks."""
+    for dirpath, _dirs, files in os.walk(top, followlinks=False):
+        for name in files:
+            fd = os.open(os.path.join(dirpath, name), os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        fsync_dir(Path(dirpath))
+
+
+def fsync_dir(d: Path) -> None:
+    fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+class UploadLock:
+    """The one-extraction-per-(job, claim) lock: a directory, so creating it is atomic.
+
+    It holds an owner token, so a holder that finishes after its lock was broken as stale
+    never removes its successor's lock; and a live holder ``touch``es it, so a slow but
+    alive upload is never mistaken for a crashed one.
+    """
+
+    STALE_S = 900.0
+    TOKEN = "owner"
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self.token = os.urandom(16).hex()
+        self._held = False
+
+    def try_acquire(self) -> bool:
+        try:
+            os.mkdir(self.path, 0o700)
+        except FileExistsError:
+            return False
+        try:
+            (self.path / self.TOKEN).write_text(self.token)
+        except OSError:
+            shutil.rmtree(self.path, ignore_errors=True)
+            raise
+        self._held = True
+        return True
+
+    def is_stale(self) -> bool:
+        try:
+            return time.time() - self.path.stat().st_mtime > self.STALE_S
+        except OSError:
+            return True
+
+    def break_stale(self) -> None:
+        shutil.rmtree(self.path, ignore_errors=True)
+
+    def touch(self) -> None:
+        if self._held:
+            try:
+                os.utime(self.path)
+            except OSError:
+                pass
+
+    def release(self) -> None:
+        if not self._held:
+            return
+        self._held = False
+        try:
+            mine = (self.path / self.TOKEN).read_text() == self.token
+        except OSError:
+            return
+        if mine:
+            shutil.rmtree(self.path, ignore_errors=True)
 
 
 def write_marker(d: Path, marker: UploadMarker) -> None:

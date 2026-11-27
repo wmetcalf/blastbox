@@ -1703,11 +1703,15 @@ def register_node_claim_routes(
                 if declared and declared.isdigit() and int(declared) > cap:
                     raise HTTPException(status_code=413, detail="result too large")
                 got = 0
+                beat = time.monotonic()
                 async for chunk in request.stream():
                     got += len(chunk)
                     if got > cap:
                         raise HTTPException(status_code=413, detail="result too large")
                     await run_in_threadpool(spool.write, chunk)
+                    if time.monotonic() - beat > 30:
+                        upload_lock.touch()     # alive: a slow upload is not a crashed one
+                        beat = time.monotonic()
                 spool.flush()
                 spool.seek(0)
 
@@ -1724,6 +1728,7 @@ def register_node_claim_routes(
                     _remote_http._safe_extract_tar(
                         spool, out, max_total_bytes=lim.max_total_artifact_bytes,
                         max_members=max_members, max_metadata_bytes=lim.max_metadata_bytes)
+                    nr.fsync_tree(out)          # 202 promises durability, not only the marker
                     return partial
 
                 try:
@@ -1742,6 +1747,7 @@ def register_node_claim_routes(
                         finished_at_ms=finished))
                     try:
                         os.rename(partial, final)
+                        nr.fsync_dir(jobdir)
                     except OSError:
                         # lost a race with an identical upload: it is already quarantined
                         shutil.rmtree(partial, ignore_errors=True)
@@ -1773,17 +1779,14 @@ def register_node_claim_routes(
         # concurrent identical PUT waits briefly for the winner's result, else answers 202.
         # A lock older than the longest plausible upload is stale (crash) and is broken.
         lock = final.with_name(final.name + ".claim")
+        upload_lock = nr.UploadLock(lock)
         for _attempt in range(2):
-            try:
-                os.mkdir(lock, 0o700)
+            if upload_lock.try_acquire():
                 break
-            except FileExistsError:
-                try:
-                    stale = time.time() - lock.stat().st_mtime > 900
-                except OSError:
-                    stale = True
-                if stale:
-                    shutil.rmtree(lock, ignore_errors=True)
+            else:
+                # a live holder touches the lock while it streams; only a silent one is stale
+                if upload_lock.is_stale():
+                    upload_lock.break_stale()
                     continue
                 for _ in range(50):
                     await asyncio.sleep(0.1)
@@ -1811,7 +1814,7 @@ def register_node_claim_routes(
                 return JSONResponse({"status": "retry"}, status_code=503,
                                     headers={"Retry-After": "30"})
         finally:
-            shutil.rmtree(lock, ignore_errors=True)
+            upload_lock.release()           # only ever OUR lock, never a successor's
 
     app.include_router(router)
     _log.info("node_claim: enforcing node grants at the hand-over (pki=%s)", resolved)

@@ -49,6 +49,8 @@ BACKOFF_MAX_S = 900.0
 def _now() -> float:
     return time.time()
 STALE_NO_OUTCOME_S = 24 * 3600.0
+# A .partial-* extraction dir or a root .upload-*.tar older than this belongs to a dead ingress.
+STALE_PARTIAL_S = 3600.0
 
 
 def retain_seconds(env: "dict[str, str] | None" = None) -> float:
@@ -275,11 +277,21 @@ class NodeFinalizer:
 
     def _sweep_old(self) -> None:
         cutoff = time.time() - self._retain_s
+        orphan_cutoff = time.time() - STALE_PARTIAL_S
         try:
             jobs = list(self._root.iterdir())
         except OSError:
             return
         for jd in jobs:
+            if jd.name.startswith(".upload-") and jd.is_file():
+                # an ingress killed mid-upload leaves its body spool behind (a live upload
+                # keeps writing it, so its mtime stays fresh)
+                try:
+                    if jd.stat().st_mtime < orphan_cutoff:
+                        jd.unlink()
+                except OSError:
+                    pass
+                continue
             if not jd.is_dir():
                 continue
             try:
@@ -288,6 +300,11 @@ class NodeFinalizer:
                 continue
             for cd in claims:
                 try:
+                    if ".partial" in cd.name:
+                        # an extraction killed mid-way (never renamed into place)
+                        if cd.is_dir() and cd.stat().st_mtime < orphan_cutoff:
+                            shutil.rmtree(cd, ignore_errors=True)
+                        continue
                     if (cd / nr.OUTCOME).is_file():
                         if (cd / nr.OUTCOME).stat().st_mtime < cutoff:
                             shutil.rmtree(cd, ignore_errors=True)

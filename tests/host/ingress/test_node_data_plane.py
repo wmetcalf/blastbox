@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
 import tarfile
 import time
 
@@ -609,3 +610,53 @@ def test_replay_of_a_retained_result_later_repaired_is_done(tmp_path, pki_dir): 
                            status=JobStatus.DONE, error=None)
     r = put(c, hdr, b"x")
     assert r.status_code == 200 and r.json() == {"status": "done"}
+
+
+# ---------------------------------------------------------------- upload lock + durability
+
+def test_upload_lock_release_never_removes_a_successors_lock(tmp_path):
+    lk = tmp_path / "x.claim"
+    a = node_results.UploadLock(lk)
+    assert a.try_acquire()
+    old = time.time() - 10_000
+    os.utime(lk, (old, old))
+    b = node_results.UploadLock(lk)
+    assert not b.try_acquire() and b.is_stale()
+    b.break_stale()
+    assert b.try_acquire()
+    a.release()                     # the slow original finishing late
+    assert lk.is_dir() and not node_results.UploadLock(lk).try_acquire()
+    b.release()
+    assert not lk.exists()
+
+
+def test_upload_lock_heartbeat_keeps_a_live_upload_fresh(tmp_path):
+    lk = tmp_path / "x.claim"
+    a = node_results.UploadLock(lk)
+    assert a.try_acquire()
+    old = time.time() - 10_000
+    os.utime(lk, (old, old))
+    assert node_results.UploadLock(lk).is_stale()
+    a.touch()
+    assert not node_results.UploadLock(lk).is_stale()
+
+
+def test_extracted_tree_is_fsynced_before_accepting(tmp_path, pki_dir, monkeypatch):  # noqa: F811
+    """202 promises the result is quarantined: the files, not only the marker, are durable."""
+    synced: list[str] = []
+    real = os.fsync
+
+    def spy(fd):
+        try:
+            synced.append(os.readlink(f"/proc/self/fd/{fd}"))
+        except OSError:
+            pass
+        return real(fd)
+
+    _, c, hdr = _setup(tmp_path, pki_dir)
+    monkeypatch.setattr(os, "fsync", spy)
+    assert put(c, hdr, make_tar([("art.bin", b"payload")])).status_code == 202
+    assert any(p.endswith("/out/art.bin") for p in synced), synced
+    assert any(p.endswith("/out/metadata.json") for p in synced), synced
+    (d,) = spool_dirs(tmp_path)
+    assert str(d.parent) in synced, synced          # the rename into place is durable
