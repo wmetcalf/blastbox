@@ -368,6 +368,41 @@ def test_unwritable_prefix_not_reported_as_held_lock(tmp_path):
         pfx.chmod(0o755)
 
 
+def test_version_dir_symlink_refused(tmp_path):
+    rel, sha = make_release(tmp_path)
+    pfx = tmp_path / "pfx"
+    pfx.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (pfx / "1.0.0").symlink_to(outside, target_is_directory=True)
+    p = install(rel, sha, pfx, "1.0.0", "--no-cosign")
+    assert p.returncode != 0 and "not a directory" in p.stderr
+    assert not (outside / "blastbox-agent").exists()
+    assert not (pfx / "current").exists()
+
+
+def test_signal_between_record_and_flip_restores_previous(tmp_path):
+    if os.path.realpath(shutil.which("sh") or "/bin/sh").endswith("busybox"):
+        pytest.skip("busybox sh runs its own applets, bypassing PATH shims")
+    pfx = _two_versions(tmp_path)  # current -> 2.0.0, .previous = 1.0.0
+    rel, sha = make_release(tmp_path, b"bin 3")
+    shim = tmp_path / "sigshim"
+    shim.mkdir()
+    w = shim / "mv"
+    w.write_text(
+        "#!/bin/sh\nfor last; do :; done\n"
+        f'{shutil.which("mv")} "$@" || exit 1\n'
+        'case "$last" in */.previous) kill -TERM "$PPID" ;; esac\n'
+    )
+    w.chmod(0o755)
+    p = run(["--version", "3.0.0", "--sha256", sha, "--from", str(rel), "--prefix", str(pfx),
+             "--no-cosign"], path=f"{shim}:{os.environ['PATH']}")
+    assert p.returncode == 143
+    assert os.readlink(pfx / "current") == "2.0.0"
+    assert (pfx / ".previous").read_text().strip() == "1.0.0"
+    assert not (pfx / ".lock").exists() and not list(pfx.glob(".*.tmp.*"))
+
+
 def test_dirs_readable_under_restrictive_umask(tmp_path):
     rel, sha = make_release(tmp_path)
     pfx = tmp_path / "pfx"

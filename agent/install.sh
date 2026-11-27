@@ -58,7 +58,16 @@ tmp=$prefix/.current.tmp.$$
 ptmp=$prefix/.previous.tmp.$$
 stage=""
 locked=0
-trap 'rm -f "$tmp" "$ptmp"; if [ -n "$stage" ]; then rm -rf "$stage"; fi; if [ "$locked" = 1 ]; then rmdir "$prefix/.lock" 2>/dev/null || :; fi' EXIT
+flipping=0   # 1 from recording .previous until current has been flipped
+on_exit() {
+  # A die or a signal between record_previous and a completed flip puts the old
+  # .previous back, so current and .previous never disagree.
+  if [ "$flipping" = 1 ]; then (restore_previous) 2>/dev/null || :; fi
+  rm -f "$tmp" "$ptmp"
+  if [ -n "$stage" ]; then rm -rf "$stage"; fi
+  if [ "$locked" = 1 ]; then rmdir "$prefix/.lock" 2>/dev/null || :; fi
+}
+trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -125,7 +134,8 @@ valid_version() {
 # Record what current points at now ($1) as <prefix>/.previous, unless it is the version
 # $2 we are about to point it at. This runs BEFORE the flip, so a failed write never
 # leaves current moved with a stale .previous; it writes a temp file and renames it. If
-# the flip then fails, restore_previous puts the old .previous back.
+# the flip then fails or is interrupted, on_exit's restore_previous puts the old
+# .previous back.
 # An absolute link into <prefix> is reduced to its version. Any other target (a link
 # outside <prefix>, a non-version name, a version that is not installed) cannot be
 # rolled back to, so .previous is removed rather than left naming an older version that
@@ -175,8 +185,10 @@ if [ "$rollback" = 1 ]; then
   valid_version "$prev" || die "corrupt $prefix/.previous"
   [ -x "$prefix/$prev/blastbox-agent" ] || die "previous version $prev is not installed"
   cur=$(current_target || true)
+  flipping=1
   if [ -n "$cur" ]; then record_previous "$cur" "$prev"; fi
-  if ! flip_current "$prev"; then restore_previous; die "could not repoint $prefix/current"; fi
+  flip_current "$prev" || die "could not repoint $prefix/current"
+  flipping=0
   say "rolled back to $prev (was ${cur:-none})"
   exit 0
 fi
@@ -210,6 +222,11 @@ base="https://github.com/$REPO/releases/download/$tag"
 acquire_lock
 if [ -e "$prefix/current" ] && [ ! -L "$prefix/current" ]; then
   die "$prefix/current exists and is not a symlink; move it aside"
+fi
+# <prefix>/<version> must be a real directory: through a symlink the binary would be
+# written outside the prefix.
+if [ -L "$prefix/$version" ] || { [ -e "$prefix/$version" ] && [ ! -d "$prefix/$version" ]; }; then
+  die "$prefix/$version is not a directory (a symlink or a file); move it aside"
 fi
 stage=$(mktemp -d "$prefix/.stage.XXXXXX")
 
@@ -252,6 +269,8 @@ mv -f "$dest/blastbox-agent.new" "$dest/blastbox-agent"
 
 # 5. flip current atomically; remember what it pointed at
 cur=$(current_target || true)
+flipping=1
 if [ -n "$cur" ]; then record_previous "$cur" "$version"; fi
-if ! flip_current "$version"; then restore_previous; die "could not repoint $prefix/current"; fi
+flip_current "$version" || die "could not repoint $prefix/current"
+flipping=0
 say "installed $version to $dest (current -> $version)"
