@@ -284,10 +284,10 @@ def test_unreadable_cert_file_defers_instead_of_dropping(tmp_path, monkeypatch):
     queue_csr(d, "n1", make_csr("n1")[0])
     real = node_renew._read_capped
 
-    def flaky(path, limit):
+    def flaky(path, limit, **kw):
         if path.name == "node-n1.crt":
             raise OSError("EIO")
-        return real(path, limit)
+        return real(path, limit, **kw)
     monkeypatch.setattr(node_renew, "_read_capped", flaky)
     [(nid, outcome)] = sign_pending(ca, d)
     assert outcome.startswith("deferred:")
@@ -516,8 +516,10 @@ def test_a_symlinked_csr_is_not_read(tmp_path):
     secret = tmp_path / "secret"
     secret.write_bytes(b"not for you")
     (d / "renew" / "n1.csr").symlink_to(secret)
-    assert sign_pending(ca, d) == []
-    assert secret.exists()
+    [(nid, outcome)] = sign_pending(ca, d)          # said, not silently skipped
+    assert nid == "n1" and outcome.startswith("refused")
+    assert secret.read_bytes() == b"not for you"
+    assert pending(d) == []                         # only the link is gone
 
 
 @pytest.mark.parametrize("bad", ["*", "n?", "../x", ""])
@@ -692,7 +694,8 @@ def test_oversized_and_fifo_files_in_a_node_dir_are_skipped(tmp_path):
     signal.signal(signal.SIGALRM, lambda *a: (_ for _ in ()).throw(TimeoutError()))
     signal.alarm(20)
     try:
-        assert sign_pending(ca, ca_dir, node_dirs=[i1]) == [("n1", "renewed")]
+        out = dict(sign_pending(ca, ca_dir, node_dirs=[i1]))
+        assert out["n1"] == "renewed" and out["n2"].startswith("refused")
         assert node_renew.revoke(ca_dir, "n1", node_dirs=[i1])
     finally:
         signal.alarm(0)
@@ -750,3 +753,68 @@ def test_revoke_removes_a_symlink_to_the_nodes_cert_but_not_its_target(tmp_path)
     assert not (i1 / "node-n1.crt").is_symlink()
     assert outside.exists()
     assert "n1" not in fleet_grants(i1)
+
+
+def test_a_symlinked_cert_the_ingress_authorises_is_renewed_too(tmp_path):
+    """Every reader of a cert dir follows a symlinked cert the same way: the ingress
+    authorises the node through it, so renewal must see it, and replaces only the link."""
+    d, ca = rig(tmp_path)
+    outside = tmp_path / "store" / "n1.crt"
+    outside.parent.mkdir()
+    os.replace(d / "node-n1.crt", outside)
+    (d / "node-n1.crt").symlink_to(outside)
+    assert set(fleet_grants(d)) == {"n1"}
+    before = outside.read_bytes()
+    queue_csr(d, "n1", make_csr("n1")[0])
+    assert sign_pending(ca, d) == [("n1", "renewed")]
+    assert not (d / "node-n1.crt").is_symlink()     # the link was replaced ...
+    assert outside.read_bytes() == before           # ... never written through
+
+
+def test_one_unreadable_file_does_not_stop_a_dirs_revocation(tmp_path):
+    ca, ca_dir, i1, _i2 = _split(tmp_path)
+    (i1 / "aaa.crt").write_bytes(b"x")
+    os.chmod(i1 / "aaa.crt", 0)
+    queue_csr(i1, "n1", make_csr("n1")[0])
+    try:
+        if os.access(i1 / "aaa.crt", os.R_OK):
+            pytest.skip("running as root: mode 000 is still readable")
+        with pytest.raises(node_renew.PartialRevoke) as exc:
+            node_renew.revoke(ca_dir, "n1", node_dirs=[i1])
+    finally:
+        os.chmod(i1 / "aaa.crt", 0o644)
+    assert not (i1 / "node-n1.crt").exists()
+    assert pending(i1) == []
+    assert i1 / "node-n1.crt" in exc.value.removed
+    assert any("aaa.crt" in why for _d, why in exc.value.failed)
+
+
+def test_revoke_does_not_wait_the_renewal_lock_timeout(tmp_path, monkeypatch):
+    import time as _t
+    ca, ca_dir, i1, i2 = _split(tmp_path)
+    monkeypatch.setattr(node_renew, "LOCK_TIMEOUT_S", 60.0)
+    holder = open(i2 / ".renew.lock", "a+")
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    t0 = _t.monotonic()
+    try:
+        with pytest.raises(node_renew.PartialRevoke):
+            node_renew.revoke(ca_dir, "n1", node_dirs=[i1, i2])
+    finally:
+        holder.close()
+    assert _t.monotonic() - t0 < 30
+    assert node_renew.current_cert(i2, "n1") is None
+
+
+def test_an_unreadable_queued_csr_is_reported_deferred(tmp_path, monkeypatch):
+    d, ca = rig(tmp_path)
+    queue_csr(d, "n1", make_csr("n1")[0])
+    real = node_renew._read_capped
+
+    def eacces(path, limit, **kw):
+        if path.name.startswith("n1.csr"):
+            raise PermissionError(13, "Permission denied")
+        return real(path, limit, **kw)
+    monkeypatch.setattr(node_renew, "_read_capped", eacces)
+    [(nid, outcome)] = sign_pending(ca, d)
+    assert outcome.startswith("deferred")
+    assert pending(d) == ["n1"]

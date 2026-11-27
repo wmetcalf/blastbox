@@ -930,8 +930,9 @@ certificates in ALL of those dirs as its current state: the renewed certificate 
 them, and replaces the node's certificates in every dir where it still verifies, so an
 ingress that narrowed a node is never widened by a renewal queued through another. A dir where
 it was revoked is left alone. Every certificate is verified against the CA host's own CA, never
-a node dir's `ca.crt`, and symlinks in a node dir are not followed: the dir is the ingress's to
-write. A run that cannot lock every dir within two minutes, or finds a node dir without `ca.crt`
+a node dir's `ca.crt`, and reads from a node dir are bounded and never block on a FIFO: the dir is
+the ingress's to write. A symlinked certificate is followed, exactly as the ingress follows it,
+and renewing it replaces the link, never its target; a symlinked queued CSR is refused. A run that cannot lock every dir within two minutes, or finds a node dir without `ca.crt`
 (an unmounted mountpoint), renews nothing and exits 1; a write that fails mid-way keeps the CSR, and the next run redoes it. Without
 `--node-dir` a split deployment's renewals are never seen: the node gets 202 and its old
 certificate until it expires.
