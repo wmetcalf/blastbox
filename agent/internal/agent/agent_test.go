@@ -686,6 +686,22 @@ func TestRenewNowAgainstControlPlane(t *testing.T) {
 	}
 }
 
+// A truncated or garbage key.next (a disk fault, a manual edit) must not wedge renewal until the
+// certificate expires: it is replaced and a fresh CSR is sent.
+func TestCorruptKeyNextIsReplaced(t *testing.T) {
+	e := newEnv(t, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	if err := os.WriteFile(e.cfg.KeyFile+".next", []byte("-----BEGIN PRIV"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	if err := RenewNow(context.Background(), e.cfg, time.Now, &out); err != nil {
+		t.Fatalf("renewal with a corrupt key.next: %v", err)
+	}
+	if !strings.Contains(out.String(), "installed") {
+		t.Fatalf("%q", out.String())
+	}
+}
+
 func TestEnrolRefusesExistingKeyAndFixesDirMode(t *testing.T) {
 	d := t.TempDir()
 	os.Chmod(d, 0o755)

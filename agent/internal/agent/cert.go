@@ -145,6 +145,16 @@ func (r *Renewer) Step(ctx context.Context, force bool) (RenewState, error) {
 	nextKey := r.Cfg.KeyFile + ".next"
 	_, statErr := os.Lstat(nextKey)
 	pendingKey := statErr == nil
+	if pendingKey {
+		if _, err := wire.LoadKey(nextKey); err != nil {
+			// A corrupt leftover can never match an issued certificate: drop it, so a fresh key
+			// and CSR replace it instead of every pass failing until the certificate expires.
+			if rerr := os.Remove(nextKey); rerr != nil {
+				return RenewPending, fmt.Errorf("unreadable %s (%v) and cannot be removed: %w", nextKey, err, rerr)
+			}
+			pendingKey, r.submitted = false, time.Time{}
+		}
+	}
 	if !due && !force && !pendingKey {
 		return RenewNotDue, nil
 	}
