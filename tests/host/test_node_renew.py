@@ -1194,3 +1194,21 @@ def test_a_queue_name_cannot_fake_the_exit_code(tmp_path, capsys):
     (d / "renew").mkdir()
     os.mkfifo(d / "renew" / "NOT written.csr")
     assert main(["pki", "--dir", str(d), "renew-pending"]) == 0
+
+
+def test_an_unrelated_unreadable_link_in_the_queueing_dir_does_not_defer(tmp_path):
+    ca, ca_dir, i1, i2 = _split(tmp_path)
+    queue_csr(i1, "n1", make_csr("n1")[0])
+    (i1 / "node-n1.crt").unlink()                        # revoked on i1 after queueing
+    (i1 / "junk.crt").symlink_to("/nonexistent/x.crt")
+    (i1 / "node-n2.crt").symlink_to("/nonexistent/n2.crt")
+    assert sign_pending(ca, ca_dir, node_dirs=[i1, i2]) == [
+        ("n1", "refused: no current certificate")]
+
+
+def test_every_unreadable_link_is_warned_including_other_nodes(tmp_path):
+    ca, ca_dir, i1, i2 = _split(tmp_path)
+    (i1 / "node-n2.crt").symlink_to("/nonexistent/n2.crt")
+    (i1 / "junk.crt").symlink_to("/nonexistent/x.crt")
+    names = {p.name for p in node_renew.unreadable_links(ca_dir, [i1, i2])}
+    assert names == {"node-n2.crt", "junk.crt"}

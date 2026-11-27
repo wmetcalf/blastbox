@@ -333,28 +333,20 @@ def unreadable_links(pki_dir: Path, node_dirs: list[Path] | None = None) -> list
                 try:
                     _read_capped(c, MAX_CERT_BYTES, follow=True)
                 except (OSError, _Unreadable):
-                    if not c.name.startswith("node-"):     # those are charged per node
-                        out.append(c)
+                    out.append(c)       # node-<id>.crt ones are ALSO charged to that node
     return out
 
 
-def _links_out_for(d: Path, node_id: str, ca: CertAuthority, *,
-                   unknown_counts: bool = False) -> bool:
-    """Does ``d`` hold a cert for ``node_id`` through a link that leaves ``d``?
+def _links_out_for(d: Path, node_id: str, ca: CertAuthority) -> bool:
+    """Does ``d`` hold a cert for ``node_id`` through a READABLE link that leaves ``d``?
 
-    ``unknown_counts``: a link this host cannot read at all (dangling here, unreadable)
-    MAY be the node's, so it counts; one that reads as something else does not.
+    (A link this host cannot read is attributed only by name: see _unreadable_named_link.)
     """
     for c in sorted(d.glob("*.crt")):
         if not _links_out(c, d):
             continue
         try:
             pem = _read_capped(c, MAX_CERT_BYTES, follow=True)
-        except (OSError, _Unreadable):
-            if unknown_counts:
-                return True
-            continue
-        try:
             if node_identity(ca, pem).node_id == node_id:
                 return True
         except Exception:                               # noqa: BLE001 - not a cert of it
@@ -658,7 +650,7 @@ def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
         return (f"deferred: {linked[0]} has a cert for this node linked from outside the "
                 "dir, which renewal does not follow -- replace the link with the file"), True
     if qdir not in states:
-        if _links_out_for(qdir, node_id, ca, unknown_counts=True):
+        if _links_out_for(qdir, node_id, ca) or _unreadable_named_link(qdir, node_id):
             # The queueing ingress may hold the node through a link this host cannot follow
             # (or even resolve): it cannot tell, so keep the CSR and say why. Bounded: once
             # the proof is older than RENEW_PROOF_MAX_AGE_S the entry is refused anyway.
