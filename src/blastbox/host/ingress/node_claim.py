@@ -533,11 +533,10 @@ class HeartbeatBody(BaseModel):
 
 
 def _heartbeat_interval_s() -> int:
-    try:
-        v = int(os.environ.get("BLASTBOX_NODE_HEARTBEAT_S", "30"))
-    except ValueError:
-        v = 30
-    return max(10, min(300, v))
+    # One source for the interval and for the node_silent default derived from it.
+    from blastbox.host.node_liveness import heartbeat_interval_s
+
+    return heartbeat_interval_s()
 
 
 class UpdateRequest(BaseModel):
@@ -984,11 +983,13 @@ def register_node_claim_routes(
         from blastbox.host.placement import refusal
 
         node_id = _node_from_token(x_blastbox_node_session)
-        # Every AUTHENTICATED attempt counts as the node being alive and polling -- including
-        # one that ends in a 204, which is the common case for an idle node. Not a 401 (above
-        # raised already). Best-effort: a store error is logged, never fails the claim.
+        # Every AUTHENTICATED attempt by a node that still holds a certificate counts as the
+        # node being alive and polling -- including one that ends in a 204, the common case for
+        # an idle node. Not a 401 (above raised already), and not a node whose certificate is
+        # gone: its session outlives the revocation, and it must not keep looking alive.
+        # Best-effort: a store error is logged, never fails the claim.
         _t = time.time()
-        if _claim_throttle.allow(node_id, _t):
+        if _grants_now(node_id) is not None and _claim_throttle.allow(node_id, _t):
             safe_record_claim(_liveness, node_id, req.engine, _t)
         if req.claimant_tier:
             # REFUSED, not ignored, and not honoured.

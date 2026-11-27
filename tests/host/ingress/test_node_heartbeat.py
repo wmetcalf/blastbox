@@ -168,3 +168,12 @@ def test_floor_longer_than_32_chars_is_refused(rig, pki_dir):
     body = dict(GOOD, engines=[dict(GOOD["engines"][0], floor="x" * 33)])
     r = c.post("/v1/nodes/heartbeat", json=body, headers=auth(token_for(c, pki_dir, "alpha")))
     assert r.status_code == 422
+
+
+def test_claim_from_a_node_whose_cert_is_gone_records_nothing(rig, pki_dir):
+    _, c = rig
+    tok = token_for(c, pki_dir, "alpha")
+    for f in pki_dir.glob("node-alpha.*"):
+        f.unlink()
+    assert _claim(c, pki_dir, "alpha", token=tok).status_code == 403
+    assert "alpha" not in _liveness(c).snapshot()
