@@ -1,0 +1,32 @@
+{
+  "params": {
+    "EXEDIR_0": "/opt/engine/bin",
+    "EXE_0": "/opt/engine/bin/scan",
+    "RO_0": "/opt/engine/models",
+    "RO_1": "/opt/engine/config",
+    "RWA_0": "/var/run/bb/scratch-1",
+    "RWR_0": "/var/run/bb/scratch-1",
+    "RW_0": "/var/run/bb/scratch-1",
+    "SYS_0": "/usr/bin",
+    "SYS_1": "/bin",
+    "SYS_2": "/usr/sbin",
+    "SYS_3": "/sbin",
+    "SYS_4": "/usr/libexec"
+  },
+  "profile": "(version 1)\n(deny default)\n(import \"system.sb\")\n(allow process-fork)\n(allow signal (target same-sandbox))\n(allow file-read-metadata)\n(allow sysctl-read)\n(allow file-read* (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/random\") (literal \"/dev/urandom\"))\n(allow file-write-data (literal \"/dev/null\"))\n(allow file-read* process-exec (subpath (param \"SYS_0\")) (subpath (param \"SYS_1\")) (subpath (param \"SYS_2\")) (subpath (param \"SYS_3\")) (subpath (param \"SYS_4\")))\n(allow file-read* process-exec (literal (param \"EXE_0\")))\n(allow file-read* (literal (param \"EXEDIR_0\")))\n(allow file-read* process-exec (subpath (param \"RO_0\")) (subpath (param \"RO_1\")))\n(allow file-read* file-write* (subpath (param \"RW_0\")))\n(deny file-write-acl (subpath (param \"RWA_0\")))\n(deny file-write-unlink (literal (param \"RWR_0\")))\n(deny file-link)\n(deny network*)\n",
+  "request": {
+    "accelerators": [],
+    "canary": null,
+    "exec_paths": [
+      "/opt/engine/bin/scan"
+    ],
+    "ro_paths": [
+      "/opt/engine/models",
+      "/opt/engine/config"
+    ],
+    "rw_paths": [
+      "/var/run/bb/scratch-1"
+    ],
+    "scratch": "/var/run/bb/scratch-1"
+  }
+}

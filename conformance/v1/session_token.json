@@ -1,0 +1,116 @@
+{
+  "issue": [
+    {
+      "node_id": "mac-mini-1",
+      "now": 1700000000.0,
+      "token": "mac-mini-1:1700000600.0:00936c5f5c230770b3ab7206baa2257ef6e4aa7bcf49e95dd5e15c0c9b5094d4",
+      "ttl_s": 600.0
+    },
+    {
+      "node_id": "worker.a_b-2",
+      "now": 1700000000.5,
+      "token": "worker.a_b-2:1700000600.5:fea5d1c1270dec6d3e7f3d6bc0c3ee88f967861d534e391ad5bb5635fa1d85c6",
+      "ttl_s": 600.0
+    },
+    {
+      "node_id": "n",
+      "now": 1700000000.0,
+      "token": "n:1700000001.0:607aba92a5b708e152e3ff61737f3a0f6a6b156a59024d86acc302909669508d",
+      "ttl_s": 1.0
+    }
+  ],
+  "secret_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "ttl_s": 600.0,
+  "verify": [
+    {
+      "node_id": "mac-mini-1",
+      "token": "mac-mini-1:1700000600.0:00936c5f5c230770b3ab7206baa2257ef6e4aa7bcf49e95dd5e15c0c9b5094d4",
+      "verdict": "ok",
+      "verify_at": 1700000001.0
+    },
+    {
+      "node_id": "mac-mini-1",
+      "token": "mac-mini-1:1700000600.0:00936c5f5c230770b3ab7206baa2257ef6e4aa7bcf49e95dd5e15c0c9b5094d4",
+      "verdict": "ok",
+      "verify_at": 1700000600.0
+    },
+    {
+      "node_id": null,
+      "token": "mac-mini-1:1700000600.0:00936c5f5c230770b3ab7206baa2257ef6e4aa7bcf49e95dd5e15c0c9b5094d4",
+      "verdict": "expired",
+      "verify_at": 1700000600.001
+    },
+    {
+      "node_id": null,
+      "token": "other-node:1700000600.0:00936c5f5c230770b3ab7206baa2257ef6e4aa7bcf49e95dd5e15c0c9b5094d4",
+      "verdict": "forged",
+      "verify_at": 1700000001.0
+    },
+    {
+      "node_id": null,
+      "token": "mac-mini-1:1700001600.0:00936c5f5c230770b3ab7206baa2257ef6e4aa7bcf49e95dd5e15c0c9b5094d4",
+      "verdict": "forged",
+      "verify_at": 1700000001.0
+    },
+    {
+      "node_id": null,
+      "token": "mac-mini-1:1700000600.0:00936c5f5c230770b3ab7206baa2257ef6e4aa7bcf49e95dd5e15c0c9b5094d0",
+      "verdict": "forged",
+      "verify_at": 1700000001.0
+    },
+    {
+      "node_id": null,
+      "token": "mac-mini-1:1700000600.0:00936C5F5C230770B3AB7206BAA2257EF6E4AA7BCF49E95DD5E15C0C9B5094D4",
+      "verdict": "forged",
+      "verify_at": 1700000001.0
+    },
+    {
+      "node_id": null,
+      "token": "mac-mini-1:1700000600.0:00936c5f5c230770b3ab7206baa2257ef6e4aa7bcf49e95dd5e15c0c9b5094d4",
+      "verdict": "forged",
+      "verify_at": 1700000001.0
+    },
+    {
+      "node_id": null,
+      "token": "",
+      "verdict": "malformed",
+      "verify_at": 1700000001.0
+    },
+    {
+      "node_id": null,
+      "token": "x",
+      "verdict": "malformed",
+      "verify_at": 1700000001.0
+    },
+    {
+      "node_id": null,
+      "token": "a:b",
+      "verdict": "malformed",
+      "verify_at": 1700000001.0
+    },
+    {
+      "node_id": null,
+      "token": "::00936c5f5c230770b3ab7206baa2257ef6e4aa7bcf49e95dd5e15c0c9b5094d4",
+      "verdict": "malformed",
+      "verify_at": 1700000001.0
+    },
+    {
+      "node_id": null,
+      "token": "mac-mini-1::00936c5f5c230770b3ab7206baa2257ef6e4aa7bcf49e95dd5e15c0c9b5094d4",
+      "verdict": "malformed",
+      "verify_at": 1700000001.0
+    },
+    {
+      "node_id": null,
+      "token": "mac-mini-1:1700000600.0:",
+      "verdict": "malformed",
+      "verify_at": 1700000001.0
+    },
+    {
+      "node_id": null,
+      "token": "mac-mini-1:nan1:00936c5f5c230770b3ab7206baa2257ef6e4aa7bcf49e95dd5e15c0c9b5094d4",
+      "verdict": "malformed",
+      "verify_at": 1700000001.0
+    }
+  ]
+}

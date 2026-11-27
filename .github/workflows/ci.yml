@@ -28,6 +28,11 @@ jobs:
         run: ruff check src tests scripts
       - name: Mypy
         run: mypy src
+      - name: Conformance vectors
+        # The Go pull-worker agent consumes conformance/v1/; this fails if the committed files
+        # drift from what the Python reference generates (or the committed-once certs/signatures
+        # stop verifying).
+        run: python scripts/gen_conformance.py --check
       - name: Pytest
         # Firecracker + Postgres suites self-skip without /dev/kvm + a DSN.
         run: pytest -q

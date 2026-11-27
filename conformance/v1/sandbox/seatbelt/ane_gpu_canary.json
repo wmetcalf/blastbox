@@ -1,0 +1,42 @@
+{
+  "params": {
+    "CANARY": "bb.canary.0123456789abcdef",
+    "EXEDIR_0": "/opt/engine/bin",
+    "EXE_0": "/opt/engine/bin/scan",
+    "EXE_1": "/opt/engine/bin/helper",
+    "RO_0": "/opt/engine/models",
+    "RWA_0": "/var/run/bb/scratch-2",
+    "RWA_1": "/var/run/bb/out",
+    "RWF_0": "/var/run/bb/out",
+    "RWR_0": "/var/run/bb/out",
+    "RWR_1": "/var/run/bb/scratch-2",
+    "RW_0": "/var/run/bb/scratch-2",
+    "RW_1": "/var/run/bb/out",
+    "SCRATCH_EXT": "/var/run/bb/scratch-2",
+    "SYS_0": "/usr/bin",
+    "SYS_1": "/bin",
+    "SYS_2": "/usr/sbin",
+    "SYS_3": "/sbin",
+    "SYS_4": "/usr/libexec"
+  },
+  "profile": "(version 1)\n(deny default)\n(import \"system.sb\")\n(allow process-fork)\n(allow signal (target same-sandbox))\n(allow file-read-metadata)\n(allow sysctl-read)\n(allow file-read* (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/random\") (literal \"/dev/urandom\"))\n(allow file-write-data (literal \"/dev/null\"))\n(allow file-read* process-exec (subpath (param \"SYS_0\")) (subpath (param \"SYS_1\")) (subpath (param \"SYS_2\")) (subpath (param \"SYS_3\")) (subpath (param \"SYS_4\")))\n(allow file-read* process-exec (literal (param \"EXE_0\")) (literal (param \"EXE_1\")))\n(allow file-read* (literal (param \"EXEDIR_0\")))\n(allow file-read* process-exec (subpath (param \"RO_0\")))\n(allow file-read* file-write* (subpath (param \"RW_0\")) (subpath (param \"RW_1\")))\n(deny file-write-flags (subpath (param \"RWF_0\")))\n(deny file-write-acl (subpath (param \"RWA_0\")) (subpath (param \"RWA_1\")))\n(deny file-write-unlink (literal (param \"RWR_0\")) (literal (param \"RWR_1\")))\n(deny file-link)\n(allow iokit-open-user-client (iokit-user-client-class \"H11ANEInDirectPathClient\" \"H11ANEInUserClient\" \"H1xANELoadBalancerDirectPathClient\" \"H1xANEInDirectPathClient\"))\n(allow mach-lookup (global-name \"com.apple.appleneuralengine\"))\n(allow iokit-open-user-client (iokit-user-client-class \"IOSurfaceRootUserClient\" \"AGXDeviceUserClient\"))\n(allow mach-lookup (global-name \"com.apple.cvmsServ\"))\n(allow file-issue-extension (require-all (extension-class \"com.apple.app-sandbox.read\") (subpath (param \"SCRATCH_EXT\"))))\n(allow mach-lookup (global-name (param \"CANARY\")))\n(deny network*)\n",
+  "request": {
+    "accelerators": [
+      "gpu",
+      "ane"
+    ],
+    "canary": "bb.canary.0123456789abcdef",
+    "exec_paths": [
+      "/opt/engine/bin/scan",
+      "/opt/engine/bin/helper"
+    ],
+    "ro_paths": [
+      "/opt/engine/models"
+    ],
+    "rw_paths": [
+      "/var/run/bb/scratch-2",
+      "/var/run/bb/out"
+    ],
+    "scratch": "/var/run/bb/scratch-2"
+  }
+}

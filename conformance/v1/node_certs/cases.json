@@ -1,0 +1,141 @@
+{
+  "ca": "ca.crt",
+  "cases": [
+    {
+      "admit": {
+        "challenge": "1811808060.0:22718422e3688308c1ff4a1273cf916b061848be0edfaa6bac71cc31a149c320",
+        "scope": "claim-next",
+        "signature_b64": "MEYCIQCyWu/y5P8fiOUbRXDRG1rAY4SBI20FpOHKX2rGXtf5HgIhANcOelufT+7Ahqnb5YP+n5bCkjLVaCXsRyAUJ75j32qu",
+        "verdict": "ok",
+        "verify_at": 1811808005.0
+      },
+      "cert": "v1_with_wg.crt",
+      "key": "v1_with_wg.key",
+      "name": "v1_with_wg",
+      "node_id": "node-v1",
+      "verdict": "ok",
+      "why": "node-info v1: WireGuard key present"
+    },
+    {
+      "admit": {
+        "challenge": "1811808060.0:22718422e3688308c1ff4a1273cf916b061848be0edfaa6bac71cc31a149c320",
+        "scope": "claim-next",
+        "signature_b64": "MEUCIQD7Hyfd+Gz2Q+N/SDxxEGfFWXQcbeVMn/HbpwzR7LLbqgIgI7NYkyK1jZAeCet6QUZ2b+hcc5g+cnjb8IyG3jKZrnQ=",
+        "verdict": "ok",
+        "verify_at": 1811808005.0
+      },
+      "cert": "v2_without_wg.crt",
+      "key": "v2_without_wg.key",
+      "name": "v2_without_wg",
+      "node_id": "node-v2",
+      "verdict": "ok",
+      "why": "node-info v2: no WireGuard key"
+    },
+    {
+      "admit": null,
+      "cert": "wrong_eku.crt",
+      "key": "wrong_eku.key",
+      "name": "wrong_eku",
+      "node_id": "node-weku",
+      "verdict": "refused",
+      "why": "EKU is serverAuth only, not the node EKU"
+    },
+    {
+      "admit": null,
+      "cert": "client_auth_eku.crt",
+      "key": "client_auth_eku.key",
+      "name": "client_auth_eku",
+      "node_id": "node-client",
+      "verdict": "refused",
+      "why": "EKU is clientAuth only (a dispatcher-style cert)"
+    },
+    {
+      "admit": null,
+      "cert": "cn_mismatch.crt",
+      "key": "cn_mismatch.key",
+      "name": "cn_mismatch",
+      "node_id": "node-real",
+      "verdict": "refused",
+      "why": "subject CN differs from node_id in node-info"
+    },
+    {
+      "admit": null,
+      "cert": "expired.crt",
+      "key": "expired.key",
+      "name": "expired",
+      "node_id": "node-old",
+      "verdict": "refused",
+      "why": "not_after is before the frozen now"
+    },
+    {
+      "admit": null,
+      "cert": "missing_node_info.crt",
+      "key": "missing_node_info.key",
+      "name": "missing_node_info",
+      "node_id": "node-noinfo",
+      "verdict": "refused",
+      "why": "no node-info extension"
+    },
+    {
+      "admit": null,
+      "cert": "garbled_node_info.crt",
+      "key": "garbled_node_info.key",
+      "name": "garbled_node_info",
+      "node_id": "node-garbled",
+      "verdict": "refused",
+      "why": "node-info is not JSON"
+    },
+    {
+      "admit": null,
+      "cert": "unsupported_version.crt",
+      "key": "unsupported_version.key",
+      "name": "unsupported_version",
+      "node_id": "node-v3",
+      "verdict": "refused",
+      "why": "node-info version 3 is unknown"
+    },
+    {
+      "admit": null,
+      "cert": "foreign_ca.crt",
+      "key": "foreign_ca.key",
+      "name": "foreign_ca",
+      "node_id": "node-foreign",
+      "verdict": "refused",
+      "why": "signed by a CA that is not the trust anchor"
+    },
+    {
+      "admit": {
+        "challenge": "1811808060.0:22718422e3688308c1ff4a1273cf916b061848be0edfaa6bac71cc31a149c320",
+        "scope": "claim-next",
+        "signature_b64": "dZ5l1hRkfY4NOfZJ/2oiv5wJeDvh/cwYedeOqMKin3YSnH2kL5RIA92HW1m7Yg0BBGIIzUlpGKXdoDF2LLvVPYyRQqa/o551Rq4ZnMFVHqmYFBgbIaoS8pl+RDhKri7SUPEzCJgaBW5Eq1fmWdjVyieHWicrt99KCADzvPNNyGjaHQbVFNXPq5/+tDfTspMcDJMPX4s/IpbauV0gli12s5msLXXtkwI3q2IPS0HVbOwQcykzX/XeIwu/X+0fv92b0Qm1HRSQ/VxyC6e/x0cMW+jNWIT1BDN9L+14b0ph5PzW2mkEfwPRCLUi8wi2bWxgZzsro7jJmwCgVqqDASn/5Q==",
+        "verdict": "refused",
+        "verify_at": 1811808005.0
+      },
+      "cert": "rsa_key.crt",
+      "key": "rsa_key.key",
+      "name": "rsa_key",
+      "node_id": "node-rsa",
+      "verdict": "ok",
+      "why": "RSA public key: identity verifies but admit_identity refuses it"
+    },
+    {
+      "admit": {
+        "challenge": "1811808060.0:22718422e3688308c1ff4a1273cf916b061848be0edfaa6bac71cc31a149c320",
+        "scope": "claim-next",
+        "signature_b64": "MEQCIC+XkOb0WujMQmTbkZ1eaqc/0gYL80aFYNy1Vr6B4LvhAiBXWoavYuaKVUJ3eOfMu80WzxlXpmKnFCsKKpKQPXMQXA==",
+        "verdict": "refused",
+        "verify_at": 1811808005.0
+      },
+      "cert": "v1_with_wg.crt",
+      "key": "v1_with_wg.key",
+      "name": "v1_wrong_key_signature",
+      "node_id": "node-v1",
+      "verdict": "ok",
+      "why": "valid cert, claim signed by someone else's key"
+    }
+  ],
+  "now": "2027-06-01T00:00:00+00:00",
+  "now_epoch": 1811808000.0,
+  "secret_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "warning": "TEST ONLY fixtures; verdict = node_identity, admit = admit_identity"
+}

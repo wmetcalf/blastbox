@@ -1,0 +1,190 @@
+{
+  "cases": [
+    {
+      "challenge": "1700000060.0:e88956c6b85d793a9c3e20025fbe965ef1ffb7c0e11b531d9044af68dcd8039e",
+      "expiry_repr": "1700000060.0",
+      "minted_scope": "claim-next",
+      "scope": "claim-next",
+      "verdict": "ok",
+      "verify_at": 1700000001.0
+    },
+    {
+      "challenge": "1700000060.0:e88956c6b85d793a9c3e20025fbe965ef1ffb7c0e11b531d9044af68dcd8039e",
+      "expiry_repr": "1700000060.0",
+      "minted_scope": "claim-next",
+      "scope": "claim-next",
+      "verdict": "ok",
+      "verify_at": 1700000060.0
+    },
+    {
+      "challenge": "1700000060.0:e88956c6b85d793a9c3e20025fbe965ef1ffb7c0e11b531d9044af68dcd8039e",
+      "expiry_repr": "1700000060.0",
+      "minted_scope": "claim-next",
+      "scope": "claim-next",
+      "verdict": "expired",
+      "verify_at": 1700000060.001
+    },
+    {
+      "challenge": "1700000060.123456:a349017bc1c06b79af43da038a73b6d46fd74fd67a3f87d8602e244c4e807515",
+      "expiry_repr": "1700000060.123456",
+      "minted_scope": "job-7f3a",
+      "scope": "job-7f3a",
+      "verdict": "ok",
+      "verify_at": 1700000001.123456
+    },
+    {
+      "challenge": "1700000060.123456:a349017bc1c06b79af43da038a73b6d46fd74fd67a3f87d8602e244c4e807515",
+      "expiry_repr": "1700000060.123456",
+      "minted_scope": "job-7f3a",
+      "scope": "job-7f3a",
+      "verdict": "ok",
+      "verify_at": 1700000060.123456
+    },
+    {
+      "challenge": "1700000060.123456:a349017bc1c06b79af43da038a73b6d46fd74fd67a3f87d8602e244c4e807515",
+      "expiry_repr": "1700000060.123456",
+      "minted_scope": "job-7f3a",
+      "scope": "job-7f3a",
+      "verdict": "expired",
+      "verify_at": 1700000060.124456
+    },
+    {
+      "challenge": "1700000060.0:9721bb7b2318ec162bd256ddf121bba04b25e9fdbf6c707bebb625333520016c",
+      "expiry_repr": "1700000060.0",
+      "minted_scope": "j\u00f6b-\ud83d\ude00",
+      "scope": "j\u00f6b-\ud83d\ude00",
+      "verdict": "ok",
+      "verify_at": 1700000001.0
+    },
+    {
+      "challenge": "1700000060.0:9721bb7b2318ec162bd256ddf121bba04b25e9fdbf6c707bebb625333520016c",
+      "expiry_repr": "1700000060.0",
+      "minted_scope": "j\u00f6b-\ud83d\ude00",
+      "scope": "j\u00f6b-\ud83d\ude00",
+      "verdict": "ok",
+      "verify_at": 1700000060.0
+    },
+    {
+      "challenge": "1700000060.0:9721bb7b2318ec162bd256ddf121bba04b25e9fdbf6c707bebb625333520016c",
+      "expiry_repr": "1700000060.0",
+      "minted_scope": "j\u00f6b-\ud83d\ude00",
+      "scope": "j\u00f6b-\ud83d\ude00",
+      "verdict": "expired",
+      "verify_at": 1700000060.001
+    },
+    {
+      "challenge": "1e+22:0cc2598b5f864a863c460e5cfd653b1714f415b8b01781d363bda8363ca8a2a3",
+      "expiry_repr": "1e+22",
+      "minted_scope": "claim-next",
+      "scope": "claim-next",
+      "verdict": "ok",
+      "verify_at": 1e+22
+    },
+    {
+      "challenge": "1e+22:0cc2598b5f864a863c460e5cfd653b1714f415b8b01781d363bda8363ca8a2a3",
+      "expiry_repr": "1e+22",
+      "minted_scope": "claim-next",
+      "scope": "claim-next",
+      "verdict": "ok",
+      "verify_at": 1e+22
+    },
+    {
+      "challenge": "1700000060.0:e88956c6b85d793a9c3e20025fbe965ef1ffb7c0e11b531d9044af68dcd8039e",
+      "expiry_repr": "1700000060.0",
+      "minted_scope": "claim-next",
+      "scope": "job-1",
+      "verdict": "wrong_scope",
+      "verify_at": 1700000001.0
+    },
+    {
+      "challenge": "1700000060.0:e88956c6b85d793a9c3e20025fbe965ef1ffb7c0e11b531d9044af68dcd8039e",
+      "expiry_repr": "1700000060.0",
+      "minted_scope": "claim-next",
+      "scope": "",
+      "verdict": "wrong_scope",
+      "verify_at": 1700000001.0
+    },
+    {
+      "challenge": "1700000060.0:cb60ccd5b488463c8b9783252c5f412bbfd70a84a42c4f6a45868a0f52921076",
+      "expiry_repr": "1700000060.0",
+      "minted_scope": "claim-next",
+      "scope": "claim-next",
+      "verdict": "foreign",
+      "verify_at": 1700000001.0
+    },
+    {
+      "challenge": "1700009999.0:e88956c6b85d793a9c3e20025fbe965ef1ffb7c0e11b531d9044af68dcd8039e",
+      "expiry_repr": "1700009999.0",
+      "minted_scope": "claim-next",
+      "scope": "claim-next",
+      "verdict": "foreign",
+      "verify_at": 1700000001.0
+    },
+    {
+      "challenge": "1700000060.0:E88956C6B85D793A9C3E20025FBE965EF1FFB7C0E11B531D9044AF68DCD8039E",
+      "expiry_repr": "1700000060.0",
+      "minted_scope": "claim-next",
+      "scope": "claim-next",
+      "verdict": "foreign",
+      "verify_at": 1700000001.0
+    },
+    {
+      "challenge": "",
+      "expiry_repr": null,
+      "minted_scope": null,
+      "scope": "claim-next",
+      "verdict": "malformed",
+      "verify_at": 1700000001.0
+    },
+    {
+      "challenge": "garbage",
+      "expiry_repr": null,
+      "minted_scope": null,
+      "scope": "claim-next",
+      "verdict": "malformed",
+      "verify_at": 1700000001.0
+    },
+    {
+      "challenge": "1700000060.0:",
+      "expiry_repr": null,
+      "minted_scope": null,
+      "scope": "claim-next",
+      "verdict": "malformed",
+      "verify_at": 1700000001.0
+    },
+    {
+      "challenge": ":e88956c6b85d793a9c3e20025fbe965ef1ffb7c0e11b531d9044af68dcd8039e",
+      "expiry_repr": null,
+      "minted_scope": null,
+      "scope": "claim-next",
+      "verdict": "malformed",
+      "verify_at": 1700000001.0
+    },
+    {
+      "challenge": "notafloat:e88956c6b85d793a9c3e20025fbe965ef1ffb7c0e11b531d9044af68dcd8039e",
+      "expiry_repr": null,
+      "minted_scope": null,
+      "scope": "claim-next",
+      "verdict": "malformed",
+      "verify_at": 1700000001.0
+    },
+    {
+      "challenge": "1700000060.0",
+      "expiry_repr": null,
+      "minted_scope": null,
+      "scope": "claim-next",
+      "verdict": "malformed",
+      "verify_at": 1700000001.0
+    },
+    {
+      "challenge": "1000.0:\u00e9",
+      "expiry_repr": null,
+      "minted_scope": null,
+      "scope": "claim-next",
+      "verdict": "foreign",
+      "verify_at": 1700000001.0
+    }
+  ],
+  "secret_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "ttl_s": 60.0
+}
