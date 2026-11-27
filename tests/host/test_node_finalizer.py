@@ -584,9 +584,9 @@ def test_sweep_removes_a_crash_left_upload_lock_but_not_a_held_one(tmp_path):
     store, job, fin, _ = build(tmp_path)
     root = nr.results_root(tmp_path / "jobs")
     (root / "job-1").mkdir(parents=True, exist_ok=True)
-    left = root / "job-1" / "aaaa.claim"
+    left = root / "job-1" / "aaaa.ulock"
     left.write_bytes(b"")
-    held = nr.UploadLock(root / "job-1" / "bbbb.claim")
+    held = nr.UploadLock(root / "job-1" / "bbbb.ulock")
     assert held.try_acquire()
     old = time.time() - 2 * 3600
     for p in (left, held.path):

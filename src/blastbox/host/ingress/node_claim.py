@@ -1774,7 +1774,7 @@ def register_node_claim_routes(
         # Exactly one extraction per (job, claim): the first PUT holds this lock dir; a
         # concurrent identical PUT waits briefly for the winner's result, else answers 202.
         # A lock older than the longest plausible upload is stale (crash) and is broken.
-        lock = final.with_name(final.name + ".claim")
+        lock = final.with_name(final.name + nr.UPLOAD_LOCK_SUFFIX)
         upload_lock = nr.UploadLock(lock)
         for _attempt in range(2):
             if upload_lock.try_acquire():

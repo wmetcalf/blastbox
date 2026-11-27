@@ -110,6 +110,11 @@ def fsync_dir(d: Path) -> None:
         os.close(fd)
 
 
+# A FILE, flock'd. Not ".claim": an earlier build used <digest>.claim as a lock DIRECTORY,
+# and opening one of those as a file would turn every PUT for that claim into a 500.
+UPLOAD_LOCK_SUFFIX = ".ulock"
+
+
 class UploadLock:
     """The one-extraction-per-(job, claim) lock: an ``flock`` on a file next to the spool dir.
 
@@ -127,7 +132,12 @@ class UploadLock:
 
     def try_acquire(self) -> bool:
         for _ in range(3):
-            fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            try:
+                fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            except FileNotFoundError:
+                # the finalizer's sweep rmdirs an EMPTY job dir; put it back and retry
+                self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                continue
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
@@ -208,6 +218,7 @@ def pending(root: Path) -> Iterator[Path]:
 # A pax ('x'/'g') or GNU long-name/long-link ('L'/'K') record is read WHOLE into memory by
 # tarfile before any member is yielded, so its size must be bounded before tarfile reads it.
 MAX_EXTENDED_HEADER = 64 * 1024
+MAX_EXTENDED_CHAIN = 4
 _EXTENDED_TYPES = frozenset({tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.SOLARIS_XHDTYPE,
                              tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK})
 
@@ -222,8 +233,21 @@ class _BoundedTarInfo(tarfile.TarInfo):
     def _proc_member(self, tarfile_obj: tarfile.TarFile) -> tarfile.TarInfo:
         if self.type == tarfile.GNUTYPE_SPARSE:
             raise TarRejected(f"sparse member refused: {self.name!r}")
-        if self.type in _EXTENDED_TYPES and self.size > MAX_EXTENDED_HEADER:
-            raise TarRejected(f"extended header record of {self.size} bytes refused")
+        if self.type == tarfile.XGLTYPE:
+            # tarfile keeps every global key for the rest of the archive and copies the whole
+            # set into each later pax member: small records multiply into gigabytes.
+            raise TarRejected("global pax header refused")
+        if self.type in _EXTENDED_TYPES:
+            if self.size > MAX_EXTENDED_HEADER:
+                raise TarRejected(f"extended header record of {self.size} bytes refused")
+            # tarfile recurses once per consecutive extended header before the member they
+            # describe; a legitimate member needs at most L + K + x.
+            depth = getattr(tarfile_obj, "_bb_ext_chain", 0) + 1
+            if depth > MAX_EXTENDED_CHAIN:
+                raise TarRejected(f"more than {MAX_EXTENDED_CHAIN} chained extended headers")
+            tarfile_obj._bb_ext_chain = depth   # type: ignore[attr-defined]
+        else:
+            tarfile_obj._bb_ext_chain = 0       # type: ignore[attr-defined]
         return super()._proc_member(tarfile_obj)  # type: ignore[misc]  # private, stable 3.8-3.13
 
 

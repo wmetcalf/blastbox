@@ -382,7 +382,7 @@ def test_concurrent_identical_puts_extract_once(tmp_path, pki_dir, monkeypatch):
     assert [r.status_code for r in rs] == [202, 202, 202]
     assert len(calls) == 1
     assert len(spool_dirs(tmp_path)) == 1
-    assert list((tmp_path / "results" / "job-1").glob("*.claim")) == []
+    assert list((tmp_path / "results" / "job-1").glob("*.ulock")) == []
 
 
 def test_results_root_tightens_existing_mode(tmp_path):
@@ -476,7 +476,7 @@ def test_lock_loser_with_no_outcome_gets_503_retry_not_202(tmp_path, pki_dir, mo
     root = tmp_path / "results"
     final = node_results.spool_dir(root, "job-1", hdr["x-blastbox-claim-id"])
     final.parent.mkdir(parents=True, exist_ok=True)
-    holder = node_results.UploadLock(final.with_name(final.name + ".claim"))
+    holder = node_results.UploadLock(final.with_name(final.name + ".ulock"))
     assert holder.try_acquire()                           # a winner that never produced anything
     import threading
     threading.Timer(0.3, holder.release).start()          # ...then died and released the lock
@@ -561,7 +561,7 @@ _BIG = 8 << 20
 def test_oversized_extended_header_refused_without_reading_it(typ):
     """tarfile reads a pax/GNU long-name record WHOLE into memory: refuse a big one first."""
     data = _ustar(b"././@Long", _BIG, typ) + b"\0" * _BIG + _META + b"\0" * 1024
-    with pytest.raises(node_results.TarRejected, match="extended header"):
+    with pytest.raises(node_results.TarRejected, match="extended header|global pax"):
         node_results.vet_tar(_NoBigReads(data), max_members=100, max_total_bytes=500 << 20)
 
 
@@ -674,7 +674,7 @@ def test_replay_of_a_retained_result_later_repaired_is_done(tmp_path, pki_dir): 
 def test_upload_lock_is_exclusive_and_needs_no_staleness_guess(tmp_path):
     """An flock dies with its holder: no age threshold, so nothing can 'break' a live lock
     and two waiters can never both end up holding it."""
-    lk = tmp_path / "x.claim"
+    lk = tmp_path / "x.ulock"
     a = node_results.UploadLock(lk)
     assert a.try_acquire()
     b, c = node_results.UploadLock(lk), node_results.UploadLock(lk)
@@ -689,7 +689,7 @@ def test_upload_lock_is_exclusive_and_needs_no_staleness_guess(tmp_path):
 
 
 def test_upload_lock_left_by_a_crashed_holder_is_free(tmp_path):
-    lk = tmp_path / "x.claim"
+    lk = tmp_path / "x.ulock"
     a = node_results.UploadLock(lk)
     assert a.try_acquire()
     assert a._fd is not None
@@ -720,3 +720,53 @@ def test_extracted_tree_is_fsynced_before_accepting(tmp_path, pki_dir, monkeypat
     assert any(p.endswith("/out/metadata.json") for p in synced), synced
     (d,) = spool_dirs(tmp_path)
     assert str(d.parent) in synced, synced          # the rename into place is durable
+
+
+def test_global_pax_header_refused():
+    """tarfile keeps every 'g' key for the rest of the archive and deep-copies the lot into
+    each later pax member: a few small records become gigabytes. A node never needs one."""
+    g = _pax_rec("k", "v")
+    data = _ustar(b"g", len(g), b"g") + _pad(g) + _META + b"\0" * 1024
+    with pytest.raises(node_results.TarRejected, match="global"):
+        node_results.vet_tar(io.BytesIO(data), max_members=100, max_total_bytes=1 << 20)
+
+
+def test_a_chain_of_extended_headers_is_refused_not_recursed():
+    """tarfile recurses once per consecutive extended header; a long chain must be a clean
+    TarRejected, not RecursionError."""
+    p = _pax_rec("comment", "x")
+    chain = (_ustar(b"pax", len(p), b"x") + _pad(p)) * 400
+    data = chain + _META + b"\0" * 1024
+    with pytest.raises(node_results.TarRejected, match="extended headers"):
+        node_results.vet_tar(io.BytesIO(data), max_members=100, max_total_bytes=1 << 20)
+
+
+def test_long_name_plus_long_link_plus_pax_still_accepted():
+    """The deepest legitimate chain (L + K + x before one member) stays accepted."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.GNU_FORMAT) as tf:
+        ti = tarfile.TarInfo("metadata.json")
+        ti.size = 2
+        tf.addfile(ti, io.BytesIO(b"{}"))
+        ti = tarfile.TarInfo("d/" + "n" * 200)
+        ti.size = 1
+        tf.addfile(ti, io.BytesIO(b"x"))
+    node_results.vet_tar(io.BytesIO(buf.getvalue()), max_members=100, max_total_bytes=1 << 20)
+
+
+def test_upload_lock_recreates_a_job_dir_the_sweep_just_removed(tmp_path):
+    jd = tmp_path / "job-1"
+    lk = node_results.UploadLock(jd / "x.ulock")      # jd does not exist (rmdir'd as empty)
+    assert not lk.held_elsewhere()
+    assert lk.try_acquire()
+    lk.release()
+
+
+def test_upload_lock_name_never_collides_with_a_legacy_lock_dir(tmp_path, pki_dir):  # noqa: F811
+    """An earlier build used <digest>.claim as a DIRECTORY lock; one left on disk must not
+    make every PUT for that claim a 500."""
+    _, c, hdr = _setup(tmp_path, pki_dir)
+    final = node_results.spool_dir(tmp_path / "results", "job-1", hdr["x-blastbox-claim-id"])
+    final.parent.mkdir(parents=True, exist_ok=True)
+    final.with_name(final.name + ".claim").mkdir()
+    assert put(c, hdr, make_tar([])).status_code == 202
