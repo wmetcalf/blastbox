@@ -98,3 +98,27 @@ func TestEdgeCases(t *testing.T) {
 		t.Errorf("raw invalid UTF-8 text: %v", err)
 	}
 }
+
+// encoding/json turns a lone UTF-16 surrogate escape into U+FFFD, where Python keeps it and
+// re-emits it: such a document cannot be canonicalised byte-exactly, so it is refused.
+func TestLoneSurrogatesRefused(t *testing.T) {
+	for _, bad := range []string{`"\ud800"`, `"\uDC00x"`, `["\ud83d"]`, `{"a":"\ud83dA"}`, `"\ude00\ud83d"`} {
+		if _, err := canon.MarshalJSONText([]byte(bad)); !errors.Is(err, canon.ErrSurrogate) {
+			t.Errorf("%s: want ErrSurrogate, got %v", bad, err)
+		}
+		if canon.Lossless([]byte(bad)) {
+			t.Errorf("%s: reported lossless", bad)
+		}
+	}
+	for _, ok := range []string{`"😀"`, `"\\ud800"`, `"\\😀"`, `"plain"`, `{"ké":1}`} {
+		if !canon.Lossless([]byte(ok)) {
+			t.Errorf("%s: reported lossy", ok)
+		}
+		if _, err := canon.MarshalJSONText([]byte(ok)); err != nil {
+			t.Errorf("%s: %v", ok, err)
+		}
+	}
+	if canon.Lossless([]byte("\"a\xffb\"")) {
+		t.Error("invalid UTF-8 reported lossless")
+	}
+}

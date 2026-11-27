@@ -722,6 +722,9 @@ func (j *job) fillArtifacts(files map[string]int64) error {
 	if err != nil {
 		return err
 	}
+	if !canon.Lossless(raw) {
+		return nil // decoding would replace bytes with U+FFFD: leave the engine's bytes alone
+	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	var env map[string]any

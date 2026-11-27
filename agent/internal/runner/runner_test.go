@@ -373,6 +373,27 @@ func TestAcceptedResultIsMarkedReported(t *testing.T) {
 	f.wiped(t)
 }
 
+// An envelope Go's decoder cannot round-trip exactly (a lone surrogate escape, invalid UTF-8)
+// is left byte-for-byte as the engine wrote it rather than silently rewritten with U+FFFD.
+func TestLossyEnvelopeIsLeftVerbatim(t *testing.T) {
+	for name, meta := range map[string]string{
+		"lone surrogate": `{"s":"\ud800","artifacts":[{"path":"a.txt","sha256":"","bytes":0}]}`,
+		"invalid utf8":   "{\"s\":\"\xff\",\"artifacts\":[{\"path\":\"a.txt\",\"sha256\":\"\",\"bytes\":0}]}",
+	} {
+		t.Run(name, func(t *testing.T) {
+			src := filepath.Join(t.TempDir(), "meta.json")
+			os.WriteFile(src, []byte(meta), 0o600)
+			f := setup(t, `printf x > "$1/a.txt"; cat `+src+` > "$1/metadata.json"`)
+			if res := f.run(); res.Outcome != "done" {
+				t.Fatalf("%+v", res)
+			}
+			if got := f.in.tarFiles()["metadata.json"]; got != meta {
+				t.Fatalf("envelope rewritten: %q", got)
+			}
+		})
+	}
+}
+
 func TestEnvelopeModeKeepsBytesVerbatim(t *testing.T) {
 	// No declared artifacts: the engine's bytes (odd spacing and key order) go through untouched.
 	f := setup(t, `printf '{ "schema" : "wtqrk",  "b":1, "a":2 }\n'`)

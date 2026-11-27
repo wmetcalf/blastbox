@@ -19,6 +19,10 @@ var intRE = regexp.MustCompile(`^-?(0|[1-9][0-9]*)$`)
 // ErrUTF8 is returned for a string that is not valid UTF-8.
 var ErrUTF8 = errors.New("canon: invalid UTF-8")
 
+// ErrSurrogate is returned for a JSON document holding an unpaired UTF-16 surrogate escape,
+// which encoding/json replaces with U+FFFD where Python keeps it.
+var ErrSurrogate = errors.New("canon: unpaired UTF-16 surrogate escape")
+
 // ErrFloat is returned for any non-integer number.
 var ErrFloat = errors.New("canon: floats are not allowed")
 
@@ -37,6 +41,9 @@ func MarshalJSONText(text []byte) ([]byte, error) {
 	if !utf8.Valid(text) {
 		return nil, ErrUTF8
 	}
+	if loneSurrogate(text) {
+		return nil, ErrSurrogate
+	}
 	d := json.NewDecoder(bytes.NewReader(text))
 	d.UseNumber()
 	var v any
@@ -47,6 +54,76 @@ func MarshalJSONText(text []byte) ([]byte, error) {
 		return nil, errors.New("canon: trailing data after JSON value")
 	}
 	return Marshal(v)
+}
+
+// Lossless reports whether encoding/json decodes text without altering any string: the text is
+// valid UTF-8 and holds no unpaired surrogate escape (both become U+FFFD silently).
+func Lossless(text []byte) bool { return utf8.Valid(text) && !loneSurrogate(text) }
+
+func hex4(b []byte) (rune, bool) {
+	if len(b) < 4 {
+		return 0, false
+	}
+	var r rune
+	for _, c := range b[:4] {
+		switch {
+		case c >= '0' && c <= '9':
+			r = r<<4 | rune(c-'0')
+		case c >= 'a' && c <= 'f':
+			r = r<<4 | rune(c-'a'+10)
+		case c >= 'A' && c <= 'F':
+			r = r<<4 | rune(c-'A'+10)
+		default:
+			return 0, false
+		}
+	}
+	return r, true
+}
+
+// loneSurrogate scans the string literals of a JSON text for a \uD800-\uDFFF escape that is not
+// a high surrogate immediately followed by a low one.
+func loneSurrogate(text []byte) bool {
+	in := false
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if !in {
+			if c == '"' {
+				in = true
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			in = false
+		case '\\':
+			if i+1 >= len(text) {
+				return false
+			}
+			if text[i+1] != 'u' {
+				i++
+				continue
+			}
+			r, ok := hex4(text[i+2:])
+			if !ok {
+				return false // malformed: the decoder refuses it anyway
+			}
+			i += 5
+			switch {
+			case r >= 0xDC00 && r <= 0xDFFF:
+				return true
+			case r >= 0xD800 && r <= 0xDBFF:
+				if i+6 >= len(text) || text[i+1] != '\\' || text[i+2] != 'u' {
+					return true
+				}
+				lo, ok := hex4(text[i+3:])
+				if !ok || lo < 0xDC00 || lo > 0xDFFF {
+					return true
+				}
+				i += 6
+			}
+		}
+	}
+	return false
 }
 
 func enc(b *bytes.Buffer, v any) error {
