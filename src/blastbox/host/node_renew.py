@@ -615,6 +615,11 @@ def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
         return (f"deferred: {linked[0]} has a cert for this node linked from outside the "
                 "dir, which renewal does not follow -- replace the link with the file"), True
     if qdir not in states:
+        if any(_links_out(c, qdir) for c in qdir.glob("*.crt")):
+            # The queueing ingress may hold the node through a link this host cannot follow
+            # (or even resolve): it cannot tell, so keep the CSR and say why.
+            return ("deferred: no current certificate here except through a link out of "
+                    f"{qdir} -- replace the link with the file"), True
         return "refused: no current certificate", False
     if not any(proof_key in cur.keys for cur in states.values()):
         # The proof's cert is CA-valid but not one the node holds NOW in any dir: an old

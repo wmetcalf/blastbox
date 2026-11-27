@@ -1097,3 +1097,19 @@ def test_a_dir_that_only_links_a_nodes_cert_cannot_veto_its_renewal(tmp_path):
 
 def test_ca_host_reads_never_take_a_controlling_terminal():
     assert node_renew._OPEN_FLAGS & os.O_NOCTTY
+
+
+def test_an_unresolvable_out_of_dir_link_defers_rather_than_drop_the_csr(tmp_path):
+    """The ingress resolves the link; the CA host (which mounts only the PKI dir) cannot.
+    It cannot tell what the link authorises, so it must keep the CSR, not refuse it."""
+    d, ca = rig(tmp_path)
+    pem = (d / "node-n1.crt").read_bytes()
+    key = _KEYS[_spki(x509.load_pem_x509_certificate(pem).public_key())]
+    csr, _ = make_csr("n1")
+    cert, at, sig = proof_for(ca, "n1", csr, key=key, cert=pem)
+    _queue_csr(d, "n1", csr, cert_pem=cert, issued_at=at, signature=sig)
+    (d / "node-n1.crt").unlink()
+    (d / "node-n1.crt").symlink_to("/nonexistent/on/the/ca/host/n1.crt")
+    [(nid, outcome)] = sign_pending(ca, d)
+    assert outcome.startswith("deferred")
+    assert pending(d) == ["n1"]
