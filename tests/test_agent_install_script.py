@@ -213,6 +213,7 @@ def test_current_real_directory_refused(tmp_path):
     p = install(rel, sha, pfx, "1.0.0", "--no-cosign")
     assert p.returncode != 0 and "not a symlink" in p.stderr
     assert not list((pfx / "current").iterdir())
+    assert not (pfx / "1.0.0").exists()  # refused before anything is staged or copied
 
 
 def test_non_version_current_target_not_recorded(tmp_path):
@@ -226,6 +227,24 @@ def test_non_version_current_target_not_recorded(tmp_path):
     assert install(rel, sha, pfx, "2.0.0", "--no-cosign").returncode == 0
     prev = pfx / ".previous"
     assert not prev.exists() or prev.read_text().strip() == "1.0.0"
+
+
+def test_uninstalled_current_target_does_not_clobber_previous(tmp_path):
+    pfx = _two_versions(tmp_path)  # .previous = 1.0.0, current -> 2.0.0
+    (pfx / "current").unlink()
+    (pfx / "current").symlink_to("9.9.9")  # dangling, version-shaped
+    rel, sha = make_release(tmp_path, b"bin 3.0.0")
+    assert install(rel, sha, pfx, "3.0.0", "--no-cosign").returncode == 0
+    assert (pfx / ".previous").read_text().strip() == "1.0.0"
+
+
+def test_failed_previous_write_leaves_no_temp(tmp_path):
+    pfx = _two_versions(tmp_path)
+    (pfx / ".previous").unlink()
+    (pfx / ".previous").mkdir()
+    rel, sha = make_release(tmp_path, b"bin 3.0.0")
+    assert install(rel, sha, pfx, "3.0.0", "--no-cosign").returncode != 0
+    assert not list(pfx.glob(".previous.tmp.*")) and not list(pfx.glob(".current.tmp.*"))
 
 
 def test_dirs_readable_under_restrictive_umask(tmp_path):
@@ -253,6 +272,7 @@ def test_failed_install_leaves_no_stage(tmp_path, break_it):
         (rel / "SHA256SUMS").unlink()
     assert install(rel, sha, pfx, "1.0.0", "--no-cosign").returncode != 0
     assert not list(pfx.glob(".stage.*")) and not list(pfx.glob(".current.tmp.*"))
+    assert not list(pfx.glob(".previous.tmp.*"))
 
 
 @pytest.mark.skipif(shutil.which("shellcheck") is None, reason="shellcheck not installed")

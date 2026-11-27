@@ -49,6 +49,14 @@ if [ -z "$prefix" ]; then
   fi
 fi
 
+# Temp names in <prefix>; the EXIT trap removes them (and the stage dir) on any exit.
+tmp=$prefix/.current.tmp.$$
+ptmp=$prefix/.previous.tmp.$$
+stage=""
+trap 'rm -f "$tmp" "$ptmp"; if [ -n "$stage" ]; then rm -rf "$stage"; fi' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 os_name=$(uname -s)
 case "$os_name" in
   Linux) goos=linux ;;
@@ -69,7 +77,6 @@ flip_current() {
   if [ -e "$prefix/current" ] && [ ! -L "$prefix/current" ]; then
     die "$prefix/current exists and is not a symlink; move it aside"
   fi
-  tmp=$prefix/.current.tmp.$$
   rm -f "$tmp"
   ln -s "$1" "$tmp"
   case "$os_name" in
@@ -97,14 +104,15 @@ valid_version() {
 # Record $1 (the version current points at now) in <prefix>/.previous, BEFORE the flip,
 # so a failed write never leaves current moved with a stale .previous. Written to a
 # temp file and renamed. A target that is not a plain version (an absolute or
-# hand-made link) is not recorded, since rollback could not use it.
+# hand-made link) or a version that is not installed is not recorded, since rollback
+# could not use it and it would overwrite a good .previous.
 record_previous() {
   valid_version "$1" || return 0
+  [ -x "$prefix/$1/blastbox-agent" ] || return 0
   if [ -e "$prefix/.previous" ] || [ -L "$prefix/.previous" ]; then
     [ -f "$prefix/.previous" ] && [ ! -L "$prefix/.previous" ] \
       || die "$prefix/.previous is not a regular file"
   fi
-  ptmp=$prefix/.previous.tmp.$$
   rm -f "$ptmp"
   printf '%s\n' "$1" > "$ptmp"
   mv -f "$ptmp" "$prefix/.previous"
@@ -153,9 +161,6 @@ if [ -e "$prefix/current" ] && [ ! -L "$prefix/current" ]; then
 fi
 mkdir -p "$prefix"
 stage=$(mktemp -d "$prefix/.stage.XXXXXX")
-trap 'rm -rf "$stage"' EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
 
 fetch() {
   if [ -n "$from" ]; then
