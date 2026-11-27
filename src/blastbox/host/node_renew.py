@@ -202,6 +202,8 @@ def queue_csr(pki_dir: Path, node_id: str, csr_pem: bytes, *, cert_pem: bytes,
     entry = json.dumps({"csr_pem": csr_text, "cert_pem": cert_text,
                         "issued_at": issued_at, "signature": signature},
                        sort_keys=True).encode()
+    if len(entry) > MAX_QUEUE_ENTRY_BYTES:      # the CA host would refuse it unread
+        raise RenewRefused("renewal request too large")
 
     d = _renew_dir(pki_dir, create=True)
     target = d / f"{node_id}.csr"
@@ -298,6 +300,19 @@ def _links_out(crt: Path, d: Path) -> bool:
         return Path(os.path.realpath(crt)).parent != Path(os.path.realpath(d))
     except OSError:
         return True
+
+
+def _links_out_for(d: Path, node_id: str, ca: CertAuthority) -> bool:
+    """Does ``d`` hold a cert for ``node_id`` through a link that leaves ``d``?"""
+    for c in sorted(d.glob("*.crt")):
+        if not _links_out(c, d):
+            continue
+        try:
+            if node_identity(ca, _read_capped(c, MAX_CERT_BYTES, follow=True)).node_id == node_id:
+                return True
+        except Exception:                               # noqa: BLE001 - not a cert of it
+            continue
+    return False
 
 
 def _find_current(pki_dir: Path, node_id: str,
@@ -583,13 +598,15 @@ def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
                 states[d] = cur
     except OSError as exc:
         return f"deferred: {exc}", True
+    linked = [d for d in every if _links_out_for(d, node_id, ca)]
+    if linked:
+        # The ingress follows a cert link out of its dir; renewal will not (resolved here,
+        # it can reach what that ingress never sees). Signing without it could drop the
+        # narrower grants it adds, so defer -- kept and loud (exit 2), not refused: the fix,
+        # a file instead of the link, is the operator's, and the next run renews.
+        return (f"deferred: {linked[0]} has a cert for this node linked from outside the "
+                "dir, which renewal does not follow -- replace the link with the file"), True
     if qdir not in states:
-        if any(_links_out(c, qdir) for c in qdir.glob("*.crt")):
-            # Kept and loud (exit 2), not refused: the ingress may be authorising the node
-            # through that link, and the fix -- a file instead of the link -- is the
-            # operator's, after which the next run renews.
-            return ("deferred: no current certificate here; a cert linked from outside its "
-                    "node dir does not count -- replace the link with the file"), True
         return "refused: no current certificate", False
     if not any(proof_key in cur.keys for cur in states.values()):
         # The proof's cert is CA-valid but not one the node holds NOW in any dir: an old

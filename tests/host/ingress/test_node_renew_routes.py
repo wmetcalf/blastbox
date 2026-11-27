@@ -183,3 +183,4 @@ def test_cert_route_store_read_fault_is_503_not_404(tmp_path, monkeypatch):
         raise OSError("EIO")
     monkeypatch.setattr(node_renew, "_find_current", boom)
     assert c.get("/v1/nodes/cert", headers=h).status_code == 503
+

@@ -1053,3 +1053,34 @@ def test_a_symlinked_csr_does_not_destroy_a_kept_retry(tmp_path, monkeypatch):
     monkeypatch.undo()
     (d / "renew" / "n1.csr").symlink_to(tmp_path / "whatever")
     assert sign_pending(ca, d) == [("n1", "renewed")]
+
+
+def test_an_out_of_dir_cert_link_beside_a_broad_cert_defers_rather_than_widen(tmp_path):
+    """The ingress intersects the broad cert with the linked narrow one; renewal cannot see
+    the link, so it must defer, not sign the broad grants alone."""
+    d, ca = rig(tmp_path)
+    broad = pki.NodeGrants(engines=("a", "b"), tiers=(), credentials=True)
+    narrow = pki.NodeGrants(engines=("a",), tiers=(), credentials=False)
+    (d / "node-n1.crt").write_bytes(ca.sign_node_csr(make_csr("n1")[0], node_id="n1",
+                                                     grants=broad))
+    store = tmp_path / "store"
+    store.mkdir()
+    (store / "narrow.crt").write_bytes(ca.sign_node_csr(make_csr("n1")[0], node_id="n1",
+                                                        grants=narrow))
+    (d / "narrow.crt").symlink_to(store / "narrow.crt")
+    assert fleet_grants(d)["n1"] == narrow
+    queue_csr(d, "n1", make_csr("n1")[0])
+    [(nid, outcome)] = sign_pending(ca, d)
+    assert outcome.startswith("deferred") and "link" in outcome
+    assert fleet_grants(d)["n1"] == narrow
+
+
+def test_a_lone_surrogate_in_a_queue_entry_is_refused_not_a_crash(tmp_path):
+    d, ca = rig(tmp_path)
+    (d / "renew").mkdir()
+    (d / "renew" / "aaa.csr").write_text(
+        '{"csr_pem": "\\ud800", "cert_pem": "x", "issued_at": %d, "signature": "AA=="}'
+        % int(__import__("time").time()))
+    queue_csr(d, "n1", make_csr("n1")[0])
+    out = dict(sign_pending(ca, d))
+    assert out["aaa"].startswith("refused") and out["n1"] == "renewed"
