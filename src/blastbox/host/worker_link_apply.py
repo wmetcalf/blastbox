@@ -1179,6 +1179,45 @@ def status(cfg: WorkerLinkConfig, *, now: float | None = None) -> tuple[bool, li
     return ok, rows
 
 
+def check_handshakes(iface: str, max_age: float = 180.0, *, now: float | None = None,
+                     run=None) -> tuple[int, list[str]]:
+    """Alarm-friendly handshake check: ``(exit_code, lines)``.
+
+    0 = every peer's latest handshake is within ``max_age`` seconds; 2 = at least one peer
+    is stale or never handshook (each offender is listed by its public key truncated to 8
+    characters and its age); 1 = the dump could not be read, or the interface has no peers.
+    Only the public key is ever printed: the dump's interface line (private key) is
+    discarded by ``parse_wg_dump`` and the per-peer preshared key is never read.
+    """
+    import time
+
+    from blastbox.host.exit_attest import parse_wg_dump
+
+    if max_age <= 0:
+        return 1, ["error: --max-handshake-age must be positive"]
+    runner = run or ea._run
+    at = time.time() if now is None else now
+    try:
+        dump = runner(["wg", "show", iface, "dump"], check=False)
+    except OSError as exc:
+        return 1, [f"error: cannot read `wg show {iface} dump`: {exc.__class__.__name__}"]
+    if dump.returncode != 0:
+        return 1, [f"error: cannot read `wg show {iface} dump` (needs root, interface up)"]
+    peers = parse_wg_dump(dump.stdout or "", observed_at=at)
+    if not peers:
+        return 1, [f"error: no peers on {iface}"]
+    bad: list[str] = []
+    for p in peers:
+        if not p.ever_connected:
+            bad.append(f"  {p.public_key[:8]}: never handshaked")
+        elif at - p.latest_handshake > max_age:
+            bad.append(f"  {p.public_key[:8]}: last handshake {at - p.latest_handshake:.0f}s ago "
+                       f"(limit {max_age:.0f}s)")
+    if bad:
+        return 2, [f"STALE: {len(bad)} of {len(peers)} peer(s) on {iface}", *bad]
+    return 0, [f"ok: {len(peers)} peer(s) on {iface} handshook within {max_age:.0f}s"]
+
+
 @_installation_locked
 def teardown(cfg: WorkerLinkConfig) -> list[str]:
     """Remove only what ``init`` created: the interface, its unit, the firewall table, its

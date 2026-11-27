@@ -2265,6 +2265,14 @@ def _dispatch(args: argparse.Namespace) -> int:
         # A step that could not be verified (still up / enabled / loaded) is not a clean
         # leave: say so in the exit status too, so automation does not read it as done.
         return 1 if any(n.startswith("WARNING") for n in notes) else 0
+    if action == "status" and getattr(args, "check", False):
+        # Alarm mode: only WireGuard handshake freshness, exit 0/2/1. Same reader on both
+        # roles; the host module is the one that owns it.
+        code, lines = _host_mod().check_handshakes(
+            args.iface or DEFAULT_IFACE, args.max_handshake_age)
+        for ln in lines:
+            print(ln, file=sys.stderr if code == 1 else sys.stdout)
+        return code
     if action == "status" and _role(args) == "worker":
         ok, rows = status(args.iface or DEFAULT_IFACE)
         for r in rows:
@@ -2396,6 +2404,11 @@ def add_parser(sub: argparse._SubParsersAction) -> None:
     iface(ps)
     ps.add_argument("--role", choices=("host", "worker"), default=None,
                     help="default: host if /etc/blastbox/worker-link.env exists, else worker")
+    ps.add_argument("--check", action="store_true",
+                    help="alarm mode: exit 2 if any peer's latest handshake is older than "
+                         "--max-handshake-age (or never happened), 1 on a read error")
+    ps.add_argument("--max-handshake-age", type=float, default=180.0, metavar="SECONDS",
+                    help="with --check: the oldest acceptable handshake (default 180)")
     ps.set_defaults(func=_cmd)
 
     # worker
