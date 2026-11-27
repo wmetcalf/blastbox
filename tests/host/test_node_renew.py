@@ -1161,21 +1161,31 @@ def test_a_renewal_says_which_link_only_dir_it_could_not_update(tmp_path, capsys
 
 
 def test_an_unreadable_out_of_dir_link_is_warned_once_per_run_not_per_node(tmp_path, capsys):
-    """A link this host cannot read may be anything: it is reported once per run (stderr),
-    naming the link, but cannot fail every node's renewal -- one junk link would otherwise
-    keep the whole fleet's timer red."""
+    """A link this host cannot read is attributed only by its conventional name,
+    node-<id>.crt: that one makes the node's renewal "NOT written" (exit 2); any other is
+    one stderr warning per run, so one junk link cannot fail the whole fleet."""
     from blastbox.host.cli import main
     ca, ca_dir, i1, i2 = _split(tmp_path)
     (i2 / "node-n1.crt").unlink()
-    (i2 / "node-n1.crt").symlink_to("/mnt/ingress2-only/n1.crt")   # resolves only there
     (i2 / "junk.crt").symlink_to("/nonexistent/x.crt")
     queue_csr(i1, "n1", make_csr("n1")[0])
     rc = main(["pki", "--dir", str(ca_dir), "renew-pending",
                "--node-dir", str(i1), "--node-dir", str(i2)])
     cap = capsys.readouterr()
     assert rc == 0 and cap.out.strip() == "n1: renewed"
-    assert "node-n1.crt" in cap.err and "junk.crt" in cap.err
-    assert cap.err.count("warning:") == 2
+    assert "junk.crt" in cap.err and cap.err.count("warning:") == 1
+
+
+def test_an_unreadable_link_named_for_the_node_fails_its_renewal_loudly(tmp_path, capsys):
+    from blastbox.host.cli import main
+    ca, ca_dir, i1, i2 = _split(tmp_path)
+    (i2 / "node-n1.crt").unlink()
+    (i2 / "node-n1.crt").symlink_to("/mnt/ingress2-only/n1.crt")   # resolves only there
+    queue_csr(i1, "n1", make_csr("n1")[0])
+    rc = main(["pki", "--dir", str(ca_dir), "renew-pending",
+               "--node-dir", str(i1), "--node-dir", str(i2)])
+    out = capsys.readouterr().out
+    assert rc == 2 and out.startswith("n1: renewed; NOT written") and str(i2) in out
 
 
 def test_a_queue_name_cannot_fake_the_exit_code(tmp_path, capsys):

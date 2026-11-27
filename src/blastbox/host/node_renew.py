@@ -308,6 +308,18 @@ def _links_out(crt: Path, d: Path) -> bool:
         return True
 
 
+def _unreadable_named_link(d: Path, node_id: str) -> bool:
+    """Is ``d/node-<node_id>.crt`` a link out of ``d`` that this host cannot read?"""
+    c = d / f"node-{node_id}.crt"
+    if not _links_out(c, d):
+        return False
+    try:
+        _read_capped(c, MAX_CERT_BYTES, follow=True)
+    except (OSError, _Unreadable):
+        return True
+    return False
+
+
 def unreadable_links(pki_dir: Path, node_dirs: list[Path] | None = None) -> list[Path]:
     """Cert links out of a node dir that this host cannot read (dangling here, unreadable).
 
@@ -321,7 +333,8 @@ def unreadable_links(pki_dir: Path, node_dirs: list[Path] | None = None) -> list
                 try:
                     _read_capped(c, MAX_CERT_BYTES, follow=True)
                 except (OSError, _Unreadable):
-                    out.append(c)
+                    if not c.name.startswith("node-"):     # those are charged per node
+                        out.append(c)
     return out
 
 
@@ -695,10 +708,12 @@ def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
         return f"deferred: {exc}", True
     # A dir that serves the node only through a link out of it was not (cannot be) written:
     # that ingress still serves the old cert. Renewed, but say so (the CLI exits 2).
-    # (A link this host cannot read at all is reported once per run by unreadable_links,
-    # not here: it may be anything, and naming it on every node's renewal would make one
-    # junk link fail the whole fleet's run.)
-    stale = [d for d in every if d not in states and _links_out_for(d, node_id, ca)]
+    # A link this host cannot read at all is charged to a node only by its conventional
+    # name (node-<id>.crt, what issue-node/sign-node-csr write); any other is reported once
+    # per run by unreadable_links: it may be anything, and naming it on every node's
+    # renewal would make one junk link fail the whole fleet's run.
+    stale = [d for d in every if d not in states
+             and (_links_out_for(d, node_id, ca) or _unreadable_named_link(d, node_id))]
     if stale:
         return (f"{RENEWED_NOT_WRITTEN} {', '.join(map(str, stale))}: it holds the node only "
                 "through a link out of the dir, so it still serves the old certificate"), False

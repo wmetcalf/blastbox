@@ -94,8 +94,9 @@ def _serve_tls_sans(host: str) -> list[str]:
                 ip = str(info[4][0])
                 if ip and not ip.startswith(("127.", "::1")) and ip not in sans:
                     sans.append(ip)
-        except OSError:
-            pass
+        except OSError as exc:      # say so: the warnings are the only evidence
+            print(f"warning: could not check node dirs for unreadable cert links: {exc}",
+                  file=sys.stderr)
     sans += ["localhost", "127.0.0.1"]
     seen: list[str] = []
     for x in sans:
@@ -1552,8 +1553,9 @@ def _pki_cmd(args: argparse.Namespace) -> int:
             for link in unreadable_links(pki_dir, [Path(p) for p in args.node_dir] or None):
                 print(f"warning: {link} links out of its node dir and cannot be read here; an "
                       "ingress serving a cert through it never gets renewals", file=sys.stderr)
-        except OSError:
-            pass
+        except OSError as exc:      # say so: the warnings are the only evidence
+            print(f"warning: could not check node dirs for unreadable cert links: {exc}",
+                  file=sys.stderr)
         # A deferral repeats every run until someone fixes its cause; exit 2 so the timer
         # unit shows it, instead of staying green while the node's cert runs out.
         from blastbox.host.node_renew import RENEWED_NOT_WRITTEN
