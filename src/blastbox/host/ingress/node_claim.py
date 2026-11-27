@@ -1549,7 +1549,11 @@ def register_node_claim_routes(
             return
         for e in entries:
             try:
-                if e.lstat().st_mtime < cutoff:
+                # a fetch still writing keeps its FILE's mtime fresh inside an old dir
+                times = [e.lstat().st_mtime]
+                if e.is_dir() and not e.is_symlink():
+                    times += [f.lstat().st_mtime for f in e.iterdir()]
+                if max(times) < cutoff:
                     shutil.rmtree(e, ignore_errors=True)
             except OSError:
                 continue
@@ -1762,9 +1766,14 @@ def register_node_claim_routes(
                         finished_at_ms=finished))
                     try:
                         os.rename(partial, final)
-                    except OSError:
+                    except OSError as exc:
                         if not final.is_dir():
-                            raise       # nothing was stored: 503 (host) or 422 below, never 202
+                            # nothing was stored, and the tree was already vetted and
+                            # extracted: the host failed, not the node. Retry, never 202/422.
+                            _log.error("node_claim: could not move job=%s result into place: %s",
+                                       job_id, exc)
+                            return JSONResponse({"status": "retry"}, status_code=503,
+                                                headers={"Retry-After": "30"})
                         # lost a race with an identical upload: it is already quarantined
                         shutil.rmtree(partial, ignore_errors=True)
                         partial = None

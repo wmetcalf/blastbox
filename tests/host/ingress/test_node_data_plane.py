@@ -772,9 +772,12 @@ def test_upload_lock_name_never_collides_with_a_legacy_lock_dir(tmp_path, pki_di
     assert put(c, hdr, make_tar([])).status_code == 202
 
 
-@pytest.mark.parametrize("err,code", [("ENOSPC", 503), ("EACCES", 422)])
+@pytest.mark.parametrize("err,code", [("ENOSPC", 503), ("EACCES", 503), ("EPERM", 503),
+                                      ("EMLINK", 503)])
 def test_a_failed_rename_into_place_is_never_acknowledged(tmp_path, pki_dir, monkeypatch, err, code):  # noqa: F811
-    """Only a lost race with an identical upload (the final dir now exists) may answer 202."""
+    """Only a lost race with an identical upload (the final dir now exists) may answer 202.
+    The tree was already vetted and extracted, so a rename failure is always the host's
+    fault: retry, never a terminal 422."""
     import errno as _errno
 
     from blastbox.host.ingress import node_claim as nc
@@ -806,3 +809,16 @@ def test_input_tmp_left_by_a_dead_stream_is_reaped(tmp_path, pki_dir):  # noqa: 
     os.utime(dead, (old, old))
     assert c.get("/v1/nodes/jobs/job-1/input", headers=hdr).status_code == 200
     assert not dead.exists()
+
+
+def test_input_tmp_still_being_fetched_is_not_reaped(tmp_path, pki_dir):  # noqa: F811
+    """A blob fetch writing into an old dir keeps its FILE's mtime fresh: that copy is live."""
+    _, c, hdr = _setup(tmp_path, pki_dir, spool=None, blobs=Blobs(DATA))
+    tmp_root = tmp_path / "jobs" / ".node-input-tmp"
+    live = tmp_root / "fetching"
+    live.mkdir(parents=True)
+    (live / "input").write_bytes(b"partial")            # written just now
+    old = time.time() - 2 * 3600
+    os.utime(live, (old, old))
+    assert c.get("/v1/nodes/jobs/job-1/input", headers=hdr).status_code == 200
+    assert (live / "input").exists()

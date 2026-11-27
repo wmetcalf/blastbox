@@ -609,3 +609,15 @@ def test_finalizer_never_resurrects_or_litters_job_root(tmp_path):
     os.utime(d / "outcome.json", (old, old))
     fin.run_once()
     assert not (nr.results_root(tmp_path / "jobs") / "job-1").exists()
+
+
+def test_sweep_removes_a_finalize_lock_left_by_a_killed_finalizer(tmp_path):
+    store, job, fin, _ = build(tmp_path)
+    jd = nr.results_root(tmp_path / "jobs") / "job-1"
+    jd.mkdir(parents=True)
+    left = jd / ".finalize.lock"
+    left.write_bytes(b"")                                 # SIGKILLed holder: never unlinked
+    old = time.time() - 2 * 3600
+    os.utime(left, (old, old))
+    fin.run_once()
+    assert not jd.exists()
