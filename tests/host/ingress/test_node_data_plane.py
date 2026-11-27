@@ -770,3 +770,39 @@ def test_upload_lock_name_never_collides_with_a_legacy_lock_dir(tmp_path, pki_di
     final.parent.mkdir(parents=True, exist_ok=True)
     final.with_name(final.name + ".claim").mkdir()
     assert put(c, hdr, make_tar([])).status_code == 202
+
+
+@pytest.mark.parametrize("err,code", [("ENOSPC", 503), ("EACCES", 422)])
+def test_a_failed_rename_into_place_is_never_acknowledged(tmp_path, pki_dir, monkeypatch, err, code):  # noqa: F811
+    """Only a lost race with an identical upload (the final dir now exists) may answer 202."""
+    import errno as _errno
+
+    from blastbox.host.ingress import node_claim as nc
+
+    _, c, hdr = _setup(tmp_path, pki_dir)
+    final = node_results.spool_dir(tmp_path / "results", "job-1", hdr["x-blastbox-claim-id"])
+    real = os.rename
+
+    def fail(src, dst):
+        if os.fspath(dst) == os.fspath(final):
+            raise OSError(getattr(_errno, err), "rename failed")
+        return real(src, dst)
+
+    monkeypatch.setattr(nc.os, "rename", fail)
+    r = put(c, hdr, make_tar([]))
+    assert r.status_code == code, r.text
+    assert not final.exists()
+    assert [p for p in (tmp_path / "results").rglob("*") if "partial" in p.name] == []
+
+
+def test_input_tmp_left_by_a_dead_stream_is_reaped(tmp_path, pki_dir):  # noqa: F811
+    _, c, hdr = _setup(tmp_path, pki_dir, spool=None, blobs=Blobs(DATA))
+    tmp_root = tmp_path / "jobs" / ".node-input-tmp"
+    dead = tmp_root / "deadbeef"
+    dead.mkdir(parents=True)
+    (dead / "input").write_bytes(b"x" * 100)
+    old = time.time() - 2 * 3600
+    os.utime(dead / "input", (old, old))
+    os.utime(dead, (old, old))
+    assert c.get("/v1/nodes/jobs/job-1/input", headers=hdr).status_code == 200
+    assert not dead.exists()

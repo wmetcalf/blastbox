@@ -133,7 +133,6 @@ def test_held_lock_skips_dir(tmp_path):
     store, job, fin, _ = build(tmp_path)
     d = spool(tmp_path, job)
     assert d.is_dir()
-    fin._lock_path("job-1").parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(fin._lock_path("job-1"), os.O_RDWR | os.O_CREAT, 0o600)
     fcntl.flock(fd, fcntl.LOCK_EX)
     try:
@@ -155,8 +154,7 @@ def test_finalizers_exclude_each_other_per_job_not_per_claim(tmp_path):
     assert job_b is not None and job_b.claim_id != old_claim
     d_b = spool(tmp_path, job_b)
     lock = fin._lock_path("job-1")
-    assert lock.parent == tmp_path / "jobs" / "job-1"
-    lock.parent.mkdir(parents=True, exist_ok=True)
+    assert lock.parent == nr.results_root(tmp_path / "jobs") / "job-1"
     fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)    # replica 1, on the OLD claim
     fcntl.flock(fd, fcntl.LOCK_EX)
     try:
@@ -165,6 +163,7 @@ def test_finalizers_exclude_each_other_per_job_not_per_claim(tmp_path):
         assert not (tmp_path / "jobs" / "job-1" / "output").exists()
     finally:
         os.close(fd)
+        lock.unlink()
     assert fin.run_once() == 1
     assert store.get("job-1").status == JobStatus.DONE
 
@@ -595,3 +594,18 @@ def test_sweep_removes_a_crash_left_upload_lock_but_not_a_held_one(tmp_path):
     assert not left.exists()
     assert held.path.exists()
     held.release()
+
+
+def test_finalizer_never_resurrects_or_litters_job_root(tmp_path):
+    """The per-job lock lives in the results spool, which the finalizer's own sweep owns; it
+    must not create job_root/<job> for a claim-lost job nor leave a lock behind there."""
+    store, job, fin, _ = build(tmp_path)
+    d = spool(tmp_path, job)
+    store.update_if_status("job-1", JobStatus.RUNNING, expect_claim_id=job.claim_id,
+                           status=JobStatus.QUEUED, claim_id=None)
+    assert fin.run_once() == 1
+    assert not (tmp_path / "jobs" / "job-1").exists()
+    old = time.time() - 7200
+    os.utime(d / "outcome.json", (old, old))
+    fin.run_once()
+    assert not (nr.results_root(tmp_path / "jobs") / "job-1").exists()

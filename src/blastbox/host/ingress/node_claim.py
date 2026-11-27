@@ -1536,6 +1536,24 @@ def register_node_claim_routes(
             raise HTTPException(status_code=403, detail=_REFUSED)
         return job
 
+    def _reap_input_tmp(tmp_root: Path) -> None:
+        """Remove blob-store input copies left by a stream whose ingress died mid-way (the
+        generator's cleanup never ran). Unlinking one a live stream still reads is harmless:
+        the open fd keeps the data until the stream closes it."""
+        import shutil
+
+        cutoff = time.time() - 3600
+        try:
+            entries = list(tmp_root.iterdir())
+        except OSError:
+            return
+        for e in entries:
+            try:
+                if e.lstat().st_mtime < cutoff:
+                    shutil.rmtree(e, ignore_errors=True)
+            except OSError:
+                continue
+
     def _local_input(job) -> "Path | None":
         name = Path(job.filename or "").name
         if not name or name != job.filename:
@@ -1567,6 +1585,7 @@ def register_node_claim_routes(
                 raise HTTPException(status_code=503, detail="input unavailable")
             tmp_root = _jobs_dir / ".node-input-tmp"
             tmp_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            _reap_input_tmp(tmp_root)
             cleanup = Path(tempfile.mkdtemp(dir=tmp_root))
             local = cleanup / "input"
             try:
@@ -1743,13 +1762,20 @@ def register_node_claim_routes(
                         finished_at_ms=finished))
                     try:
                         os.rename(partial, final)
-                        nr.fsync_dir(jobdir)
                     except OSError:
+                        if not final.is_dir():
+                            raise       # nothing was stored: 503 (host) or 422 below, never 202
                         # lost a race with an identical upload: it is already quarantined
                         shutil.rmtree(partial, ignore_errors=True)
+                        partial = None
                         return (await _existing()
                                 or JSONResponse({"status": "accepted"}, status_code=202))
                     partial = None
+                    try:
+                        nr.fsync_dir(jobdir)
+                    except OSError as exc:
+                        # the tree IS in place (a retry would replay this same 202); say so
+                        _log.error("node_claim: could not fsync %s after rename: %s", jobdir, exc)
                 except HTTPException:
                     raise
                 except Exception as exc:            # noqa: BLE001 - any extraction fault: refuse, no marker

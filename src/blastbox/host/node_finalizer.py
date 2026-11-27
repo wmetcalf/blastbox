@@ -9,7 +9,6 @@ for the node's (idempotent) PUT replay to read.
 """
 from __future__ import annotations
 
-import fcntl
 import logging
 import os
 import shutil
@@ -27,10 +26,12 @@ from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL, retry_pending_
 
 _log = logging.getLogger(__name__)
 
-# One lock PER JOB, in job_root/<job>/: every claim of a job stages into the same
-# job_root/<job>/output, so two replicas finalising different claims of one job (a stale one
-# and its successor) must exclude each other, not merely two replicas on the same claim.
-LOCK_NAME = ".node-finalize.lock"
+# One lock PER JOB: every claim of a job stages into the same job_root/<job>/output, so two
+# replicas finalising different claims of one job (a stale one and its successor) must
+# exclude each other, not merely two replicas on the same claim. It lives in the results
+# spool's <job>/ dir, which this service's own sweep removes, so it never resurrects a purged
+# job_root/<job> nor outlives the job's spool.
+LOCK_NAME = ".finalize.lock"
 RETAIN_ENV = "BLASTBOX_NODE_RESULTS_RETAIN_S"
 DEFAULT_RETAIN_S = 3600.0
 NODE_TIER = "node-agent"
@@ -137,20 +138,18 @@ class NodeFinalizer:
     # ------------------------------------------------------------------ internals
 
     def _lock_path(self, job_id: str) -> Path:
-        return self._job_root / job_id / LOCK_NAME
+        return self._root / job_id / LOCK_NAME
 
     def _finalise_dir(self, d: Path) -> bool:
-        lock = self._lock_path(d.parent.name)          # spool layout: <root>/<job_id>/<claim>
+        # spool layout: <root>/<job_id>/<claim>. UploadLock: flock + unlink-on-release +
+        # inode re-check, so the lock file never lingers and a stale inode never wins.
+        lock = nr.UploadLock(self._lock_path(d.parent.name))
         try:
-            lock.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            if not lock.try_acquire():
+                return False                    # another replica holds it
         except OSError:
             return False
         try:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                return False                    # another replica holds it
             if nr.read_outcome(d) is not None:  # finished while we waited
                 return False
             marker = nr.read_marker(d)
@@ -182,7 +181,7 @@ class NodeFinalizer:
                       nr.claim_digest(marker.claim_id), status, f" ({reason})" if reason else "")
             return True
         finally:
-            os.close(fd)                        # releases the flock
+            lock.release()
 
     @staticmethod
     def _read_attempts(d: Path) -> tuple[int, float]:
@@ -322,7 +321,8 @@ class NodeFinalizer:
                         if cd.is_dir() and _all_older_than(cd, orphan_cutoff):
                             shutil.rmtree(cd, ignore_errors=True)
                         continue
-                    if cd.name.endswith(nr.UPLOAD_LOCK_SUFFIX) and cd.is_file():
+                    if (cd.name.endswith(nr.UPLOAD_LOCK_SUFFIX) or cd.name == LOCK_NAME) \
+                            and cd.is_file():
                         # an upload lock its (crashed) holder never unlinked; a held one stays
                         if cd.stat().st_mtime < orphan_cutoff:
                             lk = nr.UploadLock(cd)
