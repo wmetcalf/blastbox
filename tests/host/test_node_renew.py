@@ -1013,10 +1013,17 @@ def test_a_transient_pass_one_error_fixed_by_pass_two_is_not_reported(tmp_path, 
     assert not (i1 / "node-n1.crt").exists()
 
 
-def test_a_dangling_cert_link_does_not_defer_renewals(tmp_path):
+def test_a_dangling_cert_link_defers_only_the_nodes_its_dir_holds(tmp_path):
+    """A link this host cannot read, in a dir that holds the node, may narrow it (it may
+    resolve on that ingress), so that node's renewal defers -- loudly, naming the link.
+    Nodes that dir does not hold are unaffected. (Never widening beats availability; the
+    operator's fix is to make the link readable here or replace it with the file.)"""
     ca, ca_dir, i1, i2 = _split(tmp_path)
     (i1 / "stale.crt").symlink_to(tmp_path / "gone.crt")
     queue_csr(i2, "n1", make_csr("n1")[0])
+    [(nid, outcome)] = sign_pending(ca, ca_dir, node_dirs=[i1, i2])
+    assert outcome.startswith("deferred") and "stale.crt" in outcome
+    (i1 / "stale.crt").unlink()
     assert sign_pending(ca, ca_dir, node_dirs=[i1, i2]) == [("n1", "renewed")]
 
 
@@ -1236,3 +1243,29 @@ def test_an_unreadable_node_named_link_beside_a_real_cert_defers(tmp_path):
     queue_csr(d, "n1", make_csr("n1")[0])
     [(nid, outcome)] = sign_pending(ca, d)
     assert outcome.startswith("deferred") and pending(d) == ["n1"]
+
+
+def test_any_unreadable_link_in_a_dir_holding_the_node_defers(tmp_path):
+    """It may be a narrower cert of the node under any name (the ingress reads every
+    *.crt); renewal cannot see it, so it must not sign the visible grants alone."""
+    d, ca = rig(tmp_path)
+    (d / "restricted.crt").symlink_to("/mnt/ingress-only/n1-narrow.crt")
+    queue_csr(d, "n1", make_csr("n1")[0])
+    [(nid, outcome)] = sign_pending(ca, d)
+    assert outcome.startswith("deferred") and "restricted.crt" in outcome
+    assert pending(d) == ["n1"]
+
+
+def test_an_inaccessible_dir_entry_after_signing_does_not_crash_the_run(tmp_path, monkeypatch):
+    ca, ca_dir, i1, i2 = _split(tmp_path)
+    (i2 / "node-n1.crt").unlink()                        # i2 does not hold n1
+    queue_csr(i1, "n1", make_csr("n1")[0])
+    real = Path.is_symlink
+
+    def flaky(self):
+        if self.parent == i2:
+            raise PermissionError(13, "Permission denied")
+        return real(self)
+    monkeypatch.setattr(Path, "is_symlink", flaky)
+    out = sign_pending(ca, ca_dir, node_dirs=[i1, i2])   # must not raise
+    assert out and out[0][0] == "n1"

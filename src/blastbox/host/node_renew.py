@@ -299,10 +299,14 @@ class _Current:
 
 
 def _links_out(crt: Path, d: Path) -> bool:
-    """True if ``crt`` is a symlink resolving outside ``d`` (or not resolving at all)."""
-    if not crt.is_symlink():
-        return False
+    """True if ``crt`` is a symlink resolving outside ``d`` (or not resolving at all).
+
+    An entry this host cannot even lstat counts as one: unknown, so never trusted, and
+    never an exception that could abort a run after certs were written.
+    """
     try:
+        if not crt.is_symlink():
+            return False
         return Path(os.path.realpath(crt)).parent != Path(os.path.realpath(d))
     except OSError:
         return True
@@ -320,6 +324,18 @@ def _unreadable_named_link(d: Path, node_id: str) -> bool:
     return False
 
 
+def _unreadable_out_links(d: Path) -> list[Path]:
+    """The cert links out of ``d`` that this host cannot read."""
+    out: list[Path] = []
+    for c in sorted(d.glob("*.crt")):
+        if _links_out(c, d):
+            try:
+                _read_capped(c, MAX_CERT_BYTES, follow=True)
+            except (OSError, _Unreadable):
+                out.append(c)
+    return out
+
+
 def unreadable_links(pki_dir: Path, node_dirs: list[Path] | None = None) -> list[Path]:
     """Cert links out of a node dir that this host cannot read (dangling here, unreadable).
 
@@ -328,12 +344,7 @@ def unreadable_links(pki_dir: Path, node_dirs: list[Path] | None = None) -> list
     """
     out: list[Path] = []
     for d in _dirs(pki_dir, node_dirs):
-        for c in sorted(d.glob("*.crt")):
-            if _links_out(c, d):
-                try:
-                    _read_capped(c, MAX_CERT_BYTES, follow=True)
-                except (OSError, _Unreadable):
-                    out.append(c)       # node-<id>.crt ones are ALSO charged to that node
+        out += _unreadable_out_links(d)     # node-<id>.crt ones are ALSO charged per node
     return out
 
 
@@ -522,7 +533,12 @@ def sign_pending(ca: CertAuthority, pki_dir: Path, *, days: int = 7,
     results: list[tuple[str, str]] = []
     with _locked(every):
         for qdir in every:
-            results += _drain(ca, qdir, days, every)
+            try:
+                results += _drain(ca, qdir, days, every)
+            except OSError as exc:
+                # One queue going bad mid-run (a mount dropping) must not abort the others,
+                # nor lose the outcomes already reached; say it, so the run exits 2.
+                results.append((f"<{qdir}>", f"deferred: cannot read this queue: {exc}"))
     return results
 
 
@@ -640,6 +656,16 @@ def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
     # Only a dir that itself holds the node (or the one that queued it) counts: a dir with
     # nothing but a link to a copy is not one of its authorisers here, and must not be able
     # to hold the renewal hostage.
+    # In a dir that HOLDS the node, any cert link this host cannot read may be a narrower
+    # cert of it under any name (the ingress reads every *.crt): renewal cannot see it, so
+    # it must not sign the visible grants alone.
+    blind = {d: links for d in every if d in states
+             for links in [_unreadable_out_links(d)] if links}
+    if blind:
+        d, links = next(iter(blind.items()))
+        return (f"deferred: {links[0]} is a cert link this host cannot read, in a dir that "
+                "holds this node; it may narrow the node -- make it readable here or replace "
+                "it with the file"), True
     linked = [d for d in every
               if (d in states or d == qdir)
               and (_links_out_for(d, node_id, ca) or _unreadable_named_link(d, node_id))]

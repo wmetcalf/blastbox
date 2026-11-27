@@ -958,9 +958,12 @@ deferred (exit 2) until the link is replaced by the file, at most for the 24 h p
 that holds the node ONLY through such a link is never written: the renewal reports it by name
 (`renewed; NOT written to …`, exit 2), since that ingress still serves the old certificate. A
 cert link the CA host cannot read at all (it resolves only on that ingress, or is dangling) is
-charged to a node only by its conventional name, `node-<id>.crt`, which then counts as above
-(for the queueing dir too); any other could be anything and is charged to no node. Every such
-unreadable link, named or not, is also printed once per run as a `warning:` line on stderr. A symlinked queued CSR is refused. A run that cannot lock every dir within two minutes, or finds a node dir without `ca.crt`
+charged to a node by its conventional name, `node-<id>.crt`, which then counts as above (for the
+queueing dir too). In a dir that holds the node, ANY such link defers the node's renewal (exit 2,
+naming the link): it may be a narrower certificate of that node under another name, and renewal
+must not sign the visible grants alone. Every unreadable link is also printed once per run as a
+`warning:` line on stderr. A queue that cannot be read mid-run is reported and skipped; the rest
+still run. A symlinked queued CSR is refused. A run that cannot lock every dir within two minutes, or finds a node dir without `ca.crt`
 (an unmounted mountpoint), renews nothing and exits 1; a write that fails mid-way keeps the CSR, and the next run redoes it. Without
 `--node-dir` a split deployment's renewals are never seen: the node gets 202 and its old
 certificate until it expires.
