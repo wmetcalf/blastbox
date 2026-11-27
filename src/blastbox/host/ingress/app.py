@@ -563,9 +563,25 @@ def build_app(
             thread = threading.Thread(target=_reap_loop, name="blastbox-ingress-reap",
                                       daemon=True)
             thread.start()
+        # Evaluate liveness alerts every 15 s so a transition is logged when it happens, not
+        # only when somebody next scrapes or polls.
+        _monitor = getattr(_app.state, "liveness_monitor", None)
+
+        async def _liveness_loop() -> None:
+            assert _monitor is not None
+            while True:
+                try:
+                    await asyncio.to_thread(_monitor.view)
+                except Exception:  # noqa: BLE001 -- alerting must never take the API down
+                    _log.warning("ingress: liveness evaluation failed", exc_info=True)
+                await asyncio.sleep(15)
+
+        liveness_task = asyncio.create_task(_liveness_loop()) if _monitor is not None else None
         try:
             yield
         finally:
+            if liveness_task is not None:
+                liveness_task.cancel()
             stop.set()
             if thread is not None:
                 thread.join(timeout=5)
@@ -1471,6 +1487,13 @@ def build_app(
     register_node_claim_routes(app, job_store=_job_store, job_root=_job_root,
                                blob_store=_blob_store, limits=_limits,
                                pepper=_api_key.encode() if _api_key else None)
+
+    # Liveness gauges are computed at scrape time (the monitor re-evaluates), on the same
+    # per-app registry /metrics already serves. Present only when the node routes are.
+    _monitor = getattr(app.state, "liveness_monitor", None)
+    if _monitor is not None:
+        from blastbox.host.node_liveness import LivenessCollector
+        _host_registry.register(LivenessCollector(_monitor))
 
     return app
 

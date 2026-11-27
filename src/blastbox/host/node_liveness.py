@@ -16,14 +16,19 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
-from dataclasses import dataclass
-from typing import Any, Protocol
+import time
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any, Callable, Iterator, Literal, Protocol
 
 __all__ = [
     "NodeLiveness", "LivenessStore", "InMemoryLivenessStore", "SqlLivenessStore",
     "RedisLivenessStore", "build_liveness_store",
     "safe_record_heartbeat", "safe_record_claim",
+    "LivenessConfig", "Alert", "evaluate", "enrolled_nodes", "oldest_queued",
+    "LivenessMonitor", "LivenessCollector", "MAX_QUEUED_SCAN",
 ]
 
 _log = logging.getLogger("blastbox.node_liveness")
@@ -192,3 +197,280 @@ def build_liveness_store(store=None) -> LivenessStore:
     if client is not None and hasattr(client, "scan_iter"):
         return RedisLivenessStore(client)
     return InMemoryLivenessStore()
+
+
+# ---------------------------------------------------------------------------------------------
+# Alert evaluation (C2)
+# ---------------------------------------------------------------------------------------------
+
+#: Bound on the fallback queue scan used by stores without ``oldest_queued_by_engine``.
+MAX_QUEUED_SCAN = 10_000
+
+AlertKind = Literal["node_silent", "node_unhealthy", "engine_orphaned", "cert_expiring"]
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+    return v if v > 0 else default
+
+
+@dataclass(frozen=True)
+class LivenessConfig:
+    """Alert thresholds. Every value is shown in the ``/v1/fleet/liveness`` JSON."""
+
+    silent_after_s: float = 90.0
+    orphaned_after_s: float = 300.0
+    cert_expiring_s: float = 172800.0
+    #: Engines watched for ``engine_orphaned``. Empty = every engine granted to at least one
+    #: enrolled node, so a pure push-path deployment (dispatchers, no nodes) never alarms.
+    orphaned_engines: tuple[str, ...] = ()
+
+    @classmethod
+    def from_env(cls) -> "LivenessConfig":
+        raw = os.environ.get("BLASTBOX_ENGINE_ORPHANED_ENGINES", "")
+        return cls(
+            silent_after_s=_env_float("BLASTBOX_NODE_SILENT_AFTER_S", 90.0),
+            orphaned_after_s=_env_float("BLASTBOX_ENGINE_ORPHANED_AFTER_S", 300.0),
+            cert_expiring_s=_env_float("BLASTBOX_NODE_CERT_EXPIRING_S", 172800.0),
+            orphaned_engines=tuple(sorted({e.strip() for e in raw.split(",") if e.strip()})),
+        )
+
+    def as_json(self) -> dict[str, Any]:
+        return {"silent_after_s": self.silent_after_s,
+                "orphaned_after_s": self.orphaned_after_s,
+                "cert_expiring_s": self.cert_expiring_s,
+                "orphaned_engines": list(self.orphaned_engines)}
+
+
+@dataclass(frozen=True)
+class Alert:
+    kind: AlertKind
+    subject: str          # a node id or an engine name -- bounded label cardinality
+    since: float
+    detail: str
+
+    def as_json(self) -> dict[str, Any]:
+        return {"kind": self.kind, "subject": self.subject, "since": self.since,
+                "detail": self.detail}
+
+
+def _engines_of(live: "NodeLiveness | None") -> list[dict[str, Any]]:
+    raw = (live.body or {}).get("engines") if live else None
+    return [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+
+
+def _fresh(live: "NodeLiveness | None", now: float, cfg: LivenessConfig) -> bool:
+    return (live is not None and live.last_heartbeat_at is not None
+            and now - live.last_heartbeat_at <= cfg.silent_after_s)
+
+
+def evaluate(*, now: float, enrolled: "dict[str, Any]", live: dict[str, NodeLiveness],
+             oldest_queued: dict[str, float], cfg: LivenessConfig) -> list[Alert]:
+    """Pure alert evaluation. ``enrolled`` maps node id -> ``pki.NodeIdentity`` for the
+    verifying, unexpired certificates; only those nodes are expected to be alive."""
+    alerts: list[Alert] = []
+    for node_id in sorted(enrolled):
+        ident = enrolled[node_id]
+        lv = live.get(node_id)
+        not_after = ident.not_after.timestamp()
+        if lv is not None and _fresh(lv, now, cfg):
+            engines = _engines_of(lv)
+            bad = sorted(str(e.get("name", "")) for e in engines if not e.get("selftest_ok"))
+            if not engines:
+                alerts.append(Alert("node_unhealthy", node_id, lv.last_heartbeat_at or now,
+                                    "heartbeating with no engines"))
+            elif bad:
+                alerts.append(Alert("node_unhealthy", node_id, lv.last_heartbeat_at or now,
+                                    "selftest failing for: " + ", ".join(bad)))
+        else:
+            hb = lv.last_heartbeat_at if lv else None
+            since = hb if hb is not None else ident.not_before.timestamp()
+            detail = ("never heartbeated" if hb is None
+                      else f"no heartbeat for {now - hb:.0f}s (limit {cfg.silent_after_s:g}s)")
+            alerts.append(Alert("node_silent", node_id, since, detail))
+        if not_after - now < cfg.cert_expiring_s:
+            alerts.append(Alert("cert_expiring", node_id, not_after,
+                                f"certificate expires in {max(0.0, not_after - now):.0f}s"))
+    granted: dict[str, set[str]] = {}
+    for node_id, ident in enrolled.items():
+        for eng in ident.grants.engines:
+            granted.setdefault(eng, set()).add(node_id)
+    watched = set(cfg.orphaned_engines) if cfg.orphaned_engines else set(granted)
+    for eng in sorted(watched):
+        oldest = oldest_queued.get(eng)
+        if oldest is None or now - oldest <= cfg.orphaned_after_s:
+            continue
+        servers = [n for n in granted.get(eng, ())
+                   if _fresh(live.get(n), now, cfg)
+                   and any(e.get("name") == eng and e.get("selftest_ok")
+                           for e in _engines_of(live.get(n)))]
+        if not servers:
+            alerts.append(Alert(
+                "engine_orphaned", eng, oldest,
+                f"queued work {now - oldest:.0f}s old and no enrolled node with a fresh "
+                f"heartbeat and a passing selftest serves it "
+                f"({len(granted.get(eng, ()))} granted)"))
+    return alerts
+
+
+def enrolled_nodes(pki_dir: "Path | str") -> "dict[str, Any]":
+    """Node id -> ``NodeIdentity`` for every verifying, unexpired ``*.crt`` in ``pki_dir``
+    (same scan as ``placement.fleet_grants``). Two certs for one id (a re-issue overlap) merge
+    to the intersection of grants and the LATER expiry, so an overlap never false-alarms."""
+    from blastbox.host.pki import load_trust_anchor, node_identity
+
+    d = Path(pki_dir)
+    out: dict[str, Any] = {}
+    try:
+        ca = load_trust_anchor(d)
+    except Exception:  # noqa: BLE001 - nothing verifies, nothing is expected
+        return out
+    for crt in sorted(d.glob("*.crt")):
+        try:
+            ident = node_identity(ca, crt.read_bytes())
+        except Exception:  # noqa: BLE001 - one bad file is not a fleet outage
+            continue
+        prior = out.get(ident.node_id)
+        if prior is not None:
+            from blastbox.host.pki import NodeGrants
+            grants = NodeGrants(
+                engines=tuple(sorted(set(prior.grants.engines) & set(ident.grants.engines))),
+                tiers=tuple(sorted(set(prior.grants.tiers) & set(ident.grants.tiers))),
+                credentials=prior.grants.credentials and ident.grants.credentials)
+            ident = replace(ident, grants=grants,
+                            not_after=max(prior.not_after, ident.not_after),
+                            not_before=min(prior.not_before, ident.not_before))
+        out[ident.node_id] = ident
+    return out
+
+
+def oldest_queued(job_store: Any) -> dict[str, float]:
+    """Engine -> ``created_at`` of its oldest QUEUED job. One GROUP BY on SQL stores
+    (``oldest_queued_by_engine``); a scan bounded at :data:`MAX_QUEUED_SCAN` otherwise."""
+    fast = getattr(job_store, "oldest_queued_by_engine", None)
+    try:
+        if callable(fast):
+            return dict(fast())
+        from blastbox.host.jobs.base import JobStatus
+        out: dict[str, float] = {}
+        for j in job_store.list(JobStatus.QUEUED, limit=MAX_QUEUED_SCAN,
+                                sort="created_at", order="asc"):
+            if j.created_at is not None and (j.engine not in out or j.created_at < out[j.engine]):
+                out[j.engine] = j.created_at
+        return out
+    except Exception:  # noqa: BLE001 - a store that cannot enumerate means "unknown", not alarm
+        _log.warning("node_liveness: could not read queue ages", exc_info=True)
+        return {}
+
+
+@dataclass
+class _View:
+    now: float
+    cfg: LivenessConfig
+    enrolled: dict[str, Any]
+    live: dict[str, NodeLiveness]
+    oldest_queued: dict[str, float]
+    alerts: list[Alert] = field(default_factory=list)
+
+
+class LivenessMonitor:
+    """Owns the inputs to :func:`evaluate` and the once-per-transition logging memo."""
+
+    def __init__(self, *, liveness: LivenessStore, job_store: Any, pki_dir: "Path | str",
+                 cfg: LivenessConfig | None = None,
+                 clock: Callable[[], float] = time.time) -> None:
+        self._liveness = liveness
+        self._jobs = job_store
+        self._pki = pki_dir
+        self.cfg = cfg or LivenessConfig.from_env()
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._memo: dict[tuple[str, str], Alert] = {}
+
+    def view(self) -> _View:
+        now = self._clock()
+        enrolled = enrolled_nodes(self._pki)
+        live = self._liveness.snapshot()
+        queued = oldest_queued(self._jobs)
+        alerts = evaluate(now=now, enrolled=enrolled, live=live, oldest_queued=queued,
+                          cfg=self.cfg)
+        with self._lock:
+            seen: set[tuple[str, str]] = {(a.kind, a.subject) for a in alerts}
+            stable: list[Alert] = []
+            for a in alerts:
+                key = (a.kind, a.subject)
+                prior = self._memo.get(key)
+                if prior is None:
+                    _log.error("ALERT %s subject=%s: %s", a.kind, a.subject, a.detail)
+                else:
+                    a = replace(a, since=prior.since)   # `since` is when it began, not last seen
+                self._memo[key] = a
+                stable.append(a)
+            for gone_key in [k for k in self._memo if k not in seen]:
+                gone = self._memo.pop(gone_key)
+                _log.info("CLEARED %s subject=%s (was: %s)", gone_key[0], gone_key[1],
+                          gone.detail)
+        return _View(now, self.cfg, enrolled, live, queued, stable)
+
+    def as_json(self) -> dict[str, Any]:
+        v = self.view()
+        nodes = []
+        for node_id in sorted(set(v.enrolled) | set(v.live)):
+            lv = v.live.get(node_id)
+            ident = v.enrolled.get(node_id)
+            body = (lv.body or {}) if lv else {}
+            nodes.append({
+                "node_id": node_id,
+                "last_heartbeat_at": lv.last_heartbeat_at if lv else None,
+                "last_claim_at": lv.last_claim_at if lv else None,
+                "agent_version": body.get("agent_version") or None,
+                "engines": _engines_of(lv),
+                "cert_not_after": ident.not_after.timestamp() if ident else None,
+            })
+        return {"config": v.cfg.as_json(), "nodes": nodes,
+                "alerts": [a.as_json() for a in v.alerts], "generated_at": v.now}
+
+
+class LivenessCollector:
+    """Prometheus custom collector: re-evaluates on every scrape, so the gauges are fresh and
+    a node that vanished stops being exported. Subjects are node ids / engine names only."""
+
+    def __init__(self, monitor: LivenessMonitor) -> None:
+        self._m = monitor
+
+    def collect(self) -> Iterator[Any]:
+        from prometheus_client.core import GaugeMetricFamily as G
+
+        try:
+            v = self._m.view()
+        except Exception:  # noqa: BLE001 - a scrape must not fail on liveness
+            _log.exception("node_liveness: evaluation failed during scrape")
+            return
+        hb = G("blastbox_node_last_heartbeat_seconds",
+               "Unix time of the node's last heartbeat", labels=["node"])
+        cl = G("blastbox_node_last_claim_seconds",
+               "Unix time of the node's last claim", labels=["node"])
+        st = G("blastbox_node_selftest_ok", "1 if the engine's last selftest passed",
+               labels=["node", "engine"])
+        ce = G("blastbox_node_cert_expiry_seconds",
+               "Unix time the node's enrolled certificate expires", labels=["node"])
+        oq = G("blastbox_engine_oldest_queued_seconds",
+               "Age in seconds of the oldest QUEUED job for the engine", labels=["engine"])
+        al = G("blastbox_node_alert", "1 while the alert is active", labels=["kind", "subject"])
+        for node_id, lv in sorted(v.live.items()):
+            if lv.last_heartbeat_at is not None:
+                hb.add_metric([node_id], lv.last_heartbeat_at)
+            if lv.last_claim_at is not None:
+                cl.add_metric([node_id], lv.last_claim_at)
+            for e in _engines_of(lv):
+                st.add_metric([node_id, str(e.get("name", ""))], 1.0 if e.get("selftest_ok") else 0.0)
+        for node_id, ident in sorted(v.enrolled.items()):
+            ce.add_metric([node_id], ident.not_after.timestamp())
+        for eng, ts in sorted(v.oldest_queued.items()):
+            oq.add_metric([eng], max(0.0, v.now - ts))
+        for a in v.alerts:
+            al.add_metric([a.kind, a.subject], 1.0)
+        yield from (hb, cl, st, ce, oq, al)

@@ -709,6 +709,14 @@ class SqlJobStore:
             rows = conn.execute(sql, tuple(params)).fetchall()
         return [job for row in rows if (job := self._row_to_job(row)) is not None]
 
+    def oldest_queued_by_engine(self) -> dict[str, float]:
+        """Engine -> ``created_at`` of its oldest QUEUED job, in one GROUP BY (liveness alerts)."""
+        sql = (f"SELECT engine, MIN(created_at) FROM jobs WHERE status = {self._param} "
+               f"GROUP BY engine")
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(sql, (JobStatus.QUEUED.value,)).fetchall()
+        return {eng: float(ts) for eng, ts in rows if ts is not None}
+
     def count(self, status: JobStatus | None = None, *, q: str | None = None,
               engine: "str | Collection[str] | None" = None,
               claimant_tier: str | None = None, untargeted_only: bool = False) -> int:

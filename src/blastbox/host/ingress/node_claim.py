@@ -819,6 +819,18 @@ def register_node_claim_routes(
         _liveness = InMemoryLivenessStore()
     app.state.node_liveness = _liveness     # read by operator tooling / alerting
 
+    # The fleet liveness view. It lives under /v1/fleet/, which is NOT self-authenticating, so
+    # BearerAuthMiddleware gates it with the API key when one is configured. It exists only
+    # where a PKI does: with no enrolled nodes there is nothing to expect or alert on.
+    from blastbox.host.node_liveness import LivenessMonitor
+
+    _monitor = LivenessMonitor(liveness=_liveness, job_store=job_store, pki_dir=resolved)
+    app.state.liveness_monitor = _monitor
+
+    @app.get("/v1/fleet/liveness", tags=["fleet"])
+    def fleet_liveness() -> dict[str, Any]:
+        return _monitor.as_json()
+
     def _secret() -> bytes:
         return _signing_key
 
