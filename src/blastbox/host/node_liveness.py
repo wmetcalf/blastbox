@@ -32,7 +32,7 @@ __all__ = [
     "RedisLivenessStore", "build_liveness_store",
     "safe_record_heartbeat", "safe_record_claim",
     "LivenessConfig", "Alert", "evaluate", "enrolled_nodes", "oldest_queued",
-    "LivenessMonitor", "LivenessCollector", "MAX_QUEUED_SCAN",
+    "LivenessMonitor", "LivenessCollector", "MAX_QUEUED_SCAN", "heartbeat_interval_s",
 ]
 
 _log = logging.getLogger("blastbox.node_liveness")
@@ -245,7 +245,17 @@ def _env_float(name: str, default: float) -> float:
         v = float(os.environ.get(name, "") or default)
     except ValueError:
         return default
-    return v if v > 0 else default
+    return v if v > 0 and v != float("inf") else default
+
+
+def heartbeat_interval_s() -> int:
+    """The heartbeat interval ``/v1/nodes/heartbeat`` hands to agents (clamped to 10..300 s).
+    The ``node_silent`` default is derived from it, so the two can never disagree."""
+    try:
+        v = int(os.environ.get("BLASTBOX_NODE_HEARTBEAT_S", "30"))
+    except ValueError:
+        v = 30
+    return max(10, min(300, v))
 
 
 @dataclass(frozen=True)
@@ -263,7 +273,9 @@ class LivenessConfig:
     def from_env(cls) -> "LivenessConfig":
         raw = os.environ.get("BLASTBOX_ENGINE_ORPHANED_ENGINES", "")
         return cls(
-            silent_after_s=_env_float("BLASTBOX_NODE_SILENT_AFTER_S", 90.0),
+            # §10: silent after 3 x heartbeat_s (90 s at the default 30 s interval).
+            silent_after_s=_env_float("BLASTBOX_NODE_SILENT_AFTER_S",
+                                      3.0 * heartbeat_interval_s()),
             orphaned_after_s=_env_float("BLASTBOX_ENGINE_ORPHANED_AFTER_S", 300.0),
             cert_expiring_s=_env_float("BLASTBOX_NODE_CERT_EXPIRING_S", 172800.0),
             orphaned_engines=tuple(sorted({e.strip() for e in raw.split(",") if e.strip()})),
@@ -294,8 +306,28 @@ def _engines_of(live: "NodeLiveness | None") -> list[dict[str, Any]]:
 
 
 def _fresh(live: "NodeLiveness | None", now: float, cfg: LivenessConfig) -> bool:
-    return (live is not None and live.last_heartbeat_at is not None
-            and now - live.last_heartbeat_at <= cfg.silent_after_s)
+    """A heartbeat within the silence window. One further ahead of ``now`` than the window
+    itself is NOT fresh: after a backward clock step a live node rewrites its row on the next
+    beat, so only a dead node keeps a future timestamp -- and it must not read as alive."""
+    if live is None or live.last_heartbeat_at is None:
+        return False
+    return abs(now - live.last_heartbeat_at) <= cfg.silent_after_s
+
+
+def _serves(live: "NodeLiveness | None", eng: str, now: float, cfg: LivenessConfig) -> bool:
+    """Fresh, a passing selftest for ``eng``, AND evidence of taking work: a claim attempt
+    within the silence window, or a busy slot on that engine. A shadow agent (claim=false)
+    heartbeats a passing selftest and never claims, so it must not hide orphaned work."""
+    if not _fresh(live, now, cfg):
+        return False
+    assert live is not None
+    mine = [e for e in _engines_of(live) if e.get("name") == eng and e.get("selftest_ok")]
+    if not mine:
+        return False
+    claimed = (live.last_claim_at is not None
+               and abs(now - live.last_claim_at) <= cfg.silent_after_s)
+    busy = any(isinstance(e.get("busy"), int) and e.get("busy", 0) > 0 for e in mine)
+    return claimed or busy
 
 
 def evaluate(*, now: float, enrolled: "Mapping[str, NodeIdentity]", live: dict[str, NodeLiveness],
@@ -310,7 +342,9 @@ def evaluate(*, now: float, enrolled: "Mapping[str, NodeIdentity]", live: dict[s
         lv = live.get(node_id)
         not_after = ident.not_after.timestamp()
         if not_after <= now:
-            alerts.append(Alert("cert_expired", node_id, now,
+            # `since` is the onset (the instant it lapsed), so it is the same on every process
+            # and across restarts rather than whenever this process first looked.
+            alerts.append(Alert("cert_expired", node_id, not_after,
                                 f"certificate expired {now - not_after:.0f}s ago"))
             continue
         if lv is not None and _fresh(lv, now, cfg):
@@ -329,28 +363,29 @@ def evaluate(*, now: float, enrolled: "Mapping[str, NodeIdentity]", live: dict[s
                       else f"no heartbeat for {now - hb:.0f}s (limit {cfg.silent_after_s:g}s)")
             alerts.append(Alert("node_silent", node_id, since, detail))
         if not_after - now < cfg.cert_expiring_s:
-            alerts.append(Alert("cert_expiring", node_id, now,
+            alerts.append(Alert("cert_expiring", node_id, not_after - cfg.cert_expiring_s,
                                 f"certificate expires in {max(0.0, not_after - now):.0f}s"))
     granted: dict[str, set[str]] = {}
+    expected: set[str] = set()
     for node_id, ident in enrolled.items():
+        # An engine whose only node just lapsed is still EXPECTED to be served -- that is the
+        # incident -- so it stays watched; the lapsed node just cannot be one of its servers.
+        expected.update(ident.grants.engines)
         if ident.not_after.timestamp() <= now:
             continue                       # an expired cert serves nothing
         for eng in ident.grants.engines:
             granted.setdefault(eng, set()).add(node_id)
-    watched = set(cfg.orphaned_engines) if cfg.orphaned_engines else set(granted)
+    watched = set(cfg.orphaned_engines) if cfg.orphaned_engines else expected
     for eng in sorted(watched):
         oldest = oldest_queued.get(eng)
         if oldest is None or now - oldest <= cfg.orphaned_after_s:
             continue
-        servers = [n for n in granted.get(eng, ())
-                   if _fresh(live.get(n), now, cfg)
-                   and any(e.get("name") == eng and e.get("selftest_ok")
-                           for e in _engines_of(live.get(n)))]
+        servers = [n for n in granted.get(eng, ()) if _serves(live.get(n), eng, now, cfg)]
         if not servers:
             alerts.append(Alert(
                 "engine_orphaned", eng, oldest,
                 f"queued work {now - oldest:.0f}s old and no enrolled node with a fresh "
-                f"heartbeat and a passing selftest serves it "
+                f"heartbeat, a passing selftest and a recent claim serves it "
                 f"({len(granted.get(eng, ()))} granted)"))
     return alerts
 
@@ -363,7 +398,8 @@ def enrolled_nodes(pki_dir: "Path | str", *, now: float | None = None) -> "dict[
     from blastbox.host.pki import load_trust_anchor, node_identity
 
     d = Path(pki_dir)
-    cutoff = (time.time() if now is None else now) - CERT_EXPIRED_GRACE_S
+    now_ = time.time() if now is None else now
+    cutoff = now_ - CERT_EXPIRED_GRACE_S
     out: dict[str, Any] = {}
     try:
         ca = load_trust_anchor(d)
@@ -377,6 +413,14 @@ def enrolled_nodes(pki_dir: "Path | str", *, now: float | None = None) -> "dict[
         if ident.not_after.timestamp() <= cutoff:
             continue                         # long gone: decommissioned, not an incident
         prior = out.get(ident.node_id)
+        if prior is not None and (prior.not_after.timestamp() <= now_) != (
+                ident.not_after.timestamp() <= now_):
+            # One lapsed, one valid: authorisation ignores the lapsed one, so must this --
+            # intersecting would drop the grants actually in force (a false engine_orphaned).
+            if ident.not_after.timestamp() <= now_:
+                continue
+            out[ident.node_id] = ident
+            continue
         if prior is not None:
             from blastbox.host.pki import NodeGrants
             grants = NodeGrants(
@@ -433,6 +477,7 @@ class LivenessMonitor:
         self._lock = threading.Lock()
         self._memo: dict[tuple[str, str], Alert] = {}
         self._enrolled_cache: tuple[Any, float, dict[str, Any]] | None = None
+        self._queued_cache: tuple[float, dict[str, float]] | None = None
 
     def _pki_signature(self) -> tuple:
         try:
@@ -453,12 +498,24 @@ class LivenessMonitor:
         return got
 
     ENROLLED_TTL_S = 10.0
+    #: Queue ages are cached too: on a store without ``oldest_queued_by_engine`` (Redis) the
+    #: fallback scans every job key, and /metrics may be public. 10 s is far inside the 300 s
+    #: orphan threshold.
+    QUEUED_TTL_S = 10.0
+
+    def _queued(self, now: float) -> dict[str, float]:
+        c = self._queued_cache
+        if c is not None and 0 <= now - c[0] < self.QUEUED_TTL_S:
+            return c[1]
+        got = oldest_queued(self._jobs)
+        self._queued_cache = (now, got)
+        return got
 
     def view(self) -> _View:
         now = self._clock()
         enrolled = self._enrolled(now)
         live = self._liveness.snapshot()
-        queued = oldest_queued(self._jobs)
+        queued = self._queued(now)
         alerts = evaluate(now=now, enrolled=enrolled, live=live, oldest_queued=queued,
                           cfg=self.cfg)
         with self._lock:
@@ -524,13 +581,24 @@ class LivenessCollector:
         oq = G("blastbox_engine_oldest_queued_seconds",
                "Age in seconds of the oldest QUEUED job for the engine", labels=["engine"])
         al = G("blastbox_node_alert", "1 while the alert is active", labels=["kind", "subject"])
+        # Per-node series only for nodes still in the expected set: a node whose certificate
+        # is gone stops being exported (its row is kept, but it is no longer anyone's node).
         for node_id, lv in sorted(v.live.items()):
+            if node_id not in v.enrolled:
+                continue
             if lv.last_heartbeat_at is not None:
                 hb.add_metric([node_id], lv.last_heartbeat_at)
             if lv.last_claim_at is not None:
                 cl.add_metric([node_id], lv.last_claim_at)
+            # One series per (node, engine): a body naming an engine twice would otherwise
+            # emit a duplicate sample, and Prometheus rejects the WHOLE scrape for that. Any
+            # failing entry wins, so a duplicate cannot mask a failure.
+            ok: dict[str, bool] = {}
             for e in _engines_of(lv):
-                st.add_metric([node_id, str(e.get("name", ""))], 1.0 if e.get("selftest_ok") else 0.0)
+                name = str(e.get("name", ""))
+                ok[name] = ok.get(name, True) and bool(e.get("selftest_ok"))
+            for name, good in sorted(ok.items()):
+                st.add_metric([node_id, name], 1.0 if good else 0.0)
         for node_id, ident in sorted(v.enrolled.items()):
             ce.add_metric([node_id], ident.not_after.timestamp())
         for eng, ts in sorted(v.oldest_queued.items()):

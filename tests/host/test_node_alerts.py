@@ -77,7 +77,7 @@ def test_orphaned_fires_with_no_live_node_and_clears_on_heartbeat():
     q = {"clamav": T0 - 301}
     got = run(T0, e, {}, q)
     assert ("engine_orphaned", "clamav") in kinds(got)
-    assert run(T0, e, {"n": lv(T0)}, q) == []
+    assert run(T0, e, {"n": lv(T0, claim=T0)}, q) == []
     young = run(T0, e, {}, {"clamav": T0 - 299})          # queued work not yet 300 s old
     assert kinds(young) == [("node_silent", "n")]
 
@@ -216,7 +216,8 @@ def test_since_is_pinned_to_first_seen_while_the_alert_stays_active(tmp_path):
                         clock=lambda: now[0])
     t_first = now[0]
     (a,) = m.as_json()["alerts"]
-    assert a["kind"] == "cert_expiring" and a["since"] == t_first
+    assert a["kind"] == "cert_expiring" and a["since"] <= t_first        # the onset
+    t_first = a["since"]
     now[0] += 5
     lvs.record_heartbeat("alpha", {"engines": [{"name": "clamav", "selftest_ok": True}]}, now[0])
     (a,) = m.as_json()["alerts"]
@@ -239,7 +240,8 @@ def test_evaluate_with_real_node_identities_and_cert_expired(tmp_path):
     enrolled = enrolled_nodes(d, now=later)
     got = evaluate(now=later, enrolled=enrolled, live={}, oldest_queued={"clamav": later - 999},
                    cfg=CFG)
-    assert kinds(got) == [("cert_expired", "alpha")]               # not silent, not orphaned-by-it
+    # Not silent. The engine it alone served IS orphaned: the lapse is the incident.
+    assert kinds(got) == [("cert_expired", "alpha"), ("engine_orphaned", "clamav")]
     # past the 24 h grace the node is simply gone
     assert enrolled_nodes(d, now=t + 7 * 86400 + 2 * 86400) == {}
 
@@ -273,3 +275,95 @@ def test_claim_writes_are_throttled_per_node():
     t = ClaimThrottle(5.0)
     assert t.allow("a", 100.0) and not t.allow("a", 102.0) and not t.allow("a", 104.9)
     assert t.allow("a", 105.0) and t.allow("b", 102.0)
+
+
+# --- review round 1 -------------------------------------------------------------------------
+
+def test_silent_default_follows_the_heartbeat_interval_handed_to_agents(monkeypatch):
+    """§10: silent after 3 x heartbeat_s. An operator who raises the interval must not turn
+    every healthy node silent."""
+    monkeypatch.delenv("BLASTBOX_NODE_SILENT_AFTER_S", raising=False)
+    monkeypatch.setenv("BLASTBOX_NODE_HEARTBEAT_S", "120")
+    assert LivenessConfig.from_env().silent_after_s == 360
+    monkeypatch.setenv("BLASTBOX_NODE_SILENT_AFTER_S", "200")     # explicit override wins
+    assert LivenessConfig.from_env().silent_after_s == 200
+
+
+def test_engine_whose_only_node_lapsed_is_still_watched_for_orphaned_work():
+    e = {"n": ident(not_after=T0 - 100)}
+    got = run(T0, e, {}, {"clamav": T0 - 5000})
+    assert kinds(got) == [("cert_expired", "n"), ("engine_orphaned", "clamav")]
+
+
+def test_shadow_node_heartbeating_but_never_claiming_does_not_serve():
+    """A claim=false (shadow) agent heartbeats a passing selftest and never claims."""
+    e = {"n": ident()}
+    q = {"clamav": T0 - 400}
+    assert ("engine_orphaned", "clamav") in kinds(run(T0, e, {"n": lv(T0)}, q))
+    assert run(T0, e, {"n": lv(T0, claim=T0 - 3)}, q) == []          # polling: serves
+    busy = NodeLiveness("n", T0, None, None, {"engines": [
+        {"name": "clamav", "selftest_ok": True, "busy": 2}]})
+    assert run(T0, e, {"n": busy}, q) == []                           # all slots busy: serves
+
+
+def test_a_heartbeat_far_in_the_future_is_not_fresh():
+    """A backward clock step leaves a dead node's last heartbeat ahead of now."""
+    assert kinds(run(T0, {"n": ident()}, {"n": lv(T0 + 3600)})) == [("node_silent", "n")]
+    assert run(T0, {"n": ident()}, {"n": lv(T0 + 5)}) == []           # small skew tolerated
+
+
+def test_cert_alert_since_is_the_onset_not_the_evaluation_time():
+    na = T0 + 47 * 3600
+    (a,) = run(T0, {"n": ident(not_after=na)}, {"n": lv(T0)})
+    assert a.kind == "cert_expiring" and a.since == na - CFG.cert_expiring_s
+    (a,) = run(T0, {"n": ident(not_after=T0 - 100)}, {})
+    assert a.kind == "cert_expired" and a.since == T0 - 100
+
+
+def test_an_expired_cert_does_not_narrow_its_valid_replacements_grants(tmp_path):
+    d = tmp_path / "pki"
+    ca = pki.ensure_ca(d)
+    ca.issue_node("alpha", wg_pubkey=WG, grants=pki.NodeGrants(engines=("old",)),
+                  days=1).write(d, "node-alpha-old")
+    ca.issue_node("alpha", wg_pubkey=WG, grants=pki.NodeGrants(engines=("clamav",)),
+                  days=30).write(d, "node-alpha-new")
+    later = time.time() + 86400 + 3600                   # old lapsed 1 h ago, new valid
+    got = enrolled_nodes(d, now=later)["alpha"]
+    assert got.grants.engines == ("clamav",)
+
+
+def test_duplicate_engine_names_never_emit_duplicate_series(rig):
+    """Prometheus rejects a whole scrape that carries one series twice."""
+    app, _, c = rig
+    app.state.node_liveness.record_heartbeat("alpha", {"engines": [
+        {"name": "clamav", "selftest_ok": True}, {"name": "clamav", "selftest_ok": False}]},
+        time.time())
+    lines = [ln for ln in c.get("/metrics").text.splitlines()
+             if ln.startswith("blastbox_node_selftest_ok{")]
+    assert len(lines) == 1 and lines[0].endswith(" 0.0")
+
+
+def test_gauges_drop_a_node_whose_certificate_is_gone(rig, tmp_path):
+    app, _, c = rig
+    app.state.node_liveness.record_heartbeat(
+        "ghost", {"engines": [{"name": "clamav", "selftest_ok": True}]}, time.time())
+    text = c.get("/metrics").text
+    assert 'node="ghost"' not in text
+
+
+def test_queue_ages_are_cached_between_scrapes(tmp_path):
+    calls = []
+
+    class Jobs:
+        def oldest_queued_by_engine(self):
+            calls.append(1)
+            return {}
+    now = [1000.0]
+    m = LivenessMonitor(liveness=InMemoryLivenessStore(), job_store=Jobs(),
+                        pki_dir=tmp_path, clock=lambda: now[0])
+    m.view()
+    m.view()
+    assert len(calls) == 1
+    now[0] += 11
+    m.view()
+    assert len(calls) == 2
