@@ -1,0 +1,124 @@
+name: agent-release
+
+# Reproducible, cosign-keyless release of the Go blastbox-agent. Triggered ONLY
+# by an `agent-vX.Y.Z` tag push. The GitHub release this creates is skipped by
+# publish.yml (PyPI) via its `agent-v` guard. See agent/RELEASING.md.
+
+on:
+  push:
+    tags:
+      - "agent-v*"
+
+permissions:
+  contents: write   # gh release create
+  id-token: write   # cosign keyless (Sigstore OIDC)
+
+env:
+  GO_VERSION: "1.22.12"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        goos: [darwin, linux]
+        goarch: [amd64, arm64]
+    steps:
+      - name: Derive version from tag
+        run: |
+          set -eu
+          case "${GITHUB_REF_NAME}" in
+            agent-v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "bad tag ${GITHUB_REF_NAME}" >&2; exit 1 ;;
+          esac
+          echo "VERSION=${GITHUB_REF_NAME#agent-v}" >> "$GITHUB_ENV"
+      # Two separate clean checkouts; both must build byte-identical output.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          path: src-a
+          persist-credentials: false
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          path: src-b
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Go tests
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        working-directory: src-a/agent
+        run: go test ./...
+      - name: Build twice and compare
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -eu
+          out="blastbox-agent-${GOOS}-${GOARCH}"
+          mkdir -p dist
+          for d in src-a src-b; do
+            (cd "$d/agent" && go build -trimpath -buildvcs=true \
+              -ldflags "-s -w -buildid= -X main.version=${VERSION}" \
+              -o "$GITHUB_WORKSPACE/dist/$d-$out" ./cmd/blastbox-agent)
+          done
+          cmp "dist/src-a-$out" "dist/src-b-$out"
+          mv "dist/src-a-$out" "dist/$out"
+          rm "dist/src-b-$out"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/blastbox-agent-*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Derive version from tag
+        run: |
+          set -eu
+          echo "VERSION=${GITHUB_REF_NAME#agent-v}" >> "$GITHUB_ENV"
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          pattern: bin-*
+          merge-multiple: true
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+      - name: Checksums, SBOM, conformance digest
+        working-directory: dist
+        run: |
+          set -eu
+          chmod 0755 blastbox-agent-*
+          sha256sum blastbox-agent-darwin-amd64 blastbox-agent-darwin-arm64 \
+            blastbox-agent-linux-amd64 blastbox-agent-linux-arm64 > SHA256SUMS
+          : > sbom.txt
+          for f in blastbox-agent-*; do
+            echo "== $f" >> sbom.txt
+            go version -m "$f" >> sbom.txt
+          done
+          sha256sum ../conformance/v1/SHA256SUMS | cut -d' ' -f1 > conformance-digest.txt
+      - name: Sign SHA256SUMS (keyless)
+        working-directory: dist
+        run: cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
+      - name: Create release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "blastbox-agent ${VERSION}" \
+            --notes "blastbox-agent ${VERSION}. Verify with agent/install.sh (pinned sha256 + cosign)." \
+            blastbox-agent-darwin-amd64 blastbox-agent-darwin-arm64 \
+            blastbox-agent-linux-amd64 blastbox-agent-linux-arm64 \
+            SHA256SUMS SHA256SUMS.sigstore.json sbom.txt conformance-digest.txt
