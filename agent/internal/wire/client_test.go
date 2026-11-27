@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -809,5 +810,95 @@ func TestHeartbeatSkewNotOverwrittenByDate(t *testing.T) {
 	c.Claim(ctx, "", nil)
 	if c.skew.Load() != before {
 		t.Fatal("Date overwrote the heartbeat skew")
+	}
+}
+
+func keys(m map[string]json.RawMessage) []string {
+	var ks []string
+	for k := range m {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
+}
+
+// The control plane's finalizer-only mode accepts exactly these key sets.
+func TestFailAndReleaseExactKeySets(t *testing.T) {
+	f, c := setup(t)
+	f.handler = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path == "/v1/nodes/jobs/j1" {
+			w.Write([]byte(`{"job":{}}`))
+			return true
+		}
+		return false
+	}
+	cl := &Claim{JobID: "j1", ClaimID: "c1", Receipt: "r1"}
+	ctx := context.Background()
+	decode := func() (map[string]json.RawMessage, map[string]json.RawMessage) {
+		var top map[string]json.RawMessage
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(f.bodies["POST /v1/nodes/jobs/j1"], &top); err != nil {
+			t.Fatal(err)
+		}
+		json.Unmarshal(top["fields"], &fields)
+		return top, fields
+	}
+	want := func(got []string, w ...string) {
+		t.Helper()
+		if strings.Join(got, ",") != strings.Join(w, ",") {
+			t.Fatalf("keys %v, want %v", got, w)
+		}
+	}
+	if err := c.Release(ctx, cl); err != nil {
+		t.Fatal(err)
+	}
+	top, fields := decode()
+	want(keys(top), "claim_id", "expect_status", "fields", "receipt")
+	want(keys(fields), "claim_id", "status")
+	if string(top["expect_status"]) != `"running"` || string(fields["status"]) != `"queued"` || string(fields["claim_id"]) != "null" {
+		t.Fatalf("%s", f.bodies["POST /v1/nodes/jobs/j1"])
+	}
+	if err := c.Fail(ctx, cl, "boom", c.now()); err != nil {
+		t.Fatal(err)
+	}
+	top, fields = decode()
+	want(keys(top), "claim_id", "expect_status", "fields", "receipt")
+	want(keys(fields), "error", "finished_at", "status")
+	if string(top["expect_status"]) != `"running"` {
+		t.Fatalf("%s", top["expect_status"])
+	}
+	if err := c.Fail(ctx, cl, "", c.now()); err != nil {
+		t.Fatal(err)
+	}
+	_, fields = decode()
+	want(keys(fields), "finished_at", "status") // error is optional: omitted when empty
+}
+
+// finished_at is never before the run's started_at as the server knows it: the claim time.
+func TestFailFinishedAtClampedToClaimTime(t *testing.T) {
+	f, c := setup(t)
+	f.handler = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path == "/v1/nodes/jobs/j1" {
+			w.Write([]byte(`{"job":{}}`))
+			return true
+		}
+		return false
+	}
+	ctx := context.Background()
+	if err := c.Session(ctx); err != nil {
+		t.Fatal(err)
+	}
+	claimed := c.now().Add(-2 * time.Second)
+	cl := &Claim{JobID: "j1", ClaimID: "c1", Receipt: "r1", ClaimedAt: claimed}
+	// A finish time (e.g. a node clock step back) earlier than the claim.
+	if err := c.Fail(ctx, cl, "x", claimed.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	var m struct{ Fields map[string]any }
+	json.Unmarshal(f.bodies["POST /v1/nodes/jobs/j1"], &m)
+	fin := m.Fields["finished_at"].(float64)
+	startedSrv := float64(c.toServer(claimed).UnixNano()) / 1e9
+	if fin < startedSrv-1e-6 {
+		t.Fatalf("finished_at %v before the claim time %v", fin, startedSrv)
 	}
 }

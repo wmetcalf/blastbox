@@ -93,6 +93,9 @@ type Claim struct {
 	Receipt string
 	NodeID  string
 	Run     RunBlock
+	// ClaimedAt is the node-clock time the claim was received: the server's started_at for the
+	// run is this claim time, and a finished_at before it is refused.
+	ClaimedAt time.Time
 }
 
 // ResultMeta describes an uploaded result. Times are local; the client translates them to
@@ -606,7 +609,7 @@ func (c *Client) Claim(ctx context.Context, engine string, exclude []string) (*C
 		return nil, fmt.Errorf("%w: claim names a different node", ErrRefused)
 	}
 	return &Claim{Job: out.Job, JobID: j.JobID, ClaimID: j.ClaimID, Receipt: out.Receipt,
-		NodeID: out.NodeID, Run: out.Run}, nil
+		NodeID: out.NodeID, Run: out.Run, ClaimedAt: c.now()}, nil
 }
 
 // ---- input ----
@@ -756,7 +759,8 @@ func (c *Client) update(ctx context.Context, cl *Claim, fields map[string]any) e
 }
 
 // Fail marks the held job failed. expires_at is never sent. finishedAt is a local time,
-// translated to the server clock and clamped to the server's present.
+// translated to the server clock, clamped to the server's present and never before the claim
+// time (the run's started_at as the server knows it). The error is omitted when empty.
 func (c *Client) Fail(ctx context.Context, cl *Claim, reason string, finishedAt time.Time) error {
 	if err := c.Session(ctx); err != nil { // learn the server clock before translating times
 		return err
@@ -764,9 +768,17 @@ func (c *Client) Fail(ctx context.Context, cl *Claim, reason string, finishedAt 
 	if finishedAt.IsZero() {
 		finishedAt = c.now()
 	}
-	fin := float64(c.toServer(finishedAt).UnixNano()) / 1e9
-	return c.update(ctx, cl, map[string]any{
-		"status": "failed", "error": truncate(reason, maxErrorChars), "finished_at": fin})
+	fin := c.toServer(finishedAt)
+	if !cl.ClaimedAt.IsZero() {
+		if st := c.toServer(cl.ClaimedAt); fin.Before(st) {
+			fin = st
+		}
+	}
+	fields := map[string]any{"status": "failed", "finished_at": float64(fin.UnixNano()) / 1e9}
+	if e := truncate(reason, maxErrorChars); e != "" {
+		fields["error"] = e
+	}
+	return c.update(ctx, cl, fields)
 }
 
 // Release puts an unstarted job back on the queue.
