@@ -1102,6 +1102,10 @@ def test_an_oversized_cert_defers_instead_of_dropping_out_of_the_intersection(tm
                                                                               monkeypatch):
     d, ca = rig(tmp_path)
     queue_csr(d, "n1", make_csr("n1")[0])
-    monkeypatch.setattr(node_renew, "MAX_CERT_BYTES", 100)   # every real cert is "huge"
+    with open(d / "node-n1.crt", "ab") as fh:              # only the NODE's cert is huge;
+        fh.write(b"\n" * node_renew.MAX_CERT_BYTES)       # ca.crt stays small
+    assert (d / "ca.crt").stat().st_size < node_renew.MAX_CERT_BYTES
     [(nid, outcome)] = sign_pending(ca, d)
-    assert outcome.startswith("deferred") and pending(d) == ["n1"]
+    assert outcome.startswith("deferred") and "node-n1.crt" in outcome
+    assert "bytes" in outcome and "links are refused" not in outcome   # said as it is
+    assert pending(d) == ["n1"]
