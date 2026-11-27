@@ -48,8 +48,8 @@ type Result struct {
 // Files a job dir may hold besides in/ out/ scratch/ (crash recovery reads them).
 const (
 	ResultTarName  = "result.tar"
-	ResultMetaName = "result.json" // the upload's headers, so recovery can replay it
-	ReportedName   = "reported"    // the control plane answered the upload: nothing left to send
+	ResultMetaName = "result.json"  // the upload's headers, so recovery can replay it
+	ReportedName   = "reported"     // the control plane answered the upload: nothing left to send
 	RunRecordName  = "sandbox.json" // the running sandbox's identity (sandbox.RunRecord)
 )
 
