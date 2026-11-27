@@ -251,6 +251,13 @@ func (a *Agent) startup(ctx context.Context) error {
 	if a.Runner == nil {
 		a.Runner = &runner.Runner{Host: a.Host, Logf: func(f string, args ...any) {
 			a.Log.Info("runner", "msg", fmt.Sprintf(f, args...))
+		}, SandboxFault: func(engine, reason string) {
+			// Stop claiming on the engine NOW, before the failed job is reported.
+			for _, es := range a.engines {
+				if es.eng.Name == engine {
+					es.markRed("sandbox failure: " + reason)
+				}
+			}
 		}}
 	}
 	a.startedAt = a.Now()
@@ -620,8 +627,13 @@ func (a *Agent) runClaim(ctx, jobsCtx context.Context, es *engState, c *wire.Cla
 	start := a.Now()
 	dl := start.Add(time.Duration(c.Run.DeadlineS) * time.Second)
 	a.mu.Lock()
-	if _, dup := a.inflight[c.JobID]; dup {
+	if live, dup := a.inflight[c.JobID]; dup {
 		a.mu.Unlock()
+		if live.ClaimID == c.ClaimID {
+			// The same claim handed over again: it is the live run's own; nothing to do.
+			a.Log.Warn("claim re-delivered for a job running here; ignored", "job", c.JobID)
+			return
+		}
 		// The control plane re-issued a job this node is still running (its earlier claim was
 		// reclaimed). The live run is left alone; the job reached a sandbox here, so the new
 		// claim is failed, never run and never released.

@@ -8,7 +8,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/wmetcalf/blastbox/agent/internal/config"
 )
@@ -107,5 +109,43 @@ func sandboxProofs(t *testing.T, h Host, sandbox string) {
 	none := config.Engine{Name: "st", Sandbox: sandbox}
 	if r := h.SelfTest(context.Background(), none); r.OK {
 		t.Error("missing selftest_argv must not pass")
+	}
+}
+
+// KillRun stops the recorded run, and never a process whose pid matches but whose identity
+// does not (the pid was reused).
+func TestKillRunGuardsPidReuse(t *testing.T) {
+	start := func() *exec.Cmd {
+		c := exec.Command("/bin/sh", "-c", "sleep 60 & sleep 60")
+		c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		if err := c.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { syscall.Kill(-c.Process.Pid, syscall.SIGKILL); c.Wait() })
+		return c
+	}
+	other := start()
+	id, ok := ProcIdentity(other.Process.Pid)
+	if !ok {
+		t.Fatal("no identity")
+	}
+	if err := KillRun(RunRecord{PID: other.Process.Pid, Identity: id + 1}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if syscall.Kill(other.Process.Pid, 0) != nil {
+		t.Fatal("killed a process whose identity does not match the record")
+	}
+	mine := start()
+	id, _ = ProcIdentity(mine.Process.Pid)
+	if err := KillRun(RunRecord{PID: mine.Process.Pid, Identity: id}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { mine.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the recorded run survived KillRun")
 	}
 }

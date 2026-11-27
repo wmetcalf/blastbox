@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -271,6 +273,32 @@ func TestRecoveryKillsAnOrphanedRun(t *testing.T) {
 	case <-reaped:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the orphaned run survived recovery")
+	}
+}
+
+// A started dir whose claim record is unusable is still a run that may be alive: it is stopped
+// before the dir is wiped.
+func TestRecoveryKillsAnOrphanEvenWithoutAClaim(t *testing.T) {
+	e := fresh(t)
+	e.cfg.Claim = false
+	d := jobDir(e, "jn", true, false)
+	cmd := exec.Command("/bin/sh", "-c", "sleep 60 & sleep 60")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	reaped := make(chan struct{})
+	go func() { cmd.Wait(); close(reaped) }()
+	t.Cleanup(func() { syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) })
+	id, _ := sandbox.ProcIdentity(cmd.Process.Pid)
+	rec, _ := json.Marshal(sandbox.RunRecord{PID: cmd.Process.Pid, Identity: id})
+	os.WriteFile(filepath.Join(d, runner.RunRecordName), rec, 0o600)
+	h := newHarness(e)
+	h.start(t)
+	select {
+	case <-reaped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the orphaned run survived recovery of a dir without a claim record")
 	}
 }
 
@@ -769,6 +797,29 @@ func TestDuplicateClaimOfALiveJob(t *testing.T) {
 		t.Fatalf("duplicate claim not failed (or the live claim was): %v", u)
 	}
 	close(release)
+}
+
+// The production runner's sandbox-fault hook marks the engine red at once, before the job's
+// report (which may take minutes) and before Run returns.
+func TestSandboxFaultHookMarksEngineRed(t *testing.T) {
+	e := fresh(t)
+	a := New(e.cfg)
+	a.Log = slog.New(slog.NewJSONHandler(io.Discard, nil))
+	if err := a.startup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	es := a.engines[0]
+	es.mu.Lock()
+	es.ok = true
+	es.mu.Unlock()
+	r, ok := a.Runner.(*runner.Runner)
+	if !ok || r.SandboxFault == nil {
+		t.Fatal("the production runner has no sandbox-fault hook")
+	}
+	r.SandboxFault(es.eng.Name, "handshake missing")
+	if es.claimable() {
+		t.Fatal("engine still claimable after a sandbox fault")
+	}
 }
 
 func TestRefusedJobGoesToRecovery(t *testing.T) {

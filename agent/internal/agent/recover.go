@@ -128,6 +128,19 @@ func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool)
 	}
 	_, startErr := os.Lstat(filepath.Join(dir, "started"))
 	started := startErr == nil
+	if started {
+		// A run the previous agent left behind may still be alive: stop it before the job is
+		// settled or its dir wiped under it, whatever the state of its claim record.
+		if raw, err := os.ReadFile(filepath.Join(dir, runner.RunRecordName)); err == nil {
+			var rec sandbox.RunRecord
+			if json.Unmarshal(raw, &rec) == nil {
+				if err := sandbox.KillRun(rec); err != nil {
+					a.Log.Warn("recovery: the previous run could not be shown stopped; will retry", "job", name, "err", err.Error())
+					return false
+				}
+			}
+		}
+	}
 	raw, err := os.ReadFile(filepath.Join(dir, "claim.json"))
 	var cj struct {
 		JobID   string `json:"job_id"`
@@ -139,19 +152,6 @@ func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool)
 		a.Log.Warn("recovery: job dir without a usable claim record; wiping", "job", name, "started", started)
 		wipeDir(dir)
 		return true
-	}
-	if started {
-		// A run the previous agent left behind may still be alive: stop it before the job is
-		// settled and its dir wiped under it.
-		if raw, err := os.ReadFile(filepath.Join(dir, runner.RunRecordName)); err == nil {
-			var rec sandbox.RunRecord
-			if json.Unmarshal(raw, &rec) == nil {
-				if err := sandbox.KillRun(rec); err != nil {
-					a.Log.Warn("recovery: the previous run could not be shown stopped; will retry", "job", name, "err", err.Error())
-					return false
-				}
-			}
-		}
 	}
 	cl := &wire.Claim{JobID: cj.JobID, ClaimID: cj.ClaimID, Receipt: cj.Receipt}
 	rctx, cancel := context.WithTimeout(ctx, 2*time.Minute)

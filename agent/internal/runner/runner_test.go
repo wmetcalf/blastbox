@@ -407,6 +407,34 @@ func TestLossyEnvelopeIsLeftVerbatim(t *testing.T) {
 	}
 }
 
+// The running sandbox is recorded (for recovery after an agent crash) while it runs.
+func TestRunRecordWrittenWhileRunning(t *testing.T) {
+	f := setup(t, `sleep 0.5; cat "$1/../sandbox.json" > "$1/rec.json"; echo '{}' > "$1/metadata.json"`)
+	if res := f.run(); res.Outcome != "done" {
+		t.Fatalf("%+v", res)
+	}
+	var rec sandbox.RunRecord
+	if err := json.Unmarshal([]byte(f.in.tarFiles()["rec.json"]), &rec); err != nil || rec.PID <= 1 || rec.Identity == 0 {
+		t.Fatalf("run record %+v (%v)", rec, err)
+	}
+}
+
+// A sandbox fault is reported to the host (the agent stops claiming) BEFORE the job's report,
+// which may take minutes against a struggling control plane.
+func TestSandboxFaultReportedBeforeTheJobReport(t *testing.T) {
+	f := setup(t, `rm -f "$3/.bb-handshake"; echo '{}' > "$1/metadata.json"`)
+	var beforeReport bool
+	f.r.SandboxFault = func(engine, reason string) {
+		f.in.mu.Lock()
+		beforeReport = len(f.in.updates) == 0
+		f.in.mu.Unlock()
+	}
+	res := f.run()
+	if !res.SandboxFailure || !beforeReport {
+		t.Fatalf("%+v: fault hook before report = %v", res, beforeReport)
+	}
+}
+
 func TestEnvelopeModeKeepsBytesVerbatim(t *testing.T) {
 	// No declared artifacts: the engine's bytes (odd spacing and key order) go through untouched.
 	f := setup(t, `printf '{ "schema" : "wtqrk",  "b":1, "a":2 }\n'`)

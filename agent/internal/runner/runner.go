@@ -81,6 +81,9 @@ type Runner struct {
 	Host sandbox.Host
 	// Logf receives one line per decision; nil = the standard logger.
 	Logf func(format string, args ...any)
+	// SandboxFault, if set, is called as soon as a run's sandbox fails (before the job is
+	// reported), so the host can stop claiming on that engine at once.
+	SandboxFault func(engine, reason string)
 
 	// Tunables (zero = production defaults); tests shorten them.
 	MemPoll     time.Duration                 // memory watchdog period (500 ms)
@@ -208,7 +211,8 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	defer cancel()
 	cmd, nonce, err := j.command(runCtx, kind, argv, env)
 	if err != nil {
-		return sandboxFailure(j.release(ctx, "sandbox: "+err.Error()))
+		why := "sandbox: " + err.Error()
+		return j.sandboxFault(why, func() Result { return j.release(ctx, why) })
 	}
 	var capw *capWriter
 	if eng.Output == "stdout-envelope" {
@@ -235,7 +239,11 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	if j.ident.Canary != "" {
 		n, err := sandbox.SweepRun(j.ident)
 		if err != nil {
-			return sandboxFailure(j.fail(ctx, "sandbox: escaped processes not shown gone: "+err.Error()))
+			why := "sandbox: escaped processes not shown gone: " + err.Error()
+			res := j.sandboxFault(why, func() Result { return j.fail(ctx, why) })
+			// Keep the dir and its run record: recovery retries the kill until the run is gone.
+			res.Keep = true
+			return res
 		}
 		if n > 0 {
 			r.logf("job %s: killed %d process(es) that escaped the run's process group", c.JobID, n)
@@ -248,7 +256,8 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 		return j.fail(ctx, "envelope over max_metadata")
 	}
 	if !handshakeOK(j.scr, nonce) {
-		return sandboxFailure(j.fail(ctx, "sandbox handshake missing: the run was not confined"))
+		why := "sandbox handshake missing: the run was not confined"
+		return j.sandboxFault(why, func() Result { return j.fail(ctx, why) })
 	}
 	if runErr != nil {
 		r.logf("job %s: engine stderr tail: %q", c.JobID, tail.String())
@@ -259,7 +268,8 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 			}
 			return j.fail(ctx, fmt.Sprintf("engine exited with status %d", ee.ExitCode()))
 		}
-		return sandboxFailure(j.fail(ctx, "engine did not run: "+runErr.Error()))
+		why := "engine did not run: " + runErr.Error()
+		return j.sandboxFault(why, func() Result { return j.fail(ctx, why) })
 	}
 
 	if capw != nil {
@@ -288,7 +298,16 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	return j.upload(ctx, tarPath, kind)
 }
 
-func sandboxFailure(r Result) Result { r.SandboxFailure = true; return r }
+// sandboxFault tells the host at once (so the engine stops claiming before the report, which may
+// take minutes against a struggling control plane), then reports and flags the result.
+func (j *job) sandboxFault(why string, report func() Result) Result {
+	if f := j.r.SandboxFault; f != nil {
+		f(j.eng.Name, why)
+	}
+	res := report()
+	res.SandboxFailure = true
+	return res
+}
 
 func orDef(v, d int64) int64 {
 	if v > 0 {
@@ -508,21 +527,36 @@ func (j *job) command(ctx context.Context, kind sandbox.Kind, argv []string, env
 // exec starts cmd and supervises it. killed is a non-empty failure reason when the agent had to
 // stop the run (deadline, memory, envelope cap, shutdown).
 func (j *job) exec(ctx context.Context, cmd *exec.Cmd, capw *capWriter) (killed string, runErr error) {
+	// The run is recorded so that, if this agent dies or gives up draining, the next one can stop
+	// it before settling its job (it would otherwise outlive the agent unsupervised). A seatbelt
+	// run's sweep identity is known before it starts, so it is recorded first: a crash between
+	// Start and the pid's record still leaves a way to find the run. A run that cannot be
+	// recorded is not started (or is killed at once).
+	rec := sandbox.RunRecord{Scratch: j.ident.Scratch, Canary: j.ident.Canary}
+	if j.ident.Canary != "" {
+		rec.StartedAfter = j.ident.StartedAfter.UnixMicro()
+	}
+	writeRec := func() error {
+		b, err := json.Marshal(rec)
+		if err != nil {
+			return err
+		}
+		return atomicWrite(filepath.Join(j.dir, RunRecordName), b)
+	}
+	if err := writeRec(); err != nil {
+		return "", fmt.Errorf("start: run record: %w", err)
+	}
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("start: %w", err)
 	}
 	pid := cmd.Process.Pid
-	// Recorded so that, if this agent dies or gives up draining, the next one can stop the run
-	// before settling its job (the run would otherwise outlive the agent unsupervised).
-	rec := sandbox.RunRecord{PID: pid, Scratch: j.ident.Scratch, Canary: j.ident.Canary}
+	rec.PID = pid
 	rec.Identity, _ = sandbox.ProcIdentity(pid)
-	if j.ident.Canary != "" {
-		rec.StartedAfter = j.ident.StartedAfter.UnixMicro()
-	}
-	if b, err := json.Marshal(rec); err == nil {
-		if err := atomicWrite(filepath.Join(j.dir, RunRecordName), b); err != nil {
-			j.r.logf("job %s: run record: %v", j.c.JobID, err)
-		}
+	if err := writeRec(); err != nil {
+		syscall.Kill(-pid, syscall.SIGKILL)
+		err2 := cmd.Wait()
+		_ = err2
+		return "run record could not be written: " + err.Error(), nil
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
