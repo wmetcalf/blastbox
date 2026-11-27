@@ -70,7 +70,7 @@ def retain_seconds(env: "dict[str, str] | None" = None) -> float:
 class NodeFinalizer:
     def __init__(self, *, job_store, blob_store, limits: Limits, job_root: Path,
                  attest_key: object = _attest.FROM_ENV, results_dir: Path | None = None,
-                 retain_s: float | None = None) -> None:
+                 retain_s: float | None = None, job_retention_seconds: int = 0) -> None:
         self._store = job_store
         self._job_root = Path(job_root)
         self._blobs = blob_store
@@ -79,7 +79,11 @@ class NodeFinalizer:
         self._dispatcher = Dispatcher(
             job_store=job_store, engines={}, limits=limits, job_root=Path(job_root),
             blob_store=blob_store, attest_key=attest_key,
+            job_retention_seconds=job_retention_seconds,
         )
+        # The same result lifecycle a dispatcher stamps (expires_at on DONE/FAILED, and on a
+        # pending-upload repair): BLASTBOX_JOB_RETENTION_SECONDS, 0 = keep forever.
+        self._job_retention_s = max(0, int(job_retention_seconds))
         self._attest_key = self._dispatcher._attest_key
 
     # ------------------------------------------------------------------ public
@@ -98,6 +102,7 @@ class NodeFinalizer:
         try:
             retry_pending_uploads(self._job_root, self._blobs, self._store, _log,
                                   on_repaired=self._dispatcher._index_repaired_result,
+                                  retention_seconds=self._job_retention_s,
                                   attest_key=self._attest_key)
         except Exception:  # noqa: BLE001
             _log.exception("node-finalizer: pending-upload sweep failed")

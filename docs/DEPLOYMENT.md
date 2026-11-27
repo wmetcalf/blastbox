@@ -913,7 +913,8 @@ blastbox node-finalizer [--once] [--interval 1.0] [--no-receipts]
   key. The finalizer refuses to start without a key unless `--no-receipts` is given, which logs
   a loud warning and marks node results DONE with no signed receipt.
 * **Env.** `BLASTBOX_DB` / job store and blob-store settings exactly as for `blastbox dispatch`
-  (same `BLASTBOX_JOB_ROOT`), `BLASTBOX_ATTEST_KEY`, and `BLASTBOX_NODE_RESULTS_RETAIN_S`
+  (same `BLASTBOX_JOB_ROOT` and `BLASTBOX_JOB_RETENTION_SECONDS`, which stamps `expires_at` on
+  node results as it does on dispatched ones), `BLASTBOX_ATTEST_KEY`, and `BLASTBOX_NODE_RESULTS_RETAIN_S`
   (default `3600`): a whole (job, claim) directory is removed once its outcome is older than
   that (a directory with no outcome at all is removed after 24 h, with a warning).
 * **A failed upload is not lost.** Before sealing, the finalizer renames the quarantined tree

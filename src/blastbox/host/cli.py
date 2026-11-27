@@ -860,6 +860,7 @@ def _node_finalizer_cmd(args: argparse.Namespace) -> int:
         job_store=build_job_store_from_env(),
         blob_store=build_blob_store_from_env({**os.environ, "BLASTBOX_JOB_ROOT": str(job_root)}),
         limits=Limits.from_env(), job_root=job_root, attest_key=key,
+        job_retention_seconds=int(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0"),
     )
     if args.once:
         fin.run_once()

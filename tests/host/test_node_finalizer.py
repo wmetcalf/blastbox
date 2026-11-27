@@ -484,3 +484,33 @@ def test_cli_no_receipts_logs_a_loud_warning(tmp_path, monkeypatch, caplog):
     with caplog.at_level("WARNING"):
         assert cli.main(["node-finalizer", "--once", "--no-receipts"]) == 0
     assert Fake.key is None and "--no-receipts" in caplog.text
+
+
+def test_node_results_honour_the_job_retention_period(tmp_path, monkeypatch):
+    """A DONE node result gets the same expires_at a dispatcher would stamp, and the
+    pending-upload sweep it runs repairs with that retention too."""
+    from blastbox.host.jobs import retention
+
+    store = InMemoryJobStore()
+    store.create(Job(job_id="job-1", engine="clamav", filename="s.bin", status=JobStatus.QUEUED,
+                     created_at=time.time(), input_sha256=SHA))
+    job = store.claim_next()
+    blobs = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    fin = NodeFinalizer(job_store=store, blob_store=blobs, limits=Limits(),
+                        job_root=tmp_path / "jobs", attest_key=None, job_retention_seconds=60)
+    spool(tmp_path, job)
+    seen = {}
+    real = retention.retry_pending_uploads
+
+    def spy(*a, **k):
+        seen.update(k)
+        return real(*a, **k)
+
+    from blastbox.host import node_finalizer as nf
+    monkeypatch.setattr(nf, "retry_pending_uploads", spy)
+    before = time.time()
+    assert fin.run_once() == 1
+    j = store.get("job-1")
+    assert j.status == JobStatus.DONE
+    assert j.expires_at is not None and before + 55 <= j.expires_at <= time.time() + 65
+    assert seen.get("retention_seconds") == 60
