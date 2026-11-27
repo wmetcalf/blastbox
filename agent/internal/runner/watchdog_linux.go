@@ -10,8 +10,10 @@ var pageKiB = int64(os.Getpagesize()) / 1024
 
 // groupRSSKiB sums the resident set of the job: the process group leader's group plus every
 // descendant of the leader (an nsjail child calls setsid, so it leaves the group but stays in
-// the leader's process tree). It reads /proc directly: no cgo, no helper binary.
-func groupRSSKiB(pgid int) (int64, error) {
+// the leader's process tree). It reads /proc directly: no cgo, no helper binary. also is the
+// darwin sandbox identity and is not needed here: nsjail's PID namespace keeps every descendant
+// in the tree.
+func groupRSSKiB(pgid int, also func(pid int) bool) (int64, error) {
 	ents, err := os.ReadDir("/proc")
 	if err != nil {
 		return 0, err

@@ -16,11 +16,11 @@ func TestGroupRSSCoversTheGroup(t *testing.T) {
 	}
 	defer func() { syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); cmd.Wait() }()
 	time.Sleep(200 * time.Millisecond)
-	one, err := groupRSSKiB(cmd.Process.Pid)
+	one, err := groupRSSKiB(cmd.Process.Pid, nil)
 	if err != nil || one <= 0 {
 		t.Fatalf("rss=%d err=%v", one, err)
 	}
-	if none, _ := groupRSSKiB(1 << 30); none != 0 {
+	if none, _ := groupRSSKiB(1<<30, nil); none != 0 {
 		t.Fatalf("unknown group reported %d", none)
 	}
 }

@@ -68,7 +68,7 @@ type Runner struct {
 	DispPoll    time.Duration                 // Disposition poll period (2 s)
 	RetryBase   time.Duration                 // first retry delay for Fail/PutResult on a retryable error (2 s)
 	RetryTries  int                           // attempts for Fail/PutResult (3)
-	rss         func(pgid int) (int64, error) // test seam; nil = groupRSSKiB
+	rss         func(pgid int) (int64, error) // test seam; nil = groupRSSKiB (plus the run's escapees)
 	build       func(context.Context, sandbox.Kind, sandbox.Request, []string, sandbox.Limits) (*exec.Cmd, error)
 	hostPins    *sandbox.HostPins
 	skipAAProbe bool
@@ -106,6 +106,7 @@ type job struct {
 	scr    string
 	start  time.Time
 	inPath string
+	ident  sandbox.RunIdentity // seatbelt: names the run's processes for the sweep and the watchdog
 }
 
 // Run is the state machine of the design (§6.4, §6.5):
@@ -199,6 +200,18 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	}
 	j.start = time.Now()
 	killed, runErr := j.exec(runCtx, cmd, capw)
+	// A seatbelt child that setsid()s leaves the process group, so the group kill above cannot
+	// reach it: find the run's processes by their sandbox and kill them BEFORE anything reads
+	// the output (a survivor could still be rewriting it) and whatever the run's outcome.
+	if j.ident.Canary != "" {
+		n, err := sandbox.SweepRun(j.ident)
+		if err != nil {
+			return j.fail(ctx, "sandbox: escaped processes not shown gone: "+err.Error())
+		}
+		if n > 0 {
+			r.logf("job %s: killed %d process(es) that escaped the run's process group", c.JobID, n)
+		}
+	}
 	if killed != "" {
 		return j.fail(ctx, killed)
 	}
@@ -386,9 +399,16 @@ func (j *job) command(ctx context.Context, kind sandbox.Kind, argv []string, env
 		return nil, "", err
 	}
 	nonce := hex.EncodeToString(nb)
+	var canary string
+	if kind == sandbox.Seatbelt {
+		if canary, err = sandbox.NewCanary(); err != nil {
+			return nil, "", err
+		}
+		j.ident = sandbox.RunIdentity{Scratch: j.scr, Canary: canary, StartedAfter: time.Now().Add(-time.Second)}
+	}
 	req := sandbox.Request{
 		ExecPaths: []string{exe}, ROPaths: ro, RWPaths: rw, Accelerators: j.eng.Accelerators,
-		Scratch: j.scr, Nonce: nonce, Env: env, AgentBin: agent,
+		Scratch: j.scr, Canary: canary, Nonce: nonce, Env: env, AgentBin: agent,
 		NsjailPath: h.NsjailPath, SeccompPolicy: h.SeccompPolicy,
 		AppArmorProfile: h.AppArmorProfile, AllowMissingAppArmor: h.AllowMissingAppArmor,
 		Pins: j.r.hostPins,
@@ -434,7 +454,7 @@ func (j *job) exec(ctx context.Context, cmd *exec.Cmd, capw *capWriter) (killed 
 	rssFails := 0
 	rssFn := j.r.rss
 	if rssFn == nil {
-		rssFn = groupRSSKiB
+		rssFn = func(pgid int) (int64, error) { return groupRSSKiB(pgid, j.ident.Match) }
 	}
 	for {
 		select {
