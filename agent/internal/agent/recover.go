@@ -51,6 +51,8 @@ func (a *Agent) addRecovery(id string) {
 
 // recoverJobs settles the job dirs in the recovery set and returns how many remain:
 //
+//	uploaded marker (202)      -> replay the same PUT, or poll the disposition when no tar is kept;
+//	                              NEVER fail or release (the server refuses both once it holds the result)
 //	reported marker            -> wipe: the control plane answered the upload (a Fail now could
 //	                              beat the finalizer's running->done and discard the result)
 //	started + result.tar/json  -> replay the idempotent result PUT (done/accepted: wipe;
@@ -127,6 +129,8 @@ func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool)
 		wipeDir(dir)
 		return true
 	}
+	_, uploadedErr := os.Lstat(filepath.Join(dir, runner.UploadedName))
+	uploaded := uploadedErr == nil
 	_, startErr := os.Lstat(filepath.Join(dir, "started"))
 	started := startErr == nil
 	if started {
@@ -162,6 +166,7 @@ func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool)
 		JobID   string `json:"job_id"`
 		ClaimID string `json:"claim_id"`
 		Receipt string `json:"receipt"`
+		Claimed int64  `json:"claimed_at_ms"`
 	}
 	if err != nil || json.Unmarshal(raw, &cj) != nil || cj.JobID != name || !recJobIDRE.MatchString(cj.JobID) ||
 		cj.ClaimID == "" || cj.Receipt == "" {
@@ -170,8 +175,21 @@ func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool)
 		return true
 	}
 	cl := &wire.Claim{JobID: cj.JobID, ClaimID: cj.ClaimID, Receipt: cj.Receipt}
+	switch {
+	case cj.Claimed > 0:
+		cl.ClaimedAt = time.UnixMilli(cj.Claimed)
+	default:
+		// A claim.json from before the claim time was recorded: its mtime is never before the
+		// claim, which is all the finished_at clamp needs.
+		if fi, err := os.Lstat(filepath.Join(dir, "claim.json")); err == nil {
+			cl.ClaimedAt = fi.ModTime()
+		}
+	}
 	rctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
+	if uploaded {
+		return a.recoverUploaded(rctx, dir, name, cl)
+	}
 	var cerr error
 	action := "release"
 	if started {
@@ -211,4 +229,41 @@ func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool)
 	}
 	wipeDir(dir)
 	return true
+}
+
+// recoverUploaded settles a job whose result upload the control plane accepted (202). It holds
+// the result and refuses release and fail (403), so the only follow-ups are the same idempotent
+// PUT, when its tar is kept, or a disposition poll. Even a 422 on the replay is never answered
+// with a fail: the first-time 422 that justifies one stores nothing and was seen before the marker.
+func (a *Agent) recoverUploaded(ctx context.Context, dir, name string, cl *wire.Claim) bool {
+	var err error
+	if tar, meta, ok := resultRecord(dir); ok {
+		var out wire.Outcome
+		out, err = a.client().PutResult(ctx, cl, tar, meta)
+		if err == nil {
+			a.Log.Info("recovery: accepted upload replayed", "job", name, "status", out.Status)
+			wipeDir(dir)
+			return true
+		}
+	} else {
+		var st string
+		st, err = a.client().Disposition(ctx, cl.JobID)
+		if err == nil {
+			if st == "running" {
+				a.Log.Info("recovery: finalizer still working on an accepted upload; will poll again", "job", name)
+				return false
+			}
+			a.Log.Info("recovery: accepted upload settled", "job", name, "disposition", st)
+			wipeDir(dir)
+			return true
+		}
+	}
+	switch {
+	case errors.Is(err, wire.ErrClaimLost), errors.Is(err, wire.ErrRefused), runner.Permanent(err):
+		a.Log.Warn("recovery: accepted upload no longer answerable; wiping", "job", name, "err", err.Error())
+		wipeDir(dir)
+		return true
+	}
+	a.Log.Warn("recovery: will retry", "job", name, "action", "poll accepted upload", "err", err.Error())
+	return false
 }

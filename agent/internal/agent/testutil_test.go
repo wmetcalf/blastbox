@@ -111,11 +111,14 @@ type ingress struct {
 	putStatus   map[string]int             // job id -> result PUT status (default 200 done)
 	onUpdate    func(id string, n int) int // optional: status for the n-th update of id (may block)
 	updCount    map[string]int
+	dispStatus  map[string]string // job id -> disposition status (absent: no job)
+	dispCount   map[string]int
 }
 
 func newIngress(t *testing.T, ca *pki) *ingress {
 	in := &ingress{t: t, ca: ca, updates: map[string]map[string]any{}, jobStatus: map[string]int{},
 		puts: map[string]int{}, putStatus: map[string]int{}, updCount: map[string]int{},
+		dispStatus: map[string]string{}, dispCount: map[string]int{},
 		hbResp: map[string]any{"heartbeat_s": 30}}
 	in.srv = httptest.NewUnstartedServer(http.HandlerFunc(in.serve))
 	in.srv.TLS = &tls.Config{Certificates: []tls.Certificate{ca.serverCert(t)}}
@@ -225,6 +228,17 @@ func (in *ingress) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		js(200, map[string]any{"cert_pem": string(c)})
+	case strings.HasPrefix(p, "/v1/nodes/jobs/") && strings.HasSuffix(p, "/disposition") && r.Method == "GET":
+		id := strings.TrimSuffix(strings.TrimPrefix(p, "/v1/nodes/jobs/"), "/disposition")
+		in.mu.Lock()
+		in.dispCount[id]++
+		st, ok := in.dispStatus[id]
+		in.mu.Unlock()
+		if !ok {
+			js(200, map[string]any{"job": nil})
+			return
+		}
+		js(200, map[string]any{"job": map[string]any{"status": st}})
 	case strings.HasPrefix(p, "/v1/nodes/jobs/") && strings.HasSuffix(p, "/result") && r.Method == "PUT":
 		id := strings.TrimSuffix(strings.TrimPrefix(p, "/v1/nodes/jobs/"), "/result")
 		in.mu.Lock()

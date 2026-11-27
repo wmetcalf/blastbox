@@ -918,3 +918,22 @@ func TestServerReasonIsASCIIAndCapped(t *testing.T) {
 		t.Fatalf("len %d", len(got))
 	}
 }
+
+// claim.json records the claim time so a recovery Fail can clamp finished_at to it.
+func TestClaimJSONRecordsClaimTime(t *testing.T) {
+	f := setup(t, `echo '{}' > "$1/metadata.json"; exit 3`)
+	f.in.updStatus = 503 // keep the dir
+	f.claim.ClaimedAt = time.UnixMilli(1700000000123)
+	f.run()
+	raw, err := os.ReadFile(filepath.Join(f.state, "jobs", testJob, "claim.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cj struct {
+		Claimed int64 `json:"claimed_at_ms"`
+	}
+	json.Unmarshal(raw, &cj)
+	if cj.Claimed != 1700000000123 {
+		t.Fatalf("%s", raw)
+	}
+}

@@ -195,6 +195,71 @@ func TestRecoveryAfterAReportedUploadSendsNothing(t *testing.T) {
 	}
 }
 
+// After a 202 the control plane holds the result and refuses release and fail (finalizer-only
+// mode): recovery may only replay the same PUT or poll the disposition.
+func TestRecoveryAfterAcceptedUploadReplaysAndNeverFails(t *testing.T) {
+	for _, put := range []int{202, 200, 422} {
+		e := fresh(t)
+		e.cfg.Claim = false
+		d := jobDir(e, "jq", true, true)
+		os.WriteFile(filepath.Join(d, runner.ResultTarName), make([]byte, 1024), 0o600)
+		os.WriteFile(filepath.Join(d, runner.ResultMetaName), []byte(`{"worker_runtime":"seatbelt","started_at_ms":1,"finished_at_ms":2}`), 0o600)
+		os.WriteFile(filepath.Join(d, runner.UploadedName), nil, 0o600)
+		e.in.putStatus["jq"] = put
+		h := newHarness(e)
+		h.start(t)
+		eventually(t, "replay and wipe", func() bool {
+			_, err := os.Stat(d)
+			return e.in.putCount("jq") >= 1 && os.IsNotExist(err)
+		})
+		if u := e.in.update("jq"); u != nil {
+			t.Fatalf("put=%d: fail or release sent after an accepted upload: %v", put, u)
+		}
+	}
+}
+
+func TestRecoveryAfterAcceptedUploadPollsDisposition(t *testing.T) {
+	e := fresh(t)
+	e.cfg.Claim = false
+	d := jobDir(e, "jp", true, true)
+	os.WriteFile(filepath.Join(d, runner.UploadedName), nil, 0o600)
+	e.in.dispStatus["jp"] = "done"
+	h := newHarness(e)
+	h.start(t)
+	eventually(t, "poll and wipe", func() bool {
+		e.in.mu.Lock()
+		n := e.in.dispCount["jp"]
+		e.in.mu.Unlock()
+		_, err := os.Stat(d)
+		return n >= 1 && os.IsNotExist(err)
+	})
+	if u, n := e.in.update("jp"), e.in.putCount("jp"); u != nil || n != 0 {
+		t.Fatalf("update=%v puts=%d", u, n)
+	}
+}
+
+// A still-running disposition keeps the dir for the next pass; nothing is sent.
+func TestRecoveryAfterAcceptedUploadKeepsWhileRunning(t *testing.T) {
+	e := fresh(t)
+	e.cfg.Claim = false
+	d := jobDir(e, "jr", true, true)
+	os.WriteFile(filepath.Join(d, runner.UploadedName), nil, 0o600)
+	e.in.dispStatus["jr"] = "running"
+	h := newHarness(e)
+	h.start(t)
+	eventually(t, "polled", func() bool {
+		e.in.mu.Lock()
+		defer e.in.mu.Unlock()
+		return e.in.dispCount["jr"] >= 1
+	})
+	if _, err := os.Stat(d); err != nil {
+		t.Fatalf("dir wiped while the finalizer is still working: %v", err)
+	}
+	if u := e.in.update("jr"); u != nil {
+		t.Fatalf("%v", u)
+	}
+}
+
 func TestKeptJobGoesToRecovery(t *testing.T) {
 	e := fresh(t)
 	e.in.onClaim = func(n int) (int, string) {
