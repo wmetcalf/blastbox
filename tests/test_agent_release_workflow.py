@@ -82,3 +82,44 @@ def test_build_flags_and_double_build_compared():
     assert "gh release create" in text
     m = load(RELEASE)["jobs"]["build"]["strategy"]["matrix"]
     assert sorted(m["goos"]) == ["darwin", "linux"] and sorted(m["goarch"]) == ["amd64", "arm64"]
+
+
+def test_cosign_installer_major_supports_cosign_release():
+    # cosign-installer v3.x cannot install Cosign v3.x; v4 is required.
+    text = RELEASE.read_text()
+    m = re.search(r"sigstore/cosign-installer@[0-9a-f]{40} # v(\d+)\.", text)
+    c = re.search(r'cosign-release: "v(\d+)\.', text)
+    assert m and c
+    if int(c.group(1)) >= 3:
+        assert int(m.group(1)) >= 4, "cosign-installer v3 cannot install cosign v3"
+
+
+def test_double_build_uses_separate_go_caches():
+    # A shared GOCACHE makes the second build relink cached objects, so cmp proves nothing.
+    steps = load(RELEASE)["jobs"]["build"]["steps"]
+    step = next(s for s in steps if s.get("name") == "Build twice and compare")
+    assert 'GOCACHE="$RUNNER_TEMP/gocache-$d"' in step["run"]
+
+
+def test_release_verifies_its_own_signature_with_installer_identity():
+    text = RELEASE.read_text()
+    assert "cosign verify-blob" in text
+    assert ("https://github.com/${GITHUB_REPOSITORY}/.github/workflows/agent-release.yml"
+            "@${GITHUB_REF}") in text
+    assert "--certificate-oidc-issuer https://token.actions.githubusercontent.com" in text
+
+
+def test_sidecar_assets_are_covered_by_signed_sums():
+    steps = load(RELEASE)["jobs"]["release"]["steps"]
+    run = next(s for s in steps if s.get("name") == "Checksums, SBOM, conformance digest")["run"]
+    # the SHA256SUMS write must come after the sidecars exist and must list them
+    sums_cmd = run[run.rindex("sha256sum blastbox-agent"):].split("> SHA256SUMS")[0]
+    assert "sbom.txt" in sums_cmd and "conformance-digest.txt" in sums_cmd
+    assert run.index("go version -m") < run.rindex("sha256sum blastbox-agent")
+
+
+def test_releasing_doc_matches_workflow_and_states_trust_anchor():
+    doc = (WF.parents[1] / "agent" / "RELEASING.md").read_text()
+    assert "<commit on main>" in doc and "master" not in doc
+    # the in-workflow main-ancestry check is self-attesting; the doc must say what actually binds it
+    assert "ruleset" in doc and "not a trust anchor" in doc

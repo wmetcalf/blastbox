@@ -62,8 +62,10 @@ jobs:
           set -eu
           out="blastbox-agent-${GOOS}-${GOARCH}"
           mkdir -p dist
+          # Separate build caches: with a shared GOCACHE the second build only relinks
+          # the first build's cached objects, and cmp would prove nothing.
           for d in src-a src-b; do
-            (cd "$d/agent" && go build -trimpath -buildvcs=true \
+            (cd "$d/agent" && GOCACHE="$RUNNER_TEMP/gocache-$d" go build -trimpath -buildvcs=true \
               -ldflags "-s -w -buildid= -X main.version=${VERSION}" \
               -o "$GITHUB_WORKSPACE/dist/$d-$out" ./cmd/blastbox-agent)
           done
@@ -111,25 +113,37 @@ jobs:
           path: dist
           pattern: bin-*
           merge-multiple: true
-      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+      # cosign-installer v3.x cannot install Cosign v3.x; v4 is required.
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
         with:
-          cosign-release: "v3.1.6"
+          cosign-release: "v3.1.4"
       - name: Checksums, SBOM, conformance digest
         working-directory: dist
         run: |
           set -eu
           chmod 0755 blastbox-agent-*
-          sha256sum blastbox-agent-darwin-amd64 blastbox-agent-darwin-arm64 \
-            blastbox-agent-linux-amd64 blastbox-agent-linux-arm64 > SHA256SUMS
           : > sbom.txt
           for f in blastbox-agent-*; do
             echo "== $f" >> sbom.txt
             go version -m "$f" >> sbom.txt
           done
           sha256sum ../conformance/v1/SHA256SUMS | cut -d' ' -f1 > conformance-digest.txt
+          # The sidecars are listed too, so the signature covers them.
+          sha256sum blastbox-agent-darwin-amd64 blastbox-agent-darwin-arm64 \
+            blastbox-agent-linux-amd64 blastbox-agent-linux-arm64 \
+            sbom.txt conformance-digest.txt > SHA256SUMS
       - name: Sign SHA256SUMS (keyless)
         working-directory: dist
         run: cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
+      # Verify with the identity install.sh pins, so a SAN or bundle mismatch fails here
+      # instead of at an operator's install.
+      - name: Verify signature as the installer will
+        working-directory: dist
+        run: |
+          cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/agent-release.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            SHA256SUMS
       - name: Create release
         working-directory: dist
         env:
