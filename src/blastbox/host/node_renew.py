@@ -9,12 +9,23 @@ cert carries the grants of the node's CURRENT verifying cert, and a node whose c
 or expired has no current cert, so its CSR is refused and deleted. "Stop renewing" stays the
 revocation path.
 
+PROOF OF POSSESSION. A session token is a bearer credential, so it cannot be what lets a
+node put a NEW key into its cert: the request also carries the node's current cert and a
+signature by that cert's key over :func:`renew_payload` (the CSR's hash and a timestamp).
+The ingress checks it, and the CA host checks it AGAIN against the real CA before signing,
+because the ingress -- whose dir the queue lives in -- may be hostile: holding a copy of a
+node's cert is not holding its key.
+
 No FastAPI in here, so the CA-host CLI and the ingress share one implementation.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import contextlib
 import dataclasses
+import hashlib
+import json
 import errno
 import fcntl
 import os
@@ -26,6 +37,8 @@ import time
 from pathlib import Path
 
 from cryptography import x509
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
@@ -42,6 +55,14 @@ from blastbox.host.pki import (
 
 RENEW_DIR = "renew"
 MAX_CSR_BYTES = 8 * 1024
+#: The renewal proof's signed-message prefix (see :func:`renew_payload`).
+RENEW_PROOF_DOMAIN = b"blastbox/node-renew/v1"
+#: How far the ingress lets a proof's ``issued_at`` be from its clock.
+RENEW_PROOF_MAX_SKEW_S = 300
+#: How old (or ahead) a queued proof may be when the CA host processes it.
+RENEW_PROOF_MAX_AGE_S = 24 * 3600
+#: Upper bound on one queue entry (JSON: CSR + cert + proof).
+MAX_QUEUE_ENTRY_BYTES = 64 * 1024
 #: Hard bound on queued files, so a fleet of valid sessions cannot fill the ingress disk.
 MAX_QUEUED = 1024
 
@@ -49,7 +70,62 @@ _NODE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class RenewRefused(Exception):
-    """The CSR was not queued; the message is safe to show the (authenticated) node."""
+    """The CSR was not queued; the message is safe to show the (authenticated) node.
+
+    ``identity`` marks a failure of WHO is asking (the cert or its key's signature), which
+    the route answers with its uniform 403 rather than the reason.
+    """
+
+    def __init__(self, msg: str, *, identity: bool = False) -> None:
+        super().__init__(msg)
+        self.identity = identity
+
+
+def renew_payload(node_id: str, csr_pem: str, issued_at: int) -> bytes:
+    """The bytes a node signs with its CURRENT cert's key to renew.
+
+    ``RENEW_PROOF_DOMAIN || 0x00 || node_id || 0x00 || sha256hex(utf8(csr_pem)) || 0x00 ||
+    decimal(issued_at)``. The CSR is hashed exactly as sent (no PEM normalisation).
+    """
+    digest = hashlib.sha256(csr_pem.encode("utf-8")).hexdigest().encode()
+    return b"\x00".join([RENEW_PROOF_DOMAIN, node_id.encode("utf-8"), digest,
+                          str(int(issued_at)).encode()])
+
+
+def sign_renew_proof(key: ec.EllipticCurvePrivateKey, node_id: str, csr_pem: str,
+                     issued_at: int) -> str:
+    """Base64 (std) DER ECDSA-P256-SHA256 signature over :func:`renew_payload`."""
+    sig = key.sign(renew_payload(node_id, csr_pem, issued_at), ec.ECDSA(hashes.SHA256()))
+    return base64.b64encode(sig).decode()
+
+
+def verify_renew_proof(anchor: CertAuthority | TrustAnchor, node_id: str, csr_pem: str,
+                       cert_pem: str, issued_at: object, signature_b64: str, *,
+                       now: float, max_skew: float) -> NodeIdentity:
+    """Check that the holder of a CA-signed, unexpired cert for ``node_id`` asked for this
+    CSR, at ``issued_at`` within ``max_skew`` of ``now``. Raises :class:`RenewRefused`."""
+    if not isinstance(issued_at, int) or isinstance(issued_at, bool):
+        raise RenewRefused("issued_at must be an integer (unix seconds)")
+    if abs(now - issued_at) > max_skew:
+        raise RenewRefused(f"proof issued_at is more than {max_skew:g}s from now")
+    try:
+        sig = base64.b64decode(signature_b64, validate=True)
+    except (binascii.Error, ValueError, TypeError):
+        raise RenewRefused("signature is not base64") from None
+    try:
+        ident = node_identity(anchor, cert_pem.encode("utf-8"))
+    except Exception:                                   # noqa: BLE001 - any verify failure
+        raise RenewRefused("proof certificate does not verify", identity=True) from None
+    if ident.node_id != node_id:
+        raise RenewRefused("proof certificate is not this node's", identity=True)
+    pub = x509.load_pem_x509_certificate(cert_pem.encode("utf-8")).public_key()
+    if not isinstance(pub, ec.EllipticCurvePublicKey) or not isinstance(pub.curve, ec.SECP256R1):
+        raise RenewRefused("proof certificate key must be EC P-256", identity=True)
+    try:
+        pub.verify(sig, renew_payload(node_id, csr_pem, issued_at), ec.ECDSA(hashes.SHA256()))
+    except InvalidSignature:
+        raise RenewRefused("proof signature does not verify", identity=True) from None
+    return ident
 
 
 def _renew_dir(pki_dir: Path, *, create: bool = False) -> Path:
@@ -60,8 +136,15 @@ def _renew_dir(pki_dir: Path, *, create: bool = False) -> Path:
     return d
 
 
-def queue_csr(pki_dir: Path, node_id: str, csr_pem: bytes) -> None:
-    """Validate ``csr_pem`` for ``node_id`` and queue it, newest-wins, one file per node."""
+def queue_csr(pki_dir: Path, node_id: str, csr_pem: bytes, *, cert_pem: bytes,
+              issued_at: object, signature: str,
+              anchor: CertAuthority | TrustAnchor | None = None,
+              now: float | None = None) -> None:
+    """Validate ``csr_pem`` and its proof for ``node_id``; queue them, newest-wins, one file
+    per node, as JSON ``{csr_pem, cert_pem, issued_at, signature}``.
+
+    ``anchor`` defaults to this PKI dir's own ``ca.crt`` (the ingress's trust anchor).
+    """
     if not _NODE_ID.match(node_id):
         raise RenewRefused("invalid node id")
     if len(csr_pem) > MAX_CSR_BYTES:
@@ -80,6 +163,20 @@ def queue_csr(pki_dir: Path, node_id: str, csr_pem: bytes) -> None:
     cns = csr.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
     if len(cns) != 1 or str(cns[0].value) != node_id:
         raise RenewRefused("CSR common name does not match the session's node")
+    if len(cert_pem) > MAX_CERT_BYTES:
+        raise RenewRefused("proof certificate too large")
+    try:
+        csr_text, cert_text = csr_pem.decode("utf-8"), cert_pem.decode("utf-8")
+    except UnicodeDecodeError:
+        raise RenewRefused("CSR and certificate must be UTF-8 PEM") from None
+    if anchor is None:
+        anchor = load_trust_anchor(Path(pki_dir))      # OSError: the caller's 503
+    verify_renew_proof(anchor, node_id, csr_text, cert_text, issued_at, signature,
+                       now=time.time() if now is None else now,
+                       max_skew=RENEW_PROOF_MAX_SKEW_S)
+    entry = json.dumps({"csr_pem": csr_text, "cert_pem": cert_text,
+                        "issued_at": issued_at, "signature": signature},
+                       sort_keys=True).encode()
 
     d = _renew_dir(pki_dir, create=True)
     target = d / f"{node_id}.csr"
@@ -93,7 +190,7 @@ def queue_csr(pki_dir: Path, node_id: str, csr_pem: bytes) -> None:
     fd, tmp = tempfile.mkstemp(dir=d, prefix=f".{node_id}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as fh:
-            fh.write(csr_pem)
+            fh.write(entry)
         os.chmod(tmp, 0o600)
         os.replace(tmp, target)
     finally:
@@ -373,7 +470,7 @@ def _drain(ca: CertAuthority, qdir: Path, days: int,
             if linked and not aside.exists():
                 results.append((node_id, f"refused: {linked[0]} is a symlink"))
                 continue
-            csr_pem = _read_capped(aside, MAX_CSR_BYTES)
+            raw = _read_capped(aside, MAX_QUEUE_ENTRY_BYTES)
         except _Unreadable as exc:              # FIFO, device, dir, oversized, link: refuse it
             _discard(aside)
             results.append((node_id, f"refused: {exc}"))
@@ -381,11 +478,38 @@ def _drain(ca: CertAuthority, qdir: Path, days: int,
         except OSError as exc:                  # say it, so the run exits 2 and is seen
             results.append((node_id, f"deferred: cannot read the queued CSR: {exc}"))
             continue
+        try:
+            csr_pem = _verified_entry(ca, node_id, raw)
+        except RenewRefused as exc:
+            _discard(aside)
+            results.append((node_id, f"refused: {exc}"))
+            continue
         outcome, keep = _renew_one(ca, qdir, every, node_id, csr_pem, days)
         if not keep:
             aside.unlink(missing_ok=True)
         results.append((node_id, outcome))
     return results
+
+
+def _verified_entry(ca: CertAuthority, node_id: str, raw: bytes) -> bytes:
+    """The CSR of a queue entry whose proof verifies against the REAL CA, or refuse.
+
+    Everything is checked again here: the queue lives in the ingress's dir, and the
+    ingress may be hostile. A legacy bare-PEM entry (no proof) is refused.
+    """
+    if raw.lstrip().startswith(b"-----BEGIN"):
+        raise RenewRefused("legacy queue entry without a proof of possession")
+    try:
+        doc = json.loads(raw)
+        csr_text, cert_text = doc["csr_pem"], doc["cert_pem"]
+        issued_at, sig = doc["issued_at"], doc["signature"]
+        if not all(isinstance(v, str) for v in (csr_text, cert_text, sig)):
+            raise TypeError
+    except (ValueError, KeyError, TypeError):
+        raise RenewRefused("malformed queue entry") from None
+    verify_renew_proof(ca, node_id, csr_text, cert_text, issued_at, sig,
+                       now=time.time(), max_skew=RENEW_PROOF_MAX_AGE_S)
+    return csr_text.encode("utf-8")
 
 
 def _discard(path: Path) -> None:

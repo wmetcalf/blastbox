@@ -423,7 +423,14 @@ blobs, a trivial engine, on linux (nsjail) and macos-14 arm64 (seatbelt) runners
   The cert is copied to the node and **to every ingress host's PKI dir** (DEPLOYMENT.md: grants
   resolve from the ingress host).
 * **Rotation.** At ⅓ of lifetime remaining, the agent `POST`s a fresh CSR to
-  `/v1/nodes/renew` under its session. The ingress has no CA key, so it only queues the CSR. A
+  `/v1/nodes/renew` under its session, **with proof of possession of its current cert's key**
+  (decision 2026-11-27, after review): the body is `{csr_pem, cert_pem, issued_at, signature}`,
+  `signature` = base64 DER ECDSA-P256-SHA256 by the current cert's key over
+  `b"blastbox/node-renew/v1" \x00 node_id \x00 sha256hex(utf8(csr_pem)) \x00 str(issued_at)`.
+  The session alone is a bearer token and must not authorise a new key. The ingress checks the
+  cert, its CN against the session, the signature and `|now - issued_at| <= 300 s`; the CA-host
+  timer re-checks everything against the real CA (`issued_at` within 24 h) because the ingress
+  that holds the queue may be hostile. Vectors: `conformance/v1/renew_proof.json`. The ingress has no CA key, so it only queues the CSR. A
   CA-holding timer (`blastbox pki renew-pending`) signs queued CSRs with **the grants of the
   node's current cert**. The agent polls for the new cert and swaps it atomically. The heartbeat
   reports `cert_not_after`, and the control plane alerts at T-48 h. Q4 covers whether to build

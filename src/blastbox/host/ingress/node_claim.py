@@ -67,7 +67,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
 from fastapi import APIRouter, Header, HTTPException, Query, Response
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, Field, StrictInt, StringConstraints
 
 from blastbox.host import node_auth, node_renew
 from blastbox.host.jobs.base import NODE_CLAIM_PREFIX as _NODE_CLAIM_PREFIX
@@ -396,9 +396,17 @@ _REFUSED = "not authorised to claim this work"
 
 
 class RenewRequest(BaseModel):
-    """A fresh CSR from a node that already holds a valid session."""
+    """A fresh CSR, and proof that the holder of the node's current cert's key asked.
+
+    ``signature`` is base64 (std) DER ECDSA-P256-SHA256 by ``cert_pem``'s key over
+    ``node_renew.renew_payload(node_id, csr_pem, issued_at)``. The session alone is a
+    bearer token, so it cannot be what authorises a new key.
+    """
 
     csr_pem: str = Field(..., max_length=16384, description="the node's new CSR, PEM")
+    cert_pem: str = Field(..., max_length=16384, description="the node's CURRENT cert, PEM")
+    issued_at: StrictInt = Field(..., description="unix seconds; within 300 s of the ingress clock")
+    signature: str = Field(..., max_length=512, description="base64 DER ECDSA-P256-SHA256")
 
 
 class SessionRequest(BaseModel):
@@ -679,8 +687,13 @@ def register_node_claim_routes(
         if _grants_now(node_id) is None:
             raise HTTPException(status_code=403, detail=_REFUSED)
         try:
-            node_renew.queue_csr(resolved, node_id, req.csr_pem.encode())
+            node_renew.queue_csr(resolved, node_id, req.csr_pem.encode(),
+                                 cert_pem=req.cert_pem.encode(), issued_at=req.issued_at,
+                                 signature=req.signature)
         except node_renew.RenewRefused as exc:
+            if exc.identity:            # who is asking failed: the uniform refusal
+                _log.warning("node_claim: renew refused for %s: %s", node_id, exc)
+                raise HTTPException(status_code=403, detail=_REFUSED) from None
             raise HTTPException(status_code=400, detail=str(exc)) from None
         except OSError as exc:
             _log.warning("node_claim: renew queue write failed: %s", exc)

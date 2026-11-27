@@ -171,3 +171,29 @@ def test_node_cert_vectors_pin_every_eku_and_wg_refusal():
     for name in ADDED_NEGATIVES:
         assert verdicts.get(name) == "refused", name
     assert verdicts.get("v2_with_wg") == "ok"
+
+
+def test_renew_proof_payloads_replay():
+    from blastbox.host import node_renew
+
+    doc = _load("renew_proof.json")
+    assert doc["domain"] == node_renew.RENEW_PROOF_DOMAIN.decode()
+    assert doc["payload_cases"], "renew_proof.json needs payload cases"
+    for case in doc["payload_cases"] + doc["python_signed"] + doc["go_signed"]:
+        got = node_renew.renew_payload(case["node_id"], case["csr_pem"], case["issued_at"])
+        assert got.hex() == case["payload_hex"], case
+
+
+def test_renew_proof_signatures_both_directions():
+    from cryptography.exceptions import InvalidSignature
+
+    doc = _load("renew_proof.json")
+    assert doc["python_signed"], "python_signed must not be empty"
+    assert any(e.get("valid") is False for e in doc["python_signed"])
+    assert not any(e.get("valid") is False for e in doc["go_signed"])
+    for entry in doc["python_signed"] + doc["go_signed"]:
+        if entry.get("valid", True):
+            _verify(entry["public_key_pem"], entry["payload_hex"], entry["signature_b64"])
+        else:
+            with pytest.raises(InvalidSignature):
+                _verify(entry["public_key_pem"], entry["payload_hex"], entry["signature_b64"])

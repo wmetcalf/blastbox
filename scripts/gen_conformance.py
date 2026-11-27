@@ -40,7 +40,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa  # noqa: E402
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID  # noqa: E402
 
 from blastbox import attest_wire  # noqa: E402
-from blastbox.host import node_auth, pki  # noqa: E402
+from blastbox.host import node_auth, node_renew, pki  # noqa: E402
 from blastbox.worker.sandbox import nsjail, seatbelt  # noqa: E402
 from blastbox.worker.sandbox.base import Mount, SandboxRequest  # noqa: E402
 
@@ -656,6 +656,101 @@ def build_ecdsa_python_signed() -> list[dict[str, str]]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Committed-once: renew_proof.json  -- node_renew.renew_payload / sign_renew_proof
+# ---------------------------------------------------------------------------
+RENEW_PAYLOAD_CASES: list[tuple[str, str, int]] = [
+    ("n1", "-----BEGIN CERTIFICATE REQUEST-----\nAAAA\n-----END CERTIFICATE REQUEST-----\n",
+     1_700_000_000),
+    ("mac-mini-1",                                      # CRLF: hashed exactly as sent
+     "-----BEGIN CERTIFICATE REQUEST-----\r\nAAAA\r\n-----END CERTIFICATE REQUEST-----\r\n", 0),
+    ("worker.a_b-2", "csr with a trailing space ", 4_102_444_800),
+    ("n", "", 1),                                       # empty CSR still hashes
+    ("node-v2", "x\u00e9\U0001f600", 1_700_000_300),  # UTF-8 before hashing
+]
+
+
+def _bump_r(sig: bytes) -> bytes:
+    """Well-formed DER whose ``r`` is off by one: must fail verification, not parsing."""
+    from cryptography.hazmat.primitives.asymmetric.utils import (
+        decode_dss_signature,
+        encode_dss_signature,
+    )
+    r, s_ = decode_dss_signature(sig)
+    order = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+    return encode_dss_signature((r % (order - 1)) + 1 if (r % (order - 1)) + 1 != r else 1, s_)
+
+
+def build_renew_proof(go_signed: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Payload cases (deterministic) plus python_signed proofs (random key: committed once)."""
+    payload_cases = [{"node_id": n, "csr_pem": c, "issued_at": t,
+                      "payload_hex": node_renew.renew_payload(n, c, t).hex()}
+                     for n, c, t in RENEW_PAYLOAD_CASES]
+    key = ec.generate_private_key(ec.SECP256R1())
+    pub_pem = key.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+    csr_key = ec.generate_private_key(ec.SECP256R1())
+    csr = (x509.CertificateSigningRequestBuilder()
+           .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "node-v2")]))
+           .sign(csr_key, hashes.SHA256())).public_bytes(serialization.Encoding.PEM).decode()
+    signed = []
+    for node_id, csr_pem, at in (("node-v2", csr, 1_700_000_000),
+                                 ("mac-mini-1", RENEW_PAYLOAD_CASES[1][1], 0)):
+        sig = node_renew.sign_renew_proof(key, node_id, csr_pem, at)
+        signed.append({"node_id": node_id, "csr_pem": csr_pem, "issued_at": at,
+                       "public_key_pem": pub_pem,
+                       "payload_hex": node_renew.renew_payload(node_id, csr_pem, at).hex(),
+                       "signature_b64": sig})
+    tampered = dict(signed[0])
+    tampered["signature_b64"] = _b64(_bump_r(base64.b64decode(signed[0]["signature_b64"])))
+    tampered["valid"] = False
+    signed.append(tampered)
+    return {"domain": node_renew.RENEW_PROOF_DOMAIN.decode(),
+            "payload": "domain || 0x00 || node_id || 0x00 || sha256hex(utf8(csr_pem)) || "
+                       "0x00 || decimal(issued_at)",
+            "max_skew_ingress_s": node_renew.RENEW_PROOF_MAX_SKEW_S,
+            "max_age_ca_s": node_renew.RENEW_PROOF_MAX_AGE_S,
+            "payload_cases": payload_cases, "python_signed": signed,
+            "go_signed": go_signed or []}
+
+
+def verify_renew_proof_doc(out: Path) -> list[str]:
+    problems: list[str] = []
+    try:
+        doc = json.loads((out / "renew_proof.json").read_text())
+    except (OSError, ValueError) as exc:
+        return [f"renew_proof.json unreadable: {exc}"]
+    if doc.get("domain") != node_renew.RENEW_PROOF_DOMAIN.decode():
+        problems.append("renew_proof.json: domain differs from node_renew.RENEW_PROOF_DOMAIN")
+    want = [(n, c, t) for n, c, t in RENEW_PAYLOAD_CASES]
+    if [(c["node_id"], c["csr_pem"], c["issued_at"]) for c in doc.get("payload_cases", [])] != want:
+        problems.append("renew_proof.json: payload_cases differ from the generator's inputs")
+    if not any(e.get("valid") is False for e in doc.get("python_signed", [])):
+        problems.append("renew_proof.json: no negative (valid: false) entry")
+    for listname in ("payload_cases", "python_signed", "go_signed"):
+        for e in doc.get(listname, []):
+            real = node_renew.renew_payload(e["node_id"], e["csr_pem"], e["issued_at"]).hex()
+            if real != e["payload_hex"]:
+                problems.append(f"renew_proof.json: a {listname} payload_hex is not "
+                                "renew_payload of its inputs")
+            if listname == "payload_cases":
+                continue
+            expect_valid = e.get("valid", True)
+            if listname == "go_signed" and not expect_valid:
+                problems.append("renew_proof.json: go_signed entries must verify")
+            pub = serialization.load_pem_public_key(e["public_key_pem"].encode())
+            try:
+                assert isinstance(pub, ec.EllipticCurvePublicKey)
+                pub.verify(base64.b64decode(e["signature_b64"]),
+                           bytes.fromhex(e["payload_hex"]), ec.ECDSA(hashes.SHA256()))
+                ok = True
+            except Exception:  # noqa: BLE001 - any verify failure is "does not verify"
+                ok = False
+            if ok != expect_valid:
+                problems.append(f"renew_proof.json: a {listname} signature verdict is wrong")
+    return problems
+
+
 def add_ecdsa_negative(cross: Path) -> bool:
     """Append a tampered-signature entry (``"valid": false``) if none is committed yet.
 
@@ -765,6 +860,7 @@ def verify_committed_once(out: Path = OUT) -> list[str]:
                 problems.append(
                     f"ecdsa_cross.json: a {listname} signature verdict is "
                     f"{'valid' if verified else 'invalid'}, entry says {expect_valid}")
+    problems += verify_renew_proof_doc(out)
     return problems
 
 
@@ -796,6 +892,10 @@ def write_all(out: Path = OUT, *, regen_certs: bool = False, regen_signed: bool 
             go_signed = []                 # their signatures were over a different key set
         _write(out, "ecdsa_cross.json",
                _dumps({"python_signed": build_ecdsa_python_signed(), "go_signed": go_signed}))
+    proof = out / "renew_proof.json"
+    if regen_signed or not proof.exists():
+        go = [] if regen_signed or not proof.exists() else json.loads(proof.read_text())["go_signed"]
+        _write(out, "renew_proof.json", _dumps(build_renew_proof(go)))
     add_node_cert_negatives(certs)
     add_ecdsa_negative(cross)
     problems = verify_committed_once(out)
@@ -836,6 +936,7 @@ edit of `v1/`.**
 | `session_token.json` | `issue` (inputs -> token) and `verify` (token, time -> `ok`/`expired`/`forged`/`malformed`) | `issue_session`, `verify_session` |
 | `receipt.json` | `issue` (inputs -> receipt) and `check` (-> `ok`/`refused`) | `claim_receipt`, `check_claim_receipt` |
 | `canonical_json.json` | `{input, canonical_hex}` or `{input_repr, error: "float"}` | `attest_wire.canonical` |
+| `renew_proof.json` | renewal proof of possession: `payload_cases` pin `renew_payload` bytes (`domain || 0x00 || node_id || 0x00 || sha256hex(utf8(csr_pem)) || 0x00 || decimal(issued_at)`); `python_signed` are P-256/SHA-256 DER base64 proofs (one tampered `"valid": false`); the Go agent appends `go_signed` | `node_renew.renew_payload`, `sign_renew_proof` |
 | `ecdsa_cross.json` | P-256/SHA-256 DER signatures, base64. `python_signed` is written by Python; the Go agent appends `go_signed`. Every entry must verify unless it has `"valid": false` (absent means true; python_signed only), which is a tampered signature that must be rejected | `node_auth.sign_claim` |
 | `node_certs/` | TEST CA, v1 (WireGuard key) and v2 (no key) node certs, and negatives; `cases.json` gives each verdict at the frozen `now` | `pki.node_identity`, `node_auth.admit_identity` |
 | `sandbox/seatbelt/*.json` | `request` -> exact SBPL `profile` + `-D` `params` | `seatbelt.build_profile` |

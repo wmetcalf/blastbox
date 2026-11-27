@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import fcntl
+import json
 import os
 from pathlib import Path
 
@@ -13,10 +14,48 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.x509.oid import NameOID
 
 from blastbox.host import node_renew, pki
-from blastbox.host.node_renew import RenewRefused, queue_csr, sign_pending
+from blastbox.host.node_renew import RenewRefused, sign_pending
+from blastbox.host.node_renew import queue_csr as _queue_csr
 from blastbox.host.placement import fleet_grants
 
 GRANTS = pki.NodeGrants(engines=("williamtells",), tiers=(), credentials=False)
+
+
+def _ca_for(d: Path) -> pki.CertAuthority:
+    """The CA that issued a test rig's certs: in ``d`` itself, or the split rig's ``ca/``."""
+    for c in (Path(d), Path(d).parent / "ca"):
+        if (c / "ca.key").exists():
+            return pki.load_ca(c)
+    raise AssertionError(f"no test CA for {d}")
+
+
+def proof_for(ca, node_id: str, csr_pem: bytes, *, issued_at=None, key=None, cert=None):
+    """(cert_pem, issued_at, signature) proving possession of a CA-issued cert's key."""
+    import time as _t
+    from cryptography.hazmat.primitives import serialization as _s
+    if key is None:
+        issued = ca.issue_node(node_id, grants=pki.NodeGrants())
+        key = _s.load_pem_private_key(issued.key_pem, password=None)
+        cert = issued.cert_pem
+    at = int(_t.time()) if issued_at is None else issued_at
+    return cert, at, node_renew.sign_renew_proof(key, node_id, csr_pem.decode(), at)
+
+
+def queue_csr(d, node_id, csr_pem, **kw):
+    """Queue with a valid proof: most tests here are about the queue, not the proof."""
+    ca = kw.pop("ca", None) or _ca_for(d)
+    cert, at, sig = proof_for(ca, node_id, csr_pem)
+    return _queue_csr(d, node_id, csr_pem, cert_pem=cert, issued_at=at, signature=sig,
+                      anchor=ca, **kw)
+
+
+def entry(ca, node_id: str, csr_pem: bytes, *, at=None, **over) -> bytes:
+    """A raw queue entry, as the ingress writes it, with a valid proof unless overridden."""
+    import json as _j
+    cert, at, sig = proof_for(ca, node_id, csr_pem, issued_at=at)
+    doc = {"csr_pem": csr_pem.decode(), "cert_pem": cert.decode(), "issued_at": at,
+           "signature": sig, **over}
+    return _j.dumps(doc).encode()
 
 
 def make_csr(cn: str, key=None) -> tuple[bytes, object]:
@@ -80,7 +119,7 @@ def test_queue_overwrites_one_file_per_node_mode_0600(tmp_path):
     queue_csr(d, "n1", second)
     files = list((d / "renew").glob("*.csr"))
     assert [f.name for f in files] == ["n1.csr"]
-    assert files[0].read_bytes() == second
+    assert json.loads(files[0].read_bytes())["csr_pem"] == second.decode()
     assert files[0].stat().st_mode & 0o777 == 0o600
     assert (d / "renew").stat().st_mode & 0o777 == 0o700
 
@@ -165,7 +204,7 @@ def test_expired_current_cert_is_not_renewed(tmp_path, monkeypatch):
 def test_cn_mismatch_at_signing_time_is_refused(tmp_path):
     d, ca = rig(tmp_path)
     (d / "renew").mkdir()
-    (d / "renew" / "n1.csr").write_bytes(make_csr("other")[0])
+    (d / "renew" / "n1.csr").write_bytes(entry(ca, "n1", make_csr("other")[0]))
     before = (d / "node-n1.crt").read_bytes()
     [(nid, outcome)] = sign_pending(ca, d)
     assert nid == "n1" and outcome.startswith("refused")
@@ -325,7 +364,7 @@ def test_a_csr_queued_while_one_is_kept_wins_next_run(tmp_path, monkeypatch):
     monkeypatch.setattr(node_renew, "_replace_file", fail_and_race)
     sign_pending(ca, d)
     monkeypatch.undo()
-    assert (d / "renew" / "n1.csr").read_bytes() == newer
+    assert json.loads((d / "renew" / "n1.csr").read_bytes())["csr_pem"] == newer.decode()
     assert sign_pending(ca, d) == [("n1", "renewed")]
     assert pub(node_renew.current_cert(d, "n1")) == newer_key.public_key().public_bytes(
         serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
@@ -438,8 +477,8 @@ def test_a_dir_trusting_a_foreign_ca_cannot_get_its_certs_signed(tmp_path):
     (hostile / "ghost.crt").write_bytes(
         evil.sign_node_csr(make_csr("ghost")[0], node_id="ghost", grants=broad))
     queue_csr(hostile, "ghost", make_csr("ghost")[0])
-    assert sign_pending(ca, ca_dir, node_dirs=[hostile]) == [
-        ("ghost", "refused: no current certificate")]
+    [(nid, outcome)] = sign_pending(ca, ca_dir, node_dirs=[hostile])
+    assert nid == "ghost" and outcome.startswith("refused")
     real_anchor = pki.load_trust_anchor(ca_dir)
     for crt in hostile.glob("*.crt"):
         with pytest.raises(ValueError):

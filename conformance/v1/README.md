@@ -12,6 +12,7 @@ edit of `v1/`.**
 | `session_token.json` | `issue` (inputs -> token) and `verify` (token, time -> `ok`/`expired`/`forged`/`malformed`) | `issue_session`, `verify_session` |
 | `receipt.json` | `issue` (inputs -> receipt) and `check` (-> `ok`/`refused`) | `claim_receipt`, `check_claim_receipt` |
 | `canonical_json.json` | `{input, canonical_hex}` or `{input_repr, error: "float"}` | `attest_wire.canonical` |
+| `renew_proof.json` | renewal proof of possession: `payload_cases` pin `renew_payload` bytes (`domain || 0x00 || node_id || 0x00 || sha256hex(utf8(csr_pem)) || 0x00 || decimal(issued_at)`); `python_signed` are P-256/SHA-256 DER base64 proofs (one tampered `"valid": false`); the Go agent appends `go_signed` | `node_renew.renew_payload`, `sign_renew_proof` |
 | `ecdsa_cross.json` | P-256/SHA-256 DER signatures, base64. `python_signed` is written by Python; the Go agent appends `go_signed`. Every entry must verify unless it has `"valid": false` (absent means true; python_signed only), which is a tampered signature that must be rejected | `node_auth.sign_claim` |
 | `node_certs/` | TEST CA, v1 (WireGuard key) and v2 (no key) node certs, and negatives; `cases.json` gives each verdict at the frozen `now` | `pki.node_identity`, `node_auth.admit_identity` |
 | `sandbox/seatbelt/*.json` | `request` -> exact SBPL `profile` + `-D` `params` | `seatbelt.build_profile` |

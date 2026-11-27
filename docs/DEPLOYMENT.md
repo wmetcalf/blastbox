@@ -911,6 +911,15 @@ issued without them produces an idle node rather than an unrestricted one, and r
 
 **Node certificate renewal.** A node holding a valid session renews online: it POSTs a fresh
 CSR to `/v1/nodes/renew` (202), then polls `GET /v1/nodes/cert` for the new certificate. The
+session is a bearer token, so it is not what authorises a new key: the request also carries the
+node's **current** certificate and a proof of possession of its key, `{csr_pem, cert_pem,
+issued_at, signature}`, where `signature` is base64 DER ECDSA-P256-SHA256 by that certificate's
+key over `blastbox/node-renew/v1 \0 <node_id> \0 sha256hex(csr_pem) \0 <issued_at>`
+(`conformance/v1/renew_proof.json`). The ingress requires the certificate to verify, to name the
+session's node, the signature to verify, and `issued_at` within 300 s of its clock (403 for an
+identity failure, 400 otherwise). The CA host checks all of it **again against its own CA**, with
+`issued_at` within 24 h, before signing: the queue sits in the ingress's dir, and a copy of a
+node's certificate is not its key. A queue entry from before this change (a bare CSR) is refused. The
 ingress has no CA key, so it only validates and queues the CSR under `<pki>/renew/` (one file
 per node, 8 KiB cap). On the CA host, `blastbox-pki-renew.timer` (every 5 min) runs
 `blastbox pki renew-pending`, which signs each queued CSR with the grants of the node's
