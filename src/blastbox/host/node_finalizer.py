@@ -237,7 +237,13 @@ class NodeFinalizer:
             return "done", None
         if res == "lost":
             return "failed", "claim lost"
-        return "failed", res[len("failed: "):] if res.startswith("failed: ") else res
+        # "failed: <raw>" says what went wrong, not that OUR _fail_job CAS won, and the raw
+        # text can carry host paths. The node is told the row's (sanitised) error when the row
+        # is FAILED under its claim, and "claim lost" otherwise.
+        cur = self._store.get(job.job_id)
+        if cur is not None and cur.status == JobStatus.FAILED and cur.claim_id == job.claim_id:
+            return "failed", cur.error or "job failed"
+        return "failed", "claim lost"
 
     def _discard_staged(self, job: Job, out: Path) -> None:
         """The staged tree is spent (sealed + uploaded, or failed). Never remove it while a row

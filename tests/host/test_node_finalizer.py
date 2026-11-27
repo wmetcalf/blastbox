@@ -514,3 +514,35 @@ def test_node_results_honour_the_job_retention_period(tmp_path, monkeypatch):
     assert j.status == JobStatus.DONE
     assert j.expires_at is not None and before + 55 <= j.expires_at <= time.time() + 65
     assert seen.get("retention_seconds") == 60
+
+
+def test_failed_reason_is_the_sanitised_row_error_never_raw(tmp_path, monkeypatch):
+    store, job, fin, _ = build(tmp_path)
+    d = spool(tmp_path, job)
+    raw = "unexpected trust validation error: /var/lib/blastbox/jobs/job-1/output/x boom"
+
+    def fail(j, out, obs, **k):
+        fin._dispatcher._fail_job(j, raw)
+        return f"failed: {raw}"
+
+    monkeypatch.setattr(fin._dispatcher, "finalise_output", fail)
+    assert fin.run_once() == 1
+    out = nr.read_outcome(d)
+    assert out["status"] == "failed"
+    assert "/var/lib" not in out["reason"] and out["reason"] == store.get("job-1").error
+
+
+def test_failed_but_cas_lost_is_recorded_as_claim_lost(tmp_path, monkeypatch):
+    """finalise_output says 'failed: ...' even when its _fail_job CAS lost to a peer."""
+    store, job, fin, _ = build(tmp_path)
+    d = spool(tmp_path, job)
+
+    def lost(j, out, obs, **k):
+        store.update_if_status("job-1", JobStatus.RUNNING, expect_claim_id=j.claim_id,
+                               status=JobStatus.QUEUED, claim_id=None)
+        fin._dispatcher._fail_job(j, "output trust validation failed: x")   # loses the CAS
+        return "failed: output trust validation failed: x"
+
+    monkeypatch.setattr(fin._dispatcher, "finalise_output", lost)
+    assert fin.run_once() == 1
+    assert nr.read_outcome(d) == {"status": "failed", "reason": "claim lost"}
