@@ -625,6 +625,22 @@ func TestRecoveryAndALiveReclaimNeverOverlap(t *testing.T) {
 	}
 }
 
+// Two agents on one state dir would each treat the other's live job dirs as crash leftovers.
+func TestOneAgentPerStateDir(t *testing.T) {
+	e := fresh(t)
+	e.cfg.Claim = false
+	first := newHarness(e)
+	first.start(t)
+	eventually(t, "first agent up", func() bool { return e.in.hbCount() >= 1 })
+	second := newHarness(e)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := second.a.Run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "state dir") {
+		t.Fatalf("second agent on the same state dir: %v", err)
+	}
+}
+
 func TestRefusedJobGoesToRecovery(t *testing.T) {
 	e := fresh(t)
 	e.in.onClaim = func(n int) (int, string) {

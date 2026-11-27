@@ -78,6 +78,7 @@ type Agent struct {
 	hbReady chan struct{}
 	hbOnce  sync.Once
 	renewer *Renewer
+	lock    *os.File // flock on <state_dir>/agent.lock, held for the life of Run
 }
 
 type engState struct {
@@ -305,6 +306,12 @@ func (a *Agent) resession(ctx context.Context) error {
 
 // Run runs the agent until ctx is cancelled (SIGTERM/SIGINT), then drains and returns nil.
 func (a *Agent) Run(ctx context.Context) error {
+	lk, err := lockStateDir(a.Cfg.StateDir)
+	if err != nil {
+		return err
+	}
+	a.lock = lk
+	defer lk.Close()
 	if err := a.startup(ctx); err != nil {
 		return err
 	}
