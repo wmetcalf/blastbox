@@ -80,7 +80,6 @@ def test_defaults(rig, pki_dir, monkeypatch):
     lambda b: b.update(agent_version="x" * 129),
     lambda b: b.update(started_at="x" * 65),
     lambda b: b.update(engines=[GOOD["engines"][0]] * 65),
-    lambda b: b.update(in_flight=[GOOD["in_flight"][0]] * 65),
     lambda b: b["engines"][0].update(name="y" * 129),
     lambda b: b["engines"][0].update(slots=-1),
 ])
@@ -191,3 +190,12 @@ def test_claims_are_recorded_per_engine(rig, pki_dir):
     _claim(c, pki_dir, "alpha", engine="clamav", token=tok)
     _claim(c, pki_dir, "alpha", token=tok)                         # unscoped: not throttled away
     assert set(_liveness(c).snapshot()["alpha"].claims) == {"clamav", ""}
+
+
+def test_more_in_flight_jobs_than_the_cap_are_truncated_not_refused(rig, pki_dir):
+    """A saturated big node must not 422 its heartbeat and read silent when busiest."""
+    _, c = rig
+    body = dict(GOOD, in_flight=[dict(GOOD["in_flight"][0], job_id=f"j{i}") for i in range(80)])
+    r = c.post("/v1/nodes/heartbeat", json=body, headers=auth(token_for(c, pki_dir, "alpha")))
+    assert r.status_code == 200, r.text
+    assert len(_liveness(c).snapshot()["alpha"].body["in_flight"]) == 64

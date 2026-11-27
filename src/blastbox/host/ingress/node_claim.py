@@ -528,7 +528,11 @@ class HeartbeatBody(BaseModel):
     goarch: _Str = ""
     started_at: _Ts = ""
     engines: list[HeartbeatEngine] = Field(default_factory=list, max_length=64)
-    in_flight: list[HeartbeatInFlight] = Field(default_factory=list, max_length=64)
+    #: Truncated, not refused: a saturated node can hold more jobs than this, and a 422 would
+    #: drop its heartbeat (node_silent) exactly when it is busiest. The list is observability.
+    in_flight: Annotated[list[HeartbeatInFlight],
+                         BeforeValidator(lambda v: v[:64] if isinstance(v, list) else v)] = Field(
+        default_factory=list)
     cert_not_after: _Ts = ""
 
 
