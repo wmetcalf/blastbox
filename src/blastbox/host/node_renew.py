@@ -674,6 +674,12 @@ def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
                     pass
     except OSError as exc:
         return f"deferred: {exc}", True
+    # A dir that serves the node only through a link out of it was not (cannot be) written:
+    # that ingress still serves the old cert. Renewed, but say so (the CLI exits 2).
+    stale = [d for d in every if d not in states and _links_out_for(d, node_id, ca)]
+    if stale:
+        return (f"renewed; NOT written to {', '.join(map(str, stale))}: it holds the node only "
+                "through a link out of the dir, so it still serves the old certificate"), False
     return "renewed", False
 
 

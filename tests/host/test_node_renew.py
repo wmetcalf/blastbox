@@ -1092,7 +1092,8 @@ def test_a_dir_that_only_links_a_nodes_cert_cannot_veto_its_renewal(tmp_path):
     copy.write_bytes((i1 / "node-n1.crt").read_bytes())
     (i2 / "x.crt").symlink_to(copy)                    # hostile: a link, nothing else
     queue_csr(i1, "n1", make_csr("n1")[0])
-    assert sign_pending(ca, ca_dir, node_dirs=[i1, i2]) == [("n1", "renewed")]
+    [(nid, outcome)] = sign_pending(ca, ca_dir, node_dirs=[i1, i2])
+    assert outcome.startswith("renewed")                # renewed, with i2 named as stale
 
 
 def test_ca_host_reads_never_take_a_controlling_terminal():
@@ -1142,3 +1143,18 @@ def test_a_deferral_for_an_unresolvable_link_ends_with_the_proof_window(tmp_path
     (d / "node-n1.crt").symlink_to("/nonexistent/n1.crt")
     [(nid, outcome)] = sign_pending(ca, d)
     assert outcome.startswith("refused") and pending(d) == []
+
+
+def test_a_renewal_says_which_link_only_dir_it_could_not_update(tmp_path, capsys):
+    from blastbox.host.cli import main
+    ca, ca_dir, i1, i2 = _split(tmp_path)
+    copy = tmp_path / "copies" / "n1.crt"
+    copy.parent.mkdir()
+    os.replace(i2 / "node-n1.crt", copy)
+    (i2 / "node-n1.crt").symlink_to(copy)               # i2 serves n1 through a link
+    queue_csr(i1, "n1", make_csr("n1")[0])
+    rc = main(["pki", "--dir", str(ca_dir), "renew-pending",
+               "--node-dir", str(i1), "--node-dir", str(i2)])
+    out = capsys.readouterr().out
+    assert out.startswith("n1: renewed") and str(i2) in out and "link" in out
+    assert rc == 2                                       # loud: i2 still serves the old cert

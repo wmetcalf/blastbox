@@ -1549,7 +1549,8 @@ def _pki_cmd(args: argparse.Namespace) -> int:
             print(f"{node_id}: {outcome}")
         # A deferral repeats every run until someone fixes its cause; exit 2 so the timer
         # unit shows it, instead of staying green while the node's cert runs out.
-        return 2 if any(o.startswith("deferred") for _, o in outcomes) else 0
+        return 2 if any(o.startswith("deferred") or "NOT written" in o
+                        for _, o in outcomes) else 0
     if args.pki_action == "sign-node-csr":
         # LOAD, never generate: a mistyped --dir must not mint a rogue CA and sign with it.
         from blastbox.host.pki import load_ca
