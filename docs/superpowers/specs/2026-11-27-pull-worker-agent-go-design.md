@@ -431,7 +431,11 @@ blobs, a trivial engine, on linux (nsjail) and macos-14 arm64 (seatbelt) runners
   cert, its CN against the session, that its key is one of the node's CURRENT certs' keys, the
   signature and `|now - issued_at| <= 300 s`; the CA-host
   timer re-checks everything against the real CA (`issued_at` within 24 h) because the ingress
-  that holds the queue may be hostile. Vectors: `conformance/v1/renew_proof.json`. The ingress has no CA key, so it only queues the CSR. A
+  that holds the queue may be hostile. Vectors: `conformance/v1/renew_proof.json`.
+  `issued_at` is integer unix seconds. The agent keeps the old and the pending key until `/cert`
+  serves a cert with the pending key, resends the SAME CSR on retry after polling `/cert`, and
+  treats a 403 from `/renew` after a queued renewal as "poll `/cert` and adopt", since the old
+  key stops being current once the timer publishes (unlike §6.2's general "403 = not granted"). The ingress has no CA key, so it only queues the CSR. A
   CA-holding timer (`blastbox pki renew-pending`) signs queued CSRs with **the grants of the
   node's current cert**. The agent polls for the new cert and swaps it atomically. The heartbeat
   reports `cert_not_after`, and the control plane alerts at T-48 h. Q4 covers whether to build

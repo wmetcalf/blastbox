@@ -197,3 +197,21 @@ def test_renew_proof_signatures_both_directions():
         else:
             with pytest.raises(InvalidSignature):
                 _verify(entry["public_key_pem"], entry["payload_hex"], entry["signature_b64"])
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda d: d.update(max_age_ca_s=1),
+    lambda d: d.update(max_skew_ingress_s=9999),
+    lambda d: d.update(payload="something else"),
+    lambda d: d.update(python_signed=[e for e in d["python_signed"] if e.get("valid") is False]),
+    lambda d: d.update(go_signed=[{"node_id": "n", "csr_pem": "", "issued_at": 1}]),
+])
+def test_check_catches_a_doctored_renew_proof(tmp_path, mutate):
+    import shutil
+    out = tmp_path / "v1"
+    shutil.copytree(VECTORS, out)
+    doc = json.loads((out / "renew_proof.json").read_text())
+    mutate(doc)
+    (out / "renew_proof.json").write_text(json.dumps(doc))
+    (out / "SHA256SUMS").write_bytes(gen.sha256sums(out))
+    assert any("renew_proof" in p for p in gen.check(out))

@@ -921,7 +921,16 @@ deletion, so an older certificate stays CA-valid until it expires; after a revok
 old key must not renew), the signature to verify, and `issued_at` within 300 s of its clock (403 for an
 identity failure, 400 otherwise). The CA host checks all of it **again against its own CA**, with
 `issued_at` within 24 h, before signing: the queue sits in the ingress's dir, and a copy of a
-node's certificate is not its key. A queue entry from before this change (a bare CSR) is refused. The
+node's certificate is not its key. A queue entry from before this change (a bare CSR) is refused.
+
+What a client must do (the Go agent follows this): `issued_at` is integer **unix seconds** from a
+clock within 300 s of the ingress's (an NTP-synced node; a 400 naming `issued_at` means the clock
+is off). Keep the **old key and the pending key** until `GET /v1/nodes/cert` serves a certificate
+whose public key is the pending one, then swap atomically. A retry resends the **same** CSR (the
+queue is newest-wins) and always polls `/cert` first: once the timer has published the renewal,
+the old certificate's key is no longer current, so a renewal proven with it is a 403. A 403 after
+a renewal was queued therefore means "fetch `/cert` and adopt it if it matches the pending key",
+not "not granted". The
 ingress has no CA key, so it only validates and queues the CSR under `<pki>/renew/` (one JSON file
 per node: CSR up to 8 KiB, the whole entry up to 64 KiB). On the CA host, `blastbox-pki-renew.timer` (every 5 min) runs
 `blastbox pki renew-pending`, which signs each queued CSR with the grants of the node's

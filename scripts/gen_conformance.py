@@ -705,13 +705,21 @@ def build_renew_proof(go_signed: list[dict[str, Any]] | None = None) -> dict[str
     tampered["signature_b64"] = _b64(_bump_r(base64.b64decode(signed[0]["signature_b64"])))
     tampered["valid"] = False
     signed.append(tampered)
-    return {"domain": node_renew.RENEW_PROOF_DOMAIN.decode(),
-            "payload": "domain || 0x00 || node_id || 0x00 || sha256hex(utf8(csr_pem)) || "
-                       "0x00 || decimal(issued_at)",
-            "max_skew_ingress_s": node_renew.RENEW_PROOF_MAX_SKEW_S,
-            "max_age_ca_s": node_renew.RENEW_PROOF_MAX_AGE_S,
+    return {**_renew_proof_constants(),
             "payload_cases": payload_cases, "python_signed": signed,
             "go_signed": go_signed or []}
+
+
+def _renew_proof_constants() -> dict[str, Any]:
+    return {"domain": node_renew.RENEW_PROOF_DOMAIN.decode(),
+            "payload": RENEW_PAYLOAD_DESCRIPTION,
+            "issued_at_unit": "unix seconds (integer)",
+            "max_skew_ingress_s": node_renew.RENEW_PROOF_MAX_SKEW_S,
+            "max_age_ca_s": node_renew.RENEW_PROOF_MAX_AGE_S}
+
+
+RENEW_PAYLOAD_DESCRIPTION = ("domain || 0x00 || node_id || 0x00 || sha256hex(utf8(csr_pem)) || "
+                             "0x00 || decimal(issued_at)")
 
 
 def verify_renew_proof_doc(out: Path) -> list[str]:
@@ -720,8 +728,11 @@ def verify_renew_proof_doc(out: Path) -> list[str]:
         doc = json.loads((out / "renew_proof.json").read_text())
     except (OSError, ValueError) as exc:
         return [f"renew_proof.json unreadable: {exc}"]
-    if doc.get("domain") != node_renew.RENEW_PROOF_DOMAIN.decode():
-        problems.append("renew_proof.json: domain differs from node_renew.RENEW_PROOF_DOMAIN")
+    for k, v in _renew_proof_constants().items():
+        if doc.get(k) != v:
+            problems.append(f"renew_proof.json: {k} differs from the Python reference")
+    if not any(e.get("valid", True) for e in doc.get("python_signed", [])):
+        problems.append("renew_proof.json: no valid python_signed proof")
     want = [(n, c, t) for n, c, t in RENEW_PAYLOAD_CASES]
     if [(c["node_id"], c["csr_pem"], c["issued_at"]) for c in doc.get("payload_cases", [])] != want:
         problems.append("renew_proof.json: payload_cases differ from the generator's inputs")
@@ -729,7 +740,15 @@ def verify_renew_proof_doc(out: Path) -> list[str]:
         problems.append("renew_proof.json: no negative (valid: false) entry")
     for listname in ("payload_cases", "python_signed", "go_signed"):
         for e in doc.get(listname, []):
-            real = node_renew.renew_payload(e["node_id"], e["csr_pem"], e["issued_at"]).hex()
+            try:
+                real = node_renew.renew_payload(e["node_id"], e["csr_pem"],
+                                                e["issued_at"]).hex()
+                if listname != "payload_cases":
+                    e["public_key_pem"], e["signature_b64"]  # noqa: B018 - must exist
+                e["payload_hex"]  # noqa: B018 - must exist
+            except (KeyError, TypeError, ValueError, AttributeError) as exc:
+                problems.append(f"renew_proof.json: a malformed {listname} entry ({exc!r})")
+                continue
             if real != e["payload_hex"]:
                 problems.append(f"renew_proof.json: a {listname} payload_hex is not "
                                 "renew_payload of its inputs")
@@ -896,6 +915,11 @@ def write_all(out: Path = OUT, *, regen_certs: bool = False, regen_signed: bool 
     if regen_signed or not proof.exists():
         go = [] if regen_signed or not proof.exists() else json.loads(proof.read_text())["go_signed"]
         _write(out, "renew_proof.json", _dumps(build_renew_proof(go)))
+    else:                                   # constants are not random: keep them current
+        doc = json.loads(proof.read_text())
+        if any(doc.get(k) != v for k, v in _renew_proof_constants().items()):
+            doc.update(_renew_proof_constants())
+            _write(out, "renew_proof.json", _dumps(doc))
     add_node_cert_negatives(certs)
     add_ecdsa_negative(cross)
     problems = verify_committed_once(out)

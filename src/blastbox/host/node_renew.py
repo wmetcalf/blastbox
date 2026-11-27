@@ -238,6 +238,10 @@ class _TooLarge(_Unreadable):
 
 
 
+#: Never block on a FIFO, never adopt a tty as controlling terminal, never leak the fd.
+_OPEN_FLAGS = os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+
+
 def _read_capped(path: Path, limit: int, *, follow: bool = False) -> bytes:
     """Read a small REGULAR file without following a link or blocking on a FIFO.
 
@@ -245,7 +249,7 @@ def _read_capped(path: Path, limit: int, *, follow: bool = False) -> bytes:
     the same descriptor, no check-then-open window) and never reads more than ``limit``.
     """
     try:
-        flags = os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | (0 if follow else os.O_NOFOLLOW)
+        flags = _OPEN_FLAGS | (0 if follow else os.O_NOFOLLOW)
         fd = os.open(path, flags)
     except OSError as exc:
         if exc.errno == errno.ELOOP:
@@ -598,7 +602,11 @@ def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
                 states[d] = cur
     except OSError as exc:
         return f"deferred: {exc}", True
-    linked = [d for d in every if _links_out_for(d, node_id, ca)]
+    # Only a dir that itself holds the node (or the one that queued it) counts: a dir with
+    # nothing but a link to a copy is not one of its authorisers here, and must not be able
+    # to hold the renewal hostage.
+    linked = [d for d in every
+              if (d in states or d == qdir) and _links_out_for(d, node_id, ca)]
     if linked:
         # The ingress follows a cert link out of its dir; renewal will not (resolved here,
         # it can reach what that ingress never sees). Signing without it could drop the

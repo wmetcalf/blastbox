@@ -57,17 +57,11 @@ def proof_for(ca, node_id: str, csr_pem: bytes, *, issued_at=None, key=None, cer
     in ``d`` (any dir of the rig when None). A node with no current cert gets a fresh,
     unrelated cert -- which the CA host must then refuse."""
     import time as _t
-    if key is None:
-        for c in sorted(Path(d).glob("*.crt")) if d is not None else []:
-            try:
-                pem = node_renew._read_capped(c, node_renew.MAX_CERT_BYTES, follow=True)
-                ident = pki.node_identity(ca, pem)
-            except Exception:  # noqa: BLE001 - FIFOs, junk, foreign certs: not the node's
-                continue
-            k = _KEYS.get(_spki(x509.load_pem_x509_certificate(pem).public_key()))
-            if ident.node_id == node_id and k is not None:
-                key, cert = k, pem
-                break
+    cur = node_renew._find_current(Path(d), node_id, anchor=ca) if d is not None else None
+    if key is None and cur is not None:     # the node's current cert, as the CA host sees it
+        k = _KEYS.get(_spki(x509.load_pem_x509_certificate(cur.pem).public_key()))
+        if k is not None:
+            key, cert = k, cur.pem
     if key is None:
         issued = ca.issue_node(node_id, grants=pki.NodeGrants())
         key = serialization.load_pem_private_key(issued.key_pem, password=None)
@@ -82,12 +76,10 @@ def queue_csr(d, node_id, csr_pem, **kw):
     more, so its entry is written as if queued before it was revoked."""
     ca = kw.pop("ca", None) or _ca_for(d)
     cert, at, sig = proof_for(ca, node_id, csr_pem, d=d)
-    try:
+    if node_renew._find_current(Path(d), node_id, anchor=ca) is not None:
+        # The node is current here: the ingress must accept this, so never paper over it.
         return _queue_csr(d, node_id, csr_pem, cert_pem=cert, issued_at=at, signature=sig,
                           anchor=ca, **kw)
-    except RenewRefused as exc:
-        if "current certificate" not in str(exc):
-            raise
     import json as _j
     r = Path(d) / "renew"
     r.mkdir(mode=0o700, exist_ok=True)
@@ -855,7 +847,11 @@ def test_a_cert_linked_from_outside_its_dir_defers_loudly_and_keeps_the_csr(tmp_
     os.replace(d / "node-n1.crt", outside)
     (d / "node-n1.crt").symlink_to(outside)
     assert set(fleet_grants(d)) == {"n1"}
-    queue_csr(d, "n1", make_csr("n1")[0])
+    # queued through the ingress, which follows the link: proven by the node's real key
+    pem = outside.read_bytes()
+    key = _KEYS[_spki(x509.load_pem_x509_certificate(pem).public_key())]
+    cert, at, sig = proof_for(ca, "n1", (csr := make_csr("n1")[0]), key=key, cert=pem)
+    _queue_csr(d, "n1", csr, cert_pem=cert, issued_at=at, signature=sig)
     [(nid, outcome)] = sign_pending(ca, d)
     assert outcome.startswith("deferred") and "link" in outcome
     assert pending(d) == ["n1"]
@@ -1084,3 +1080,20 @@ def test_a_lone_surrogate_in_a_queue_entry_is_refused_not_a_crash(tmp_path):
     queue_csr(d, "n1", make_csr("n1")[0])
     out = dict(sign_pending(ca, d))
     assert out["aaa"].startswith("refused") and out["n1"] == "renewed"
+
+
+def test_a_dir_that_only_links_a_nodes_cert_cannot_veto_its_renewal(tmp_path):
+    """A dir that does not itself hold the node (only a link out to a copy) is not one of
+    its authorisers here, so it must not be able to hold the node's renewal hostage."""
+    ca, ca_dir, i1, i2 = _split(tmp_path)
+    (i2 / "node-n1.crt").unlink()
+    copy = tmp_path / "copies" / "n1.crt"
+    copy.parent.mkdir()
+    copy.write_bytes((i1 / "node-n1.crt").read_bytes())
+    (i2 / "x.crt").symlink_to(copy)                    # hostile: a link, nothing else
+    queue_csr(i1, "n1", make_csr("n1")[0])
+    assert sign_pending(ca, ca_dir, node_dirs=[i1, i2]) == [("n1", "renewed")]
+
+
+def test_ca_host_reads_never_take_a_controlling_terminal():
+    assert node_renew._OPEN_FLAGS & os.O_NOCTTY

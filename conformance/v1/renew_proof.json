@@ -1,6 +1,7 @@
 {
   "domain": "blastbox/node-renew/v1",
   "go_signed": [],
+  "issued_at_unit": "unix seconds (integer)",
   "max_age_ca_s": 86400,
   "max_skew_ingress_s": 300,
   "payload": "domain || 0x00 || node_id || 0x00 || sha256hex(utf8(csr_pem)) || 0x00 || decimal(issued_at)",
