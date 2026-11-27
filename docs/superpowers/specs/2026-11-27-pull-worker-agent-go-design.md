@@ -628,8 +628,25 @@ These settle §17. Where they differ from an option discussed above, they win.
 
 1. **macOS floor = seatbelt deny-default**, applied by the agent via `/usr/bin/sandbox-exec`.
    App Sandbox is an added layer only if a spike on the Mac (no sudo) proves it nests under
-   `sandbox-exec`; otherwise it is dropped. The spike result is recorded in the plan. Linux
-   floor = nsjail. A confinement probe must pass before the agent claims anything.
+   `sandbox-exec`; otherwise it is dropped. Linux floor = nsjail. A confinement probe must
+   pass before the agent claims anything.
+
+   **Spike result (2026-11-27, macOS 26.6.2 arm64, no sudo): App Sandbox does NOT nest, so it
+   is dropped.** A minimal C binary in an `.app` bundle (Info.plist with a bundle id), ad-hoc
+   signed `--options runtime` with only `com.apple.security.app-sandbox`:
+
+   ```text
+   run directly                                  sandboxed=1, read /etc/hosts = yes, rc 0
+   under sandbox-exec "(version 1)(allow default)"   SIGTRAP, rc 133
+   under a deny-default seatbelt profile         SIGTRAP, rc 133
+   unsigned control under the same deny-default  sandboxed=1, read /etc/hosts = no, rc 0
+   ```
+
+   Identical from an ssh session and from the user's `gui/<uid>` launchd domain. Without a
+   bundle the App Sandbox binary SIGTRAPs even standalone. So App Sandbox cannot be layered
+   under seatbelt, and on its own it reads `/etc/hosts` where seatbelt does not (it is the
+   broader profile, as §3.3 says). `worker_runtime` is therefore always `"seatbelt"` on macOS;
+   `"appsandbox+seatbelt"` (§12) is not emitted.
 2. **Finalisation runs in a separate `blastbox node-finalizer` service** on the control plane.
    It holds DB, blobs and the attest key and never claims. The ingress quarantines the upload
    and hands it over; the ingress never holds the attest key.
