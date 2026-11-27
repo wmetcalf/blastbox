@@ -1557,7 +1557,8 @@ def _pki_cmd(args: argparse.Namespace) -> int:
             crt, key = issued.write(pki_dir, f"node-{args.node_id}")
         print(f"node cert for {args.node_id} ({args.days}d) -> {crt} / {key}")
         print(f"  {key} is a PRIVATE KEY (0600). Renewal is this same command with the "
-              f"same --node-id and --wg-pubkey, then `egress peer-add --cert {crt}`; at "
+              f"same --node-id (and the same --wg-pubkey, if it has one); a node on the "
+              f"overlay then needs `egress peer-add --cert {crt}`; at "
               f"{args.days}d it is a recurring step, not a one-off enrolment.")
         if not grants.engines and not grants.tiers:
             # Fail-closed defaults are correct but silently useless; say so once here
@@ -1576,20 +1577,30 @@ def _pki_cmd(args: argparse.Namespace) -> int:
         try:
             cert_pem = ca.sign_node_csr(Path(args.csr).read_bytes(), node_id=args.node_id,
                                         grants=grants, days=args.days)
-        except ValueError as exc:
+            out = Path(args.out) if args.out else pki_dir / f"node-{args.node_id}.crt"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            existed = out.exists()
+            tmp = out.with_name(out.name + f".{os.getpid()}.tmp")
+            try:
+                for attempt in (0, 1):
+                    try:
+                        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                        break
+                    except FileExistsError:
+                        if attempt:
+                            raise
+                        tmp.unlink(missing_ok=True)   # stale, from a pid collision
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(cert_pem)
+                os.chmod(tmp, 0o644)
+                os.replace(tmp, out)
+            finally:
+                tmp.unlink(missing_ok=True)
+        except (OSError, ValueError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
-        out = Path(args.out) if args.out else pki_dir / f"node-{args.node_id}.crt"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        tmp = out.with_name(out.name + f".{os.getpid()}.tmp")
-        try:
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(cert_pem)
-            os.chmod(tmp, 0o644)
-            os.replace(tmp, out)
-        finally:
-            tmp.unlink(missing_ok=True)
+        if existed:
+            print(f"replaced existing {out}", file=sys.stderr)
         not_after = _x509.load_pem_x509_certificate(cert_pem).not_valid_after_utc
         print(f"node cert for {args.node_id} -> {out}")
         print(f"  not_after: {not_after.isoformat()}")
@@ -1964,16 +1975,16 @@ def _egress_cmd_inner(args: argparse.Namespace) -> int:
             # decision, which is the habit this whole change exists to break.
             overlay_tiers = tuple(t for t in ("openvpn", "wireguard")
                                   if ident.grants.allows_tier(t))
+            if ident.wg_pubkey is None:
+                print(f"error: {ident.node_id}'s certificate carries no WireGuard public "
+                      f"key (node-info v2), so it cannot be added as an overlay peer.",
+                      file=sys.stderr)
+                return 1
             if not overlay_tiers and not args.force:
                 print(f"error: {ident.node_id} is not granted an overlay tier "
                       f"(has: {list(ident.grants.tiers) or 'none'}). Reissue with "
                       f"--tier openvpn/--tier wireguard, or pass --force to register it "
                       f"anyway.", file=sys.stderr)
-                return 1
-            if ident.wg_pubkey is None:
-                print(f"error: {ident.node_id}'s certificate carries no WireGuard public "
-                      f"key (node-info v2), so it cannot be added as an overlay peer.",
-                      file=sys.stderr)
                 return 1
             name, pubkey = ident.node_id, ident.wg_pubkey
             expires = ident.not_after.isoformat()
@@ -2164,7 +2175,7 @@ def build_parser() -> argparse.ArgumentParser:
     pk_csr.add_argument("--days", type=int, default=30)
     pk_node = pks.add_parser(
         "issue-node",
-        help="mint a NODE cert: identity + its WireGuard key + its grants")
+        help="mint a NODE cert: identity + its grants (+ its WireGuard key, optional)")
     pk_node.add_argument("--node-id", required=True,
                          help="the machine's identity (lowercase, 1-63 chars)")
     pk_node.add_argument("--wg-pubkey", default=None,

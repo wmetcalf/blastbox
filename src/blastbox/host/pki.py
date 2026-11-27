@@ -70,6 +70,8 @@ OID_NODE_INFO = x509.ObjectIdentifier(f"{_OID_ARC}.1.1")
 #: authenticate nodes, it checks for THIS.
 OID_NODE_AUTH = x509.ObjectIdentifier(f"{_OID_ARC}.1.2")
 
+#: Upper bound on a node cert's life: revocation is "stop renewing", so it must be short.
+MAX_NODE_CERT_DAYS = 30
 _NODE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 def _is_wg_key(value: str) -> bool:
     """Exactly 32 bytes of canonically-padded base64 — a real Curve25519 public key.
@@ -254,6 +256,9 @@ class CertAuthority:
         Split from :meth:`issue_node` so a CSR-enrolment path can reuse the exact same
         extension set and checks with a node-supplied key instead of a generated one.
         """
+        if not 1 <= days <= MAX_NODE_CERT_DAYS:
+            raise ValueError(
+                f"node cert lifetime must be 1..{MAX_NODE_CERT_DAYS} days, got {days}")
         if not _NODE_ID_RE.match(node_id):
             raise ValueError(
                 f"invalid node id {node_id!r}: lowercase letters, digits, dot, dash, "
@@ -459,13 +464,22 @@ def node_identity(ca: "CertAuthority | TrustAnchor", cert_pem: bytes,
         raise ValueError(f"node certificate expired at {not_after.isoformat()}")
 
     try:
-        eku = cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+        eku_ext = cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage)
     except x509.ExtensionNotFound:
-        eku = []  # type: ignore[assignment]
-    if OID_NODE_AUTH not in list(eku):
+        eku_ext = None
+    if eku_ext is None or OID_NODE_AUTH not in list(eku_ext.value):
         raise ValueError(
             "certificate does not carry the node extended key usage — it is a transport "
             "cert, not a node identity")
+    if not eku_ext.critical:
+        raise ValueError("node extended key usage must be critical")
+    transport = {ExtendedKeyUsageOID.CLIENT_AUTH, ExtendedKeyUsageOID.SERVER_AUTH,
+                 ExtendedKeyUsageOID.ANY_EXTENDED_KEY_USAGE}
+    if transport & set(eku_ext.value):
+        raise ValueError(
+            "node certificate also carries a transport extended key usage "
+            "(clientAuth/serverAuth/anyExtendedKeyUsage); a node cert must never double "
+            "as a transport cert")
     try:
         raw = cert.extensions.get_extension_for_oid(OID_NODE_INFO).value.public_bytes()
     except x509.ExtensionNotFound as exc:
@@ -492,7 +506,8 @@ def node_identity(ca: "CertAuthority | TrustAnchor", cert_pem: bytes,
         if not _is_wg_key(wg):
             raise ValueError("node-info extension carries no valid WireGuard public key")
     return NodeIdentity(
-        node_id=node_id, wg_pubkey=wg, info_version=version, not_after=not_after, not_before=not_before,
+        node_id=node_id, wg_pubkey=wg, info_version=version,
+        not_after=not_after, not_before=not_before,
         grants=NodeGrants(
             engines=tuple(info.get("engines") or ()),
             tiers=tuple(info.get("tiers") or ()),

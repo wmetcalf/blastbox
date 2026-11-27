@@ -389,3 +389,16 @@ def test_a_trust_anchor_cannot_issue_anything():
     """It must be the public half, not a CertAuthority with a missing attribute."""
     assert not hasattr(pki.TrustAnchor, "issue_node")
     assert not hasattr(pki.TrustAnchor, "key_pem")
+
+
+def test_peer_add_refuses_a_wgless_v2_identity_with_the_right_error(
+        ca, tmp_path, monkeypatch, capsys):
+    """A v2 cert with no overlay tier must say it has no WireGuard key, not that the
+    tier is missing: the key check runs first."""
+    cert = tmp_path / "v2.crt"
+    cert.write_bytes(ca.issue_node("pullnode", grants=NodeGrants()).cert_pem)
+    got: list = []
+    rc = _peer_add(monkeypatch, tmp_path, ["--cert", str(cert)], registered=got)
+    assert rc == 1 and got == []
+    err = capsys.readouterr().err
+    assert "no WireGuard public key" in err and "overlay tier" not in err
