@@ -490,6 +490,52 @@ class ClaimRequest(BaseModel):
                     "sending it gets a reason rather than silence.")
 
 
+_Str = Annotated[str, StringConstraints(max_length=128)]
+_Ts = Annotated[str, StringConstraints(max_length=64)]
+
+
+class HeartbeatEngine(BaseModel):
+    model_config = {"extra": "ignore"}
+    name: _Str = ""
+    sandbox: _Str = ""
+    floor: int = Field(0, ge=0, le=1_000_000)
+    slots: int = Field(0, ge=0, le=1_000_000)
+    busy: int = Field(0, ge=0, le=1_000_000)
+    selftest_ok: bool = False
+    selftest_at: _Ts = ""
+
+
+class HeartbeatInFlight(BaseModel):
+    model_config = {"extra": "ignore"}
+    job_id: _Str = ""
+    claim_id: _Str = ""
+    started_at: _Ts = ""
+    deadline_at: _Ts = ""
+
+
+class HeartbeatBody(BaseModel):
+    """What a node SAYS about itself. A claim, never consulted for authorisation: unknown
+    fields are ignored so a newer agent stays compatible, but everything is bounded."""
+
+    model_config = {"extra": "ignore"}
+    agent_version: _Str = ""
+    binary_sha256: _Str = ""
+    goos: _Str = ""
+    goarch: _Str = ""
+    started_at: _Ts = ""
+    engines: list[HeartbeatEngine] = Field(default_factory=list, max_length=64)
+    in_flight: list[HeartbeatInFlight] = Field(default_factory=list, max_length=64)
+    cert_not_after: _Ts = ""
+
+
+def _heartbeat_interval_s() -> int:
+    try:
+        v = int(os.environ.get("BLASTBOX_NODE_HEARTBEAT_S", "30"))
+    except ValueError:
+        v = 30
+    return max(10, min(300, v))
+
+
 class UpdateRequest(BaseModel):
     """A node reporting on a job it holds the claim for.
 
@@ -761,6 +807,18 @@ def register_node_claim_routes(
     # node_auth.resolve_claim_secret for the precedence and why None fails closed.
     _signing_key = node_auth.resolve_claim_secret(job_store, resolved, pepper=pepper)
 
+    from blastbox.host.node_liveness import (
+        build_liveness_store, safe_record_claim, safe_record_heartbeat)
+
+    try:
+        _liveness = build_liveness_store(job_store)
+    except Exception:                   # noqa: BLE001 - liveness is best-effort
+        _log.exception("node_claim: liveness store unavailable; heartbeats are accepted but "
+                       "not recorded")
+        from blastbox.host.node_liveness import InMemoryLivenessStore
+        _liveness = InMemoryLivenessStore()
+    app.state.node_liveness = _liveness     # read by operator tooling / alerting
+
     def _secret() -> bytes:
         return _signing_key
 
@@ -908,6 +966,10 @@ def register_node_claim_routes(
         from blastbox.host.placement import refusal
 
         node_id = _node_from_token(x_blastbox_node_session)
+        # Every AUTHENTICATED attempt counts as the node being alive and polling -- including
+        # one that ends in a 204, which is the common case for an idle node. Not a 401 (above
+        # raised already). Best-effort: a store error is logged, never fails the claim.
+        safe_record_claim(_liveness, node_id, req.engine, time.time())
         if req.claimant_tier:
             # REFUSED, not ignored, and not honoured.
             #
@@ -1062,6 +1124,27 @@ def register_node_claim_routes(
             "receipt": node_auth.claim_receipt(
                 job.job_id, job.claim_id or "", node_id, secret=_secret()),
         }
+
+    @router.post("/heartbeat", response_model=None)
+    def heartbeat(body: HeartbeatBody,
+                  x_blastbox_node_session: str | None = Header(None)) -> dict[str, Any]:
+        """A node reporting that it is alive. Needs a session AND a held grant.
+
+        The body is stored as the node's own claim for an operator to alert on. It is never
+        read back into an authorisation decision: /claim resolves grants from the
+        certificate, so a heartbeat listing engines the node is not granted changes nothing.
+        """
+        node_id = _node_from_token(x_blastbox_node_session)
+        if _grants_now(node_id) is None:
+            _log.warning("node_claim: heartbeat refused node=%s: no verifiable certificate",
+                         node_id)
+            raise HTTPException(status_code=403, detail=_REFUSED)
+        now = time.time()
+        safe_record_heartbeat(_liveness, node_id, body.model_dump(), now)
+        return {"server_time": now,
+                "min_agent_version": os.environ.get("BLASTBOX_NODE_MIN_AGENT_VERSION")
+                or "0.0.0",
+                "heartbeat_s": _heartbeat_interval_s()}
 
     #: fleet_grants is O(certificates) with a full X.509 verify per file, and it ran on EVERY
     #: request -- 77 ms of ingress CPU per poll at 200 certificates, from a request a node can
