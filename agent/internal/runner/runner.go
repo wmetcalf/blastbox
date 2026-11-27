@@ -71,7 +71,7 @@ const (
 )
 
 var (
-	badNameRE  = regexp.MustCompile(`[^A-Za-z0-9._-]`)
+	badNameRE = regexp.MustCompile(`[^A-Za-z0-9._-]`)
 )
 
 // Runner holds the host-level settings shared by every job. The zero value works with

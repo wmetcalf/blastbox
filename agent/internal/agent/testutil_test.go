@@ -106,9 +106,9 @@ type ingress struct {
 	dateOffset  time.Duration
 	hbResp      map[string]any
 	onClaim     func(n int) (code int, body string)
-	jobStatus   map[string]int // job id -> status code override for updates
-	puts        map[string]int // job id -> result PUTs
-	putStatus   map[string]int // job id -> result PUT status (default 200 done)
+	jobStatus   map[string]int             // job id -> status code override for updates
+	puts        map[string]int             // job id -> result PUTs
+	putStatus   map[string]int             // job id -> result PUT status (default 200 done)
 	onUpdate    func(id string, n int) int // optional: status for the n-th update of id (may block)
 	updCount    map[string]int
 }
