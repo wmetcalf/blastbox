@@ -58,11 +58,15 @@ tmp=$prefix/.current.tmp.$$
 ptmp=$prefix/.previous.tmp.$$
 stage=""
 locked=0
-flipping=0   # 1 from recording .previous until current has been flipped
+flipping=0   # 1 from recording .previous until current has been flipped to $flip_to
+flip_to=""
 on_exit() {
-  # A die or a signal between record_previous and a completed flip puts the old
-  # .previous back, so current and .previous never disagree.
-  if [ "$flipping" = 1 ]; then (restore_previous) 2>/dev/null || :; fi
+  # A die or a signal between record_previous and the flip puts the old .previous
+  # back, so current and .previous never disagree. If current already points at
+  # $flip_to (a signal right after the rename), the new .previous is the right one.
+  if [ "$flipping" = 1 ] && [ "$(current_target 2>/dev/null || :)" != "$flip_to" ]; then
+    (restore_previous) 2>/dev/null || :
+  fi
   rm -f "$tmp" "$ptmp"
   if [ -n "$stage" ]; then rm -rf "$stage"; fi
   if [ "$locked" = 1 ]; then rmdir "$prefix/.lock" 2>/dev/null || :; fi
@@ -185,7 +189,7 @@ if [ "$rollback" = 1 ]; then
   valid_version "$prev" || die "corrupt $prefix/.previous"
   [ -x "$prefix/$prev/blastbox-agent" ] || die "previous version $prev is not installed"
   cur=$(current_target || true)
-  flipping=1
+  flip_to=$prev; flipping=1
   if [ -n "$cur" ]; then record_previous "$cur" "$prev"; fi
   flip_current "$prev" || die "could not repoint $prefix/current"
   flipping=0
@@ -269,7 +273,7 @@ mv -f "$dest/blastbox-agent.new" "$dest/blastbox-agent"
 
 # 5. flip current atomically; remember what it pointed at
 cur=$(current_target || true)
-flipping=1
+flip_to=$version; flipping=1
 if [ -n "$cur" ]; then record_previous "$cur" "$version"; fi
 flip_current "$version" || die "could not repoint $prefix/current"
 flipping=0

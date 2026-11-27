@@ -403,6 +403,28 @@ def test_signal_between_record_and_flip_restores_previous(tmp_path):
     assert not (pfx / ".lock").exists() and not list(pfx.glob(".*.tmp.*"))
 
 
+def test_signal_after_flip_keeps_matching_previous(tmp_path):
+    # a signal after current has moved must not put back the old .previous
+    if os.path.realpath(shutil.which("sh") or "/bin/sh").endswith("busybox"):
+        pytest.skip("busybox sh runs its own applets, bypassing PATH shims")
+    pfx = _two_versions(tmp_path)  # current -> 2.0.0, .previous = 1.0.0
+    rel, sha = make_release(tmp_path, b"bin 3")
+    shim = tmp_path / "sigshim2"
+    shim.mkdir()
+    w = shim / "mv"
+    w.write_text(
+        "#!/bin/sh\nfor last; do :; done\n"
+        f'{shutil.which("mv")} "$@" || exit 1\n'
+        'case "$last" in */current) kill -TERM "$PPID" ;; esac\n'
+    )
+    w.chmod(0o755)
+    p = run(["--version", "3.0.0", "--sha256", sha, "--from", str(rel), "--prefix", str(pfx),
+             "--no-cosign"], path=f"{shim}:{os.environ['PATH']}")
+    assert p.returncode == 143
+    assert os.readlink(pfx / "current") == "3.0.0"
+    assert (pfx / ".previous").read_text().strip() == "2.0.0"
+
+
 def test_dirs_readable_under_restrictive_umask(tmp_path):
     rel, sha = make_release(tmp_path)
     pfx = tmp_path / "pfx"
