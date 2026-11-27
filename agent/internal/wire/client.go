@@ -35,6 +35,9 @@ var (
 	ErrRedirect     = errors.New("wire: redirect refused")
 	ErrRejected     = errors.New("wire: request rejected (4xx)")
 	ErrNotFound     = errors.New("wire: not found")
+	// ErrTLS is a certificate or verification failure (wrong CA, SAN mismatch): permanent until
+	// an operator intervenes, so callers back off long.
+	ErrTLS = errors.New("wire: TLS verification failed")
 )
 
 // DispositionAbsent is what Disposition returns when the control plane has no such job.
@@ -50,6 +53,9 @@ const (
 	streamTimeout = 30 * time.Minute
 	maxJSONBody   = 4 << 20
 	maxErrorChars = 8192
+	maxDetail     = 256
+	claimScope    = "claim-next"
+	resultHdrWait = 300 * time.Second
 )
 
 var jobIDRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
@@ -151,8 +157,9 @@ type Client struct {
 	cert   string // PEM, sent in the session request
 	key    *ecdsa.PrivateKey
 
-	now  func() time.Time
-	skew atomic.Int64 // server clock minus local clock, ns
+	now    func() time.Time
+	skew   atomic.Int64 // server clock minus local clock, ns
+	hbSkew atomic.Bool  // skew came from a heartbeat server_time; Date (1 s resolution) no longer overrides it
 
 	mu         sync.Mutex
 	token      string
@@ -163,11 +170,18 @@ type Client struct {
 type originOnly struct {
 	origin string
 	next   http.RoundTripper
+	long   http.RoundTripper // PUT result: the server extracts the tar before replying
 }
 
 func (o originOnly) RoundTrip(r *http.Request) (*http.Response, error) {
 	if r.URL.Scheme+"://"+r.URL.Host != o.origin {
+		if r.Body != nil {
+			r.Body.Close()
+		}
 		return nil, fmt.Errorf("wire: %s is not the ingress origin", r.URL.Redacted())
+	}
+	if r.Method == http.MethodPut && o.long != nil {
+		return o.long.RoundTrip(r)
 	}
 	return o.next.RoundTrip(r)
 }
@@ -217,11 +231,13 @@ func New(cfg *config.Config, ua string) (*Client, error) {
 		MaxIdleConnsPerHost:   2,
 		ForceAttemptHTTP2:     true,
 	}
+	long := tr.Clone()
+	long.ResponseHeaderTimeout = resultHdrWait
 	c := &Client{
 		base: base, origin: origin, ua: ua, nodeID: cert.Subject.CommonName,
 		cert: string(certPEM), key: key, now: time.Now,
 		hc: &http.Client{
-			Transport: originOnly{origin: origin, next: tr},
+			Transport: originOnly{origin: origin, next: tr, long: long},
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return ErrRedirect
 			},
@@ -245,6 +261,9 @@ func (c *Client) toServer(t time.Time) time.Time {
 }
 
 func (c *Client) noteDate(h http.Header) {
+	if c.hbSkew.Load() {
+		return
+	}
 	if d := h.Get("Date"); d != "" {
 		if t, err := http.ParseTime(d); err == nil {
 			c.skew.Store(int64(t.Sub(c.now())))
@@ -324,6 +343,13 @@ func (c *Client) send(ctx context.Context, s reqSpec, token string) (*resp, erro
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+		var cve *tls.CertificateVerificationError
+		var ua x509.UnknownAuthorityError
+		var he x509.HostnameError
+		var ci x509.CertificateInvalidError
+		if errors.As(err, &cve) || errors.As(err, &ua) || errors.As(err, &he) || errors.As(err, &ci) {
+			return nil, fmt.Errorf("%w: %v", ErrTLS, scrub(err))
+		}
 		return nil, fmt.Errorf("%w: %v", ErrServer, scrub(err))
 	}
 	c.noteDate(r.Header)
@@ -394,7 +420,7 @@ func detail(r *resp) string {
 	}
 	if json.Unmarshal(raw, &d) == nil {
 		if s, ok := d.Detail.(string); ok {
-			return s
+			return truncate(s, maxDetail)
 		}
 	}
 	return ""
@@ -410,7 +436,7 @@ func statusErr(r *resp, claimed bool) error {
 		return ErrRefused
 	case code == http.StatusNotFound:
 		return ErrNotFound
-	case code >= 500:
+	case code >= 500, code == http.StatusRequestTimeout, code == http.StatusTooManyRequests:
 		return fmt.Errorf("%w: HTTP %d", ErrServer, code)
 	default:
 		return fmt.Errorf("%w: HTTP %d: %s", ErrRejected, code, detail(r))
@@ -465,6 +491,10 @@ func (c *Client) handshake(ctx context.Context, stale string) (string, error) {
 	}
 	if ch.Challenge == "" {
 		return "", fmt.Errorf("%w: incomplete challenge", ErrServer)
+	}
+	if ch.Scope != claimScope {
+		// Never sign another scope: a compromised ingress could harvest signatures.
+		return "", fmt.Errorf("%w: challenge scope is not %q; refusing to sign", ErrRefused, claimScope)
 	}
 	sig, err := Sign(c.key, SigningPayload(ch.Challenge, ch.Scope, c.nodeID))
 	if err != nil {
@@ -571,6 +601,9 @@ func (c *Client) Claim(ctx context.Context, engine string, exclude []string) (*C
 	if err := json.Unmarshal(out.Job, &j); err != nil || !jobIDRE.MatchString(j.JobID) ||
 		j.ClaimID == "" || out.Receipt == "" {
 		return nil, fmt.Errorf("%w: incomplete claim", ErrServer)
+	}
+	if out.NodeID != c.nodeID {
+		return nil, fmt.Errorf("%w: claim names a different node", ErrRefused)
 	}
 	return &Claim{Job: out.Job, JobID: j.JobID, ClaimID: j.ClaimID, Receipt: out.Receipt,
 		NodeID: out.NodeID, Run: out.Run}, nil
@@ -782,6 +815,7 @@ func (c *Client) Heartbeat(ctx context.Context, hb Heartbeat) (HeartbeatResp, er
 	if out.ServerTime > 0 {
 		mid := sent.Add(c.now().Sub(sent) / 2)
 		c.skew.Store(int64(time.Duration(out.ServerTime*1e9) - time.Duration(mid.UnixNano())))
+		c.hbSkew.Store(true)
 	}
 	return out, nil
 }

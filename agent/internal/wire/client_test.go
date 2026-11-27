@@ -83,6 +83,7 @@ type fake struct {
 	token            string
 	expires          float64
 	handler          func(w http.ResponseWriter, r *http.Request) bool
+	host             string
 }
 
 func newClient(t *testing.T, f *fake, ca *testCA) *Client {
@@ -90,8 +91,12 @@ func newClient(t *testing.T, f *fake, ca *testCA) *Client {
 	dir := t.TempDir()
 	caFile := filepath.Join(dir, "ca.pem")
 	os.WriteFile(caFile, ca.pem, 0o600)
+	ingress := f.srv.URL
+	if f.host != "" {
+		ingress = strings.Replace(ingress, "127.0.0.1", f.host, 1)
+	}
 	cfg := &config.Config{
-		Ingress: f.srv.URL, CAFile: caFile,
+		Ingress: ingress, CAFile: caFile,
 		CertFile: conformance.Path("node_certs", "v2_without_wg.crt"),
 		KeyFile:  conformance.Path("node_certs", "v2_without_wg.key"),
 	}
@@ -189,6 +194,11 @@ func TestHandshakeConformanceVectors(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, cs := range sf.Cases {
+		if cs.Scope != claimScope {
+			// The client pins the scope (TestHandshakeRefusesOtherScopes); other scopes' byte
+			// layout is covered by TestSigningPayloadVectors.
+			continue
+		}
 		f, c := setup(t)
 		f.challenge, f.scope = cs.Challenge, cs.Scope
 		c.nodeID = cs.NodeID
@@ -240,7 +250,7 @@ func TestWrongCARefused(t *testing.T) {
 	f := newFake(t, other) // server cert from a CA the client does not trust
 	c := newClient(t, f, ca)
 	err := c.Session(context.Background())
-	if err == nil || !errors.Is(err, ErrServer) {
+	if !errors.Is(err, ErrTLS) {
 		t.Fatalf("want TLS failure, got %v", err)
 	}
 	if len(f.urls) != 0 {
@@ -287,7 +297,7 @@ func Test401OneRehandshake(t *testing.T) {
 	if _, err := c.Claim(context.Background(), "e", nil); err != nil {
 		t.Fatal(err)
 	}
-	if f.sessions != 2 || claims != 2 {
+	if f.sessions != 2 || claims != 2 || c.handshakes != 2 {
 		t.Fatalf("sessions=%d claims=%d", f.sessions, claims)
 	}
 }
@@ -523,6 +533,11 @@ func TestPutResult(t *testing.T) {
 		if d := time.UnixMilli(fin).Sub(time.Now()); d > 2*time.Second {
 			t.Errorf("finished-at not clamped to server time: +%v", d)
 		}
+		st, _ := strconv.ParseInt(hdr.Get("x-blastbox-started-at-ms"), 10, 64)
+		// started = (node now - 1 min) shifted onto the server clock = real now - 1 min
+		if d := time.Since(time.UnixMilli(st)); d < 58*time.Second || d > 63*time.Second {
+			t.Errorf("started-at-ms not translated to server time: %v ago", d)
+		}
 	}
 }
 
@@ -559,8 +574,9 @@ func TestFailAndReleaseBodies(t *testing.T) {
 	}
 	// First request learned the skew from Date (the Fail itself may be the first POST after the
 	// handshake, so the session responses already set it).
-	if fin := m.Fields["finished_at"].(float64); fin > float64(time.Now().Unix())+2 {
-		t.Fatalf("finished_at in the server's future: %v", fin)
+	nowf := float64(time.Now().UnixNano()) / 1e9
+	if fin := m.Fields["finished_at"].(float64); fin > nowf+2 || fin < nowf-5 {
+		t.Fatalf("finished_at %v not within [now-5, now+2] of %v", fin, nowf)
 	}
 	if err := c.Release(ctx, cl); err != nil {
 		t.Fatal(err)
@@ -678,5 +694,120 @@ func TestKeyMismatchAndLoadKey(t *testing.T) {
 	os.WriteFile(p, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0o600)
 	if _, err := LoadKey(p); err == nil {
 		t.Fatal("P-384 accepted")
+	}
+}
+
+func TestHandshakeRefusesOtherScopes(t *testing.T) {
+	f, c := setup(t)
+	f.scope = "job-7f3a"
+	if err := c.Session(context.Background()); !errors.Is(err, ErrRefused) {
+		t.Fatalf("got %v", err)
+	}
+	if f.sessions != 0 || len(f.bodies["POST /v1/nodes/session"]) != 0 {
+		t.Fatal("signed a challenge with a foreign scope")
+	}
+}
+
+func TestTLSErrorClass(t *testing.T) {
+	ca, other := newCA(t, "real"), newCA(t, "other")
+	f := newFake(t, other)
+	if err := newClient(t, f, ca).Session(context.Background()); !errors.Is(err, ErrTLS) || errors.Is(err, ErrServer) {
+		t.Fatalf("wrong CA: %v", err)
+	}
+	// Cert has only the 127.0.0.1 IP SAN; dial "localhost".
+	f2 := newFake(t, ca)
+	f2.host = "localhost"
+	if err := newClient(t, f2, ca).Session(context.Background()); !errors.Is(err, ErrTLS) {
+		t.Fatalf("SAN mismatch: %v", err)
+	}
+	if len(f2.urls) != 0 {
+		t.Fatal("request reached server")
+	}
+}
+
+func TestClaimNodeIDMismatchRefused(t *testing.T) {
+	f, c := setup(t)
+	f.handler = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path == "/v1/nodes/claim" {
+			w.Write([]byte(`{"job":{"job_id":"j","claim_id":"c"},"node_id":"someone-else","receipt":"r","run":{}}`))
+			return true
+		}
+		return false
+	}
+	if _, err := c.Claim(context.Background(), "", nil); !errors.Is(err, ErrRefused) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestRetryableAndDetailTruncation(t *testing.T) {
+	f, c := setup(t)
+	code := 408
+	f.handler = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path == "/v1/nodes/renew" {
+			w.WriteHeader(code)
+			w.Write([]byte(`{"detail":"` + strings.Repeat("x", 1000) + `"}`))
+			return true
+		}
+		return false
+	}
+	for _, code = range []int{408, 429} {
+		if err := c.Renew(context.Background(), []byte("c")); !errors.Is(err, ErrServer) {
+			t.Fatalf("%d: %v", code, err)
+		}
+	}
+	code = 400
+	err := c.Renew(context.Background(), []byte("c"))
+	if !errors.Is(err, ErrRejected) || len(err.Error()) > 400 {
+		t.Fatalf("%v", err)
+	}
+}
+
+func Test401MidPutResultReopensBody(t *testing.T) {
+	f, c := setup(t)
+	tar := filepath.Join(t.TempDir(), "r.tar")
+	os.WriteFile(tar, []byte("TARBYTES"), 0o600)
+	var puts int
+	var last []byte
+	f.handler = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == "PUT" {
+			puts++
+			if r.Header.Get(hdrSession) == "tok-1-1" {
+				w.WriteHeader(401)
+				return true
+			}
+			last = f.bodies["PUT /v1/nodes/jobs/j1/result"]
+			w.WriteHeader(202)
+			w.Write([]byte(`{"status":"accepted"}`))
+			return true
+		}
+		return false
+	}
+	o, err := c.PutResult(context.Background(), &Claim{JobID: "j1", ClaimID: "c", Receipt: "r"}, tar, ResultMeta{})
+	if err != nil || o.Status != "accepted" || puts != 2 || string(last) != "TARBYTES" || c.handshakes != 2 {
+		t.Fatalf("%+v %v puts=%d body=%q hs=%d", o, err, puts, last, c.handshakes)
+	}
+}
+
+func TestHeartbeatSkewNotOverwrittenByDate(t *testing.T) {
+	f, c := setup(t)
+	f.handler = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path == "/v1/nodes/heartbeat" {
+			w.Write([]byte(`{"server_time":` + strconv.FormatFloat(float64(time.Now().Add(-5*time.Minute).UnixNano())/1e9, 'f', 3, 64) + `,"heartbeat_s":30}`))
+			return true
+		}
+		if r.URL.Path == "/v1/nodes/claim" {
+			w.WriteHeader(204)
+			return true
+		}
+		return false
+	}
+	ctx := context.Background()
+	if _, err := c.Heartbeat(ctx, Heartbeat{}); err != nil || !c.hbSkew.Load() {
+		t.Fatal(err, c.hbSkew.Load())
+	}
+	before := c.skew.Load()
+	c.Claim(ctx, "", nil)
+	if c.skew.Load() != before {
+		t.Fatal("Date overwrote the heartbeat skew")
 	}
 }
