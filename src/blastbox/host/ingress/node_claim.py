@@ -682,11 +682,23 @@ def register_node_claim_routes(
             _grants_cache["until"] = now + _GRANTS_CACHE_TTL_S
         return _grants_cache["map"].get(node_id)
 
+    def _refuse_irregular_pki_dir() -> None:
+        """503 before anything reads the PKI dir: a FIFO there would block the grants
+        lookup (it reads every *.crt), and links are refused for renewal anyway."""
+        try:
+            bad = node_renew._non_regular(resolved)
+        except OSError:
+            bad = []
+        if bad:
+            _log.warning("node_claim: %s %s", resolved, node_renew.LINKS_REFUSED)
+            raise HTTPException(status_code=503, detail=_LINKS_REFUSED)
+
     @router.post("/renew", status_code=202)
     def renew(req: RenewRequest,
               x_blastbox_node_session: str | None = Header(None)) -> dict[str, Any]:
         """Queue a fresh CSR for the CA host's timer to sign. No CA key lives here."""
         node_id = _node_from_token(x_blastbox_node_session)
+        _refuse_irregular_pki_dir()
         if _grants_now(node_id) is None:
             raise HTTPException(status_code=403, detail=_REFUSED)
         try:
@@ -710,6 +722,7 @@ def register_node_claim_routes(
     def current_node_cert(x_blastbox_node_session: str | None = Header(None)) -> dict[str, Any]:
         """The session node's own current certificate, never another node's."""
         node_id = _node_from_token(x_blastbox_node_session)
+        _refuse_irregular_pki_dir()
         if _grants_now(node_id) is None:
             raise HTTPException(status_code=403, detail=_REFUSED)
         try:

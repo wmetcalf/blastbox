@@ -195,3 +195,20 @@ def test_renew_and_cert_refuse_a_pki_dir_with_links(tmp_path, monkeypatch):
     csr, _ = make_csr("n1")
     r = c.post("/v1/nodes/renew", json=_body(d, "n1", keys["n1"], csr), headers=h)
     assert r.status_code == 503 and "regular files" in r.json()["detail"]
+
+
+def test_a_fifo_in_the_pki_dir_is_a_503_not_a_hang(tmp_path, monkeypatch):
+    import os
+    import signal
+    c, d, _, keys = _setup(tmp_path, monkeypatch)
+    h = _session(c, d, "n1", keys["n1"])
+    os.mkfifo(d / "odd.crt")
+    signal.signal(signal.SIGALRM, lambda *a: (_ for _ in ()).throw(TimeoutError()))
+    signal.alarm(10)
+    try:
+        assert c.get("/v1/nodes/cert", headers=h).status_code == 503
+        csr, _ = make_csr("n1")
+        assert c.post("/v1/nodes/renew", json=_body(d, "n1", keys["n1"], csr),
+                      headers=h).status_code == 503
+    finally:
+        signal.alarm(0)
