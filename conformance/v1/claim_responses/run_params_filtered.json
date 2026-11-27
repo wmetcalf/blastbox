@@ -15,8 +15,10 @@
       "net_policy": null,
       "params": {
         "BLASTBOX_SECRET": "x",
-        "depth": 3,
-        "scan": "fast"
+        "DEPTH": 3,
+        "LD_PRELOAD": "/x.so",
+        "SCAN": "fast",
+        "lower": "x"
       },
       "result_summary": null,
       "security_warnings": [],
@@ -44,12 +46,12 @@
       },
       "network": "none",
       "params": {
-        "depth": 3,
-        "scan": "fast"
+        "DEPTH": "3",
+        "SCAN": "fast"
       }
     }
   },
   "decision": "run",
-  "description": "BLASTBOX_* params are stripped from run.params; job.params keeps them",
+  "description": "run.params passes the engine param gate (UPPERCASE shape, no BLASTBOX_*/LD_*/PATH/PYTHON*, engine allowlist + defaults); job.params keeps the raw values",
   "status": 200
 }

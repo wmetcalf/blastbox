@@ -627,6 +627,25 @@ def register_node_claim_routes(
         except (OSError, ValueError):
             return None
 
+    def _run_params(job) -> "dict[str, str]":
+        """job.params through the SAME gate the cold path applies before worker env (shape,
+        reserved floor incl. BLASTBOX_*/LD_*/PATH/PYTHON*, the engine's reserved keys, its
+        allowlist and its operator defaults), read from the same per-engine env the
+        dispatcher's EngineSpec is built from."""
+        from blastbox.host.cli import _parse_default_params
+        from blastbox.host.dispatch import Dispatcher
+
+        eng = job.engine.upper().replace("-", "_")
+        keys_raw = os.environ.get(f"BLASTBOX_ENGINE_{eng}_PARAM_KEYS")
+        allowed = (None if keys_raw is None else
+                   frozenset(k.strip().upper() for k in keys_raw.split(",") if k.strip()))
+        reserved = frozenset(
+            k.strip().upper()
+            for k in (os.environ.get(f"BLASTBOX_ENGINE_{eng}_RESERVED_KEYS") or "").split(",")
+            if k.strip())
+        defaults = _parse_default_params(os.environ.get(f"BLASTBOX_ENGINE_{eng}_DEFAULT_PARAMS"))
+        return Dispatcher._sanitize_params(job.params or {}, allowed, reserved, defaults)
+
     def _run_block(job) -> "dict[str, Any]":
         """The server-authored run description a credential-less agent reads and nothing else."""
         from blastbox.limits import Limits
@@ -639,7 +658,8 @@ def register_node_claim_routes(
         except ValueError:
             deadline = 300
         deadline = max(10, min(3600, deadline))
-        lim = Limits.from_env()
+        # The limits this control plane ENFORCES on the result PUT, not a fresh env read.
+        lim = limits if limits is not None else Limits.from_env()
         tier, _creds, _tell = _job_requirements(job)
         return {
             "deadline_s": deadline,
@@ -651,8 +671,7 @@ def register_node_claim_routes(
                 "max_artifacts": lim.max_artifacts,
             },
             "network": tier or "none",
-            "params": {k: v for k, v in (job.params or {}).items()
-                       if not str(k).upper().startswith("BLASTBOX_")},
+            "params": _run_params(job),
             "input": {"sha256": job.input_sha256, "bytes": _input_bytes(job),
                       "filename": job.filename},
         }

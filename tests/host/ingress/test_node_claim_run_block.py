@@ -13,7 +13,7 @@ from blastbox.host.jobs.memory import InMemoryJobStore
 from .test_node_claim import _claim, pki_dir  # noqa: F401  (fixture)
 
 
-def _setup(tmp_path, pki_dir, *, params=None, spool=b"hello"):  # noqa: F811
+def _setup(tmp_path, pki_dir, *, params=None, spool=b"hello", limits=None):  # noqa: F811
     store = InMemoryJobStore()
     store.create(Job(job_id="job-1", engine="clamav", filename="sample.bin",
                      status=JobStatus.QUEUED, created_at=time.time(),
@@ -25,7 +25,7 @@ def _setup(tmp_path, pki_dir, *, params=None, spool=b"hello"):  # noqa: F811
         (root / "job-1" / "input" / "sample.bin").write_bytes(spool)
     app = FastAPI()
     assert register_node_claim_routes(app, job_store=store, pki_dir=pki_dir,
-                                      job_root=root) is True
+                                      job_root=root, limits=limits) is True
     return store, app, TestClient(app)
 
 
@@ -50,9 +50,35 @@ def test_run_input_bytes_none_when_not_local(tmp_path, pki_dir):  # noqa: F811
 
 
 def test_run_params_strip_blastbox_keys(tmp_path, pki_dir):  # noqa: F811
-    _, _, c = _setup(tmp_path, pki_dir, params={"BLASTBOX_X": "1", "blastbox_y": "2", "ok": "v"})
+    _, _, c = _setup(tmp_path, pki_dir, params={"BLASTBOX_X": "1", "blastbox_y": "2", "OK": "v"})
     run = _claim(c, pki_dir, "alpha", engine="clamav").json()["run"]
-    assert run["params"] == {"ok": "v"}
+    assert run["params"] == {"OK": "v"}
+
+
+def test_run_params_go_through_the_engine_param_gate(tmp_path, pki_dir, monkeypatch):  # noqa: F811
+    """run.params is what the cold path would hand the worker: shape, the reserved floor
+    (LD_*/PATH/PYTHON*), the engine's reserved keys, its allowlist and its defaults."""
+    params = {"LD_PRELOAD": "/x.so", "PATH": "/evil", "lower": "1", "SCAN": "fast",
+              "DEPTH": "3", "SECRET_MODE": "on"}
+    _, _, c = _setup(tmp_path, pki_dir, params=params)
+    assert _claim(c, pki_dir, "alpha", engine="clamav").json()["run"]["params"] == {
+        "SCAN": "fast", "DEPTH": "3", "SECRET_MODE": "on"}
+
+    monkeypatch.setenv("BLASTBOX_ENGINE_CLAMAV_PARAM_KEYS", "scan,secret_mode,LEVEL")
+    monkeypatch.setenv("BLASTBOX_ENGINE_CLAMAV_RESERVED_KEYS", "SECRET_MODE")
+    monkeypatch.setenv("BLASTBOX_ENGINE_CLAMAV_DEFAULT_PARAMS", "LEVEL=2")
+    _, _, c = _setup(tmp_path / "b", pki_dir, params=params)
+    assert _claim(c, pki_dir, "alpha", engine="clamav").json()["run"]["params"] == {
+        "SCAN": "fast", "LEVEL": "2"}
+
+
+def test_run_limits_are_the_enforced_limits(tmp_path, pki_dir):  # noqa: F811
+    from blastbox.limits import Limits
+
+    lim = Limits(max_input_bytes=1000, max_metadata_bytes=100)
+    _, _, c = _setup(tmp_path, pki_dir, limits=lim)
+    got = _claim(c, pki_dir, "alpha", engine="clamav").json()["run"]["limits"]
+    assert got["max_input"] == 1000 and got["max_metadata"] == 100
 
 
 def test_claim_job_has_no_result_dir(tmp_path, pki_dir):  # noqa: F811

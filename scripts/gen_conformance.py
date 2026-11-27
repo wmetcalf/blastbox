@@ -1132,9 +1132,12 @@ def gen_claim_responses() -> dict[str, dict[str, Any]]:
         out["run_basic"] = _claim_vec(claim(rig), "run",
                                       "network none, input spooled on the ingress host")
     with _dp_rig() as rig:
-        rig.submit(params={"scan": "fast", "depth": 3, "BLASTBOX_SECRET": "x"})
+        rig.submit(params={"SCAN": "fast", "DEPTH": 3, "lower": "x", "LD_PRELOAD": "/x.so",
+                           "BLASTBOX_SECRET": "x"})
         out["run_params_filtered"] = _claim_vec(
-            claim(rig), "run", "BLASTBOX_* params are stripped from run.params; job.params keeps them")
+            claim(rig), "run", "run.params passes the engine param gate (UPPERCASE shape, no "
+                               "BLASTBOX_*/LD_*/PATH/PYTHON*, engine allowlist + defaults); "
+                               "job.params keeps the raw values")
     with _dp_rig() as rig:
         rig.submit(spool=None)
         out["run_input_bytes_unknown"] = _claim_vec(
