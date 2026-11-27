@@ -482,6 +482,10 @@ jobs:
         run: python -m pip install -q -e ".[host]"
       - name: Build the agent
         run: cd agent && CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/blastbox-agent" ./cmd/blastbox-agent
+      - name: go vet and go test (darwin-only code paths, real seatbelt)
+        env:
+          BLASTBOX_AGENT_BIN: ${{ runner.temp }}/blastbox-agent
+        run: cd agent && CGO_ENABLED=0 go vet ./... && CGO_ENABLED=0 go test ./...
       - name: End to end
         env:
           AGENT_BIN: ${{ runner.temp }}/blastbox-agent
