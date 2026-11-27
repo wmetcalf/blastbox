@@ -177,3 +177,17 @@ def test_claim_from_a_node_whose_cert_is_gone_records_nothing(rig, pki_dir):
         f.unlink()
     assert _claim(c, pki_dir, "alpha", token=tok).status_code == 403
     assert "alpha" not in _liveness(c).snapshot()
+
+
+def test_a_claim_refused_for_an_ungranted_engine_is_not_serving_evidence(rig, pki_dir):
+    _, c = rig
+    assert _claim(c, pki_dir, "beta", engine="clamav").status_code == 403   # beta: boxjs only
+    assert "beta" not in _liveness(c).snapshot()
+
+
+def test_claims_are_recorded_per_engine(rig, pki_dir):
+    _, c = rig
+    tok = token_for(c, pki_dir, "alpha")
+    _claim(c, pki_dir, "alpha", engine="clamav", token=tok)
+    _claim(c, pki_dir, "alpha", token=tok)                         # unscoped: not throttled away
+    assert set(_liveness(c).snapshot()["alpha"].claims) == {"clamav", ""}

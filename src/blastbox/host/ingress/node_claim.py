@@ -983,14 +983,6 @@ def register_node_claim_routes(
         from blastbox.host.placement import refusal
 
         node_id = _node_from_token(x_blastbox_node_session)
-        # Every AUTHENTICATED attempt by a node that still holds a certificate counts as the
-        # node being alive and polling -- including one that ends in a 204, the common case for
-        # an idle node. Not a 401 (above raised already), and not a node whose certificate is
-        # gone: its session outlives the revocation, and it must not keep looking alive.
-        # Best-effort: a store error is logged, never fails the claim.
-        _t = time.time()
-        if _grants_now(node_id) is not None and _claim_throttle.allow(node_id, _t):
-            safe_record_claim(_liveness, node_id, req.engine, _t)
         if req.claimant_tier:
             # REFUSED, not ignored, and not honoured.
             #
@@ -1029,6 +1021,15 @@ def register_node_claim_routes(
             _log.warning("node_claim: refused node=%s engines=%s not granted",
                          node_id, wanted)
             raise HTTPException(status_code=403, detail=_REFUSED)
+
+        # Every attempt that gets this far counts as the node polling for THIS engine (or, with
+        # no engine, for every grant) -- including one that ends in a 204, the common case for
+        # an idle node. Not one refused above: a revoked node's session outlives its
+        # certificate, and a poll for an engine it is not granted is not evidence it serves
+        # anything. Throttled per (node, engine). Best-effort: a store error never fails it.
+        _t = time.time()
+        if _claim_throttle.allow(f"{node_id}\0{req.engine or ''}", _t):
+            safe_record_claim(_liveness, node_id, req.engine, _t)
 
         # KEEP LOOKING PAST A JOB THIS NODE MAY NOT RUN. `claim_next` always returns the
         # OLDEST eligible job, and a refused job goes back to QUEUED -- so returning after one
