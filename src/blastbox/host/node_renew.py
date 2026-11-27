@@ -30,7 +30,6 @@ import errno
 import fcntl
 import os
 import re
-import shutil
 import stat
 import tempfile
 import time
@@ -632,15 +631,22 @@ def _verified_entry(ca: CertAuthority, node_id: str, raw: bytes) -> tuple[bytes,
 
 def _discard(name: str, dfd: int) -> None:
     """Remove a refused queue entry (in the pinned queue ``dfd``), whatever it is; never
-    raise (a planted directory must not crash the run and starve every other queue)."""
+    raise (a planted directory must not crash the run and starve every other queue).
+
+    A directory's contents are the ingress's and are never traversed (a deep enough tree
+    makes a recursive delete raise RecursionError): an empty one is removed, any other is
+    renamed to a hidden name the queue never reads, for the ingress to clean up."""
     try:
         st = _lstat_at(name, dfd)
         if st is None:
             return
-        if stat.S_ISDIR(st.st_mode):
-            shutil.rmtree(name, dir_fd=dfd, ignore_errors=True)
-        else:
+        if not stat.S_ISDIR(st.st_mode):
             os.unlink(name, dir_fd=dfd)
+            return
+        try:
+            os.rmdir(name, dir_fd=dfd)
+        except OSError:
+            os.rename(name, f".refused-{os.urandom(8).hex()}", src_dir_fd=dfd, dst_dir_fd=dfd)
     except OSError:
         pass
 

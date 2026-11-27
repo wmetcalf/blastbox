@@ -954,6 +954,23 @@ def test_a_directory_in_the_queue_is_refused_not_fatal(tmp_path):
     assert out["evil"].startswith("refused") and out["evil2"].startswith("refused")
 
 
+def test_a_deeply_nested_directory_in_the_queue_does_not_abort_the_run(tmp_path):
+    """Cleanup must not traverse what the ingress planted: a recursive rmtree raises
+    RecursionError on a deep enough tree, despite ignore_errors."""
+    ca, ca_dir, i1, _i2 = _split(tmp_path)
+    (i1 / "renew").mkdir(exist_ok=True)
+    deep = i1 / "renew" / "aaa.csr.signing"
+    cur = deep
+    for _ in range(1100):
+        cur.mkdir()
+        cur = cur / "d"
+    queue_csr(i1, "n1", make_csr("n1")[0])
+    out = dict(sign_pending(ca, ca_dir, node_dirs=[i1]))
+    assert out["aaa"].startswith("refused") and out["n1"] == "renewed"
+    assert pending(i1) == []                        # out of the queue, so not seen again
+    assert dict(sign_pending(ca, ca_dir, node_dirs=[i1])) == {}
+
+
 def test_revoke_never_holds_one_lock_while_waiting_for_another(tmp_path, monkeypatch):
     ca, ca_dir, i1, i2 = _split(tmp_path)
     monkeypatch.setattr(node_renew, "REVOKE_LOCK_WAIT_S", 0.1)
