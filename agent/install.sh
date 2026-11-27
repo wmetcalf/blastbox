@@ -60,7 +60,8 @@ esac
 tmp=$prefix/.current.tmp.$$
 ptmp=$prefix/.previous.tmp.$$
 stage=""
-trap 'rm -f "$tmp" "$ptmp"; if [ -n "$stage" ]; then rm -rf "$stage"; fi' EXIT
+locked=0
+trap 'rm -f "$tmp" "$ptmp"; if [ -n "$stage" ]; then rm -rf "$stage"; fi; if [ "$locked" = 1 ]; then rmdir "$prefix/.lock" 2>/dev/null || :; fi' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -98,6 +99,16 @@ flip_current() {
         rm -f "$tmp"
       fi ;;
   esac
+}
+
+# One installer at a time per prefix: reading current, recording .previous and flipping
+# current are one transaction. mkdir is atomic; a lock left by a killed run must be
+# removed by hand.
+acquire_lock() {
+  mkdir -p "$prefix"
+  mkdir "$prefix/.lock" 2>/dev/null \
+    || die "another install.sh holds $prefix/.lock (remove it if none is running)"
+  locked=1
 }
 
 current_target() {
@@ -158,6 +169,7 @@ restore_previous() {
 
 if [ "$rollback" = 1 ]; then
   [ -f "$prefix/.previous" ] || die "no previous version recorded in $prefix/.previous"
+  acquire_lock
   prev=$(cat "$prefix/.previous")
   valid_version "$prev" || die "corrupt $prefix/.previous"
   [ -x "$prefix/$prev/blastbox-agent" ] || die "previous version $prev is not installed"
@@ -194,10 +206,10 @@ bin="blastbox-agent-$goos-$goarch"
 tag="agent-v$version"
 base="https://github.com/$REPO/releases/download/$tag"
 
+acquire_lock
 if [ -e "$prefix/current" ] && [ ! -L "$prefix/current" ]; then
   die "$prefix/current exists and is not a symlink; move it aside"
 fi
-mkdir -p "$prefix"
 stage=$(mktemp -d "$prefix/.stage.XXXXXX")
 
 fetch() {

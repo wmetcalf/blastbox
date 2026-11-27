@@ -338,6 +338,22 @@ def test_reinstall_same_version_via_absolute_link_keeps_previous(tmp_path):
     assert (pfx / ".previous").read_text().strip() == "1.0.0"
 
 
+def test_concurrent_install_refused_while_locked(tmp_path):
+    pfx = _two_versions(tmp_path)
+    assert not (pfx / ".lock").exists()  # released after each run
+    (pfx / ".lock").mkdir()  # another installer is mid-flight
+    rel, sha = make_release(tmp_path, b"bin 3.0.0")
+    p = install(rel, sha, pfx, "3.0.0", "--no-cosign")
+    assert p.returncode != 0 and ".lock" in p.stderr
+    assert os.readlink(pfx / "current") == "2.0.0" and not (pfx / "3.0.0").exists()
+    p = run(["--rollback", "--prefix", str(pfx)])
+    assert p.returncode != 0 and ".lock" in p.stderr
+    assert (pfx / ".lock").is_dir()  # someone else's lock is left alone
+    (pfx / ".lock").rmdir()
+    assert run(["--rollback", "--prefix", str(pfx)]).returncode == 0
+    assert not (pfx / ".lock").exists()
+
+
 def test_dirs_readable_under_restrictive_umask(tmp_path):
     rel, sha = make_release(tmp_path)
     pfx = tmp_path / "pfx"

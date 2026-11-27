@@ -59,7 +59,8 @@ The installer checks the pinned sha256 first, then runs
 and issuer `https://token.actions.githubusercontent.com`, then installs to
 `<prefix>/X.Y.Z/blastbox-agent` and flips `<prefix>/current`.
 Use cosign v3.x to verify; the bundle is written by cosign v3.
-`--rollback` flips back to the version in `<prefix>/.previous`. `--no-cosign`
+`--rollback` flips back to the version in `<prefix>/.previous`. One run at a time
+holds `<prefix>/.lock`; remove it by hand only if a killed run left it behind. `--no-cosign`
 (only with `--sha256`) skips the signature check and is weaker; use it only
 where cosign cannot be installed.
 
