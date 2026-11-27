@@ -36,7 +36,19 @@ const (
 	bsdStartUsecOff    = 128 // pbi_start_tvusec
 )
 
-func cstr(s string) []byte { return append([]byte(s), 0) }
+// heapBytes returns zeroed memory that is guaranteed to live on the heap. Every buffer handed
+// to libSystem must: its address travels as a uintptr, which a goroutine stack copy (a
+// morestack at the call into syscall6) would not update, leaving libSystem a stale pointer. Not
+// inlined, so the returned slice always escapes.
+//
+//go:noinline
+func heapBytes(n int) []byte { return make([]byte, n) }
+
+func cstr(s string) []byte {
+	b := heapBytes(len(s) + 1)
+	copy(b, s)
+	return b
+}
 
 // sandboxCheck returns sandbox_check's result: 0 allowed, 1 denied, -1 error. op "" passes NULL
 // (with typ 0: "is pid sandboxed at all").
@@ -84,6 +96,7 @@ func procListUIDPids(uid int) ([]int, error) {
 		size := len(buf) * 4
 		got, _, _ := syscall_syscall6(libc_proc_listpids_trampoline_addr, procUIDOnly, uintptr(uid),
 			uintptr(unsafe.Pointer(&buf[0])), uintptr(size), 0, 0)
+		runtime.KeepAlive(buf)
 		g := int(int32(got))
 		if g <= 0 {
 			return nil, errorf("proc_listpids returned %d", g)
@@ -105,9 +118,10 @@ func procListUIDPids(uid int) ([]int, error) {
 // procStart returns pid's start time in microseconds since the epoch (its identity: a pid alone
 // may by now name another process), or false.
 func procStart(pid int) (int64, bool) {
-	var buf [procBSDInfoSize]byte
+	buf := heapBytes(procBSDInfoSize)
 	r, _, _ := syscall_syscall6(libc_proc_pidinfo_trampoline_addr, uintptr(pid), procPidTBSDInfo, 0,
 		uintptr(unsafe.Pointer(&buf[0])), procBSDInfoSize, 0)
+	runtime.KeepAlive(buf)
 	if int32(r) != procBSDInfoSize {
 		return 0, false
 	}
