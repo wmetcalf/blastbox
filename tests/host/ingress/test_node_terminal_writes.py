@@ -69,11 +69,62 @@ def test_finalizer_only_allows_release(tmp_path, pki_dir, monkeypatch):  # noqa:
     assert store.get("job-1").status == JobStatus.QUEUED
 
 
-def test_finalizer_only_allows_a_write_without_status(tmp_path, pki_dir, monkeypatch):  # noqa: F811
+@pytest.mark.parametrize("fields", [
+    {"security_warnings": []},
+    {"input_sha256": "ab" * 32},
+    {"status": "failed", "input_sha256": "ab" * 32},
+    {"status": "failed", "worker_tier": "firecracker"},
+    {"status": "failed", "worker_runtime": "nsjail"},
+    {"status": "failed", "started_at": 1.0},
+    {"status": "failed", "security_warnings": []},
+])
+def test_finalizer_only_accepts_only_the_agents_two_write_shapes(tmp_path, pki_dir, monkeypatch,  # noqa: F811
+                                                                 fields):
+    """Release {status: queued, claim_id: null} and fail {status: failed, error, finished_at,
+    expires_at} (spec 6.5), nothing else: input_sha256 is what the finalizer gates on and
+    signs, and the rest describe a run the node does not get to narrate onto the row."""
     monkeypatch.setenv(ENV, "finalizer-only")
     store, c, hdr = _setup(tmp_path, pki_dir)
-    assert _post(c, hdr, {"security_warnings": []}).status_code == 200
-    assert store.get("job-1").status == JobStatus.RUNNING
+    before = store.get("job-1")
+    assert _post(c, hdr, fields, expect="running").status_code == 403
+    assert store.get("job-1") == before
+
+
+def test_finalizer_only_fail_shape_with_all_its_fields(tmp_path, pki_dir, monkeypatch):  # noqa: F811
+    import time as _t
+
+    monkeypatch.setenv(ENV, "finalizer-only")
+    store, c, hdr = _setup(tmp_path, pki_dir)
+    now = _t.time()
+    r = _post(c, hdr, {"status": "failed", "error": "killed at deadline", "finished_at": now,
+                       "expires_at": now + 3600}, expect="running")
+    assert r.status_code == 200, r.text
+    assert store.get("job-1").status == JobStatus.FAILED
+
+
+@pytest.mark.parametrize("expect", [None, "done"])
+def test_finalizer_only_the_cas_is_always_on_running(tmp_path, pki_dir, monkeypatch, expect):  # noqa: F811
+    """The RUNNING check reads a snapshot; the finalizer can make the job DONE before the
+    write lands. The write's CAS must therefore expect RUNNING, never the caller's choice."""
+    monkeypatch.setenv(ENV, "finalizer-only")
+    store, c, hdr = _setup(tmp_path, pki_dir)
+    claim = hdr["x-blastbox-claim-id"]
+    orig_get = store.get
+    armed = {"on": True}
+
+    def racing_get(job_id):
+        j = orig_get(job_id)
+        if armed["on"] and j is not None and j.status == JobStatus.RUNNING:
+            armed["on"] = False      # the finalizer seals right after the node's snapshot
+            store.update_if_status(job_id, JobStatus.RUNNING, expect_claim_id=claim,
+                                   status=JobStatus.DONE)
+        return j
+
+    monkeypatch.setattr(store, "get", racing_get)
+    r = _post(c, hdr, {"status": "queued", "claim_id": None}, expect=expect)
+    assert not armed["on"], "the race was not exercised"
+    assert r.status_code in (403, 409), r.text
+    assert orig_get("job-1").status == JobStatus.DONE
 
 
 def test_an_unknown_mode_fails_closed(tmp_path, pki_dir, monkeypatch):  # noqa: F811

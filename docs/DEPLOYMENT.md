@@ -894,9 +894,11 @@ Three things an operator must know:
   existing deployments) lets a node write `status: done` itself through
   `POST /v1/nodes/jobs/{id}` — right only for Python credential-less dispatcher nodes that run
   the trust gate themselves; for an untrusted pull agent it means DONE with no result, no trust
-  gate and no receipt. `finalizer-only` lets a node write `status` only as `queued` (release)
-  or `failed`, only while its job is RUNNING, and never `result_summary`; anything else is the
-  usual 403 refusal, logged at WARNING, and DONE comes only from `blastbox node-finalizer`. An unrecognised value is treated as `finalizer-only`. While
+  gate and no receipt. `finalizer-only` accepts exactly the agent's two writes, release
+  `{status: queued, claim_id: null}` and fail `{status: failed, error, finished_at,
+  expires_at}`, only while the job is RUNNING (the write's CAS is always on RUNNING); any other
+  field (`input_sha256`, `result_summary`, `worker_tier`, …) or status is the usual 403
+  refusal, logged at WARNING, and DONE comes only from `blastbox node-finalizer`. An unrecognised value is treated as `finalizer-only`. While
   a PKI is present and the setting is not `finalizer-only`, the ingress logs a WARNING and the
   node-finalizer an ERROR at startup.
 * **Set the engine param gate on the ingress too.** The claim's `run.params` is what a node

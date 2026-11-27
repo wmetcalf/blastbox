@@ -409,6 +409,10 @@ _LINKS_REFUSED = ("this ingress's PKI dir contains cert entries that are not reg
 TERMINAL_WRITES_ENV = "BLASTBOX_NODE_TERMINAL_WRITES"
 TERMINAL_WRITES_FINALIZER_ONLY = "finalizer-only"
 TERMINAL_WRITES_DIRECT = "direct"
+#: Under finalizer-only, the union of the two write shapes a node may send (spec 6.5):
+#: release {status: queued, claim_id: null}; fail {status: failed, error, finished_at,
+#: expires_at}.
+_FINALIZER_ONLY_FIELDS = frozenset({"status", "claim_id", "error", "finished_at", "expires_at"})
 
 
 def terminal_writes_mode(env: "dict[str, str] | None" = None) -> str:
@@ -1530,18 +1534,36 @@ def register_node_claim_routes(
             # without the RUNNING check a node could release a finished job to be detonated
             # again, or flip it to FAILED. result_summary is the finalizer's (it is derived
             # from the sealed envelope), never the node's.
+            # Exactly the agent's two write shapes (spec 6.5): release and fail. Nothing else:
+            # input_sha256 is what the finalizer gates on and signs, and worker_tier/runtime,
+            # started_at and security_warnings would narrate a run onto the row.
             why = None
+            # what the NODE sent (_vetted_fields adds server-derived keys to a release)
+            extra = sorted(set(req.fields) - _FINALIZER_ONLY_FIELDS)
             if current.status != JobStatus.RUNNING:
                 why = f"job is {current.status.value}"
-            elif "status" in fields and fields["status"] not in (JobStatus.QUEUED,
-                                                                 JobStatus.FAILED):
+            elif "status" not in fields:
+                why = "no status"
+            elif fields["status"] not in (JobStatus.QUEUED, JobStatus.FAILED):
                 why = f"status={getattr(fields['status'], 'value', fields['status'])}"
-            elif "result_summary" in fields:
-                why = "result_summary"
+            elif extra:
+                why = f"fields {', '.join(extra)}"
+            elif req.expect_status is not None and req.expect_status != JobStatus.RUNNING.value:
+                why = f"expect_status={req.expect_status}"
             if why is not None:
                 _log.warning("node_claim: refused node=%s job=%s write (%s) under %s=%s",
                              node_id, job_id, why, TERMINAL_WRITES_ENV, terminal_mode)
                 raise HTTPException(status_code=403, detail=_REFUSED)
+        if terminal_mode == TERMINAL_WRITES_FINALIZER_ONLY:
+            # The RUNNING check above read a snapshot; the finalizer may make the job DONE
+            # before this write lands. The CAS is on RUNNING, whatever the caller expected.
+            if not job_store.update_if_status(job_id, JobStatus.RUNNING,
+                                              expect_claim_id=req.claim_id, **fields):
+                raise HTTPException(status_code=409, detail="status changed")
+            fresh = job_store.get(job_id)
+            if fresh is None:
+                raise HTTPException(status_code=409, detail="status changed")
+            return {"job": fresh.to_node_dict()}
         if req.expect_status is not None:
             try:
                 expect = JobStatus(req.expect_status)
