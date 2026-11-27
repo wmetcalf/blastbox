@@ -1,7 +1,6 @@
 package sandbox
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -15,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -256,8 +256,8 @@ func (h Host) runUnder(ctx context.Context, eng config.Engine, scratch string, a
 	if err != nil {
 		return runResult{}, err
 	}
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	stdout, stderr := &tailBuf{max: probeOutputCap}, &tailBuf{max: probeOutputCap}
+	cmd.Stdout, cmd.Stderr = stdout, stderr
 	runErr := cmd.Run()
 	code := 0
 	if runErr != nil {
@@ -267,7 +267,37 @@ func (h Host) runUnder(ctx context.Context, eng config.Engine, scratch string, a
 		}
 		code = ee.ExitCode()
 	}
-	return runResult{code, stdout.Bytes(), stderr.Bytes(), handshakeOK(scratch, req.Nonce), h.layers(kind)}, nil
+	return runResult{code, stdout.bytes(), stderr.bytes(), handshakeOK(scratch, req.Nonce), h.layers(kind)}, nil
+}
+
+// probeOutputCap bounds what is kept of a probe's or self-test's stdout and stderr: the tail,
+// since the verdict is the last line.
+const probeOutputCap = 64 << 10
+
+type tailBuf struct {
+	mu  sync.Mutex
+	max int
+	b   []byte
+}
+
+func (w *tailBuf) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(p) >= w.max {
+		w.b = append(w.b[:0], p[len(p)-w.max:]...)
+		return len(p), nil
+	}
+	if over := len(w.b) + len(p) - w.max; over > 0 {
+		w.b = append(w.b[:0], w.b[over:]...)
+	}
+	w.b = append(w.b, p...)
+	return len(p), nil
+}
+
+func (w *tailBuf) bytes() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]byte(nil), w.b...)
 }
 
 // parseVerdict enforces the probe output contract: the last non-empty stdout line is a JSON

@@ -148,3 +148,20 @@ func TestCommandRefusesInsecureNsjailHost(t *testing.T) {
 		t.Errorf("seatbelt: %v", err)
 	}
 }
+
+// A probe or self-test that floods its output must not grow the agent's memory without bound:
+// only the tail is kept (the verdict is the LAST line, so it survives).
+func TestProbeOutputIsBounded(t *testing.T) {
+	flood := `head -c 33554432 /dev/zero | tr '\0' x; echo; echo '{"read":"denied","connect":"denied","write":"denied"}'; head -c 33554432 /dev/zero >&2`
+	h := fakeHost(false)
+	rr, err := h.runUnder(context.Background(), verdictEngine(), t.TempDir(), []string{"/bin/sh", "-c", flood})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rr.stdout) > probeOutputCap || len(rr.stderr) > probeOutputCap {
+		t.Fatalf("kept %d stdout / %d stderr bytes, cap %d", len(rr.stdout), len(rr.stderr), probeOutputCap)
+	}
+	if err := parseVerdict(rr.stdout); err != nil {
+		t.Fatalf("the verdict line was lost: %v", err)
+	}
+}
