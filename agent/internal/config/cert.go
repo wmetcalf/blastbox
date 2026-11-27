@@ -5,11 +5,13 @@ import (
 	"crypto/elliptic"
 	"crypto/x509"
 	"encoding/asn1"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -79,14 +81,23 @@ func CheckNodeCert(certPEM, caPEM []byte, now time.Time) (nodeID string, notAfte
 		return "", time.Time{}, errors.New("node cert has no node-info extension")
 	}
 	var info struct {
-		V      int    `json:"v"`
-		NodeID string `json:"node_id"`
+		V      int             `json:"v"`
+		NodeID string          `json:"node_id"`
+		WG     json.RawMessage `json:"wg"`
 	}
 	if err := json.Unmarshal(infoRaw, &info); err != nil {
 		return "", time.Time{}, fmt.Errorf("node-info is not valid JSON: %w", err)
 	}
 	if info.V != 1 && info.V != 2 {
 		return "", time.Time{}, fmt.Errorf("unsupported node-info version %d", info.V)
+	}
+	// Mirror pki.py: v1 requires a WireGuard key, v2 may omit it, and a key that is present
+	// must be exactly 32 bytes of canonically padded base64 whatever the version.
+	if info.V == 1 || info.WG != nil {
+		var wg string
+		if err := json.Unmarshal(info.WG, &wg); err != nil || !validWGKey(wg) {
+			return "", time.Time{}, errors.New("node-info carries no valid WireGuard public key")
+		}
 	}
 	if !nodeIDRE.MatchString(info.NodeID) {
 		return "", time.Time{}, fmt.Errorf("node-info node_id %q is not a valid node id", info.NodeID)
@@ -102,4 +113,13 @@ func CheckNodeCert(certPEM, caPEM []byte, now time.Time) (nodeID string, notAfte
 		return "", time.Time{}, errors.New("subject must carry exactly one CN, equal to node-info node_id")
 	}
 	return info.NodeID, cert.NotAfter, nil
+}
+
+func validWGKey(v string) bool {
+	v = strings.TrimSpace(v)
+	if strings.ContainsAny(v, "\r\n") {
+		return false
+	}
+	b, err := base64.StdEncoding.Strict().DecodeString(v)
+	return err == nil && len(b) == 32
 }

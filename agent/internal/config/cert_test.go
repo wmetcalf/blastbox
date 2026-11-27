@@ -67,8 +67,8 @@ func TestCheckNodeCertVectors(t *testing.T) {
 			}
 		}
 	}
-	for _, n := range []string{"wrong_eku", "client_auth_eku", "cn_mismatch", "expired", "missing_node_info",
-		"garbled_node_info", "unsupported_version", "foreign_ca", "rsa_key", "v1_with_wg", "v2_without_wg"} {
+	for _, n := range []string{"wrong_eku", "client_auth_eku", "node_plus_client_auth_eku", "cn_mismatch", "expired", "missing_node_info",
+		"garbled_node_info", "unsupported_version", "foreign_ca", "rsa_key", "v1_with_wg", "v2_without_wg", "v2_bad_wg", "v1_without_wg"} {
 		if !seen[n] {
 			t.Errorf("vector %s not exercised", n)
 		}

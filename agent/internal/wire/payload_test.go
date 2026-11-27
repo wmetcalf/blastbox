@@ -62,8 +62,9 @@ func TestECDSACross(t *testing.T) {
 	}
 	for i, e := range f.PythonSigned {
 		payload, _ := hex.DecodeString(e.PayloadHex)
-		if !wire.Verify(parsePub(t, e.PublicKeyPEM), payload, e.SignatureB64) {
-			t.Errorf("python_signed[%d] does not verify", i)
+		want := e.Valid == nil || *e.Valid
+		if got := wire.Verify(parsePub(t, e.PublicKeyPEM), payload, e.SignatureB64); got != want {
+			t.Errorf("python_signed[%d]: verify=%v, vector says valid=%v", i, got, want)
 		}
 		if wire.Verify(parsePub(t, e.PublicKeyPEM), append(payload, 'x'), e.SignatureB64) {
 			t.Errorf("python_signed[%d] verifies a tampered payload", i)

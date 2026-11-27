@@ -73,6 +73,9 @@ type SignedEntry struct {
 	PayloadHex   string `json:"payload_hex"`
 	PublicKeyPEM string `json:"public_key_pem"`
 	SignatureB64 string `json:"signature_b64"`
+	// Valid is absent (nil) for a normal entry, meaning true; false marks a deliberately
+	// tampered signature that must fail verification.
+	Valid *bool `json:"valid,omitempty"`
 }
 
 type CrossFile struct {
