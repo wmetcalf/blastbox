@@ -735,9 +735,11 @@ def revoke(pki_dir: Path, node_id: str, *, node_dirs: list[Path] | None = None) 
             failed.append((d, "not a PKI dir (no ca.crt) -- unmounted?"))
             continue
         bad = _non_regular(d)
-        if bad:                               # refused like renewal: nothing is followed
-            failed.append((d, f"{LINKS_REFUSED} ({', '.join(e.name for e in bad)})"))
-            continue
+        if bad:
+            # Never follow them -- but still revoke the node's REGULAR certs here (the
+            # ingress authorises through those), and report the dir: a link may hold it too.
+            failed.append((d, f"{LINKS_REFUSED} ({', '.join(e.name for e in bad)}); "
+                              "its regular certs were revoked, the links were not followed"))
         if not one(d, REVOKE_LOCK_WAIT_S):
             unlocked.append(d)
     for d in list(unlocked):                  # second pass, now waiting for the lock

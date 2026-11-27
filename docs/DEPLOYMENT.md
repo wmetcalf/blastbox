@@ -959,8 +959,8 @@ reported by name, no cert entry in it is followed and no cert is written there: 
 every node it holds in a regular file (or that it queued) is deferred, and the run exits 2, until
 an operator replaces the links with regular files. (Its queue is still drained the usual way, so a
 stale or invalid entry there is refused as anywhere else.) The ingress likewise answers `/v1/nodes/renew` and
-`/v1/nodes/cert` with 503 while its PKI dir holds one, and `revoke-node` refuses such a dir
-(reported, exit 1) while revoking the others. A queue that cannot be read mid-run is reported and
+`/v1/nodes/cert` with 503 while its PKI dir holds one, and `revoke-node` revokes the node's
+regular certificates there without following the links and reports the dir (exit 1). A queue that cannot be read mid-run is reported and
 skipped; the rest still run. A symlinked queued CSR is refused. A run that cannot lock every dir within two minutes, or finds a node dir without `ca.crt`
 (an unmounted mountpoint), renews nothing and exits 1; a write that fails mid-way keeps the CSR, and the next run redoes it. Without
 `--node-dir` a split deployment's renewals are never seen: the node gets 202 and its old
@@ -971,8 +971,10 @@ certificates and any queued renewal from every dir under the same lock `renew-pe
 renewal in flight cannot write a certificate back. A held lock does not block it: such a dir is
 revoked at once anyway and then again once the lock comes (a renewal that held it may have just
 written the certificate back). A dir it cannot reach, a lock that never comes, a file too large to
-check, and a dir holding any non-regular `*.crt` entry (links are refused, `ca.crt` included) are
-NOT revoked but reported -- remove the node's certificate from such a dir by hand after fixing it.
+check are NOT revoked but reported. In a dir holding any non-regular `*.crt` entry (links are
+refused, `ca.crt` included) the node's regular certificates and queued renewal ARE removed, the
+links are not followed or touched, and the dir is reported: check the links by hand, since one may
+still hold the node.
 It exits 1 unless every dir was fully revoked.
 `renew-pending` exits 2 when any renewal was deferred, so a fault that repeats every run (a
 read-only mount) turns the timer unit red instead of letting the node's certificate run out. Deleting the file by hand still revokes, but

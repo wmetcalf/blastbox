@@ -1069,14 +1069,20 @@ def test_cli_exits_2_and_says_to_replace_links(tmp_path, capsys):
     assert "regular files" in capsys.readouterr().out
 
 
-def test_revoke_refuses_a_dir_with_links_but_revokes_the_rest(tmp_path):
+def test_revoke_still_removes_regular_certs_from_a_dir_with_links_and_reports_it(tmp_path):
+    """Refusing the whole dir would leave the node's REGULAR cert there, which the ingress
+    still authorises: revocation must not fail open. Regular certs (and the queue) are
+    removed; links are never followed or touched, and the dir is reported (exit 1)."""
     ca, ca_dir, i1, i2 = _split(tmp_path)
+    queue_csr(i2, "n1", make_csr("n1")[0])
     (i2 / "x.crt").symlink_to(tmp_path / "gone.crt")
     with pytest.raises(node_renew.PartialRevoke) as exc:
         node_renew.revoke(ca_dir, "n1", node_dirs=[i1, i2])
     assert any(d == i2 and "regular files" in why for d, why in exc.value.failed)
-    assert not (i1 / "node-n1.crt").exists() and (i2 / "node-n1.crt").exists()
+    assert not (i1 / "node-n1.crt").exists() and not (i2 / "node-n1.crt").exists()
+    assert pending(i2) == []
     assert (i2 / "x.crt").is_symlink()
+    assert "n1" not in fleet_grants(i2)
 
 
 def test_a_cert_swapped_for_a_link_after_the_check_defers_not_drops(tmp_path, monkeypatch):
