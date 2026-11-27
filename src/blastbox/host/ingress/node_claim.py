@@ -652,11 +652,15 @@ def register_node_claim_routes(
 
     terminal_mode = terminal_writes_mode()
     try:
-        node_fail_retention_s = max(0, int(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0"))
+        # float, as the ingress retention sweeper parses it (app.py), so '3600.0' agrees
+        node_fail_retention_s = max(0.0, float(
+            os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0"))
+        if node_fail_retention_s != node_fail_retention_s:          # NaN
+            raise ValueError("nan")
     except ValueError:
-        _log.error("BLASTBOX_JOB_RETENTION_SECONDS is not an integer; node fail writes keep "
+        _log.error("BLASTBOX_JOB_RETENTION_SECONDS is not a number; node fail writes keep "
                    "their rows (expires_at unset)")
-        node_fail_retention_s = 0
+        node_fail_retention_s = 0.0
     _open = terminal_writes_open_message(terminal_mode)
     if _open:
         _log.warning("node_claim: %s", _open)
@@ -1569,6 +1573,15 @@ def register_node_claim_routes(
                 why = "fail write with a null finished_at"
             elif req.expect_status is not None and req.expect_status != JobStatus.RUNNING.value:
                 why = f"expect_status={req.expect_status}"
+            else:
+                from blastbox.host import node_results as _nr
+
+                # After a 202 the sample has run and its result waits for the finalizer: a
+                # release would discard it and hand the sample to another node (spec 6.5:
+                # a sample handed to a sandbox is never released); a fail would throw away a
+                # good result. The finalizer decides from here.
+                if _nr.spool_dir(_nr.results_root(_jobs_dir), job_id, req.claim_id).is_dir():
+                    why = "a result for this claim is already quarantined"
             if why is not None:
                 _log.warning("node_claim: refused node=%s job=%s write (%s) under %s=%s",
                              node_id, job_id, why, TERMINAL_WRITES_ENV, terminal_mode)

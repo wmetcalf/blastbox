@@ -900,7 +900,9 @@ Three things an operator must know:
   start; the error is scrubbed like a dispatcher's). Retention is the operator's: the fail
   write's `expires_at` is set by the ingress from `BLASTBOX_JOB_RETENTION_SECONDS` (now +
   retention, or unset when 0, exactly as a dispatcher's own fail), so set it on the ingress
-  too; a node that sends `expires_at` gets a 400. Each shape is checked on its own and only while the job is
+  too; a node that sends `expires_at` gets a 400. Once the node's result upload has been accepted
+  (202), neither write is allowed: the result waits for the finalizer, and a release would
+  hand an already-run sample to another node. Each shape is checked on its own and only while the job is
   RUNNING (the write's CAS is always on RUNNING); any other
   field (`input_sha256`, `result_summary`, `worker_tier`, …) or status is the usual 403
   refusal, logged at WARNING, and DONE comes only from `blastbox node-finalizer`. An unrecognised value is treated as `finalizer-only`. While

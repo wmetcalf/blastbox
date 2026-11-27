@@ -316,3 +316,35 @@ def test_direct_mode_still_takes_the_nodes_expiry(tmp_path, pki_dir, monkeypatch
               expect="running")
     assert r.status_code == 200, r.text
     assert abs(store.get("job-1").expires_at - want) < 1
+
+
+@pytest.mark.parametrize("fields", [{"status": "queued", "claim_id": None},
+                                    {"status": "failed", "error": "x", "finished_at": "<now>"}])
+def test_finalizer_only_no_release_or_fail_once_a_result_is_quarantined(tmp_path, pki_dir,  # noqa: F811
+                                                                         monkeypatch, fields):
+    """After a 202 the sample has run and its result waits for the finalizer: a release would
+    discard it and hand the sample to another node, a fail would throw away a good result."""
+    import time as _t
+
+    from .test_node_data_plane import make_tar, put
+
+    fields = {k: (_t.time() if v == "<now>" else v) for k, v in fields.items()}
+    monkeypatch.setenv(ENV, "finalizer-only")
+    store, c, hdr = _setup(tmp_path, pki_dir)
+    assert put(c, hdr, make_tar([])).status_code == 202
+    assert _post(c, hdr, fields, expect="running").status_code == 403
+    assert store.get("job-1").status == JobStatus.RUNNING
+
+
+def test_finalizer_only_retention_parses_like_the_ingress_sweeper(tmp_path, pki_dir, monkeypatch):  # noqa: F811
+    """The ingress retention sweeper reads BLASTBOX_JOB_RETENTION_SECONDS as a float; a value
+    such as '3600.0' must not silently leave node-failed rows without an expiry."""
+    import time as _t
+
+    monkeypatch.setenv(ENV, "finalizer-only")
+    monkeypatch.setenv("BLASTBOX_JOB_RETENTION_SECONDS", "60.0")
+    store, c, hdr = _setup(tmp_path, pki_dir)
+    t0 = _t.time()
+    assert _post(c, hdr, {"status": "failed", "finished_at": t0}, expect="running").status_code == 200
+    exp = store.get("job-1").expires_at
+    assert exp is not None and t0 + 55 <= exp <= _t.time() + 65
