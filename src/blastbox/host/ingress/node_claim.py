@@ -1435,7 +1435,7 @@ def register_node_claim_routes(
         if not x_blastbox_claim_id or not x_blastbox_receipt:
             raise HTTPException(status_code=403, detail=_REFUSED)
         return {"job": _owned_job(job_id, node_id, x_blastbox_claim_id,
-                                  x_blastbox_receipt).to_dict()}
+                                  x_blastbox_receipt).to_node_dict()}
 
     @router.get("/jobs/{job_id}/disposition", response_model=None)
     def disposition(job_id: str,
@@ -1504,7 +1504,7 @@ def register_node_claim_routes(
             fresh = job_store.get(job_id)
             if fresh is None:
                 raise HTTPException(status_code=409, detail="status changed")
-            return {"job": fresh.to_dict()}
+            return {"job": fresh.to_node_dict()}
         # FENCED even without expect_status. `_owned_job` read the claim a moment ago, and an
         # unconditional write here would apply after a timeout sweep had already reclaimed the
         # job -- a stale owner's report landing on somebody else's run. The CAS on
@@ -1516,7 +1516,7 @@ def register_node_claim_routes(
         fresh = job_store.get(job_id)
         if fresh is None:
             raise HTTPException(status_code=409, detail="status changed")
-        return {"job": fresh.to_dict()}
+        return {"job": fresh.to_node_dict()}
 
     # ---- data plane: input to the node, result tar back into the quarantine spool ----------
     # The ingress only QUARANTINES. It holds no attest key and runs no trust gate; the

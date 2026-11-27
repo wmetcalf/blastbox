@@ -115,3 +115,23 @@ def test_run_network_carries_resolved_tier(tmp_path, pki_dir, monkeypatch):  # n
     _, _, c = _setup(tmp_path, pki_dir)
     run = _claim(c, pki_dir, "alpha", engine="clamav").json()["run"]
     assert run["network"] == "socks"
+
+
+def test_no_node_facing_job_response_carries_result_dir(tmp_path, pki_dir):  # noqa: F811
+    """GET /jobs/{id} and both POST /jobs/{id} returns, not only the claim."""
+    from .test_node_claim import auth, token_for
+
+    _, _, c = _setup(tmp_path, pki_dir)
+    body = _claim(c, pki_dir, "alpha", engine="clamav").json()
+    hdr = {**auth(token_for(c, pki_dir, "alpha")),
+           "x-blastbox-claim-id": body["job"]["claim_id"], "x-blastbox-receipt": body["receipt"]}
+    g = c.get("/v1/nodes/jobs/job-1", headers=hdr)
+    assert g.status_code == 200, g.text
+    assert "result_dir" not in g.json()["job"] and "/srv/internal" not in g.text
+    base = {"claim_id": body["job"]["claim_id"], "receipt": body["receipt"]}
+    for payload in ({**base, "security_warnings": []},
+                    {**base, "expect_status": "running",
+                     "security_warnings": []}):
+        p = c.post("/v1/nodes/jobs/job-1", headers=hdr, json=payload)
+        assert p.status_code == 200, p.text
+        assert "result_dir" not in p.json()["job"] and "/srv/internal" not in p.text
