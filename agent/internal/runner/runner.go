@@ -50,6 +50,7 @@ const (
 	ResultTarName  = "result.tar"
 	ResultMetaName = "result.json" // the upload's headers, so recovery can replay it
 	ReportedName   = "reported"    // the control plane answered the upload: nothing left to send
+	RunRecordName  = "sandbox.json" // the running sandbox's identity (sandbox.RunRecord)
 )
 
 // ResultRecord is result.json.
@@ -506,6 +507,18 @@ func (j *job) exec(ctx context.Context, cmd *exec.Cmd, capw *capWriter) (killed 
 		return "", fmt.Errorf("start: %w", err)
 	}
 	pid := cmd.Process.Pid
+	// Recorded so that, if this agent dies or gives up draining, the next one can stop the run
+	// before settling its job (the run would otherwise outlive the agent unsupervised).
+	rec := sandbox.RunRecord{PID: pid, Scratch: j.ident.Scratch, Canary: j.ident.Canary}
+	rec.Identity, _ = sandbox.ProcIdentity(pid)
+	if j.ident.Canary != "" {
+		rec.StartedAfter = j.ident.StartedAfter.UnixMicro()
+	}
+	if b, err := json.Marshal(rec); err == nil {
+		if err := atomicWrite(filepath.Join(j.dir, RunRecordName), b); err != nil {
+			j.r.logf("job %s: run record: %v", j.c.JobID, err)
+		}
+	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	deadline := time.Duration(j.c.Run.DeadlineS) * time.Second

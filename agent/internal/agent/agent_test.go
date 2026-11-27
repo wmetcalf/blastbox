@@ -3,12 +3,15 @@ package agent
 import (
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -238,6 +241,36 @@ func TestRecoveryGivesUpOnPermanentRefusals(t *testing.T) {
 	}
 	if n := e.in.putCount("jt"); n != 1 {
 		t.Fatalf("replayed %d times", n)
+	}
+}
+
+// The agent died (or gave up draining) while an engine ran: the engine is still alive when the
+// next agent starts. Recovery stops the recorded run before failing the job and wiping its dir.
+func TestRecoveryKillsAnOrphanedRun(t *testing.T) {
+	e := fresh(t)
+	e.cfg.Claim = false
+	d := jobDir(e, "jo", true, true)
+	cmd := exec.Command("/bin/sh", "-c", "sleep 60 & sleep 60")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	reaped := make(chan struct{})
+	go func() { cmd.Wait(); close(reaped) }()
+	t.Cleanup(func() { syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) })
+	id, ok := sandbox.ProcIdentity(cmd.Process.Pid)
+	if !ok {
+		t.Fatal("no identity")
+	}
+	rec, _ := json.Marshal(sandbox.RunRecord{PID: cmd.Process.Pid, Identity: id})
+	os.WriteFile(filepath.Join(d, runner.RunRecordName), rec, 0o600)
+	h := newHarness(e)
+	h.start(t)
+	eventually(t, "recovery", func() bool { return e.in.update("jo") != nil })
+	select {
+	case <-reaped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the orphaned run survived recovery")
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"syscall"
 	"time"
 )
 
@@ -27,6 +28,34 @@ func NewCanary() (string, error) {
 		return "", err
 	}
 	return "io.blastbox.run." + hex.EncodeToString(b), nil
+}
+
+// RunRecord is what a job dir keeps about its sandboxed run (runner's sandbox.json), so that
+// crash recovery can stop a run the agent no longer supervises before settling its job.
+type RunRecord struct {
+	PID          int    `json:"pid"`      // the process group leader (Setpgid)
+	Identity     int64  `json:"identity"` // ProcIdentity(pid) at start
+	Scratch      string `json:"scratch,omitempty"`
+	Canary       string `json:"canary,omitempty"`
+	StartedAfter int64  `json:"started_after_us,omitempty"`
+}
+
+// KillRun SIGKILLs a recorded run's process group, if its leader is still that process (or is
+// gone: the kernel does not reuse a pid while its process group lives), then sweeps a seatbelt
+// run's escapees. An error means the run could not be shown stopped.
+func KillRun(rec RunRecord) error {
+	if rec.PID > 1 {
+		id, alive := ProcIdentity(rec.PID)
+		if !alive || id == rec.Identity {
+			syscall.Kill(-rec.PID, syscall.SIGKILL)
+		}
+	}
+	if rec.Canary != "" {
+		_, err := SweepRun(RunIdentity{Scratch: rec.Scratch, Canary: rec.Canary,
+			StartedAfter: time.UnixMicro(rec.StartedAfter)})
+		return err
+	}
+	return nil
 }
 
 func errorf(format string, a ...any) error { return fmt.Errorf("sandbox sweep: "+format, a...) }
