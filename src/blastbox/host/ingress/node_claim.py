@@ -683,12 +683,9 @@ def register_node_claim_routes(
         return _grants_cache["map"].get(node_id)
 
     def _refuse_irregular_pki_dir() -> None:
-        """503 before anything reads the PKI dir: a FIFO there would block the grants
-        lookup (it reads every *.crt), and links are refused for renewal anyway."""
-        try:
-            bad = node_renew._non_regular(resolved)
-        except OSError:
-            bad = []
+        """503 up front: links and other non-regular cert entries are refused for renewal.
+        (The grants lookup itself never blocks on a FIFO: fleet_grants reads non-blocking.)"""
+        bad = node_renew._non_regular(resolved)      # lstat failures count as bad
         if bad:
             _log.warning("node_claim: %s %s", resolved, node_renew.LINKS_REFUSED)
             raise HTTPException(status_code=503, detail=_LINKS_REFUSED)

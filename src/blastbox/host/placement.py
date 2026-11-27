@@ -110,6 +110,25 @@ def refusal(
     return None
 
 
+#: A cert file larger than this is not read (real ones are ~1 KiB).
+_MAX_CERT_FILE_BYTES = 1024 * 1024
+
+
+def _read_cert_file(path: Path) -> bytes:
+    """Read a cert file without ever blocking: O_NONBLOCK, and only if what was opened is a
+    regular file (a symlink to one is still followed, as before). A FIFO or device planted
+    in the PKI dir would otherwise hang every request that resolves grants."""
+    import stat as _stat
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode) or st.st_size > _MAX_CERT_FILE_BYTES:
+            raise ValueError(f"{path} is not a regular cert file")
+        return os.read(fd, _MAX_CERT_FILE_BYTES + 1)
+    finally:
+        os.close(fd)
+
+
 def fleet_grants(
     pki_dir: Path | str,
     *,
@@ -154,7 +173,7 @@ def fleet_grants(
         return out
     for crt in sorted(d.glob("*.crt")):
         try:
-            ident = node_identity(ca, crt.read_bytes())
+            ident = node_identity(ca, _read_cert_file(crt))
         except Exception:                          # noqa: BLE001 - one bad file is not a fleet outage
             continue
         prior = out.get(ident.node_id)
