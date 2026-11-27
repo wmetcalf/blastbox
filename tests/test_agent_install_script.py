@@ -49,7 +49,7 @@ def stripped_path(tmp: Path, with_cosign: str | None = None) -> str:
     d = tmp / "bin"
     d.mkdir(exist_ok=True)
     for tool in ("uname", "id", "mkdir", "mktemp", "cp", "mv", "ln", "rm", "chmod", "cat",
-                 "cut", "tr", "wc", "grep", "readlink", "sha256sum", "shasum", "curl", "dirname"):
+                 "cut", "tr", "wc", "grep", "readlink", "sha256sum", "shasum", "curl", "rmdir"):
         src = shutil.which(tool)
         if src and not (d / tool).exists():
             (d / tool).symlink_to(src)
@@ -132,6 +132,7 @@ def test_cosign_called_with_pinned_identity(tmp_path):
     assert "https://token.actions.githubusercontent.com" in args
     assert args[-2] == "SHA256SUMS"
     assert os.readlink(pfx / "current") == "1.2.3"
+    assert not (pfx / ".lock").exists()  # released even on a minimal PATH
 
 
 def test_cosign_not_invoked_on_sha_mismatch(tmp_path):

@@ -69,7 +69,10 @@ on_exit() {
   fi
   rm -f "$tmp" "$ptmp"
   if [ -n "$stage" ]; then rm -rf "$stage"; fi
-  if [ "$locked" = 1 ]; then rmdir "$prefix/.lock" 2>/dev/null || :; fi
+  if [ "$locked" = 1 ]; then
+    rmdir "$prefix/.lock" 2>/dev/null \
+      || printf 'install.sh: could not remove %s/.lock; remove it by hand\n' "$prefix" >&2
+  fi
 }
 trap on_exit EXIT
 trap 'exit 130' INT
