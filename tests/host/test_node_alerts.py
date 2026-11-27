@@ -425,3 +425,41 @@ def test_evaluation_and_memo_update_are_one_critical_section(tmp_path, monkeypat
     monkeypatch.setattr(nl, "evaluate", lambda **kw: held.append(m._lock.locked()) or real(**kw))
     m.view()
     assert held == [True]
+
+
+# --- review round 4 -------------------------------------------------------------------------
+
+def test_selftest_series_only_for_engines_the_node_is_granted(rig):
+    """Engine names in a heartbeat are the node's own claim: as label values they must not let
+    a node mint new series at will."""
+    app, _, c = rig
+    app.state.node_liveness.record_heartbeat("alpha", {"engines": [
+        {"name": "clamav", "selftest_ok": True}, {"name": "made-up-1", "selftest_ok": True}]},
+        time.time())
+    text = c.get("/metrics").text
+    assert 'blastbox_node_selftest_ok{engine="clamav",node="alpha"}' in text
+    assert "made-up-1" not in text
+
+
+def test_concurrent_callers_share_one_recent_view(tmp_path):
+    """/metrics may be public: a burst of scrapes must not each re-read the whole store."""
+    snaps = []
+
+    class Live(InMemoryLivenessStore):
+        def snapshot(self):
+            snaps.append(1)
+            return super().snapshot()
+    now = [1000.0]
+    m = LivenessMonitor(liveness=Live(), job_store=InMemoryJobStore(), pki_dir=tmp_path,
+                        clock=lambda: now[0])
+    from blastbox.host.node_liveness import LivenessCollector
+    col = LivenessCollector(m)
+    for _ in range(3):
+        m.as_json()
+        list(col.collect())
+    assert len(snaps) == 1
+    now[0] += 2.5
+    m.as_json()
+    assert len(snaps) == 2
+    m.view()                                    # the alert loop always evaluates afresh
+    assert len(snaps) == 3

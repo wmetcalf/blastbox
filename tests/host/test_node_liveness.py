@@ -110,3 +110,23 @@ def test_claims_are_kept_per_engine_on_every_backend(kind, tmp_path):
     r = s.snapshot()["a"]
     assert dict(r.claims) == {"clamav": 16.0, "boxjs": 12.0, "": 14.0}
     assert r.last_claim_at == 16.0
+
+
+def test_sql_store_survives_a_failed_table_create_and_retries(tmp_path):
+    """A transient DDL failure at startup (two ingresses racing CREATE on postgres) must not
+    leave this process on a private in-memory store for good."""
+    from blastbox.host.jobs.sql_store import SqlJobStore
+    js = SqlJobStore(f"sqlite:///{tmp_path}/t.db")
+    real = js.connection
+    fail = [True]
+
+    def flaky():
+        if fail[0]:
+            fail[0] = False
+            raise RuntimeError("transient")
+        return real()
+    js.connection = flaky
+    s = build_liveness_store(js)
+    assert isinstance(s, SqlLivenessStore)
+    s.record_heartbeat("a", {"x": 1}, 5.0)
+    assert s.snapshot()["a"].last_heartbeat_at == 5.0

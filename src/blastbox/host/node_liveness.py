@@ -123,6 +123,20 @@ class SqlLivenessStore:
 
     def __init__(self, store) -> None:
         self._store = store
+        self._ready = False
+        try:
+            self._ensure()
+        except Exception:  # noqa: BLE001 - retried on first use; never a silent memory fallback
+            _log.warning("node_liveness: could not create the liveness tables yet; retrying on "
+                         "first use", exc_info=True)
+
+    def _ensure(self) -> None:
+        """Create the tables once. A transient failure (two ingresses racing CREATE on postgres,
+        a connection blip) is retried on the next read or write rather than demoting this process
+        to a private in-memory store that disagrees with every other ingress."""
+        if self._ready:
+            return
+        store = self._store
         with store.connection() as conn:
             real = "DOUBLE PRECISION" if store.param_style == "%s" else "REAL"
             conn.execute(
@@ -137,8 +151,10 @@ class SqlLivenessStore:
                 " engine TEXT NOT NULL,"
                 f" at {real} NOT NULL,"
                 " PRIMARY KEY (node_id, engine))")
+        self._ready = True
 
     def record_heartbeat(self, node_id: str, body: dict, at: float) -> None:
+        self._ensure()
         p = self._store.param_style
         sql = (f"INSERT INTO node_liveness (node_id, last_heartbeat_at, last_claim_at, body) "
                f"VALUES ({p}, {p}, NULL, {p}) ON CONFLICT (node_id) DO UPDATE SET "
@@ -147,6 +163,7 @@ class SqlLivenessStore:
             conn.execute(sql, (node_id, at, json.dumps(body, separators=(",", ":"))))
 
     def record_claim(self, node_id: str, engine: str | None, at: float) -> None:
+        self._ensure()
         p = self._store.param_style
         sql = (f"INSERT INTO node_liveness (node_id, last_heartbeat_at, last_claim_at, body) "
                f"VALUES ({p}, NULL, {p}, NULL) ON CONFLICT (node_id) DO UPDATE SET "
@@ -158,6 +175,7 @@ class SqlLivenessStore:
             conn.execute(per, (node_id, engine or "", at))
 
     def snapshot(self) -> dict[str, NodeLiveness]:
+        self._ensure()
         with self._store.connection() as conn:
             rows = conn.execute("SELECT node_id, last_heartbeat_at, last_claim_at, body "
                                 "FROM node_liveness").fetchall()
@@ -512,6 +530,7 @@ class LivenessMonitor:
         self._memo: dict[tuple[str, str], Alert] = {}
         self._enrolled_cache: tuple[Any, float, dict[str, Any]] | None = None
         self._queued_cache: tuple[float, dict[str, float]] | None = None
+        self._last_view: _View | None = None
 
     def _pki_signature(self) -> tuple:
         try:
@@ -545,12 +564,23 @@ class LivenessMonitor:
         self._queued_cache = (now, got)
         return got
 
-    def view(self) -> _View:
-        # ONE critical section from the clock read to the memo update: the 15 s loop, /metrics
-        # and /v1/fleet/liveness call this concurrently, and a view evaluated earlier but
-        # applied later would re-raise an alert a newer view had cleared (and race the caches).
+    #: How long /metrics and /v1/fleet/liveness may reuse a view. /metrics may be public, and
+    #: every caller holds the lock below, so a burst of scrapes is served from one evaluation
+    #: instead of each re-reading the whole store while parking a threadpool worker on the lock.
+    VIEW_TTL_S = 2.0
+
+    def view(self, max_age_s: float = 0.0) -> _View:
+        """Evaluate, or reuse a view at most ``max_age_s`` old (the alert loop passes 0).
+
+        ONE critical section from the clock read to the memo update: the 15 s loop, /metrics
+        and /v1/fleet/liveness call this concurrently, and a view evaluated earlier but applied
+        later would re-raise an alert a newer view had cleared (and race the caches)."""
         with self._lock:
-            return self._view_locked()
+            last = self._last_view
+            if max_age_s > 0 and last is not None and 0 <= self._clock() - last.now < max_age_s:
+                return last
+            self._last_view = self._view_locked()
+            return self._last_view
 
     def _view_locked(self) -> _View:
         now = self._clock()
@@ -577,7 +607,7 @@ class LivenessMonitor:
         return _View(now, self.cfg, enrolled, live, queued, stable)
 
     def as_json(self) -> dict[str, Any]:
-        v = self.view()
+        v = self.view(self.VIEW_TTL_S)
         nodes = []
         for node_id in sorted(set(v.enrolled) | set(v.live)):
             lv = v.live.get(node_id)
@@ -606,7 +636,7 @@ class LivenessCollector:
         from prometheus_client.core import GaugeMetricFamily as G
 
         try:
-            v = self._m.view()
+            v = self._m.view(self._m.VIEW_TTL_S)
         except Exception:  # noqa: BLE001 - a scrape must not fail on liveness
             _log.exception("node_liveness: evaluation failed during scrape")
             return
@@ -633,9 +663,14 @@ class LivenessCollector:
             # One series per (node, engine): a body naming an engine twice would otherwise
             # emit a duplicate sample, and Prometheus rejects the WHOLE scrape for that. Any
             # failing entry wins, so a duplicate cannot mask a failure.
+            # Only engines the certificate grants: the names are the node's own claim, and as
+            # label values they would otherwise let a node mint new series on every heartbeat.
+            granted = set(v.enrolled[node_id].grants.engines)
             ok: dict[str, bool] = {}
             for e in _engines_of(lv):
                 name = str(e.get("name", ""))
+                if name not in granted:
+                    continue
                 ok[name] = ok.get(name, True) and bool(e.get("selftest_ok"))
             for name, good in sorted(ok.items()):
                 st.add_metric([node_id, name], 1.0 if good else 0.0)
