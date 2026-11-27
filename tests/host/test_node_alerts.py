@@ -463,3 +463,11 @@ def test_concurrent_callers_share_one_recent_view(tmp_path):
     assert len(snaps) == 2
     m.view()                                    # the alert loop always evaluates afresh
     assert len(snaps) == 3
+
+
+def test_node_health_counts_only_granted_engines():
+    e = {"n": ident(("boxjs",))}
+    extra = lv(T0, engines=(("boxjs", True), ("clamav", False)))     # clamav: not granted
+    assert run(T0 + 10, e, {"n": extra}) == []
+    only_ungranted = lv(T0, engines=(("clamav", True),))
+    assert kinds(run(T0 + 10, e, {"n": only_ungranted})) == [("node_unhealthy", "n")]

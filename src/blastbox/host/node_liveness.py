@@ -398,11 +398,14 @@ def evaluate(*, now: float, enrolled: "Mapping[str, NodeIdentity]", live: dict[s
                                 f"certificate expired {now - not_after:.0f}s ago"))
             continue
         if lv is not None and _fresh(lv, now, cfg):
-            engines = _engines_of(lv)
-            bad = sorted(str(e.get("name", "")) for e in engines if not e.get("selftest_ok"))
+            # Only engines the certificate grants: an ungranted entry (a node configured with
+            # more engines than it was issued) neither raises nor masks this alert.
+            granted_here = set(ident.grants.engines)
+            engines = [e for e in _engines_of(lv) if e.get("name") in granted_here]
+            bad = sorted({str(e.get("name", "")) for e in engines if not e.get("selftest_ok")})
             if not engines:
                 alerts.append(Alert("node_unhealthy", node_id, lv.last_heartbeat_at or now,
-                                    "heartbeating with no engines"))
+                                    "heartbeating with no granted engine"))
             elif bad:
                 alerts.append(Alert("node_unhealthy", node_id, lv.last_heartbeat_at or now,
                                     "selftest failing for: " + ", ".join(bad)))
