@@ -1,0 +1,135 @@
+// Package canon reproduces Python's
+// json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=True).
+package canon
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"unicode/utf16"
+)
+
+// ErrFloat is returned for any non-integer number.
+var ErrFloat = errors.New("canon: floats are not allowed")
+
+// Marshal encodes v canonically. Supported: nil, bool, string, ints, json.Number,
+// []any, map[string]any. Floats (float32/64 or a json.Number containing . e E) are rejected.
+func Marshal(v any) ([]byte, error) {
+	var b bytes.Buffer
+	if err := enc(&b, v); err != nil {
+		return nil, err
+	}
+	return b.Bytes(), nil
+}
+
+// MarshalJSONText canonicalises a JSON document (numbers kept exact via UseNumber).
+func MarshalJSONText(text []byte) ([]byte, error) {
+	d := json.NewDecoder(bytes.NewReader(text))
+	d.UseNumber()
+	var v any
+	if err := d.Decode(&v); err != nil {
+		return nil, err
+	}
+	return Marshal(v)
+}
+
+func enc(b *bytes.Buffer, v any) error {
+	switch x := v.(type) {
+	case nil:
+		b.WriteString("null")
+	case bool:
+		if x {
+			b.WriteString("true")
+		} else {
+			b.WriteString("false")
+		}
+	case string:
+		encString(b, x)
+	case json.Number:
+		if strings.ContainsAny(string(x), ".eE") {
+			return ErrFloat
+		}
+		b.WriteString(string(x))
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		fmt.Fprintf(b, "%d", x)
+	case float32, float64:
+		return ErrFloat
+	case []any:
+		b.WriteByte('[')
+		for i, e := range x {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			if err := enc(b, e); err != nil {
+				return err
+			}
+		}
+		b.WriteByte(']')
+	case map[string]any:
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
+		}
+		// UTF-8 byte order == code point order == Python's str sort.
+		sort.Strings(keys)
+		b.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			encString(b, k)
+			b.WriteByte(':')
+			if err := enc(b, x[k]); err != nil {
+				return err
+			}
+		}
+		b.WriteByte('}')
+	default:
+		return fmt.Errorf("canon: unsupported type %T", v)
+	}
+	return nil
+}
+
+func encString(b *bytes.Buffer, s string) {
+	const hex = "0123456789abcdef"
+	u := func(r rune) {
+		b.WriteString(`\u`)
+		b.WriteByte(hex[r>>12&0xf])
+		b.WriteByte(hex[r>>8&0xf])
+		b.WriteByte(hex[r>>4&0xf])
+		b.WriteByte(hex[r&0xf])
+	}
+	b.WriteByte('"')
+	for _, r := range s {
+		switch {
+		case r == '"':
+			b.WriteString(`\"`)
+		case r == '\\':
+			b.WriteString(`\\`)
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case r == '\b':
+			b.WriteString(`\b`)
+		case r == '\f':
+			b.WriteString(`\f`)
+		case r < 0x20:
+			u(r)
+		case r < 0x7f:
+			b.WriteRune(r)
+		case r >= 0x10000:
+			r1, r2 := utf16.EncodeRune(r)
+			u(r1)
+			u(r2)
+		default:
+			u(r)
+		}
+	}
+	b.WriteByte('"')
+}
