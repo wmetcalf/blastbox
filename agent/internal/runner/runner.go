@@ -233,6 +233,15 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	}
 	j.start = time.Now()
 	killed, runErr := j.exec(runCtx, cmd, capw)
+	if errors.Is(runErr, exec.ErrWaitDelay) && cmd.ProcessState != nil {
+		// The engine exited, but something it left held its stdout/stderr open past WaitDelay.
+		// Judge the run by the engine's own exit status; the leftover is killed with the group
+		// (and swept below).
+		runErr = nil
+		if !cmd.ProcessState.Success() {
+			runErr = &exec.ExitError{ProcessState: cmd.ProcessState}
+		}
+	}
 	// A seatbelt child that setsid()s leaves the process group, so the group kill above cannot
 	// reach it: find the run's processes by their sandbox and kill them BEFORE anything reads
 	// the output (a survivor could still be rewriting it) and whatever the run's outcome.

@@ -435,6 +435,17 @@ func TestSandboxFaultReportedBeforeTheJobReport(t *testing.T) {
 	}
 }
 
+// An engine that exits 0 while a child it left holds stderr open makes Wait return
+// exec.ErrWaitDelay. That is the engine's own business (the group is killed anyway), not a
+// sandbox fault: hostile input must not be able to turn the engine red this way.
+func TestLingeringChildIsNotASandboxFault(t *testing.T) {
+	f := setup(t, `echo '{}' > "$1/metadata.json"; (sleep 30 >&2 &)`)
+	res := f.run()
+	if res.SandboxFailure || res.Outcome != "done" {
+		t.Fatalf("%+v", res)
+	}
+}
+
 func TestEnvelopeModeKeepsBytesVerbatim(t *testing.T) {
 	// No declared artifacts: the engine's bytes (odd spacing and key order) go through untouched.
 	f := setup(t, `printf '{ "schema" : "wtqrk",  "b":1, "a":2 }\n'`)
