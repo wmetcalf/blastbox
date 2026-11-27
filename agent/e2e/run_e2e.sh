@@ -165,7 +165,10 @@ api "$BASE/v1/jobs/$JOB/attestation" >"$T/receipt.json" || fail "no receipt for 
 "$PYTHON" - "$T/receipt.json" "$NODE" "$T/node/node.crt" "$SAMPLE_SHA" <<'PY'
 import hashlib, json, ssl, sys
 rcpt, node, crt, sample = sys.argv[1:]
-d = json.load(open(rcpt))
+doc = json.load(open(rcpt))
+assert doc.get("signature"), "receipt is unsigned"
+d = doc["attestation"]
+print("[e2e] receipt:", json.dumps(doc, sort_keys=True))
 der = ssl.PEM_cert_to_DER_cert(open(crt).read())
 want = hashlib.sha256(der).hexdigest()
 assert d.get("node_id") == node, f"node_id {d.get('node_id')!r}"
@@ -185,6 +188,7 @@ assert rows, f"{node} missing from liveness: {d['nodes']}"
 assert rows[0]["last_heartbeat_at"], f"{node} never heartbeated"
 silent = [a for a in d["alerts"] if a.get("kind") == "node_silent" and a.get("subject") == node]
 assert not silent, f"node_silent alert while running: {silent}"
+print("[e2e] liveness node:", json.dumps(rows[0], sort_keys=True), "alerts:", d["alerts"])
 print("[e2e] liveness ok: heartbeating, no node_silent")
 PY
 
