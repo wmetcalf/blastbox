@@ -719,8 +719,8 @@ for a lapsed certificate or an operator mistake, and it is not a control against
 because the node executes it.
 
 If the ingress host has a CA (`blastbox pki init`), ingress also serves the routes that move
-the decision to the *other* side of the hand-over. **All seven**, because a reverse proxy or
-WAF allowlist written from a short list silently breaks two of them:
+the decision to the *other* side of the hand-over. **All of these**, because a reverse proxy or
+WAF allowlist written from a short list silently breaks some of them:
 
 ```
 GET  /v1/nodes/challenge             → a short-lived challenge
@@ -730,7 +730,15 @@ GET  /v1/nodes/backlog               → how much granted work waits } all carry
 GET  /v1/nodes/jobs/{id}             → read a job this node holds  } X-Blastbox-Node-Session
 POST /v1/nodes/jobs/{id}             → report on it                }
 GET  /v1/nodes/jobs/{id}/disposition → whose job is this?          }
+POST /v1/nodes/heartbeat             → liveness (a claim; never authorisation) }
+POST /v1/nodes/renew                 → queue a fresh CSR           }
+GET  /v1/nodes/cert                  → this node's current cert    }
+GET  /v1/fleet/liveness              → operator fleet view (API key, not a node session)
 ```
+
+Blocking `/v1/nodes/heartbeat` makes every Go-agent node read `node_silent`. A node with no
+heartbeat client (the Python `HttpJobStore` node) is judged by its claims instead. The alert
+thresholds are in CONFIGURATION.md under "Node liveness alerts".
 
 `/backlog` and `/disposition` are not optional extras. Without `/backlog` a node's sizer has no
 demand signal at all and sits at its floors however deep the queue is; without `/disposition` the
