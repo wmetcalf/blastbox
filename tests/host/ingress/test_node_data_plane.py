@@ -519,22 +519,79 @@ def test_sparse_member_refused_before_expansion(tmp_path, pki_dir):  # noqa: F81
     assert spool_dirs(tmp_path) == []
 
 
+class _NoBigReads(io.BytesIO):
+    """A stream that fails any single read big enough to be an unbounded header record."""
+
+    def read(self, n=-1):
+        if n is None or n < 0 or n > (1 << 20):
+            raise AssertionError(f"unbounded read of {n} bytes")
+        return super().read(n)
+
+
+def _ustar(name: bytes, size: int, typ: bytes) -> bytes:
+    b = bytearray(512)
+    b[0:len(name)] = name
+    b[100:108] = b"0000644\0"
+    b[124:136] = b"%011o\0" % size
+    b[156] = typ[0]
+    b[257:263] = b"ustar\0"
+    b[263:265] = b"00"
+    b[148:156] = b"        "
+    b[148:156] = b"%06o\0 " % sum(b)
+    return bytes(b)
+
+
+def _pad(b: bytes) -> bytes:
+    return b + b"\0" * (-len(b) % 512)
+
+
+def _pax_rec(k: str, v: str) -> bytes:
+    body = f" {k}={v}\n".encode()
+    n = len(body) + 1
+    while len(str(n)) + len(body) != n:
+        n = len(str(n)) + len(body)
+    return str(n).encode() + body
+
+
+_META = _ustar(b"metadata.json", 2, b"0") + _pad(b"{}")
+_BIG = 8 << 20
+
+
 @pytest.mark.parametrize("typ", [b"x", b"g", b"L", b"K"])
-def test_oversized_extended_header_refused_without_reading_it(typ, monkeypatch):
+def test_oversized_extended_header_refused_without_reading_it(typ):
     """tarfile reads a pax/GNU long-name record WHOLE into memory: refuse a big one first."""
-    size = 8 << 20
-    ti = tarfile.TarInfo("././@Long")
-    ti.size = size
-    ti.type = typ
-    head = bytearray(ti.tobuf(tarfile.GNU_FORMAT, "utf-8", "surrogateescape"))
-    data = bytes(head) + b"\0" * size + b"\0" * 1024
-
-    def boom(*a, **k):
-        raise AssertionError("tarfile must not parse an oversized extended header")
-
-    monkeypatch.setattr(node_results.tarfile, "open", boom)
+    data = _ustar(b"././@Long", _BIG, typ) + b"\0" * _BIG + _META + b"\0" * 1024
     with pytest.raises(node_results.TarRejected, match="extended header"):
-        node_results.vet_tar(io.BytesIO(data), max_members=100, max_total_bytes=500 << 20)
+        node_results.vet_tar(_NoBigReads(data), max_members=100, max_total_bytes=500 << 20)
+
+
+def test_extended_header_bound_holds_behind_a_pax_size_override():
+    """A pax size= record moves tarfile's next header; the bound must follow tarfile's walk."""
+    p = _pax_rec("size", "1024")
+    data = (_ustar(b"pax", len(p), b"x") + _pad(p) + _ustar(b"a", 0, b"0") + b"\0" * 1024
+            + _ustar(b"pax2", _BIG, b"x") + b"\0" * _BIG + _META + b"\0" * 1024)
+    with pytest.raises(node_results.TarRejected, match="extended header"):
+        node_results.vet_tar(_NoBigReads(data), max_members=100, max_total_bytes=500 << 20)
+
+
+def test_extended_header_bound_holds_behind_a_directory_with_a_size():
+    """tarfile ignores a directory's size field; a raw walk that honours it skips the record."""
+    big = b"%d x=%s\n" % (0, b"A" * (2 << 20))
+    data = (_ustar(b"d/", 1 << 20, b"5") + _ustar(b"PaxHeader", len(big), b"x") + _pad(big)
+            + _META + b"\0" * 1024)
+    with pytest.raises(node_results.TarRejected, match="extended header"):
+        node_results.vet_tar(_NoBigReads(data), max_members=100, max_total_bytes=500 << 20)
+
+
+@pytest.mark.parametrize("fmt", [tarfile.PAX_FORMAT, tarfile.GNU_FORMAT])
+def test_long_names_in_pax_and_gnu_tars_still_accepted(fmt):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=fmt) as tf:
+        for name, body in (("metadata.json", b"{}"), ("a/" + "b" * 150 + "/" + "c" * 150, b"x")):
+            ti = tarfile.TarInfo(name)
+            ti.size = len(body)
+            tf.addfile(ti, io.BytesIO(body))
+    node_results.vet_tar(io.BytesIO(buf.getvalue()), max_members=100, max_total_bytes=1 << 20)
 
 
 def test_metadata_not_counted_against_the_artifact_total(tmp_path, pki_dir, monkeypatch):  # noqa: F811

@@ -212,49 +212,25 @@ def pending(root: Path) -> Iterator[Path]:
 
 
 # A pax ('x'/'g') or GNU long-name/long-link ('L'/'K') record is read WHOLE into memory by
-# tarfile before any member is yielded, so its size must be bounded before tarfile sees it.
+# tarfile before any member is yielded, so its size must be bounded before tarfile reads it.
 MAX_EXTENDED_HEADER = 64 * 1024
-_EXTENDED_TYPES = frozenset(b"xgLK")
-_SPARSE_TYPE = ord("S")
+_EXTENDED_TYPES = frozenset({tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.SOLARIS_XHDTYPE,
+                             tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK})
 
 
-def _header_size(field: bytes) -> int:
-    if field[0] & 0x80:                       # GNU base-256
-        n = field[0] & 0x7F
-        for b in field[1:]:
-            n = (n << 8) | b
-        return n
-    txt = field.split(b"\0", 1)[0].strip()
-    return int(txt, 8) if txt else 0
+class _BoundedTarInfo(tarfile.TarInfo):
+    """Refuses an oversized extended header record and a GNU sparse member at the moment
+    tarfile reaches it in ITS OWN header walk, before it reads the record. A separate raw
+    prescan cannot do this: tarfile ignores a directory's size field and applies a pax
+    ``size=`` override to the next member, so any independent walk can be steered onto a
+    different chain than the one tarfile parses."""
 
-
-def _prescan_headers(fileobj: Any, *, max_headers: int) -> None:
-    """Walk the raw 512-byte header chain without tarfile: refuse a GNU sparse member and any
-    extended header record larger than MAX_EXTENDED_HEADER. Leaves fileobj at offset 0."""
-    fileobj.seek(0)
-    off = 0
-    seen = 0
-    try:
-        while True:
-            fileobj.seek(off)
-            block = fileobj.read(512)
-            if len(block) < 512 or not block.strip(b"\0"):
-                break                         # EOF or the end-of-archive zero block
-            seen += 1
-            if seen > max_headers:
-                raise TarRejected(f"more than {max_headers} headers")
-            try:
-                size = _header_size(block[124:136])
-            except ValueError:
-                raise TarRejected("unreadable tar: bad size field") from None
-            typ = block[156]
-            if typ == _SPARSE_TYPE:
-                raise TarRejected("sparse member refused")
-            if typ in _EXTENDED_TYPES and size > MAX_EXTENDED_HEADER:
-                raise TarRejected(f"extended header record of {size} bytes refused")
-            off += 512 + ((size + 511) // 512) * 512
-    finally:
-        fileobj.seek(0)
+    def _proc_member(self, tarfile_obj):  # type: ignore[no-untyped-def]
+        if self.type == tarfile.GNUTYPE_SPARSE:
+            raise TarRejected(f"sparse member refused: {self.name!r}")
+        if self.type in _EXTENDED_TYPES and self.size > MAX_EXTENDED_HEADER:
+            raise TarRejected(f"extended header record of {self.size} bytes refused")
+        return super()._proc_member(tarfile_obj)
 
 
 def vet_tar(fileobj: Any, *, max_members: int, max_total_bytes: int,
@@ -268,13 +244,14 @@ def vet_tar(fileobj: Any, *, max_members: int, max_total_bytes: int,
     declared bytes. ``metadata.json`` has its own cap and does not count toward the artifact
     total, exactly as ``_safe_extract_tar`` and the cold trust gate count it.
     """
-    _prescan_headers(fileobj, max_headers=2 * max_members + 16)
     seen: set[str] = set()
     meta_regular = False
     count = 0
     total = 0
     try:
-        with tarfile.open(fileobj=fileobj, mode="r:") as tf:   # "r:" refuses gz/bz2/xz
+        fileobj.seek(0)
+        with tarfile.open(fileobj=fileobj, mode="r:",          # "r:" refuses gz/bz2/xz
+                          tarinfo=_BoundedTarInfo) as tf:
             for m in tf:
                 count += 1
                 if count > max_members:
