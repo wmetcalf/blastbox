@@ -308,6 +308,23 @@ def _links_out(crt: Path, d: Path) -> bool:
         return True
 
 
+def unreadable_links(pki_dir: Path, node_dirs: list[Path] | None = None) -> list[Path]:
+    """Cert links out of a node dir that this host cannot read (dangling here, unreadable).
+
+    Renewal cannot tell whose they are, so it reports them once per run rather than per
+    node: an ingress may be serving certs through one that no renewal will ever update.
+    """
+    out: list[Path] = []
+    for d in _dirs(pki_dir, node_dirs):
+        for c in sorted(d.glob("*.crt")):
+            if _links_out(c, d):
+                try:
+                    _read_capped(c, MAX_CERT_BYTES, follow=True)
+                except (OSError, _Unreadable):
+                    out.append(c)
+    return out
+
+
 def _links_out_for(d: Path, node_id: str, ca: CertAuthority, *,
                    unknown_counts: bool = False) -> bool:
     """Does ``d`` hold a cert for ``node_id`` through a link that leaves ``d``?
@@ -678,12 +695,13 @@ def _renew_one(ca: CertAuthority, qdir: Path, every: list[Path], node_id: str,
         return f"deferred: {exc}", True
     # A dir that serves the node only through a link out of it was not (cannot be) written:
     # that ingress still serves the old cert. Renewed, but say so (the CLI exits 2).
-    # A link this host cannot read may be the node's too (resolved on that ingress only).
-    stale = [d for d in every
-             if d not in states and _links_out_for(d, node_id, ca, unknown_counts=True)]
+    # (A link this host cannot read at all is reported once per run by unreadable_links,
+    # not here: it may be anything, and naming it on every node's renewal would make one
+    # junk link fail the whole fleet's run.)
+    stale = [d for d in every if d not in states and _links_out_for(d, node_id, ca)]
     if stale:
-        return (f"{RENEWED_NOT_WRITTEN} {', '.join(map(str, stale))}: it may hold the node only "
-                "through a link out of the dir, so it may still serve the old certificate"), False
+        return (f"{RENEWED_NOT_WRITTEN} {', '.join(map(str, stale))}: it holds the node only "
+                "through a link out of the dir, so it still serves the old certificate"), False
     return "renewed", False
 
 

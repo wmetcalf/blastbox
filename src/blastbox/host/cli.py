@@ -1547,6 +1547,13 @@ def _pki_cmd(args: argparse.Namespace) -> int:
             return 1
         for node_id, outcome in outcomes:
             print(f"{node_id}: {outcome}")
+        from blastbox.host.node_renew import unreadable_links
+        try:
+            for link in unreadable_links(pki_dir, [Path(p) for p in args.node_dir] or None):
+                print(f"warning: {link} links out of its node dir and cannot be read here; an "
+                      "ingress serving a cert through it never gets renewals", file=sys.stderr)
+        except OSError:
+            pass
         # A deferral repeats every run until someone fixes its cause; exit 2 so the timer
         # unit shows it, instead of staying green while the node's cert runs out.
         from blastbox.host.node_renew import RENEWED_NOT_WRITTEN
