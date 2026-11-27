@@ -3108,13 +3108,30 @@ class Dispatcher:
                 stderr_tail,
             )
 
+        self.finalise_output(job, output_dir, observation, capture_on=capture_on)
+
+    def finalise_output(
+        self,
+        job: Job,
+        output_dir: Path,
+        observation: _attest.RunObservation | None,
+        *,
+        capture_on: bool = False,
+    ) -> str:
+        """Trust-gate, seal, upload and mark DONE an already-populated output tree.
+
+        Callable without a container having run (e.g. on a tree uploaded by a remote agent).
+        Returns "done", "failed: <reason>" (the job was failed with that reason), "lost" (our
+        claim no longer holds; terminal state left to the new owner) or "retained" (upload
+        failed; tree retained for the upload-retry sweep).
+        """
         # Bound TOTAL on-disk output (declared + UNDECLARED) before trusting it, so a worker
         # that wrote a huge undeclared file can't exhaust job_root (#3 disk-exhaustion DoS).
         try:
             self._enforce_output_size_cap(output_dir)
         except OutputTrustError as exc:
             self._fail_job(job, f"output too large: {exc}")
-            return
+            return f"failed: output too large: {exc}"
 
         # ------------------------------------------------------------------
         # Step 5: Validate output through trust gate
@@ -3135,10 +3152,10 @@ class Dispatcher:
         except OutputTrustError as exc:
             # Scrub the message before storing it.
             self._fail_job(job, f"output trust validation failed: {exc}")
-            return
+            return f"failed: output trust validation failed: {exc}"
         except Exception as exc:  # noqa: BLE001
             self._fail_job(job, f"unexpected trust validation error: {exc}")
-            return
+            return f"failed: unexpected trust validation error: {exc}"
 
         # The trust gate validates output STRUCTURE, not the engine's verdict: a structurally valid
         # envelope can still report a FAILED conversion (status="engine_error"). Gate on it here —
@@ -3147,7 +3164,7 @@ class Dispatcher:
         if envelope.status == "engine_error":
             detail = envelope.warnings[0].message if envelope.warnings else "engine_error"
             self._fail_job(job, f"engine_error: {detail}")
-            return
+            return f"failed: engine_error: {detail}"
 
         # Fold a per-job network capture (if blastbox-netd produced one) into the sealed envelope
         # as a TRUSTED host artifact. The pcap lives off the worker /output mount, so the worker
@@ -3201,7 +3218,7 @@ class Dispatcher:
                 "cold job %s reclaimed before upload; skipping put_output (peer owns it "
                 "now)", job.job_id,
             )
-            return
+            return "lost"
         # The receipt goes INTO the sealed tree immediately before it ships (see the warm twin).
         sealed = self._seal_receipt(job, output_dir, observation)
         if not self._upload_output(job, output_dir, sealed=sealed):
@@ -3214,7 +3231,7 @@ class Dispatcher:
             # superseded attempt publish over a peer. If we then lose the CAS we clear it anyway,
             # so the common case leaves nothing behind (#85 review).
             self._retain_for_upload_retry(job, self._retained_reason(sealed))
-            return
+            return "retained"
 
         # ------------------------------------------------------------------
         # Step 6: Mark DONE
@@ -3247,9 +3264,10 @@ class Dispatcher:
                 "another dispatcher); leaving its terminal state untouched",
                 job.job_id,
             )
-            return
+            return "lost"
         # DONE applied + still ours: index per-page perceptual hashes for /similar search.
         self._index_page_hashes(job.job_id, envelope)
+        return "done"
 
     # ------------------------------------------------------------------
     # Helpers
