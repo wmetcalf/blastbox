@@ -54,7 +54,6 @@ const (
 )
 
 var (
-	paramKeyRE = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
 	badNameRE  = regexp.MustCompile(`[^A-Za-z0-9._-]`)
 )
 
@@ -127,7 +126,7 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	if c.Run.Network != "none" {
 		return j.release(ctx, fmt.Sprintf("run.network is %q, not none", c.Run.Network))
 	}
-	env, err := paramEnv(eng, c.Run.Params)
+	env, err := r.paramEnv(c.JobID, eng, c.Run.Params)
 	if err != nil {
 		return j.fail(ctx, "invalid run params: "+err.Error())
 	}
@@ -324,13 +323,48 @@ func template(argv []string, vars map[string]string) ([]string, error) {
 	return out, nil
 }
 
-// paramEnv turns run.params into extra child env. Keys must match ^[A-Z][A-Z0-9_]{0,63}$ and
-// values must be <= 8 KiB; BLASTBOX_* keys are never forwarded. Nothing is forwarded unless the
-// engine opts in (default true).
-func paramEnv(eng config.Engine, params map[string]any) (map[string]string, error) {
+// Keys a job may never set, whatever the engine's allowlist says: the dispatcher's
+// engine-agnostic floor (dispatch._RESERVED_ENV_PREFIXES/_KEYS: framework, loader, interpreter,
+// executable and shell resolution) plus DYLD_, the macOS loader's LD_.
+var (
+	reservedParamPrefixes = []string{"BLASTBOX_", "LD_", "DYLD_", "PYTHON"}
+	reservedParamKeys     = map[string]bool{"PATH": true, "IFS": true}
+)
+
+func reservedParam(eng config.Engine, k string) bool {
+	if reservedParamKeys[k] {
+		return true
+	}
+	for _, p := range reservedParamPrefixes {
+		if strings.HasPrefix(k, p) {
+			return true
+		}
+	}
+	for _, r := range eng.ReservedParamKeys {
+		if k == r {
+			return true
+		}
+	}
+	return false
+}
+
+// paramEnv turns run.params into extra child env, filtered as the dispatcher's
+// _sanitize_params filters them: a key must match ^[A-Z][A-Z0-9_]{0,63}$, must not be reserved
+// (the floor above, or the engine's reserved_param_keys) and, when the engine sets param_keys,
+// must be in it; a value must be <= 8 KiB. Anything else is dropped (and logged), not fatal:
+// the push path runs such a job without the key, and so does this one. Nothing is forwarded
+// unless the engine opts in (default true).
+func (r *Runner) paramEnv(jobID string, eng config.Engine, params map[string]any) (map[string]string, error) {
 	env := map[string]string{}
 	if len(params) == 0 || !eng.ForwardParams() {
 		return env, nil
+	}
+	var allow map[string]bool
+	if eng.ParamKeys != nil {
+		allow = map[string]bool{}
+		for _, k := range *eng.ParamKeys {
+			allow[k] = true
+		}
 	}
 	keys := make([]string, 0, len(params))
 	for k := range params {
@@ -338,8 +372,16 @@ func paramEnv(eng config.Engine, params map[string]any) (map[string]string, erro
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		if !paramKeyRE.MatchString(k) {
-			return nil, fmt.Errorf("param key %q does not match ^[A-Z][A-Z0-9_]{0,63}$", k)
+		switch {
+		case !config.ParamKeyRE.MatchString(k):
+			r.logf("job %s: dropping param %+q: not ^[A-Z][A-Z0-9_]{0,63}$", jobID, k)
+			continue
+		case reservedParam(eng, k):
+			r.logf("job %s: dropping reserved param %+q", jobID, k)
+			continue
+		case allow != nil && !allow[k]:
+			r.logf("job %s: dropping param %+q: not in the engine's param_keys", jobID, k)
+			continue
 		}
 		var v string
 		switch t := params[k].(type) {
@@ -360,10 +402,8 @@ func paramEnv(eng config.Engine, params map[string]any) (map[string]string, erro
 			}
 			v = string(b)
 		}
-		if len(v) > maxParamValue {
-			return nil, fmt.Errorf("param %q value is over 8 KiB", k)
-		}
-		if strings.HasPrefix(k, "BLASTBOX_") {
+		if len(v) > maxParamValue || strings.ContainsRune(v, 0) {
+			r.logf("job %s: dropping param %+q: value over 8 KiB or holding NUL", jobID, k)
 			continue
 		}
 		env[k] = v

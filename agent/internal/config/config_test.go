@@ -91,6 +91,10 @@ func TestLoadRefusals(t *testing.T) {
 	}{
 		{"unknown top key", "linux", func(f fixture) string { return f.toml(eng(good), nsj) + "bogus = 1\n" }, "unknown keys"},
 		{"unknown engine key", "linux", func(f fixture) string { return f.toml(eng(good+"bogus = 1\n"), nsj) }, "unknown keys"},
+		{"bad param_keys entry", "linux", func(f fixture) string { return f.toml(eng(good+"param_keys = [\"ok\"]\n"), nsj) }, "param key"},
+		{"bad reserved_param_keys entry", "linux", func(f fixture) string {
+			return f.toml(eng(good+"reserved_param_keys = [\"A-B\"]\n"), nsj)
+		}, "param key"},
 		{"http ingress", "linux", func(f fixture) string {
 			return strings.Replace(f.toml(eng(good), nsj), "https://", "http://", 1)
 		}, "https"},

@@ -45,6 +45,12 @@ type Engine struct {
 	SelftestArgv []string `toml:"selftest_argv"` // known-positive self-test, must exit 0
 	MaxRSSMiB    *int     `toml:"max_rss_mib"`
 	EnvParams    *bool    `toml:"env_params"` // forward run.params as env vars (default true)
+	// ParamKeys is the engine's param ALLOWLIST (the dispatcher's per-engine PARAM_KEYS): unset
+	// = any key that clears the reserved floor; set (even empty) = only these keys.
+	ParamKeys *[]string `toml:"param_keys"`
+	// ReservedParamKeys are keys this engine never takes from a job (posture selectors, binary
+	// paths), on top of the engine-agnostic floor; they win over ParamKeys.
+	ReservedParamKeys []string `toml:"reserved_param_keys"`
 }
 
 // Nsjail pins the nsjail binary and the confinement layers around it. Like blastbox's nsjail
@@ -86,6 +92,9 @@ func (e *Engine) RSSLimitMiB() int {
 
 // ForwardParams reports whether run.params are forwarded as env vars (default true).
 func (e *Engine) ForwardParams() bool { return e.EnvParams == nil || *e.EnvParams }
+
+// ParamKeyRE is the shape of a run param forwarded as an env var.
+var ParamKeyRE = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
 
 var (
 	engineNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
@@ -236,6 +245,15 @@ func (e *Engine) validate(goos string) error {
 	}
 	if r := e.RSSLimitMiB(); r < 64 {
 		return fmt.Errorf("max_rss_mib must be >= 64, got %d", r)
+	}
+	var keys []string
+	if e.ParamKeys != nil {
+		keys = append(keys, *e.ParamKeys...)
+	}
+	for _, k := range append(keys, e.ReservedParamKeys...) {
+		if !ParamKeyRE.MatchString(k) {
+			return fmt.Errorf("param key %q must match %s", k, ParamKeyRE)
+		}
 	}
 	return nil
 }

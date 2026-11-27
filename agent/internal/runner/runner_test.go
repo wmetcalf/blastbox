@@ -458,20 +458,49 @@ func TestLostClaimOnPutNoRetryAndWiped(t *testing.T) {
 	f.wiped(t)
 }
 
-func TestBadParamKeyFailsBeforeLaunch(t *testing.T) {
-	ran := filepath.Join(t.TempDir(), "ran")
-	f := setup(t, "touch "+ran+"; "+happyEngine)
-	f.claim.Run.Params = map[string]any{"lower-case": "x"}
-	f.wantFail(t, f.run(), "invalid run params")
-	if _, err := os.Stat(ran); err == nil {
-		t.Error("engine ran")
+// Params the dispatcher would drop are dropped here too, not fatal: a lowercase or oversized
+// key, and the loader/interpreter/shell keys a submitter must never set.
+func TestUnusableParamsAreDropped(t *testing.T) {
+	const show = `env | grep -E '^(FOO|PYTHON|IFS|LD_|DYLD_|lower|BIG)' | sort | tr '\n' ' ' > "$1/env.txt"; echo '{}' > "$1/metadata.json"`
+	f := setup(t, show)
+	f.claim.Run.Params = map[string]any{"FOO": "bar", "lower-case": "x", "password": "infected",
+		"BIG": strings.Repeat("v", 8193), "PYTHONPATH": "/x", "PYTHONSTARTUP": "/x", "IFS": "x",
+		"LD_PRELOAD": "/x", "DYLD_INSERT_LIBRARIES": "/x"}
+	if res := f.run(); res.Outcome != "done" {
+		t.Fatalf("%+v", res)
 	}
-	if f.in.inputGets != 0 {
-		t.Error("input fetched for a doomed job")
+	if got := f.in.tarFiles()["env.txt"]; got != "FOO=bar " {
+		t.Fatalf("env %q", got)
 	}
-	f = setup(t, happyEngine)
-	f.claim.Run.Params = map[string]any{"OK": strings.Repeat("v", 8193)}
-	f.wantFail(t, f.run(), "over 8 KiB")
+}
+
+func TestEngineParamAllowlistAndReservedKeys(t *testing.T) {
+	const show = `env | grep -E '^(FOO|BAR|MODE)=' | sort | tr '\n' ' ' > "$1/env.txt"; echo '{}' > "$1/metadata.json"`
+	params := map[string]any{"FOO": "1", "BAR": "2", "MODE": "3"}
+	for _, tc := range []struct {
+		name     string
+		allow    *[]string
+		reserved []string
+		want     string
+	}{
+		{"none", nil, nil, "BAR=2 FOO=1 MODE=3 "},
+		{"allowlist", &[]string{"FOO", "MODE"}, nil, "FOO=1 MODE=3 "},
+		{"empty allowlist blocks all", &[]string{}, nil, ""},
+		{"reserved", nil, []string{"MODE"}, "BAR=2 FOO=1 "},
+		{"reserved beats allowlist", &[]string{"FOO", "MODE"}, []string{"MODE"}, "FOO=1 "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := setup(t, show)
+			f.eng.ParamKeys, f.eng.ReservedParamKeys = tc.allow, tc.reserved
+			f.claim.Run.Params = params
+			if res := f.run(); res.Outcome != "done" {
+				t.Fatalf("%+v", res)
+			}
+			if got := f.in.tarFiles()["env.txt"]; got != tc.want {
+				t.Fatalf("env %q, want %q", got, tc.want)
+			}
+		})
+	}
 }
 
 func TestParamsBecomeEnvButNeverBlastbox(t *testing.T) {
