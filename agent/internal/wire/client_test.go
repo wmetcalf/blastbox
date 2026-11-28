@@ -1021,3 +1021,22 @@ func TestHeldCallSessionRefusalIsNotAJobAnswer(t *testing.T) {
 		}
 	}
 }
+
+// A held call's session error keeps the handshake's pacing and class: a 503 with Retry-After
+// on /session still tells the retry loop how long to wait.
+func TestHeldCallSessionErrorKeepsRetryAfter(t *testing.T) {
+	f, c := setup(t)
+	f.handler = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path == "/v1/nodes/session" {
+			w.Header().Set("Retry-After", "7")
+			w.WriteHeader(503)
+			return true
+		}
+		return false
+	}
+	err := c.Fail(context.Background(), &Claim{JobID: "j1", ClaimID: "c1", Receipt: "r1"}, "x", time.Now())
+	var ra *RetryAfterError
+	if !errors.Is(err, ErrSession) || !errors.As(err, &ra) || ra.After != 7*time.Second {
+		t.Fatalf("%v: the session's Retry-After was lost", err)
+	}
+}

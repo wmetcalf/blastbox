@@ -308,8 +308,23 @@ var ErrSession = errors.New("wire: session handshake failed")
 
 type sessionError struct{ err error }
 
-func (e *sessionError) Error() string   { return "wire: session handshake failed: " + e.err.Error() }
-func (e *sessionError) Unwrap() []error { return []error{ErrSession, ErrServer} }
+func (e *sessionError) Error() string { return "wire: session handshake failed: " + e.err.Error() }
+
+// Unwrap keeps the handshake's pacing and transport class (Retry-After, TLS) but never its
+// job-shaped sentinels (refused, not found, rejected), which would read as an answer about the job.
+func (e *sessionError) Unwrap() []error {
+	out := []error{ErrSession, ErrServer}
+	var ra *RetryAfterError
+	if errors.As(e.err, &ra) {
+		out = append(out, &RetryAfterError{Err: ErrServer, After: ra.After})
+	}
+	for _, s := range []error{ErrTLS, ErrClientCertRefused} {
+		if errors.Is(e.err, s) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
 
 func heldSessionErr(err error) error {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
