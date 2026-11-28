@@ -2275,16 +2275,20 @@ def _dispatch(args: argparse.Namespace) -> int:
             # action does rather than assuming the default name.
             iface = _host_cfg(args, base_required=False).wg_iface
         iface = iface or DEFAULT_IFACE
+        # Resolved as `status` does (PATH plus the Homebrew/local prefixes): under sudo or a
+        # timer the ambient PATH may not reach it, and the dump must run the same binary.
+        wg = _which("wg")
         if role == "worker" and _supported_platform() == "darwin":
             # macOS wg-quick runs the link on a utunN, not on the logical name: check the
             # utun verified by key to run THIS link, exactly as `status` does.
-            real = _our_real_iface_darwin(_which("wg"), _link_iface(iface))
+            real = _our_real_iface_darwin(wg, _link_iface(iface))
             if real is None:
                 print(f"error: {iface}: no running utun verified to carry this link "
                       "(link down, or `wg` / our key unreadable)", file=sys.stderr)
                 return 1
             iface = real
-        code, lines = _host_mod().check_handshakes(iface, args.max_handshake_age)
+        code, lines = _host_mod().check_handshakes(iface, args.max_handshake_age,
+                                                   wg=wg or "wg")
         for ln in lines:
             print(ln, file=sys.stderr if code == 1 else sys.stdout)
         return code

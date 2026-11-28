@@ -1180,13 +1180,14 @@ def status(cfg: WorkerLinkConfig, *, now: float | None = None) -> tuple[bool, li
 
 
 def check_handshakes(iface: str, max_age: float = 180.0, *, now: float | None = None,
-                     run=None) -> tuple[int, list[str]]:
+                     run=None, wg: str = "wg") -> tuple[int, list[str]]:
     """Alarm-friendly handshake check: ``(exit_code, lines)``.
 
     0 = every peer's latest handshake is within ``max_age`` seconds; 2 = at least one peer
     is stale or never handshook (each offender is listed by its public key truncated to 8
     characters and its age); 1 = the dump could not be read, or the interface has no peers.
-    Only the public key is ever printed: the dump's interface line (private key) is
+    ``wg`` is the executable to run (a resolved path: under sudo or a timer the ambient
+    ``PATH`` may not reach it). Only the public key is ever printed: the dump's interface line (private key) is
     discarded by ``parse_wg_dump`` and the per-peer preshared key is never read.
     """
     import time
@@ -1200,7 +1201,7 @@ def check_handshakes(iface: str, max_age: float = 180.0, *, now: float | None = 
     runner = run or ea._run
     at = time.time() if now is None else now
     try:
-        dump = runner(["wg", "show", iface, "dump"], check=False)
+        dump = runner([wg, "show", iface, "dump"], check=False)
     except OSError as exc:
         return 1, [f"error: cannot read `wg show {iface} dump`: {exc.__class__.__name__}"]
     if dump.returncode != 0:

@@ -130,13 +130,15 @@ def test_cli_check_on_a_macos_worker_reads_the_real_utun(monkeypatch):
     resolved = []
     monkeypatch.setattr(link, "_our_real_iface_darwin",
                         lambda wg, iface: resolved.append((wg, iface)) or "utun7")
-    seen = []
+    seen, wgs = [], []
     monkeypatch.setattr(wla, "check_handshakes",
-                        lambda iface, age, **_: seen.append(iface) or (0, ["ok"]))
+                        lambda iface, age, wg="wg", **_: seen.append(iface) or wgs.append(wg)
+                        or (0, ["ok"]))
     args = _worker_check_args()
     assert args.func(args) == 0
     assert seen == ["utun7"]
     assert resolved == [("/opt/homebrew/bin/wg", link.DEFAULT_IFACE)]
+    assert wgs == ["/opt/homebrew/bin/wg"]      # the dump runs the SAME resolved binary
 
 
 def test_cli_check_on_a_macos_worker_with_no_verified_utun_is_an_error(monkeypatch, capsys):
@@ -158,3 +160,15 @@ def test_cli_check_on_a_linux_worker_keeps_the_logical_name(monkeypatch):
     args = _worker_check_args("--iface", "wtwg0")
     assert args.func(args) == 0
     assert seen == ["wtwg0"]
+
+
+def test_check_handshakes_runs_the_given_wg_binary():
+    """Under sudo or a launchd timer PATH may lack Homebrew: run the resolved binary."""
+    argvs = []
+
+    def run(argv, **_kw):
+        argvs.append(argv)
+        return subprocess.CompletedProcess(argv, 0, _dump(("AAAAAAAAAAAA=", int(NOW) - 10)), "")
+    code, _ = wla.check_handshakes("utun7", 180, now=NOW, run=run, wg="/opt/homebrew/bin/wg")
+    assert code == 0
+    assert argvs == [["/opt/homebrew/bin/wg", "show", "utun7", "dump"]]
