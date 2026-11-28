@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -14,15 +13,15 @@ import (
 	"github.com/wmetcalf/blastbox/agent/internal/wire"
 )
 
-// wipeDir removes a job dir whatever modes the engine left behind.
-func wipeDir(dir string) {
-	filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-		if d != nil && d.IsDir() {
-			os.Chmod(p, 0o700)
-		}
-		return nil
-	})
-	os.RemoveAll(dir)
+// wipeDir removes a settled job dir whatever the engine left behind. It reports false (keep
+// the id in the recovery set, try again) while any of the dir is still on disk: the report is
+// settled, so a retry finds no claim record left and only wipes.
+func (a *Agent) wipeDir(dir, name string) bool {
+	if err := runner.Wipe(dir); err != nil {
+		a.Log.Warn("recovery: job dir not wiped; will retry", "job", name, "err", err.Error())
+		return false
+	}
+	return true
 }
 
 // snapshotRecovery records the job ids present on disk at startup, BEFORE any slot loop runs.
@@ -123,8 +122,7 @@ func resultRecord(dir string) (string, wire.ResultMeta, bool) {
 func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool) {
 	if _, err := os.Lstat(filepath.Join(dir, runner.ReportedName)); err == nil {
 		a.Log.Info("recovery: the control plane already answered this job's upload; wiping", "job", name)
-		wipeDir(dir)
-		return true
+		return a.wipeDir(dir, name)
 	}
 	_, uploadedErr := os.Lstat(filepath.Join(dir, runner.UploadedName))
 	uploaded := uploadedErr == nil
@@ -168,8 +166,7 @@ func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool)
 	if err != nil || json.Unmarshal(raw, &cj) != nil || cj.JobID != name || !wire.ValidJobID(cj.JobID) ||
 		cj.ClaimID == "" || cj.Receipt == "" {
 		a.Log.Warn("recovery: job dir without a usable claim record; wiping", "job", name, "started", started)
-		wipeDir(dir)
-		return true
+		return a.wipeDir(dir, name)
 	}
 	cl := &wire.Claim{JobID: cj.JobID, ClaimID: cj.ClaimID, Receipt: cj.Receipt}
 	switch {
@@ -239,8 +236,7 @@ func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool)
 		a.Log.Warn("recovery: will retry", "job", name, "action", action, "err", cerr.Error())
 		return false
 	}
-	wipeDir(dir)
-	return true
+	return a.wipeDir(dir, name)
 }
 
 // recoverUploaded settles a job whose result upload the control plane accepted (202). It holds
@@ -254,8 +250,7 @@ func (a *Agent) recoverUploaded(ctx context.Context, dir, name string, cl *wire.
 		out, err = a.client().PutResult(ctx, cl, tar, meta)
 		if err == nil {
 			a.Log.Info("recovery: accepted upload replayed", "job", name, "status", out.Status)
-			wipeDir(dir)
-			return true
+			return a.wipeDir(dir, name)
 		}
 	} else {
 		var st string
@@ -266,15 +261,13 @@ func (a *Agent) recoverUploaded(ctx context.Context, dir, name string, cl *wire.
 				return false
 			}
 			a.Log.Info("recovery: accepted upload settled", "job", name, "disposition", st)
-			wipeDir(dir)
-			return true
+			return a.wipeDir(dir, name)
 		}
 	}
 	switch {
 	case errors.Is(err, wire.ErrClaimLost), errors.Is(err, wire.ErrRefused), runner.Permanent(err):
 		a.Log.Warn("recovery: accepted upload no longer answerable; wiping", "job", name, "err", err.Error())
-		wipeDir(dir)
-		return true
+		return a.wipeDir(dir, name)
 	}
 	a.Log.Warn("recovery: will retry", "job", name, "action", "poll accepted upload", "err", err.Error())
 	return false

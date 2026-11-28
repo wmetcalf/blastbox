@@ -164,12 +164,17 @@ func Command(ctx context.Context, sb Kind, req Request, argv []string, lim Limit
 		nreq.EnvOrder = []string{"HOME", "TMPDIR", "LANG"}
 		// Engine and probe binaries outside /usr must be visible in the jail; mounting the
 		// files themselves (not their directories) keeps the grant minimal.
+		// A path inside another granted read-only path is not mounted again: the ancestor's
+		// bind already exposes it, and a file mounted before its directory is shadowed by the
+		// directory mount, which nsjail then fails to remount read-only.
+		ro := append(append([]string(nil), req.ExecPaths...), req.ROPaths...)
 		seen := map[string]bool{}
-		for _, p := range append(append([]string(nil), req.ExecPaths...), req.ROPaths...) {
-			if !seen[p] && !isRelativeTo(p, "/usr") && !isRelativeTo(p, "/etc") {
-				seen[p] = true
-				nreq.ROMounts = append(nreq.ROMounts, Mount{p, p})
+		for _, p := range ro {
+			if seen[p] || isRelativeTo(p, "/usr") || isRelativeTo(p, "/etc") || insideOther(p, ro) {
+				continue
 			}
+			seen[p] = true
+			nreq.ROMounts = append(nreq.ROMounts, Mount{p, p})
 		}
 		if m, ok := jailAlias(argv[0], req.ExecPaths, req.ROPaths, rw); ok {
 			nreq.ROMounts = append(nreq.ROMounts, m)
@@ -244,6 +249,16 @@ func jailAlias(argv0 string, execPaths, roPaths, rwPaths []string) (Mount, bool)
 		return Mount{}, false
 	}
 	return Mount{resolved, argv0}, true
+}
+
+// insideOther reports whether p lies strictly inside another path of ps.
+func insideOther(p string, ps []string) bool {
+	for _, q := range ps {
+		if q != p && isRelativeTo(p, q) {
+			return true
+		}
+	}
+	return false
 }
 
 func contains(ss []string, s string) bool {

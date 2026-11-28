@@ -864,7 +864,7 @@ func TestWipeHandlesUnreadableTree(t *testing.T) {
 	os.WriteFile(filepath.Join(d, "a/b/f"), []byte("x"), 0o600)
 	os.Chmod(filepath.Join(d, "a/b"), 0)
 	os.Chmod(filepath.Join(d, "a"), 0o500)
-	wipe(d)
+	Wipe(d)
 	if _, err := os.Lstat(d); err == nil {
 		t.Fatal("not wiped")
 	}

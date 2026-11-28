@@ -87,3 +87,21 @@ sleep 30`)
 		t.Fatalf("result %+v after %s, want memory cap exceeded", res, time.Since(t0))
 	}
 }
+
+// An engine may set uchg (seatbelt leaves file flags settable in scratch); the job dir must
+// still be wiped once the run is over.
+func TestSeatbeltImmutableScratchIsWiped(t *testing.T) {
+	f := seatbeltFixture(t, `printf x > "$HOME/locked" && /usr/bin/chflags uchg "$HOME/locked" && mkdir "$HOME/d" && /usr/bin/chflags uchg "$HOME/d"
+printf '{}' > "$1/metadata.json"`)
+	res := f.run()
+	t.Logf("result %+v", res)
+	if res.Outcome == "released" {
+		t.Fatalf("the engine never ran: %+v", res)
+	}
+	jobs := filepath.Join(f.state, "jobs")
+	t.Cleanup(func() { exec.Command("/usr/bin/chflags", "-R", "nouchg", jobs).Run() })
+	ents, _ := os.ReadDir(jobs)
+	for _, e := range ents {
+		t.Errorf("job dir %s left behind", e.Name())
+	}
+}
