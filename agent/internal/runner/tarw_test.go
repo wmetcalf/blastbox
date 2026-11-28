@@ -6,11 +6,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -109,6 +111,9 @@ func TestTarRefusesNonRegular(t *testing.T) {
 		root := t.TempDir()
 		os.WriteFile(filepath.Join(root, "f"), []byte("x"), 0o600)
 		if err := c.mk(root); err != nil {
+			if errors.Is(err, syscall.EILSEQ) {
+				continue // APFS refuses non-UTF-8 names, so no engine there can produce one
+			}
 			t.Fatalf("%s setup: %v", c.name, err)
 		}
 		dst := filepath.Join(t.TempDir(), "r.tar")
