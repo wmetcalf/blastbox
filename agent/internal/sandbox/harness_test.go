@@ -194,3 +194,27 @@ func TestNsjailFileSizeCapIsNsjails(t *testing.T) {
 		}
 	}
 }
+
+// A read-only path that lies inside another read-only path is not mounted on its own: the
+// ancestor's bind already exposes it, and nsjail cannot remount a file the later directory
+// mount shadows (every job failed before the handshake).
+func TestNsjailNestedROPathsMountOnce(t *testing.T) {
+	pins := HostPins{AppArmorProfile: "p", Exists: map[string]bool{"/usr": true}, Symlinks: map[string]bool{}}
+	req := Request{ExecPaths: []string{"/opt/eng/bin/engine.sh"}, ROPaths: []string{"/opt/eng", "/opt/eng/data", "/opt/other"},
+		Scratch: "/tmp/s", Nonce: "n", AgentBin: "/x/agent",
+		NsjailPath: "/usr/local/bin/nsjail", Pins: &pins, SeccompPolicy: "/x/seccomp.kafel", AttachAppArmor: true}
+	cmd, err := Command(context.Background(), Nsjail, req, []string{"/opt/eng/bin/engine.sh"}, Limits{TimeoutS: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ro []string
+	for i, a := range cmd.Args {
+		if a == "--bindmount_ro" && i+1 < len(cmd.Args) && strings.HasPrefix(cmd.Args[i+1], "/opt/") {
+			ro = append(ro, cmd.Args[i+1])
+		}
+	}
+	want := []string{"/opt/eng:/opt/eng", "/opt/other:/opt/other"}
+	if strings.Join(ro, " ") != strings.Join(want, " ") {
+		t.Fatalf("ro mounts %v, want %v", ro, want)
+	}
+}

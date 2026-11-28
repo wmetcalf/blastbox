@@ -113,3 +113,32 @@ func TestNsjailCommandKeepsTheInvokedName(t *testing.T) {
 		t.Fatalf("the engine did not see the name it was invoked by: %v: %s", err, out)
 	}
 }
+
+// An engine binary inside one of the engine's ro_paths was mounted twice, the file and then its
+// directory over it; nsjail could not remount the shadowed file read-only and every job died
+// before the handshake ("Launching child process failed"), while the probe stayed green.
+func TestNsjailCommandRunsAnEngineInsideItsROPath(t *testing.T) {
+	h := nsjailHost(t)
+	dir := t.TempDir()
+	script := filepath.Join(dir, "engine.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	scratch := t.TempDir()
+	cmd, err := Command(context.Background(), Nsjail, Request{
+		ExecPaths: []string{script}, ROPaths: []string{dir}, Scratch: scratch, Nonce: "n0nce",
+		AgentBin: testAgentBin, NsjailPath: h.NsjailPath, SeccompPolicy: h.SeccompPolicy, AllowMissingAppArmor: true,
+	}, []string{script}, Limits{TimeoutS: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("an engine inside its ro_path did not run in the jail: %v: %s", err, out)
+	}
+	if b, _ := os.ReadFile(filepath.Join(scratch, HandshakeName)); string(b) != "n0nce" {
+		t.Fatalf("handshake = %q", b)
+	}
+}

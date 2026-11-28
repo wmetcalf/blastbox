@@ -296,6 +296,7 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 		return j.sandboxFault(why, func() Result { return j.fail(ctx, why) })
 	}
 	if !handshakeOK(j.scr, nonce) {
+		r.logf("job %s: sandbox stderr tail: %q", c.JobID, tail.String())
 		why := "sandbox handshake missing: the run was not confined"
 		return j.sandboxFault(why, func() Result { return j.fail(ctx, why) })
 	}
