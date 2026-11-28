@@ -144,6 +144,8 @@ func (in *ingress) serve(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(503)
 		case 409:
 			w.WriteHeader(409)
+		case 404:
+			w.WriteHeader(404)
 		case 202:
 			js(202, map[string]any{"status": "accepted"})
 		case 422:
@@ -361,10 +363,11 @@ func TestUndeliveredFailIsKeptForRecovery(t *testing.T) {
 	}
 }
 
-// A report the control plane answered with a permanent refusal (a 4xx, a 404) will never be
-// accepted: keeping the dir would only make recovery repeat it forever.
+// A report the control plane answered with a permanent refusal (a 4xx) will never be
+// accepted: keeping the dir would only make recovery repeat it forever. (A 404 is not one:
+// no job route answers it; see TestJobRoute404KeepsTheResult.)
 func TestRejectedReportIsNotKept(t *testing.T) {
-	for _, code := range []int{400, 404} {
+	for _, code := range []int{400, 413} {
 		f := setup(t, `echo '{}' > "$1/metadata.json"; exit 3`)
 		f.in.updStatus = code
 		if res := f.run(); res.Keep {
@@ -1008,5 +1011,22 @@ func TestRefusedClaimHandsBackItsUndeliveredFail(t *testing.T) {
 	res := f.run()
 	if res.Outcome != "refused" || !res.Unrecorded || res.PendingFail == "" {
 		t.Fatalf("%+v: the refused claim's undelivered fail was not handed back", res)
+	}
+}
+
+// No node job route answers 404 (an unknown job or claim is a 403, by design): a 404 there
+// comes from the infrastructure in front of the ingress (a rolling deploy, a misrouted path).
+// It is retried later, never taken as "no such job" -- which failed the job and wiped a good
+// result.
+func TestJobRoute404KeepsTheResult(t *testing.T) {
+	f := setup(t, happyEngine)
+	f.in.putStatus = 404
+	f.in.updStatus = 404
+	res := f.run()
+	if !res.Keep {
+		t.Fatalf("%+v: a 404 from the result route wiped the result", res)
+	}
+	if _, err := os.Stat(filepath.Join(f.state, "jobs", testJob, ResultTarName)); err != nil {
+		t.Fatalf("result.tar gone: %v", err)
 	}
 }

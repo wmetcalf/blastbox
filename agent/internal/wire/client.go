@@ -543,6 +543,10 @@ func statusErr(r *resp, claimed bool) error {
 		return fmt.Errorf("%w: HTTP %d", ErrClaimLost, code)
 	case code == http.StatusForbidden:
 		return ErrRefused
+	case code == http.StatusNotFound && claimed:
+		// No node job route answers 404 (an unknown job or claim is a 403, by design): this one
+		// came from the infrastructure in front of the ingress. Retry; it is no answer about the job.
+		return fmt.Errorf("%w: HTTP 404 on a job route", ErrServer)
 	case code == http.StatusNotFound:
 		return ErrNotFound
 	case code >= 500, code == http.StatusRequestTimeout, code == http.StatusTooManyRequests:

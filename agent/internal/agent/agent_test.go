@@ -389,8 +389,8 @@ func TestKeptJobGoesToRecovery(t *testing.T) {
 	}
 }
 
-// Recovery settles a job the control plane will never accept a report for (deleted: 404;
-// refused outright: 4xx) instead of re-sending it every pass, and fails a job whose replayed
+// Recovery settles a job the control plane will never accept a report for (deleted: the job
+// routes answer 403 for an unknown job; refused outright: 4xx) instead of re-sending it every pass, and fails a job whose replayed
 // upload is refused outright.
 func TestRecoveryGivesUpOnPermanentRefusals(t *testing.T) {
 	e := fresh(t)
@@ -400,7 +400,7 @@ func TestRecoveryGivesUpOnPermanentRefusals(t *testing.T) {
 	big := jobDir(e, "jt", true, true)
 	os.WriteFile(filepath.Join(big, runner.ResultTarName), make([]byte, 1024), 0o600)
 	os.WriteFile(filepath.Join(big, runner.ResultMetaName), []byte(`{"worker_runtime":"seatbelt"}`), 0o600)
-	e.in.jobStatus["jg"], e.in.jobStatus["jb"] = 404, 400
+	e.in.jobStatus["jg"], e.in.jobStatus["jb"] = 403, 400
 	e.in.putStatus["jt"] = 413
 	h := newHarness(e)
 	h.start(t)
