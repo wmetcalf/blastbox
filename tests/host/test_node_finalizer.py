@@ -710,3 +710,33 @@ def test_confirmed_lost_claim_is_still_recorded_as_lost(tmp_path, monkeypatch):
     monkeypatch.setattr(fin._dispatcher, "_claim_is_still_ours", steal)
     assert fin.run_once() == 1
     assert nr.read_outcome(d) == {"status": "failed", "reason": "claim lost"}
+
+
+def test_cli_refuses_a_blob_target_the_ingress_does_not_share(tmp_path, monkeypatch, capsys):
+    """Same queue-backed agreement check the ingress and dispatcher run: a finalizer sealing to
+    a different target would mark jobs DONE whose results the ingress cannot read."""
+    from blastbox.host import canary, cli, node_finalizer
+    monkeypatch.setenv("BLASTBOX_JOB_ROOT", str(tmp_path / "jobs"))
+    monkeypatch.setenv("BLASTBOX_CANARY", "0")
+    monkeypatch.delenv("BLASTBOX_ATTEST_KEY", raising=False)
+    ran = []
+
+    class Fake:
+        def __init__(self, **kw):
+            pass
+
+        def run_once(self):
+            ran.append(1)
+            return 0
+
+    def disagree(job_store, blob_store, *, role):
+        assert role == "node-finalizer"
+        raise canary.CanaryFailure("blob target mismatch", "fix it", None)
+
+    monkeypatch.setattr(node_finalizer, "NodeFinalizer", Fake)
+    monkeypatch.setattr(canary, "check_blob_target_agreement", disagree)
+    import blastbox.host.jobs.factory as jf
+    monkeypatch.setattr(jf, "build_job_store_from_env", lambda *a, **k: InMemoryJobStore())
+    assert cli.main(["node-finalizer", "--once", "--no-receipts"]) == 1
+    assert ran == []
+    assert "blob target" in capsys.readouterr().err

@@ -865,9 +865,23 @@ def _node_finalizer_cmd(args: argparse.Namespace) -> int:
         if _open:
             log.error("%s", _open)
     job_root = Path(os.environ.get("BLASTBOX_JOB_ROOT", "/var/lib/blastbox/jobs"))
+    job_store = build_job_store_from_env()
+    blob_store = build_blob_store_from_env({**os.environ, "BLASTBOX_JOB_ROOT": str(job_root)})
+    # BEFORE the first result is sealed: this process uploads and marks DONE, so it must write
+    # the blob target the ingress serves from. The same queue-backed checks the dispatcher runs,
+    # round-trip first (under the canary toggle) because the agreement check PERSISTS.
+    from blastbox.host import canary as _canary
+
+    try:
+        if _canary_settings()[0]:
+            _canary.blob_roundtrip(blob_store, key_hint="node-finalizer")
+        _canary.check_blob_target_agreement(job_store, blob_store, role="node-finalizer")
+    except _canary.CanaryFailure as exc:
+        print(f"error: node-finalizer startup check failed: {exc}", file=sys.stderr)
+        return 1
     fin = NodeFinalizer(
-        job_store=build_job_store_from_env(),
-        blob_store=build_blob_store_from_env({**os.environ, "BLASTBOX_JOB_ROOT": str(job_root)}),
+        job_store=job_store,
+        blob_store=blob_store,
         limits=Limits.from_env(), job_root=job_root, attest_key=key,
         # float, exactly as the ingress parses it ("3600.0" is a valid ingress value)
         job_retention_seconds=int(float(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0")),
