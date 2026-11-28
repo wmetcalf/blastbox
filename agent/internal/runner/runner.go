@@ -774,22 +774,16 @@ type outFile struct {
 }
 
 // checkOutput walks out/ and enforces run.limits locally. Anything that is not a plain regular
-// file with a single link is refused. The walk stops at the first violation, so a tree of
-// millions of files is never fully scanned.
+// file with a single link is refused. The walk reads directories in batches and stops at the
+// first violation, so a tree (or one directory) of millions of entries is never fully read.
 func (j *job) checkOutput() (map[string]int64, error) {
 	lim := j.c.Run.Limits
 	maxArt, maxTotal, maxN := orDef(lim.MaxArtifact, defMaxArtifact), orDef(lim.MaxTotalArtifacts, defMaxTotalArtifacts), orDef(lim.MaxArtifacts, defMaxArtifacts)
 	maxMeta := orDef(lim.MaxMetadata, defMaxMetadata)
 	files := map[string]int64{}
 	var total, n, dirs int64
-	err := filepath.WalkDir(j.out, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
+	err := walkBatched(j.out, false, func(p string, d fs.DirEntry) error {
 		rel, _ := filepath.Rel(j.out, p)
-		if rel == "." {
-			return nil
-		}
 		fi, err := os.Lstat(p)
 		if err != nil {
 			return err
