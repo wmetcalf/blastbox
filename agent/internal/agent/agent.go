@@ -75,7 +75,8 @@ type Agent struct {
 	mu        sync.Mutex
 	cl        *wire.Client
 	notAfter  time.Time
-	certInUse []byte // the cert file the wire client was built from
+	certInUse []byte                   // the cert file the wire client was built from
+	pending   map[string]pendingReport // undelivered reports with no job dir to retry from
 	inflight  map[string]wire.HeartbeatJob
 	recSet    map[string]bool // job ids left on disk by a previous run (and runner-refused ids)
 	idLocks   map[string]*idLock
@@ -117,7 +118,7 @@ func (e *engState) claimable() bool { e.mu.Lock(); defer e.mu.Unlock(); return e
 func New(cfg *config.Config) *Agent {
 	a := &Agent{Cfg: cfg, Version: Version, Host: sandbox.HostFromConfig(cfg), hbReady: make(chan struct{}),
 		inflight: map[string]wire.HeartbeatJob{}, recSet: map[string]bool{}, idLocks: map[string]*idLock{},
-		unswept: map[string]string{}}
+		unswept: map[string]string{}, pending: map[string]pendingReport{}}
 	a.Log = slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	a.ProbeFn = func(ctx context.Context, e config.Engine) sandbox.ProbeResult { return a.Host.Probe(ctx, e) }
 	a.SelfTestFn = func(ctx context.Context, e config.Engine) sandbox.ProbeResult { return a.Host.SelfTest(ctx, e) }
@@ -560,6 +561,54 @@ func (a *Agent) reprobeLoop(ctx context.Context) {
 func (a *Agent) recoverLoop(ctx context.Context) {
 	for a.Sleep(ctx, 30*time.Second) {
 		a.recoverJobs(ctx)
+		a.retryPending(ctx)
+	}
+}
+
+// pendingReport is a release (fail == "") or fail the runner could not deliver for a claim it
+// never recorded on disk. It lives in memory only: after a restart the control plane's reclaim
+// sweep is the backstop, as for any claim this node never recorded.
+type pendingReport struct {
+	claim wire.Claim
+	fail  string
+}
+
+func (a *Agent) addPending(c *wire.Claim, fail string) {
+	a.mu.Lock()
+	a.pending[c.JobID+"\x00"+c.ClaimID] = pendingReport{claim: *c, fail: fail}
+	a.mu.Unlock()
+}
+
+// retryPending re-sends each undelivered, unrecorded report; it is dropped once answered (a
+// lost claim or a permanent refusal is an answer too).
+func (a *Agent) retryPending(ctx context.Context) {
+	a.mu.Lock()
+	keys := make([]string, 0, len(a.pending))
+	for k := range a.pending {
+		keys = append(keys, k)
+	}
+	a.mu.Unlock()
+	for _, k := range keys {
+		a.mu.Lock()
+		p, ok := a.pending[k]
+		a.mu.Unlock()
+		if !ok || ctx.Err() != nil {
+			continue
+		}
+		rctx, cancel := context.WithTimeout(ctx, orDur(a.ReportWait, 2*time.Minute))
+		var err error
+		if p.fail != "" {
+			err = a.client().Fail(rctx, &p.claim, p.fail, a.Now())
+		} else {
+			err = a.client().Release(rctx, &p.claim)
+		}
+		cancel()
+		if err == nil || errors.Is(err, wire.ErrClaimLost) || errors.Is(err, wire.ErrRefused) || runner.Permanent(err) {
+			a.mu.Lock()
+			delete(a.pending, k)
+			a.mu.Unlock()
+			a.Log.Info("undelivered report settled", "job", p.claim.JobID, "err", fmt.Sprint(err))
+		}
 	}
 }
 
@@ -711,8 +760,12 @@ func (a *Agent) runClaim(ctx, jobsCtx context.Context, es *engState, c *wire.Cla
 		// claim is failed, never run and never released.
 		rctx, cancel := context.WithTimeout(jobsCtx, 2*time.Minute)
 		defer cancel()
-		err := a.client().Fail(rctx, c, "this node is still running the job under an earlier claim", a.Now())
+		why := "this node is still running the job under an earlier claim"
+		err := a.client().Fail(rctx, c, why, a.Now())
 		a.Log.Warn("claimed a job that is still running here; failed the new claim", "job", c.JobID, "err", fmt.Sprint(err))
+		if err != nil && !errors.Is(err, wire.ErrClaimLost) && !errors.Is(err, wire.ErrRefused) && !runner.Permanent(err) {
+			a.addPending(c, why)
+		}
 		return
 	}
 	a.inflight[c.JobID] = wire.HeartbeatJob{JobID: c.JobID, ClaimID: c.ClaimID, StartedAt: rfc3339(start), DeadlineAt: rfc3339(dl)}
@@ -739,6 +792,11 @@ func (a *Agent) runClaim(ctx, jobsCtx context.Context, es *engState, c *wire.Cla
 		a.mu.Lock()
 		a.unswept[c.JobID] = es.eng.Name
 		a.mu.Unlock()
+	}
+	if res.Unrecorded {
+		// The report went unanswered before claim.json reached disk: no dir to retry from.
+		a.Log.Warn("job report not delivered and not recorded on disk; retrying from memory", "job", c.JobID)
+		a.addPending(c, res.PendingFail)
 	}
 	switch {
 	case res.Keep:

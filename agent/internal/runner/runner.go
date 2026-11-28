@@ -46,6 +46,11 @@ type Result struct {
 	// Unswept: processes of this (seatbelt) run could not be shown gone; recovery keeps trying
 	// to stop them, and the engine must not claim until it has.
 	Unswept bool
+	// Unrecorded (with Keep): the undelivered report was for a claim whose claim.json never
+	// reached disk, so crash recovery has nothing to retry it from. The host must retry it:
+	// a release, or a fail with PendingFail as its reason.
+	Unrecorded  bool
+	PendingFail string
 }
 
 // Files a job dir may hold besides in/ out/ scratch/ (crash recovery reads them).
@@ -138,6 +143,8 @@ type job struct {
 	start  time.Time
 	inPath string
 	ident  sandbox.RunIdentity // seatbelt: names the run's processes for the sweep and the watchdog
+	// recorded: claim.json is on disk, so crash recovery can retry an undelivered report.
+	recorded bool
 }
 
 // Run is the state machine of the design (§6.4, §6.5):
@@ -181,7 +188,8 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 		// -- never released, never run -- or it would stay RUNNING until the reclaim sweep.
 		why := "job dir already holds a started marker; left for crash recovery"
 		fr := j.fail(ctx, "this node already started the job under an earlier claim")
-		return Result{Outcome: "refused", Reason: why + " (new claim: " + fr.Outcome + ")"}
+		return Result{Outcome: "refused", Reason: why + " (new claim: " + fr.Outcome + ")",
+			Unrecorded: fr.Unrecorded, PendingFail: fr.PendingFail}
 	}
 	if _, err := os.Lstat(j.dir); err == nil { // leftover of an earlier, unstarted attempt
 		wipe(j.dir)
@@ -207,6 +215,7 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	if err := atomicWrite(filepath.Join(j.dir, "claim.json"), claimJSON); err != nil {
 		return j.release(ctx, "claim.json: "+err.Error())
 	}
+	j.recorded = true
 
 	j.inPath = filepath.Join(j.in, sanitiseName(c.Run.Input.Filename))
 	argv, err := template(eng.Argv, map[string]string{"input": j.inPath, "out": j.out, "scratch": j.scr})
@@ -967,7 +976,8 @@ func (j *job) releaseOrLost2(_ context.Context, why string, err error) Result {
 	case errors.Is(err, wire.ErrRefused), Permanent(err):
 		return Result{Outcome: "failed", Reason: why + "; release refused: " + err.Error()}
 	}
-	return Result{Outcome: "failed", Reason: why + "; release not delivered: " + err.Error(), Keep: true}
+	return Result{Outcome: "failed", Reason: why + "; release not delivered: " + err.Error(), Keep: true,
+		Unrecorded: !j.recorded}
 }
 
 // serverReason makes a reason safe to send: printable ASCII only, at most 200 chars.
@@ -999,7 +1009,15 @@ func (j *job) fail(ctx context.Context, why string) Result {
 	case errors.Is(err, wire.ErrRefused), Permanent(err):
 		return Result{Outcome: "failed", Reason: why + "; fail refused: " + err.Error()}
 	}
-	return Result{Outcome: "failed", Reason: why + "; fail not delivered: " + err.Error(), Keep: true}
+	return Result{Outcome: "failed", Reason: why + "; fail not delivered: " + err.Error(), Keep: true,
+		Unrecorded: !j.recorded, PendingFail: pendingFail(j.recorded, why)}
+}
+
+func pendingFail(recorded bool, why string) string {
+	if recorded {
+		return ""
+	}
+	return why
 }
 
 func (j *job) upload(ctx context.Context, tarPath string, kind sandbox.Kind) Result {

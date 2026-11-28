@@ -1556,3 +1556,45 @@ func TestRenewReplacesAFifoPendingKeyWithoutHanging(t *testing.T) {
 		t.Fatalf("key.next not replaced by a regular key: %v", err)
 	}
 }
+
+// A runner report that went unanswered before claim.json reached disk (Unrecorded) is retried
+// by the agent itself -- recovery has no dir to retry it from -- until the control plane
+// answers, so the claim is not left RUNNING forever.
+func TestUnrecordedReportIsRetriedUntilDelivered(t *testing.T) {
+	for _, pendingFail := range []string{"", "invalid run params"} {
+		e := fresh(t)
+		var once sync.Once
+		e.in.onClaim = func(int) (int, string) {
+			code, body := 204, ""
+			once.Do(func() { code, body = 200, claimBody("ju") })
+			return code, body
+		}
+		e.in.onUpdate = func(id string, n int) int {
+			if n < 3 {
+				return 503
+			}
+			return 200
+		}
+		h := newHarness(e)
+		h.a.Runner = fakeRunner{fn: func(context.Context, *wire.Claim) runner.Result {
+			return runner.Result{Outcome: "failed", Reason: "release not delivered", Keep: true,
+				Unrecorded: true, PendingFail: pendingFail}
+		}}
+		stop := h.start(t)
+		eventually(t, "report delivered", func() bool {
+			e.in.mu.Lock()
+			defer e.in.mu.Unlock()
+			return e.in.updCount["ju"] >= 3
+		})
+		u := e.in.update("ju")
+		f, _ := u["fields"].(map[string]any)
+		want := "queued"
+		if pendingFail != "" {
+			want = "failed"
+		}
+		if f["status"] != want {
+			t.Fatalf("pendingFail=%q: retried report %v, want status %s", pendingFail, u, want)
+		}
+		stop()
+	}
+}

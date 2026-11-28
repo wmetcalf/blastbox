@@ -983,3 +983,16 @@ func TestClaimJSONRecordsClaimTime(t *testing.T) {
 		t.Fatalf("%s", raw)
 	}
 }
+
+// A release or fail sent before claim.json is on disk leaves recovery nothing to retry from:
+// when it goes unanswered the Result says so (Unrecorded, with the report to retry), so the
+// host keeps retrying it instead of dropping the claim, which would stay RUNNING forever.
+func TestUndeliveredEarlyReportIsHandedBack(t *testing.T) {
+	f := setup(t, happyEngine)
+	f.in.updStatus = 503
+	f.claim.Run.DeadlineS = 0
+	res := f.run()
+	if !res.Keep || !res.Unrecorded || res.PendingFail != "" {
+		t.Fatalf("%+v: an undelivered early release was not handed back", res)
+	}
+}
