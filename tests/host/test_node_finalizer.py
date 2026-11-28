@@ -646,3 +646,24 @@ def test_crash_after_failed_cas_ignores_another_claims_sentinel(tmp_path):
                            status=JobStatus.FAILED, error="boom")
     assert fin.run_once() == 1
     assert nr.read_outcome(d) == {"status": "failed", "reason": "boom"}
+
+
+def test_cli_accepts_a_float_retention_like_the_ingress(tmp_path, monkeypatch):
+    """The ingress parses BLASTBOX_JOB_RETENTION_SECONDS as a float; "3600.0" must start us."""
+    from blastbox.host import cli, node_finalizer
+    monkeypatch.setenv("BLASTBOX_JOB_ROOT", str(tmp_path / "jobs"))
+    monkeypatch.setenv("BLASTBOX_JOB_RETENTION_SECONDS", "3600.0")
+    monkeypatch.delenv("BLASTBOX_ATTEST_KEY", raising=False)
+
+    class Fake:
+        def __init__(self, **kw):
+            Fake.retention = kw["job_retention_seconds"]
+
+        def run_once(self):
+            return 0
+
+    monkeypatch.setattr(node_finalizer, "NodeFinalizer", Fake)
+    import blastbox.host.jobs.factory as jf
+    monkeypatch.setattr(jf, "build_job_store_from_env", lambda *a, **k: InMemoryJobStore())
+    assert cli.main(["node-finalizer", "--once", "--no-receipts"]) == 0
+    assert Fake.retention == 3600
