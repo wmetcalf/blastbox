@@ -1,8 +1,0 @@
-{
-  "tar_bytes": 3072,
-  "tar_sha256": "e5fd1784eb03efbeb18be00f7fa36d463fd0c6845f860b3eae3ca76851bd49ac",
-  "tree": {
-    "artifacts/caf\u00e9.txt": "75746638206e616d65",
-    "metadata.json": "{}"
-  }
-}
