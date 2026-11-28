@@ -313,9 +313,20 @@ func RunLaunch(args []string) error {
 	}
 	for _, t := range table {
 		if n, ok := want[t.flag]; ok {
+			// Never above the current hard limit (an unprivileged process cannot raise it, and
+			// a lower one already is stricter); then prove the limit took: the kernel may
+			// clamp it lower still (darwin: kern.maxprocperuid), never higher.
+			var cur syscall.Rlimit
+			if err := syscall.Getrlimit(t.res, &cur); err != nil {
+				return fmt.Errorf("getrlimit %s: %w", t.flag, err)
+			}
+			n = min(n, cur.Max)
 			lim := syscall.Rlimit{Cur: n, Max: n}
 			if err := syscall.Setrlimit(t.res, &lim); err != nil {
 				return fmt.Errorf("setrlimit %s=%d: %w", t.flag, n, err)
+			}
+			if err := syscall.Getrlimit(t.res, &cur); err != nil || cur.Cur > n {
+				return fmt.Errorf("setrlimit %s=%d did not take", t.flag, n)
 			}
 		}
 	}

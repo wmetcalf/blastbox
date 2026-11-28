@@ -119,6 +119,55 @@ func resultRecord(dir string) (string, wire.ResultMeta, bool) {
 	return tar, m, true
 }
 
+// stopLeftover stops the run a previous agent left behind in a started job dir (it may still
+// be alive, unsupervised) and reports whether it is shown stopped (or nothing recorded could be
+// stopped). One that is not stays gated in unswept: its engine must not claim meanwhile.
+func (a *Agent) stopLeftover(dir, name string) bool {
+	raw, err := os.ReadFile(filepath.Join(dir, runner.RunRecordName))
+	if err != nil {
+		return true
+	}
+	var rec sandbox.RunRecord
+	if json.Unmarshal(raw, &rec) != nil {
+		return true
+	}
+	if err := a.KillRunFn(rec); err != nil {
+		a.Log.Warn("recovery: the previous run could not be shown stopped; will retry", "job", name, "err", err.Error())
+		// Its engine must not claim meanwhile, also after a restart (the gate lives in
+		// memory): name it from the claim record, or gate every engine if unreadable.
+		var ce struct {
+			Engine string `json:"engine"`
+		}
+		if raw, err := os.ReadFile(filepath.Join(dir, "claim.json")); err == nil {
+			json.Unmarshal(raw, &ce)
+		}
+		a.mu.Lock()
+		a.unswept[name] = ce.Engine
+		a.mu.Unlock()
+		return false
+	}
+	return true
+}
+
+// stopLeftovers stops, before any network recovery, every run left behind in the recovery
+// set's started job dirs: a bounded startup pass may not reach a job before the engines are
+// probed and claim again, and a run still alive then would have no watchdog.
+func (a *Agent) stopLeftovers() {
+	jobs := filepath.Join(a.Cfg.StateDir, "jobs")
+	a.mu.Lock()
+	ids := make([]string, 0, len(a.recSet))
+	for id := range a.recSet {
+		ids = append(ids, id)
+	}
+	a.mu.Unlock()
+	for _, id := range ids {
+		dir := filepath.Join(jobs, id)
+		if _, err := os.Lstat(filepath.Join(dir, "started")); err == nil {
+			a.stopLeftover(dir, id)
+		}
+	}
+}
+
 func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool) {
 	if _, err := os.Lstat(filepath.Join(dir, runner.ReportedName)); err == nil {
 		a.Log.Info("recovery: the control plane already answered this job's upload; wiping", "job", name)
@@ -128,30 +177,8 @@ func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool)
 	uploaded := uploadedErr == nil
 	_, startErr := os.Lstat(filepath.Join(dir, "started"))
 	started := startErr == nil
-	if started {
-		// A run the previous agent left behind may still be alive: stop it before the job is
-		// settled or its dir wiped under it, whatever the state of its claim record.
-		if raw, err := os.ReadFile(filepath.Join(dir, runner.RunRecordName)); err == nil {
-			var rec sandbox.RunRecord
-			if json.Unmarshal(raw, &rec) == nil {
-				if err := a.KillRunFn(rec); err != nil {
-					a.Log.Warn("recovery: the previous run could not be shown stopped; will retry", "job", name, "err", err.Error())
-					// Its engine must not claim meanwhile, also after a restart (the gate lives in
-					// memory): name it from the claim record, or gate every engine if unreadable.
-					var ce struct {
-						Engine string `json:"engine"`
-					}
-					if raw, err := os.ReadFile(filepath.Join(dir, "claim.json")); err == nil {
-						json.Unmarshal(raw, &ce)
-					}
-					a.mu.Lock()
-					a.unswept[name] = ce.Engine
-					a.mu.Unlock()
-					return false
-				}
-
-			}
-		}
+	if started && !a.stopLeftover(dir, name) {
+		return false
 	}
 	a.mu.Lock()
 	delete(a.unswept, name) // stopped, or nothing recorded that could be stopped

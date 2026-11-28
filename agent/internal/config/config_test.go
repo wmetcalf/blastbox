@@ -152,6 +152,7 @@ func TestLoadRefusals(t *testing.T) {
 		}, "apparmor_profile"},
 		{"slots 0", "linux", func(f fixture) string { return f.toml(eng(good+"slots = 0\n"), nsj) }, "slots"},
 		{"slots 17", "linux", func(f fixture) string { return f.toml(eng(good+"slots = 17\n"), nsj) }, "slots"},
+		{"max_disk_mib 0", "linux", func(f fixture) string { return f.toml(eng(good+"max_disk_mib = 0\n"), nsj) }, "max_disk_mib"},
 		{"argv relative", "linux", func(f fixture) string {
 			return strings.Replace(f.toml(eng(good), nsj), `"/opt/wt/bin/scan", "blastbox"`, `"scan", "blastbox"`, 1)
 		}, "absolute"},

@@ -100,6 +100,7 @@ type Runner struct {
 
 	// Tunables (zero = production defaults); tests shorten them.
 	MemPoll     time.Duration                 // memory watchdog period (500 ms)
+	DiskPoll    time.Duration                 // disk watchdog period (1 s)
 	DispWait    time.Duration                 // how long to poll Disposition after an "accepted" (60 s)
 	DispPoll    time.Duration                 // Disposition poll period (2 s)
 	RetryBase   time.Duration                 // first retry delay for Fail/PutResult on a retryable error (2 s)
@@ -109,7 +110,8 @@ type Runner struct {
 	rss         func(pgid int) (int64, error) // test seam; nil = groupRSSKiB (plus the run's escapees)
 	build       func(context.Context, sandbox.Kind, sandbox.Request, []string, sandbox.Limits) (*exec.Cmd, error)
 	hostPins    *sandbox.HostPins
-	sweep       func(sandbox.RunIdentity) (int, error) // test seam; nil = sandbox.SweepRun
+	sweep       func(sandbox.RunIdentity) (int, error)          // test seam; nil = sandbox.SweepRun
+	held        func(pids []int, roots []string) (int64, error) // test seam; nil = heldUnlinkedBytes
 	skipAAProbe bool
 }
 
@@ -146,6 +148,8 @@ type job struct {
 	start  time.Time
 	inPath string
 	ident  sandbox.RunIdentity // seatbelt: names the run's processes for the sweep and the watchdog
+	// nprocDone releases this run's share of the seatbelt NPROC ceiling (nil = none held).
+	nprocDone func()
 	// recorded: claim.json is on disk, so crash recovery can retry an undelivered report.
 	recorded bool
 }
@@ -240,6 +244,11 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	cmd, nonce, err := j.command(runCtx, kind, argv, env)
+	defer func() {
+		if j.nprocDone != nil {
+			j.nprocDone()
+		}
+	}()
 	if err != nil {
 		why := "sandbox: " + err.Error()
 		return j.sandboxFault(why, func() Result { return j.release(ctx, why) })
@@ -292,6 +301,11 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	}
 	if killed != "" {
 		return j.fail(ctx, killed)
+	}
+	// One last measurement now that the run is over (its processes killed and swept): a burst
+	// written after the last sample must not slip through.
+	if over, _ := j.diskOver(0, false); over != "" {
+		return j.fail(ctx, over+" after the run")
 	}
 	if capw != nil && capw.overflowed() {
 		return j.fail(ctx, "envelope over max_metadata")
@@ -580,6 +594,16 @@ func (j *job) command(ctx context.Context, kind sandbox.Kind, argv []string, env
 		TimeoutS:   int64(j.c.Run.DeadlineS),
 		FSizeBytes: uint64(max(orDef(j.c.Run.Limits.MaxArtifact, defMaxArtifact), orDef(j.c.Run.Limits.MaxMetadata, defMaxMetadata))),
 	}
+	if kind == sandbox.Seatbelt {
+		// Mandatory: seatbelt permits fork, and without the limit a fork bomb has until the
+		// next watchdog sample to exhaust the uid's processes (the watchdog's own ps included).
+		n, done, err := nprocLimit()
+		if err != nil {
+			return nil, "", fmt.Errorf("process limit: %w", err)
+		}
+		j.nprocDone = done
+		lim.NProc = n
+	}
 	build := j.r.build
 	if build == nil {
 		build = sandbox.Command
@@ -617,8 +641,14 @@ func (j *job) exec(ctx context.Context, cmd *exec.Cmd, capw *capWriter) (killed 
 	pid := cmd.Process.Pid
 	rec.PID = pid
 	rec.Identity, _ = sandbox.ProcIdentity(pid)
+	// killGroup signals the run's process group only while its leader is still the process
+	// that was started (running, or a zombie not yet reaped: either way it holds the group id).
+	// Once cmd.Wait has reaped it -- possibly seconds before Wait returns, while WaitDelay waits
+	// on a pipe an escaped child holds -- the bare number may name another group; whatever is
+	// left of the run is then the sweep's (by sandbox identity) or died with its jail.
+	killGroup := func() { killGroupOf(pid, rec.Identity) }
 	if err := writeRec(); err != nil {
-		syscall.Kill(-pid, syscall.SIGKILL)
+		killGroup()
 		err2 := cmd.Wait()
 		_ = err2
 		return "run record could not be written: " + err.Error(), nil
@@ -637,17 +667,22 @@ func (j *job) exec(ctx context.Context, cmd *exec.Cmd, capw *capWriter) (killed 
 	}
 	kill := func(reason string) {
 		killed = reason
-		syscall.Kill(-pid, syscall.SIGKILL)
+		killGroup()
 	}
 	rssFails := 0
 	rssFn := j.r.rss
 	if rssFn == nil {
 		rssFn = func(pgid int) (int64, error) { return groupRSSKiB(pgid, j.ident.Match) }
 	}
+	diskTick := time.NewTicker(def(j.r.DiskPoll, time.Second))
+	defer diskTick.Stop()
+	diskFails := 0
 	for {
 		select {
 		case err := <-done:
-			syscall.Kill(-pid, syscall.SIGKILL) // reap strays left in the group
+			// The leader is reaped: never signal its bare group number now (see killGroup).
+			// A seatbelt run's leftovers are swept by identity next; an nsjail run's died with
+			// its PID namespace.
 			if killed == "" && ctx.Err() != nil {
 				// exec.CommandContext's Cancel killed the group before our select saw Done.
 				killed = "run interrupted: agent shutting down"
@@ -665,6 +700,24 @@ func (j *job) exec(ctx context.Context, cmd *exec.Cmd, capw *capWriter) (killed 
 			kill("run interrupted: agent shutting down")
 			err := <-done
 			return killed, err
+		case <-diskTick.C:
+			over, err := j.diskOver(pid, true)
+			if err != nil {
+				diskFails++
+				j.r.logf("job %s: disk watchdog read failed (%d/3): %v", j.c.JobID, diskFails, err)
+				if diskFails >= 3 {
+					kill("disk watchdog unavailable")
+					err := <-done
+					return killed, err
+				}
+				continue
+			}
+			diskFails = 0
+			if over != "" {
+				kill(over)
+				err := <-done
+				return killed, err
+			}
 		case <-tick.C:
 			rss, err := rssFn(pid)
 			if err != nil {
@@ -687,6 +740,70 @@ func (j *job) exec(ctx context.Context, cmd *exec.Cmd, capw *capWriter) (killed 
 			}
 		}
 	}
+}
+
+// diskRoots are the run's writable dirs.
+func (j *job) diskRoots() []string {
+	roots := []string{j.scr}
+	if j.eng.Output == "dir" {
+		roots = append(roots, j.out)
+	}
+	return roots
+}
+
+// diskBudget is the most a run may hold in its writable dirs: the engine's max_disk_mib, but
+// never less than a full output (max_total_artifacts + max_metadata, plus block slack).
+func (j *job) diskBudget() int64 {
+	lim := j.c.Run.Limits
+	floor := orDef(lim.MaxTotalArtifacts, defMaxTotalArtifacts) + orDef(lim.MaxMetadata, defMaxMetadata) + 64<<20
+	return max(int64(j.eng.DiskLimitMiB())<<20, floor)
+}
+
+// diskOver measures the run's writable dirs (and, while it runs, the unlinked files its
+// processes still hold) and returns a kill reason when they are over budget or could not all
+// be read (fail closed: what cannot be measured cannot be shown under budget). err is a
+// failed held-file sample.
+func (j *job) diskOver(pid int, running bool) (string, error) {
+	roots := j.diskRoots()
+	used, entries, complete := dirUsage(roots, maxDiskEntries)
+	if !complete {
+		return "disk budget: part of the writable dirs could not be read", nil
+	}
+	if running {
+		procs, err := groupProcs(pid, j.ident.Match)
+		if err != nil {
+			return "", err
+		}
+		pids := make([]int, 0, len(procs))
+		for p := range procs {
+			pids = append(pids, p)
+		}
+		heldFn := j.r.held
+		if heldFn == nil {
+			heldFn = heldUnlinkedBytes
+		}
+		h, err := heldFn(pids, roots)
+		if err != nil {
+			return "", err
+		}
+		used += h
+	}
+	if budget := j.diskBudget(); used > budget || entries > maxDiskEntries {
+		return fmt.Sprintf("disk budget exceeded: writable dirs hold %d bytes / %d entries (limit %d bytes / %d entries)",
+			used, entries, budget, maxDiskEntries), nil
+	}
+	return "", nil
+}
+
+// killGroupOf SIGKILLs process group pid only while pid is still the leader that was started
+// (identity = its sandbox.ProcIdentity at start; 0 = unknown, which signals unconditionally).
+func killGroupOf(pid int, identity int64) bool {
+	if identity != 0 {
+		if id, ok := sandbox.ProcIdentity(pid); !ok || id != identity {
+			return false
+		}
+	}
+	return syscall.Kill(-pid, syscall.SIGKILL) == nil
 }
 
 func handshakeOK(scratch, nonce string) bool {
@@ -858,6 +975,13 @@ func (j *job) fillArtifacts(files map[string]int64) error {
 		return nil
 	}
 	arts, _ := env["artifacts"].([]any)
+	// Bound the declarations before hashing anything (the control plane's trust gate refuses
+	// more than max_artifacts anyway), and hash each file once however often it is declared:
+	// otherwise a small envelope could make the agent re-read one large file without end.
+	if maxN := orDef(j.c.Run.Limits.MaxArtifacts, defMaxArtifacts); int64(len(arts)) > maxN {
+		return fmt.Errorf("metadata.json declares %d artifacts, over max_artifacts (%d)", len(arts), maxN)
+	}
+	sums := map[string]string{}
 	changed := false
 	for _, a := range arts {
 		m, ok := a.(map[string]any)
@@ -873,9 +997,12 @@ func (j *job) fillArtifacts(files map[string]int64) error {
 		if !ok {
 			continue
 		}
-		sum, err := fileSHA(filepath.Join(j.out, filepath.FromSlash(clean)))
-		if err != nil {
-			return fmt.Errorf("artifact %+q: %v", clean, err)
+		sum, ok := sums[clean]
+		if !ok {
+			if sum, err = fileSHA(filepath.Join(j.out, filepath.FromSlash(clean))); err != nil {
+				return fmt.Errorf("artifact %+q: %v", clean, err)
+			}
+			sums[clean] = sum
 		}
 		m["sha256"], m["bytes"] = sum, json.Number(strconv.FormatInt(size, 10))
 		changed = true
@@ -890,7 +1017,7 @@ func (j *job) fillArtifacts(files map[string]int64) error {
 	return os.WriteFile(p, out, 0o600)
 }
 
-func fileSHA(p string) (string, error) {
+var fileSHA = func(p string) (string, error) {
 	f, err := os.Open(p)
 	if err != nil {
 		return "", err

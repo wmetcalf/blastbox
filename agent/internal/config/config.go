@@ -65,7 +65,12 @@ type Engine struct {
 	ProbeArgv    []string `toml:"probe_argv"`
 	SelftestArgv []string `toml:"selftest_argv"` // known-positive self-test, must exit 0
 	MaxRSSMiB    *int     `toml:"max_rss_mib"`
-	EnvParams    *bool    `toml:"env_params"` // forward run.params as env vars (default true)
+	// MaxDiskMiB caps what one run may hold in its writable dirs (scratch, and out for a dir
+	// engine), files it keeps open after unlinking them included (default 1024). RLIMIT_FSIZE
+	// caps one file; this caps their sum. A run's out/ is always allowed max_total_artifacts +
+	// max_metadata, whatever this says.
+	MaxDiskMiB *int  `toml:"max_disk_mib"`
+	EnvParams  *bool `toml:"env_params"` // forward run.params as env vars (default true)
 	// ParamKeys is the engine's param ALLOWLIST (the dispatcher's per-engine PARAM_KEYS): unset
 	// = any key that clears the reserved floor; set (even empty) = only these keys.
 	ParamKeys *[]string `toml:"param_keys"`
@@ -109,6 +114,14 @@ func (e *Engine) RSSLimitMiB() int {
 		return 2048
 	}
 	return *e.MaxRSSMiB
+}
+
+// DiskLimitMiB returns the effective disk budget of one run (default 1024).
+func (e *Engine) DiskLimitMiB() int {
+	if e.MaxDiskMiB == nil {
+		return 1024
+	}
+	return *e.MaxDiskMiB
 }
 
 // ForwardParams reports whether run.params are forwarded as env vars (default true).
@@ -272,6 +285,9 @@ func (e *Engine) validate(goos string) error {
 	}
 	if r := e.RSSLimitMiB(); r < 64 {
 		return fmt.Errorf("max_rss_mib must be >= 64, got %d", r)
+	}
+	if d := e.DiskLimitMiB(); d < 1 {
+		return fmt.Errorf("max_disk_mib must be >= 1, got %d", d)
 	}
 	var keys []string
 	if e.ParamKeys != nil {

@@ -1745,3 +1745,67 @@ func TestRenewalSyncsTheKeyDirBeforeTheCertRename(t *testing.T) {
 		t.Fatalf("key dir not synced between the key and cert renames: %+v", *ev)
 	}
 }
+
+// The startup pass as a whole is bounded, not each job in it: many kept uploads against a slow
+// ingress must not hold the first heartbeat for the sum of their bounds.
+func TestStartupRecoveryOfManyJobsDoesNotSilenceTheNode(t *testing.T) {
+	e := fresh(t)
+	e.cfg.Claim = false
+	var dirs []string
+	for i := 0; i < 16; i++ {
+		d := jobDir(e, fmt.Sprintf("jm%02d", i), true, true)
+		os.WriteFile(filepath.Join(d, runner.ResultTarName), make([]byte, 1024), 0o600)
+		os.WriteFile(filepath.Join(d, runner.ResultMetaName), []byte(`{"worker_runtime":"seatbelt","started_at_ms":1,"finished_at_ms":2}`), 0o600)
+		os.WriteFile(filepath.Join(d, runner.UploadedName), nil, 0o600)
+		dirs = append(dirs, d)
+	}
+	e.in.putDelay = 1500 * time.Millisecond
+	h := newHarness(e)
+	h.a.ReportWait = 300 * time.Millisecond
+	start := time.Now()
+	h.start(t)
+	eventually(t, "first heartbeat", func() bool {
+		e.in.mu.Lock()
+		defer e.in.mu.Unlock()
+		return len(e.in.hbs) > 0
+	})
+	if waited := time.Since(start); waited > 2*time.Second {
+		t.Fatalf("first heartbeat only after %v: the startup recovery pass held it", waited)
+	}
+}
+
+// A leftover run is stopped before any network recovery: a slow kept upload that uses up the
+// bounded startup pass must not leave a later job's still-running sandbox unstopped (and its
+// engine claimable) when the engines are probed.
+func TestStartupStopsLeftoverRunsBeforeNetworkRecovery(t *testing.T) {
+	e := fresh(t)
+	up := jobDir(e, "ja-upload", true, true)
+	os.WriteFile(filepath.Join(up, runner.ResultTarName), make([]byte, 1024), 0o600)
+	os.WriteFile(filepath.Join(up, runner.ResultMetaName), []byte(`{"worker_runtime":"seatbelt","started_at_ms":1,"finished_at_ms":2}`), 0o600)
+	os.WriteFile(filepath.Join(up, runner.UploadedName), nil, 0o600)
+	run := jobDir(e, "jz-running", true, true)
+	os.WriteFile(filepath.Join(run, runner.RunRecordName), []byte(`{"pid":0,"canary":"io.blastbox.run.y"}`), 0o600)
+	e.in.putDelay = 1500 * time.Millisecond
+	e.in.onClaim = func(int) (int, string) { return 204, "" }
+	h := newHarness(e)
+	h.a.ReportWait = 100 * time.Millisecond
+	var mu sync.Mutex
+	var stopped []string
+	h.a.KillRunFn = func(r sandbox.RunRecord) error {
+		mu.Lock()
+		defer mu.Unlock()
+		stopped = append(stopped, r.Canary)
+		return nil
+	}
+	h.start(t)
+	eventually(t, "first claim", func() bool { return e.in.claimCount() >= 1 })
+	mu.Lock()
+	defer mu.Unlock()
+	found := false
+	for _, c := range stopped {
+		found = found || c == "io.blastbox.run.y"
+	}
+	if !found {
+		t.Fatalf("the engine claimed before the leftover run was stopped (stopped: %v)", stopped)
+	}
+}
