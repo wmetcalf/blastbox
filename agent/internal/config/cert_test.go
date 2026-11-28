@@ -33,6 +33,9 @@ func TestCheckNodeCertVectors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(cc.Cases) < 19 {
+		t.Fatalf("node_certs/cases.json has %d cases, want at least 19", len(cc.Cases))
+	}
 	seen := map[string]bool{}
 	for _, c := range cc.Cases {
 		certPEM, err := os.ReadFile(conformance.Path("node_certs", c.Cert))
@@ -68,7 +71,8 @@ func TestCheckNodeCertVectors(t *testing.T) {
 		}
 	}
 	for _, n := range []string{"wrong_eku", "client_auth_eku", "node_plus_client_auth_eku", "cn_mismatch", "expired", "missing_node_info",
-		"garbled_node_info", "unsupported_version", "foreign_ca", "rsa_key", "v1_with_wg", "v2_without_wg", "v2_bad_wg", "v1_without_wg"} {
+		"garbled_node_info", "unsupported_version", "foreign_ca", "rsa_key", "v1_with_wg", "v2_without_wg", "v2_bad_wg", "v1_without_wg",
+		"v1_wrong_key_signature", "node_eku_not_critical", "node_plus_server_auth_eku", "node_plus_any_eku", "v2_with_wg"} {
 		if !seen[n] {
 			t.Errorf("vector %s not exercised", n)
 		}
