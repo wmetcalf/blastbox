@@ -290,3 +290,36 @@ class TestOneSweeperPerHost:
 
         with sweeper_lock(tmp_path / "nonexistent" / "\0bad") as ok:
             assert ok is True
+
+
+def _quarantine(root, job_id, claim_id, *, outcome=False):
+    import json
+
+    from blastbox.host import node_results as nr
+    d = nr.spool_dir(root, job_id, claim_id)
+    (d / nr.OUT).mkdir(parents=True)
+    (d / nr.MARKER).write_text(json.dumps({"job_id": job_id, "claim_id": claim_id}))
+    if outcome:
+        nr.write_outcome(d, "failed", "x")
+    return d
+
+
+def test_an_accepted_upload_awaiting_the_finalizer_is_not_abandoned(store, tmp_path):
+    """The node uploaded and got 202; a finalizer outage or backlog must not turn that into
+    "abandoned" and throw the acknowledged result away."""
+    running(store, "uploaded", started_at=time.time() - 10_000)
+    _quarantine(tmp_path, "uploaded", "node:c1")
+    assert reclaim_stale_claims(store, after_s=600.0, results_root=tmp_path) == 0
+    assert store.get("uploaded").status is JobStatus.RUNNING
+
+
+def test_an_upload_under_another_claim_does_not_shield_this_one(store, tmp_path):
+    running(store, "gone", started_at=time.time() - 10_000)
+    _quarantine(tmp_path, "gone", "node:someone-else")
+    assert reclaim_stale_claims(store, after_s=600.0, results_root=tmp_path) == 1
+
+
+def test_a_finalised_upload_does_not_shield_the_claim(store, tmp_path):
+    running(store, "done", started_at=time.time() - 10_000)
+    _quarantine(tmp_path, "done", "node:c1", outcome=True)
+    assert reclaim_stale_claims(store, after_s=600.0, results_root=tmp_path) == 1

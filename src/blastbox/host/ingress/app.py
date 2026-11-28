@@ -515,8 +515,17 @@ def build_app(
                             _log.warning("ingress: scratch reclaim failed", exc_info=True)
                     if reclaim_after:
                         try:
+                            from blastbox.host import node_results as _node_results
+
+                            # an accepted upload awaiting the finalizer is not a gone node; an
+                            # unusable results root must not cost the fleet its reclaim sweep
+                            try:
+                                _res_root = _node_results.results_root(_job_root)
+                            except OSError:
+                                _res_root = None
                             reclaim_stale_claims(_job_store, after_s=reclaim_after,
-                                             retention_s=_retention_s)
+                                                 retention_s=_retention_s,
+                                                 results_root=_res_root)
                         except Exception:  # noqa: BLE001 -- same contract as above
                             _log.warning("ingress: stale-claim sweep failed", exc_info=True)
                     if queued_age:
