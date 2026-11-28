@@ -250,6 +250,19 @@ class _BoundedTarInfo(tarfile.TarInfo):
             tarfile_obj._bb_ext_chain = 0       # type: ignore[attr-defined]
         return super()._proc_member(tarfile_obj)  # type: ignore[misc]  # private, stable 3.8-3.13
 
+    # A PAX sparse member (GNU formats 0.0 / 0.1 / 1.0) has its map decoded inside _proc_pax,
+    # while the header is parsed and BEFORE the member is yielded: 1.0 reads the map from the
+    # data blocks, so a small archive materialises an unbounded list. tarfile calls these on
+    # the extended header's TarInfo (this class), so refusing here runs before any map parse.
+    def _proc_gnusparse_00(self, *_a: Any, **_k: Any) -> None:
+        raise TarRejected("PAX sparse member refused (GNU sparse 0.0)")
+
+    def _proc_gnusparse_01(self, *_a: Any, **_k: Any) -> None:
+        raise TarRejected("PAX sparse member refused (GNU sparse 0.1)")
+
+    def _proc_gnusparse_10(self, *_a: Any, **_k: Any) -> None:
+        raise TarRejected("PAX sparse member refused (GNU sparse 1.0)")
+
 
 def vet_tar(fileobj: Any, *, max_members: int, max_total_bytes: int,
             max_metadata_bytes: int | None = None) -> None:

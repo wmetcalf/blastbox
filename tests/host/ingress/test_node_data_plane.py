@@ -855,3 +855,31 @@ def test_quarantine_dir_is_fsynced_with_its_marker_before_publish(tmp_path, pki_
     assert any(".partial-" in p and has for p, has in synced), synced
     root = node_results.results_root(tmp_path / "jobs")
     assert str(root) in [p for p, _ in synced], synced
+
+
+@pytest.mark.parametrize("hdrs", [
+    {"GNU.sparse.major": "1", "GNU.sparse.minor": "0", "GNU.sparse.name": "a",
+     "GNU.sparse.realsize": "10"},
+    {"GNU.sparse.map": "0,1", "GNU.sparse.size": "10"},
+    {"GNU.sparse.size": "10", "GNU.sparse.numblocks": "1"},
+], ids=["v1.0", "v0.1", "v0.0"])
+def test_pax_sparse_headers_refused_before_the_map_is_parsed(monkeypatch, hdrs):
+    """tarfile decodes a PAX sparse map while parsing the header, before the member is
+    yielded: a small archive can hold a huge map. The map parsers must never run."""
+    def boom(*a, **k):
+        raise AssertionError("sparse map parser ran")
+
+    for n in ("_proc_gnusparse_00", "_proc_gnusparse_01", "_proc_gnusparse_10"):
+        monkeypatch.setattr(tarfile.TarInfo, n, boom)
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tf:
+        ti = tarfile.TarInfo("metadata.json")
+        ti.size = 2
+        tf.addfile(ti, io.BytesIO(b"{}"))
+        ti = tarfile.TarInfo("a")
+        ti.size = 512
+        ti.pax_headers = dict(hdrs)
+        tf.addfile(ti, io.BytesIO(b"\0" * 512))
+    with pytest.raises(node_results.TarRejected, match="sparse"):
+        node_results.vet_tar(io.BytesIO(buf.getvalue()), max_members=100,
+                             max_total_bytes=1 << 20)
