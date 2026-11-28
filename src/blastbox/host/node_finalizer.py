@@ -260,6 +260,14 @@ class NodeFinalizer:
         res = self._dispatcher.finalise_output(job, out, self._observation(job, marker))
         if res == "retained":
             return "failed", RETAINED_REASON    # the tree stays under job_root for the sweep
+        if res == "lost":
+            # finalise_output fails CLOSED: a store read error in its ownership check also says
+            # "lost". Only a CONFIRMED loss is terminal; a row still RUNNING under this claim
+            # (or an unreadable store, which raises here) keeps the staged tree and retries.
+            cur = self._store.get(job.job_id)
+            if cur is not None and cur.status == JobStatus.RUNNING \
+                    and cur.claim_id == job.claim_id:
+                raise RuntimeError("claim ownership unconfirmed; keeping the staged tree")
         self._discard_staged(job, out)
         if res == "done":
             return "done", None

@@ -667,3 +667,46 @@ def test_cli_accepts_a_float_retention_like_the_ingress(tmp_path, monkeypatch):
     monkeypatch.setattr(jf, "build_job_store_from_env", lambda *a, **k: InMemoryJobStore())
     assert cli.main(["node-finalizer", "--once", "--no-receipts"]) == 0
     assert Fake.retention == 3600
+
+
+def test_unconfirmed_ownership_keeps_the_tree_and_retries(tmp_path, monkeypatch):
+    """_claim_is_still_ours fails closed (False) on a store read error, so finalise_output says
+    "lost" without a confirmed loss. With the row still RUNNING under this claim, the staged
+    tree must survive and the next attempt must finish the job, never a permanent claim lost."""
+    clock = _clock(monkeypatch)
+    store, job, fin, _ = build(tmp_path)
+    d = spool(tmp_path, job)
+    real = fin._dispatcher._claim_is_still_ours
+    calls = []
+
+    def flaky(j):
+        calls.append(1)
+        if len(calls) == 1:
+            return False                # what a swallowed store read error looks like
+        return real(j)
+
+    monkeypatch.setattr(fin._dispatcher, "_claim_is_still_ours", flaky)
+    assert fin.run_once() == 0
+    assert nr.read_outcome(d) is None
+    assert store.get("job-1").status == JobStatus.RUNNING
+    assert (tmp_path / "jobs" / "job-1" / "output" / "metadata.json").is_file()
+    clock.t += 3600
+    assert fin.run_once() == 1
+    assert nr.read_outcome(d) == {"status": "done", "reason": None}
+    assert store.get("job-1").status == JobStatus.DONE
+    assert attest.verify_body(attest.load_existing_key(tmp_path / "keys" / "a.key"),
+                              receipt(tmp_path))
+
+
+def test_confirmed_lost_claim_is_still_recorded_as_lost(tmp_path, monkeypatch):
+    store, job, fin, _ = build(tmp_path)
+    d = spool(tmp_path, job)
+
+    def steal(j):
+        store.update_if_status("job-1", JobStatus.RUNNING, expect_claim_id=j.claim_id,
+                               status=JobStatus.QUEUED, claim_id=None)
+        return False
+
+    monkeypatch.setattr(fin._dispatcher, "_claim_is_still_ours", steal)
+    assert fin.run_once() == 1
+    assert nr.read_outcome(d) == {"status": "failed", "reason": "claim lost"}
