@@ -105,3 +105,24 @@ printf '{}' > "$1/metadata.json"`)
 		t.Errorf("job dir %s left behind", e.Name())
 	}
 }
+
+// A seatbelt run gets RLIMIT_NPROC = the uid's process count + nprocAllowance (darwin counts
+// the whole uid), so a fork bomb is stopped by the kernel, not the next watchdog sample.
+func TestSeatbeltRunHasAProcessLimit(t *testing.T) {
+	var counted int64
+	prev := uidProcs
+	uidProcs = func() (int64, error) { n, err := prev(); counted = n; return n, err }
+	t.Cleanup(func() { uidProcs = prev })
+	f := seatbeltFixture(t, `echo "nproc=$(ulimit -u)" >&2; exit 3`)
+	var logs []string
+	f.r.Logf = func(format string, a ...any) { logs = append(logs, fmt.Sprintf(format, a...)) }
+	res := f.run()
+	all := strings.Join(logs, "\n")
+	if res.Outcome != "failed" || !strings.Contains(all, "nproc=") {
+		t.Fatalf("result %+v, logs %s", res, all)
+	}
+	want := fmt.Sprintf("nproc=%d", counted+nprocAllowance)
+	if !strings.Contains(all, want) {
+		t.Fatalf("engine saw %s, want %s (or lower, if the kernel clamped it)", all, want)
+	}
+}

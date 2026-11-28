@@ -132,3 +132,24 @@ func heldUnlinkedBytes(pids []int, roots []string) (int64, error) {
 	}
 	return total, nil
 }
+
+// uidProcCount counts this uid's processes, via ps (no cgo for proc_listpids).
+func uidProcCount() (int64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), psTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "/bin/ps", "-axo", "uid=").Output()
+	if err != nil {
+		return 0, err
+	}
+	me := strconv.Itoa(os.Getuid())
+	var n int64
+	for _, f := range strings.Fields(string(out)) {
+		if f == me {
+			n++
+		}
+	}
+	if n == 0 {
+		return 0, errors.New("ps listed no process of this uid")
+	}
+	return n, nil
+}

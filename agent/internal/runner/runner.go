@@ -148,6 +148,8 @@ type job struct {
 	start  time.Time
 	inPath string
 	ident  sandbox.RunIdentity // seatbelt: names the run's processes for the sweep and the watchdog
+	// nprocDone releases this run's share of the seatbelt NPROC ceiling (nil = none held).
+	nprocDone func()
 	// recorded: claim.json is on disk, so crash recovery can retry an undelivered report.
 	recorded bool
 }
@@ -242,6 +244,11 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	cmd, nonce, err := j.command(runCtx, kind, argv, env)
+	defer func() {
+		if j.nprocDone != nil {
+			j.nprocDone()
+		}
+	}()
 	if err != nil {
 		why := "sandbox: " + err.Error()
 		return j.sandboxFault(why, func() Result { return j.release(ctx, why) })
@@ -586,6 +593,16 @@ func (j *job) command(ctx context.Context, kind sandbox.Kind, argv []string, env
 	lim := sandbox.Limits{
 		TimeoutS:   int64(j.c.Run.DeadlineS),
 		FSizeBytes: uint64(max(orDef(j.c.Run.Limits.MaxArtifact, defMaxArtifact), orDef(j.c.Run.Limits.MaxMetadata, defMaxMetadata))),
+	}
+	if kind == sandbox.Seatbelt {
+		// Mandatory: seatbelt permits fork, and without the limit a fork bomb has until the
+		// next watchdog sample to exhaust the uid's processes (the watchdog's own ps included).
+		n, done, err := nprocLimit()
+		if err != nil {
+			return nil, "", fmt.Errorf("process limit: %w", err)
+		}
+		j.nprocDone = done
+		lim.NProc = n
 	}
 	build := j.r.build
 	if build == nil {

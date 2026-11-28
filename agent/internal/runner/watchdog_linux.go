@@ -167,3 +167,27 @@ func heldUnlinkedBytes(pids []int, roots []string) (int64, error) {
 func mkdev(major, minor uint64) uint64 {
 	return (minor & 0xff) | ((major & 0xfff) << 8) | ((minor &^ 0xff) << 12) | ((major &^ 0xfff) << 32)
 }
+
+// uidProcCount counts this uid's processes (used for a seatbelt run, i.e. darwin; nsjail sets
+// its own --rlimit_nproc).
+func uidProcCount() (int64, error) {
+	ents, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, err
+	}
+	me := uint32(os.Getuid())
+	var n int64
+	for _, e := range ents {
+		if _, err := strconv.Atoi(e.Name()); err != nil {
+			continue
+		}
+		var st syscall.Stat_t
+		if syscall.Stat("/proc/"+e.Name(), &st) == nil && st.Uid == me {
+			n++
+		}
+	}
+	if n == 0 {
+		return 0, errors.New("no process of this uid in /proc")
+	}
+	return n, nil
+}
