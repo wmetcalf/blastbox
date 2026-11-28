@@ -822,3 +822,100 @@ def test_input_tmp_still_being_fetched_is_not_reaped(tmp_path, pki_dir):  # noqa
     os.utime(live, (old, old))
     assert c.get("/v1/nodes/jobs/job-1/input", headers=hdr).status_code == 200
     assert (live / "input").exists()
+
+
+def test_implicit_parent_directories_count_against_the_member_cap():
+    """Extraction creates every missing parent: a deep path per file must spend the budget."""
+    deep = "/".join(f"d{i}" for i in range(20))
+    body = make_tar([(f"t{n}/{deep}/f", b"") for n in range(5)])   # 5 files, 105 dirs
+    with pytest.raises(node_results.TarRejected, match="members"):
+        node_results.vet_tar(io.BytesIO(body), max_members=50, max_total_bytes=1 << 20)
+
+
+def test_explicit_and_implicit_directories_are_counted_once():
+    body = make_tar([("a", special("a", tarfile.DIRTYPE)), ("a/b", b"x"), ("a/c", b"y")])
+    # metadata.json + a + a/b + a/c = 4 entries
+    node_results.vet_tar(io.BytesIO(body), max_members=4, max_total_bytes=1 << 20)
+
+
+def test_quarantine_dir_is_fsynced_with_its_marker_before_publish(tmp_path, pki_dir, monkeypatch):  # noqa: F811
+    """202 promises the upload survives a crash: the partial dir's entries (upload.json, out)
+    must be fsynced while the marker is in it, and the new job dir entry persisted in root."""
+    synced: list[tuple[str, bool]] = []
+    real = node_results.fsync_dir
+
+    def spy(d):
+        synced.append((str(d), (d / node_results.MARKER).is_file()))
+        real(d)
+
+    monkeypatch.setattr(node_results, "fsync_dir", spy)
+    _, c, hdr = _setup(tmp_path, pki_dir)
+    r = put(c, hdr, make_tar([]))
+    assert r.status_code == 202, r.text
+    assert any(".partial-" in p and has for p, has in synced), synced
+    root = node_results.results_root(tmp_path / "jobs")
+    assert str(root) in [p for p, _ in synced], synced
+
+
+@pytest.mark.parametrize("hdrs", [
+    {"GNU.sparse.major": "1", "GNU.sparse.minor": "0", "GNU.sparse.name": "a",
+     "GNU.sparse.realsize": "10"},
+    {"GNU.sparse.map": "0,1", "GNU.sparse.size": "10"},
+    {"GNU.sparse.size": "10", "GNU.sparse.numblocks": "1"},
+], ids=["v1.0", "v0.1", "v0.0"])
+def test_pax_sparse_headers_refused_before_the_map_is_parsed(monkeypatch, hdrs):
+    """tarfile decodes a PAX sparse map while parsing the header, before the member is
+    yielded: a small archive can hold a huge map. The map parsers must never run."""
+    def boom(*a, **k):
+        raise AssertionError("sparse map parser ran")
+
+    for n in ("_proc_gnusparse_00", "_proc_gnusparse_01", "_proc_gnusparse_10"):
+        monkeypatch.setattr(tarfile.TarInfo, n, boom)
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tf:
+        ti = tarfile.TarInfo("metadata.json")
+        ti.size = 2
+        tf.addfile(ti, io.BytesIO(b"{}"))
+        ti = tarfile.TarInfo("a")
+        ti.size = 512
+        ti.pax_headers = dict(hdrs)
+        tf.addfile(ti, io.BytesIO(b"\0" * 512))
+    with pytest.raises(node_results.TarRejected, match="sparse"):
+        node_results.vet_tar(io.BytesIO(buf.getvalue()), max_members=100,
+                             max_total_bytes=1 << 20)
+
+
+def test_a_result_published_before_the_lock_is_replayed_not_reprocessed(tmp_path, pki_dir, monkeypatch):  # noqa: F811
+    """A peer PUT publishes (and the finalizer finishes) after this request's first look but
+    before it takes the lock: the replay must answer from the stored outcome, body unread."""
+    _, c, hdr = _setup(tmp_path, pki_dir)
+    assert put(c, hdr, make_tar([])).status_code == 202
+    (d,) = spool_dirs(tmp_path)
+    node_results.write_outcome(d, "done", None)
+    hidden = d.with_name(d.name + ".hidden")
+    d.rename(hidden)                    # first _existing() sees nothing
+    real = node_results.node_cert_sha256
+
+    def cert_then_publish(*a, **k):
+        hidden.rename(d)                # the peer's result lands during the cert lookup
+        return real(*a, **k)
+
+    monkeypatch.setattr(node_results, "node_cert_sha256", cert_then_publish)
+    r = put(c, hdr, b"placeholder, not a tar")
+    assert r.status_code == 200 and r.json() == {"status": "done"}, r.text
+
+
+def test_one_very_deep_name_is_refused_without_quadratic_memory():
+    """Joining every prefix of an 8,000-component name allocates ~64 MB before a cap fires."""
+    import tracemalloc
+
+    deep = "/".join(["a"] * 8000) + "/f"
+    body = make_tar([(deep, b"")])              # GNU/PAX long name, ~16 KB
+    tracemalloc.start()
+    try:
+        with pytest.raises(node_results.TarRejected, match="members"):
+            node_results.vet_tar(io.BytesIO(body), max_members=65, max_total_bytes=1 << 20)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 4 << 20, peak

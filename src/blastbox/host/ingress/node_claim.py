@@ -2003,6 +2003,15 @@ def register_node_claim_routes(
                         node_cert_sha256=cert, worker_runtime=runtime,
                         received_at=time.time(), started_at_ms=started,
                         finished_at_ms=finished))
+                    # the marker and out/ are entries OF partial: persist them before the
+                    # rename publishes the dir, or a crash can leave a quarantine with no marker
+                    try:
+                        await run_in_threadpool(nr.fsync_dir, partial)
+                    except OSError as exc:
+                        # OUR disk failed, not the node's result: nothing published, retry
+                        _log.error("node_claim: could not fsync %s: %s", partial, exc)
+                        return JSONResponse({"status": "retry"}, status_code=503,
+                                            headers={"Retry-After": "30"})
                     try:
                         os.rename(partial, final)
                     except OSError as exc:
@@ -2021,6 +2030,7 @@ def register_node_claim_routes(
                     partial = None
                     try:
                         nr.fsync_dir(jobdir)
+                        nr.fsync_dir(root)      # jobdir itself may be a new entry of root
                     except OSError as exc:
                         # the tree IS in place (a retry would replay this same 202); say so
                         _log.error("node_claim: could not fsync %s after rename: %s", jobdir, exc)
@@ -2070,6 +2080,11 @@ def register_node_claim_routes(
             return JSONResponse({"status": "retry"}, status_code=503,
                                              headers={"Retry-After": "2"})
         try:
+            # a peer may have published between the first look and taking the lock: replay its
+            # stored outcome, body unread, exactly as the first check would have
+            prior = await _existing()
+            if prior is not None:
+                return prior
             try:
                 return await _receive_and_extract()
             except OSError as exc:

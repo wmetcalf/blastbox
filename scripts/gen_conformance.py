@@ -881,7 +881,6 @@ WRITER_TREES: dict[str, dict[str, bytes]] = {
     "ustar_prefix_split": {"metadata.json": b'{"a":1}',
                            "a-" + "n" * 90 + "/" + "m" * 90: b"split into ustar prefix"},
     "deep_path": {"metadata.json": b"{}", "deep/er/path/f": b"x" * 1000},
-    "unicode_name": {"metadata.json": b"{}", "artifacts/café.txt": b"utf8 name"},
 }
 
 
@@ -1596,7 +1595,7 @@ Notes for consumers:
   * `claim_responses`: random values are replaced by placeholders `<CLAIM_ID>` (`job.claim_id`), `<STARTED_AT>` (`job.started_at`) and `<RECEIPT>`; match on shape, never on those. `run.network` is the exit driver name (`none` unless the engine has a governed egress personality). The reference has no driver called `sinkhole`, so `release_network_sinkhole` is `"synthetic": true` (real body, `network` rewritten); the real non-`none` cases are `release_network_socks` and `release_network_inetsim`. The agent releases the job UNSTARTED whenever `run.network != "none"`. `idle` is 204 with `body: null`.
   * `input_stream`: `expected` is `run.input` (`bytes` may be null, then the stream's `content-length` is the length). Header names are lowercase. `abort_redirect` has a 307 and must never be followed.
   * `result_tars/*.tar` are committed once (a rebuild would change nothing today, but the bytes are the contract); `--check` replays every one through `vet_tar` + extraction and compares to its `.json`. Caps (member count, byte totals, 413 stream ceiling) depend on `Limits` and are not vectors.
-  * `result_tars/writer`: USTAR, regular files only, paths sorted bytewise, mode 0644, uid/gid 0, empty uname/gname, mtime 0, no directory entries, 512-byte blocks plus the two-block end marker, and NO padding to a 10240-byte record (the Go writer does not pad; Python's tarfile does unless told otherwise). Go writes devmajor/devminor as `0000000\0`. In `tree`, `metadata.json` is UTF-8 text and every other value is hex.
+  * `result_tars/writer`: USTAR, regular files only, paths sorted bytewise, mode 0644, uid/gid 0, empty uname/gname, mtime 0, no directory entries, 512-byte blocks plus the two-block end marker, and NO padding to a 10240-byte record (the Go writer does not pad; Python's tarfile does unless told otherwise). Go writes devmajor/devminor as `0000000\0`. The Go writer emits no PAX headers, so it REFUSES (fails the job) any tree with a non-ASCII path: a non-ASCII path is not representable in USTAR without PAX, and there is no writer vector for one. Server-side, `vet_tar` may still accept such names from other writers. In `tree`, `metadata.json` is UTF-8 text and every other value is hex.
   * `transcripts`: `lost_claim_409` is the status write (`POST /jobs/{id}` with `expect_status`) losing its compare-and-swap; a node that has lost its claim sees 403 on input/result. `session_expiry_mid_upload`: PUT 401, then challenge + session, then the same PUT 202.
 
 Regenerate / check:

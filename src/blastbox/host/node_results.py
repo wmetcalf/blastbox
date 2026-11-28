@@ -250,6 +250,19 @@ class _BoundedTarInfo(tarfile.TarInfo):
             tarfile_obj._bb_ext_chain = 0       # type: ignore[attr-defined]
         return super()._proc_member(tarfile_obj)  # type: ignore[misc]  # private, stable 3.8-3.13
 
+    # A PAX sparse member (GNU formats 0.0 / 0.1 / 1.0) has its map decoded inside _proc_pax,
+    # while the header is parsed and BEFORE the member is yielded: 1.0 reads the map from the
+    # data blocks, so a small archive materialises an unbounded list. tarfile calls these on
+    # the extended header's TarInfo (this class), so refusing here runs before any map parse.
+    def _proc_gnusparse_00(self, *_a: Any, **_k: Any) -> None:
+        raise TarRejected("PAX sparse member refused (GNU sparse 0.0)")
+
+    def _proc_gnusparse_01(self, *_a: Any, **_k: Any) -> None:
+        raise TarRejected("PAX sparse member refused (GNU sparse 0.1)")
+
+    def _proc_gnusparse_10(self, *_a: Any, **_k: Any) -> None:
+        raise TarRejected("PAX sparse member refused (GNU sparse 1.0)")
+
 
 def vet_tar(fileobj: Any, *, max_members: int, max_total_bytes: int,
             max_metadata_bytes: int | None = None) -> None:
@@ -263,6 +276,11 @@ def vet_tar(fileobj: Any, *, max_members: int, max_total_bytes: int,
     total, exactly as ``_safe_extract_tar`` and the cold trust gate count it.
     """
     seen: set[str] = set()
+    # every filesystem entry extraction will create: explicit members AND the missing parents
+    # _safe_extract_tar makes for them, so deep paths cannot multiply inodes past the cap
+    # Interned as (parent entry id, component) -> id, never as joined prefix strings: joining
+    # every prefix of one deep name is quadratic in its length, before any cap could fire.
+    entries: dict[tuple[int, str], int] = {}
     meta_regular = False
     count = 0
     total = 0
@@ -290,6 +308,16 @@ def vet_tar(fileobj: Any, *, max_members: int, max_total_bytes: int,
                 if norm in seen:
                     raise TarRejected(f"duplicate member: {norm!r}")
                 seen.add(norm)
+                parent = 0                      # 0 = the extraction root
+                for comp in norm.split("/"):
+                    key = (parent, comp)
+                    nid = entries.get(key)
+                    if nid is None:
+                        if len(entries) >= max_members:     # checked per NEW entry
+                            raise TarRejected(f"more than {max_members} members, counting "
+                                              "the directories extraction creates")
+                        nid = entries[key] = len(entries) + 1
+                    parent = nid
                 if norm == "metadata.json" and m.isfile():
                     meta_regular = True
                     if max_metadata_bytes is not None and m.size > max_metadata_bytes:

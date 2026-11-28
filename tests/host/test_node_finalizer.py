@@ -621,3 +621,122 @@ def test_sweep_removes_a_finalize_lock_left_by_a_killed_finalizer(tmp_path):
     os.utime(left, (old, old))
     fin.run_once()
     assert not jd.exists()
+
+
+def test_crash_after_retained_fail_keeps_the_retained_outcome(tmp_path):
+    """finalise_output marked the row FAILED and the tree retained, then the finalizer died
+    before outcome.json: recovery must record RETAINED_REASON (so a later sweep repair to
+    DONE reads as done on replay), not the row's error."""
+    store, job, fin, _ = build(tmp_path)
+    d = spool(tmp_path, job)
+    (tmp_path / "jobs" / "job-1").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "jobs" / "job-1" / ".pending-upload").write_text(job.claim_id)
+    store.update_if_status("job-1", JobStatus.RUNNING, expect_claim_id=job.claim_id,
+                           status=JobStatus.FAILED, error="result upload failed")
+    assert fin.run_once() == 1
+    assert nr.read_outcome(d) == {"status": "failed", "reason": nr.RETAINED_REASON}
+
+
+def test_crash_after_failed_cas_ignores_another_claims_sentinel(tmp_path):
+    store, job, fin, _ = build(tmp_path)
+    d = spool(tmp_path, job)
+    (tmp_path / "jobs" / "job-1").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "jobs" / "job-1" / ".pending-upload").write_text("someone-else")
+    store.update_if_status("job-1", JobStatus.RUNNING, expect_claim_id=job.claim_id,
+                           status=JobStatus.FAILED, error="boom")
+    assert fin.run_once() == 1
+    assert nr.read_outcome(d) == {"status": "failed", "reason": "boom"}
+
+
+def test_cli_accepts_a_float_retention_like_the_ingress(tmp_path, monkeypatch):
+    """The ingress parses BLASTBOX_JOB_RETENTION_SECONDS as a float; "3600.0" must start us."""
+    from blastbox.host import cli, node_finalizer
+    monkeypatch.setenv("BLASTBOX_JOB_ROOT", str(tmp_path / "jobs"))
+    monkeypatch.setenv("BLASTBOX_JOB_RETENTION_SECONDS", "3600.0")
+    monkeypatch.delenv("BLASTBOX_ATTEST_KEY", raising=False)
+
+    class Fake:
+        def __init__(self, **kw):
+            Fake.retention = kw["job_retention_seconds"]
+
+        def run_once(self):
+            return 0
+
+    monkeypatch.setattr(node_finalizer, "NodeFinalizer", Fake)
+    import blastbox.host.jobs.factory as jf
+    monkeypatch.setattr(jf, "build_job_store_from_env", lambda *a, **k: InMemoryJobStore())
+    assert cli.main(["node-finalizer", "--once", "--no-receipts"]) == 0
+    assert Fake.retention == 3600
+
+
+def test_unconfirmed_ownership_keeps_the_tree_and_retries(tmp_path, monkeypatch):
+    """_claim_is_still_ours fails closed (False) on a store read error, so finalise_output says
+    "lost" without a confirmed loss. With the row still RUNNING under this claim, the staged
+    tree must survive and the next attempt must finish the job, never a permanent claim lost."""
+    clock = _clock(monkeypatch)
+    store, job, fin, _ = build(tmp_path)
+    d = spool(tmp_path, job)
+    real = fin._dispatcher._claim_is_still_ours
+    calls = []
+
+    def flaky(j):
+        calls.append(1)
+        if len(calls) == 1:
+            return False                # what a swallowed store read error looks like
+        return real(j)
+
+    monkeypatch.setattr(fin._dispatcher, "_claim_is_still_ours", flaky)
+    assert fin.run_once() == 0
+    assert nr.read_outcome(d) is None
+    assert store.get("job-1").status == JobStatus.RUNNING
+    assert (tmp_path / "jobs" / "job-1" / "output" / "metadata.json").is_file()
+    clock.t += 3600
+    assert fin.run_once() == 1
+    assert nr.read_outcome(d) == {"status": "done", "reason": None}
+    assert store.get("job-1").status == JobStatus.DONE
+    assert attest.verify_body(attest.load_existing_key(tmp_path / "keys" / "a.key"),
+                              receipt(tmp_path))
+
+
+def test_confirmed_lost_claim_is_still_recorded_as_lost(tmp_path, monkeypatch):
+    store, job, fin, _ = build(tmp_path)
+    d = spool(tmp_path, job)
+
+    def steal(j):
+        store.update_if_status("job-1", JobStatus.RUNNING, expect_claim_id=j.claim_id,
+                               status=JobStatus.QUEUED, claim_id=None)
+        return False
+
+    monkeypatch.setattr(fin._dispatcher, "_claim_is_still_ours", steal)
+    assert fin.run_once() == 1
+    assert nr.read_outcome(d) == {"status": "failed", "reason": "claim lost"}
+
+
+def test_cli_refuses_a_blob_target_the_ingress_does_not_share(tmp_path, monkeypatch, capsys):
+    """Same queue-backed agreement check the ingress and dispatcher run: a finalizer sealing to
+    a different target would mark jobs DONE whose results the ingress cannot read."""
+    from blastbox.host import canary, cli, node_finalizer
+    monkeypatch.setenv("BLASTBOX_JOB_ROOT", str(tmp_path / "jobs"))
+    monkeypatch.setenv("BLASTBOX_CANARY", "0")
+    monkeypatch.delenv("BLASTBOX_ATTEST_KEY", raising=False)
+    ran = []
+
+    class Fake:
+        def __init__(self, **kw):
+            pass
+
+        def run_once(self):
+            ran.append(1)
+            return 0
+
+    def disagree(job_store, blob_store, *, role):
+        assert role == "node-finalizer"
+        raise canary.CanaryFailure("blob target mismatch", "fix it", None)
+
+    monkeypatch.setattr(node_finalizer, "NodeFinalizer", Fake)
+    monkeypatch.setattr(canary, "check_blob_target_agreement", disagree)
+    import blastbox.host.jobs.factory as jf
+    monkeypatch.setattr(jf, "build_job_store_from_env", lambda *a, **k: InMemoryJobStore())
+    assert cli.main(["node-finalizer", "--once", "--no-receipts"]) == 1
+    assert ran == []
+    assert "blob target" in capsys.readouterr().err

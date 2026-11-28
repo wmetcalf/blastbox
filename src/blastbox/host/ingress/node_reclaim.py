@@ -262,7 +262,8 @@ def _delete_input(input_path: "Path") -> None:
 
 def reclaim_stale_claims(job_store: "JobStore", *, after_s: float,
                          retention_s: float = 0.0,
-                         now: float | None = None) -> int:
+                         now: float | None = None,
+                         results_root: "Path | str | None" = None) -> int:
     """Fail every RUNNING job whose owner has plainly gone. Returns how many.
 
     IT STAMPS ``expires_at``, like both dispatcher siblings do on their own terminal writes.
@@ -275,6 +276,11 @@ def reclaim_stale_claims(job_store: "JobStore", *, after_s: float,
     terminal status the owner wrote, and never touches a job that was reclaimed between the read
     and the write. That is the same fence the dispatcher's recovery uses, and it is what makes it
     safe for both to run against one queue.
+
+    AN ACCEPTED UPLOAD IS NOT A GONE NODE. With *results_root*, a claim whose result is already
+    quarantined there (marker present, no outcome yet) is waiting on the HOST's finalizer, not
+    on the node: it got 202, and a finalizer outage or backlog past the cutoff must not fail it
+    as abandoned and so discard an acknowledged result. The finalizer resolves those rows.
     """
     import time
 
@@ -312,6 +318,9 @@ def reclaim_stale_claims(job_store: "JobStore", *, after_s: float,
         started = job.started_at if job.started_at is not None else job.created_at
         if started >= cutoff:
             continue
+        if results_root is not None and _awaiting_finalizer(Path(results_root), job.job_id,
+                                                            job.claim_id or ""):
+            continue
         try:
             applied = job_store.update_if_status(
                 job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
@@ -328,3 +337,14 @@ def reclaim_stale_claims(job_store: "JobStore", *, after_s: float,
                          ">%.0fs). FAILED rather than requeued: re-queuing would let a second "
                          "worker re-detonate the same untrusted input.", job.job_id, after_s)
     return failed
+
+
+def _awaiting_finalizer(results_root: Path, job_id: str, claim_id: str) -> bool:
+    """True when this claim's upload was accepted (quarantine marker) and not yet finalised."""
+    from blastbox.host import node_results as nr
+
+    try:
+        d = nr.spool_dir(results_root, job_id, claim_id)
+        return (d / nr.MARKER).is_file() and not (d / nr.OUTCOME).exists()
+    except (OSError, ValueError):
+        return False
