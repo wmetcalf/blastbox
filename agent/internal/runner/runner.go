@@ -617,8 +617,14 @@ func (j *job) exec(ctx context.Context, cmd *exec.Cmd, capw *capWriter) (killed 
 	pid := cmd.Process.Pid
 	rec.PID = pid
 	rec.Identity, _ = sandbox.ProcIdentity(pid)
+	// killGroup signals the run's process group only while its leader is still the process
+	// that was started (running, or a zombie not yet reaped: either way it holds the group id).
+	// Once cmd.Wait has reaped it -- possibly seconds before Wait returns, while WaitDelay waits
+	// on a pipe an escaped child holds -- the bare number may name another group; whatever is
+	// left of the run is then the sweep's (by sandbox identity) or died with its jail.
+	killGroup := func() { killGroupOf(pid, rec.Identity) }
 	if err := writeRec(); err != nil {
-		syscall.Kill(-pid, syscall.SIGKILL)
+		killGroup()
 		err2 := cmd.Wait()
 		_ = err2
 		return "run record could not be written: " + err.Error(), nil
@@ -637,7 +643,7 @@ func (j *job) exec(ctx context.Context, cmd *exec.Cmd, capw *capWriter) (killed 
 	}
 	kill := func(reason string) {
 		killed = reason
-		syscall.Kill(-pid, syscall.SIGKILL)
+		killGroup()
 	}
 	rssFails := 0
 	rssFn := j.r.rss
@@ -647,7 +653,9 @@ func (j *job) exec(ctx context.Context, cmd *exec.Cmd, capw *capWriter) (killed 
 	for {
 		select {
 		case err := <-done:
-			syscall.Kill(-pid, syscall.SIGKILL) // reap strays left in the group
+			// The leader is reaped: never signal its bare group number now (see killGroup).
+			// A seatbelt run's leftovers are swept by identity next; an nsjail run's died with
+			// its PID namespace.
 			if killed == "" && ctx.Err() != nil {
 				// exec.CommandContext's Cancel killed the group before our select saw Done.
 				killed = "run interrupted: agent shutting down"
@@ -687,6 +695,17 @@ func (j *job) exec(ctx context.Context, cmd *exec.Cmd, capw *capWriter) (killed 
 			}
 		}
 	}
+}
+
+// killGroupOf SIGKILLs process group pid only while pid is still the leader that was started
+// (identity = its sandbox.ProcIdentity at start; 0 = unknown, which signals unconditionally).
+func killGroupOf(pid int, identity int64) bool {
+	if identity != 0 {
+		if id, ok := sandbox.ProcIdentity(pid); !ok || id != identity {
+			return false
+		}
+	}
+	return syscall.Kill(-pid, syscall.SIGKILL) == nil
 }
 
 func handshakeOK(scratch, nonce string) bool {
