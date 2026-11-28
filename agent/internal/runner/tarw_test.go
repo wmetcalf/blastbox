@@ -106,9 +106,6 @@ func TestTarRefusesNonRegular(t *testing.T) {
 		// The control plane refuses the whole tar on a backslash: refuse it before uploading.
 		{"backslash", func(r string) error { return os.WriteFile(filepath.Join(r, `win\path.txt`), []byte("x"), 0o600) }},
 		{"not utf-8", func(r string) error { return os.WriteFile(filepath.Join(r, "caf\xe9"), []byte("x"), 0o600) }},
-		{"too long", func(r string) error {
-			return os.WriteFile(filepath.Join(r, strings.Repeat("n", 101)), []byte("x"), 0o600)
-		}},
 	} {
 		root := t.TempDir()
 		os.WriteFile(filepath.Join(root, "f"), []byte("x"), 0o600)
@@ -141,6 +138,10 @@ func TestTarMatchesPythonTarfile(t *testing.T) {
 		"art/" + strings.Repeat("é", 60) + "/f.txt":                                             "02",
 		strings.Repeat("n", 100):       "",
 		"a/" + strings.Repeat("b", 99): "0303",
+		// Beyond USTAR (a 101+ byte component, or over 255 bytes): tarfile's PAX path record.
+		"art/" + strings.Repeat("长", 40) + ".txt": "04",
+		strings.Repeat("q", 101):                  "05",
+		strings.Repeat("d/", 130) + "f":           "06",
 	}
 	root := t.TempDir()
 	for rel, hx := range tree {

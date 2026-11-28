@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"unicode/utf8"
@@ -18,7 +19,8 @@ import (
 // exclusively, mode 0600). Paths are sorted bytewise; every header has mode 0644, uid/gid 0,
 // empty uname/gname and mtime 0; directories are not emitted. Anything that is not a regular
 // file (symlinks, devices, FIFOs, sockets) and any hardlinked file (nlink > 1) is refused, as is
-// any path that is not UTF-8, holds a backslash, or that USTAR cannot hold without a PAX extension. Names are raw
+// any path that is not UTF-8 or holds a backslash. A path USTAR cannot hold gets a PAX path
+// record, as Python's tarfile writes it. Names are raw
 // UTF-8 bytes, split into prefix/name as Python's tarfile does (conformance result_tars/writer).
 // The same bytes come out on every host.
 func Write(root, dst string) (err error) {
@@ -90,7 +92,8 @@ const (
 )
 
 // splitName splits name into a USTAR prefix and name exactly as Python's tarfile does: the
-// SHORTEST "/"-boundary prefix whose remainder fits. ok is false when no split fits.
+// SHORTEST "/"-boundary prefix whose remainder fits. ok is false when no split fits (the
+// name then gets a PAX path record).
 func splitName(name string) (prefix, base string, ok bool) {
 	if len(name) <= nameSize {
 		return "", name, true
@@ -120,17 +123,55 @@ func ustarHeader(name string, size int64) ([]byte, error) {
 	}
 	prefix, base, ok := splitName(name)
 	if !ok {
-		return nil, errors.New("path too long for a USTAR header")
+		return paxHeader(name, size), nil
 	}
+	return ustarBlock(base, prefix, size, '0', 0o644), nil
+}
+
+// paxHeader is what Python's tarfile PAX format writes for a path USTAR cannot hold (a
+// component over 100 bytes, or over 255 in all): an "x" header named ././@PaxHeader whose
+// payload is the "path" record, then the USTAR header with the name ASCII-replaced and cut to
+// 100 bytes (readers take the path record). The control plane's tar reader accepts it.
+func paxHeader(name string, size int64) []byte {
+	kv := "path=" + name + "\n"
+	l := len(kv) + 1 // + the space after the length
+	n, p := 0, 0
+	for {
+		n = l + len(strconv.Itoa(p))
+		if n == p {
+			break
+		}
+		p = n
+	}
+	rec := strconv.Itoa(p) + " " + kv
+	out := ustarBlock("././@PaxHeader", "", int64(len(rec)), 'x', 0)
+	payload := make([]byte, (len(rec)+blockSize-1)/blockSize*blockSize)
+	copy(payload, rec)
+	out = append(out, payload...)
+	short := make([]byte, 0, len(name))
+	for _, r := range name {
+		if r < 0x80 {
+			short = append(short, byte(r))
+		} else {
+			short = append(short, '?')
+		}
+	}
+	if len(short) > nameSize {
+		short = short[:nameSize]
+	}
+	return append(out, ustarBlock(string(short), "", size, '0', 0o644)...)
+}
+
+func ustarBlock(base, prefix string, size int64, typ byte, mode int) []byte {
 	h := make([]byte, blockSize)
 	copy(h[0:100], base)
-	copy(h[100:108], "0000644\x00")
+	copy(h[100:108], fmt.Sprintf("%07o\x00", mode))
 	copy(h[108:116], "0000000\x00")
 	copy(h[116:124], "0000000\x00")
 	copy(h[124:136], fmt.Sprintf("%011o\x00", size))
 	copy(h[136:148], "00000000000\x00")
 	copy(h[148:156], "        ")
-	h[156] = '0'
+	h[156] = typ
 	copy(h[257:265], "ustar\x0000")
 	copy(h[329:337], "0000000\x00")
 	copy(h[337:345], "0000000\x00")
@@ -140,7 +181,7 @@ func ustarHeader(name string, size int64) ([]byte, error) {
 		sum += int(c)
 	}
 	copy(h[148:156], fmt.Sprintf("%06o\x00 ", sum))
-	return h, nil
+	return h
 }
 
 func addFile(tw io.Writer, root, name string) error {
