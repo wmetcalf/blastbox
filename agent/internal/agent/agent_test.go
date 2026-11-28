@@ -297,6 +297,36 @@ func TestStartupRecoveryDoesNotSilenceTheNode(t *testing.T) {
 	})
 }
 
+// A refused SESSION (a 403 from an ingress behind a load balancer with an unshared claim key,
+// a 404 while a route rolls out) says nothing about the job's claim: recovery keeps the result
+// and replays it once a session opens, instead of wiping it as "claim no longer ours".
+func TestRecoveryKeepsTheResultWhenTheSessionIsRefused(t *testing.T) {
+	for _, code := range []int{403, 404, 422} {
+		e := fresh(t)
+		e.cfg.Claim = false
+		d := jobDir(e, "jz", true, true)
+		os.WriteFile(filepath.Join(d, runner.ResultTarName), make([]byte, 1024), 0o600)
+		os.WriteFile(filepath.Join(d, runner.ResultMetaName), []byte(`{"worker_runtime":"seatbelt","started_at_ms":1,"finished_at_ms":2}`), 0o600)
+		e.in.mu.Lock()
+		e.in.sessionCode = code
+		e.in.mu.Unlock()
+		h := newHarness(e)
+		stop := h.start(t)
+		time.Sleep(300 * time.Millisecond)
+		if _, err := os.Stat(filepath.Join(d, runner.ResultTarName)); err != nil {
+			t.Fatalf("session %d: the undelivered result was wiped: %v", code, err)
+		}
+		e.in.mu.Lock()
+		e.in.sessionCode = 0
+		e.in.mu.Unlock()
+		eventually(t, "replayed once a session opens", func() bool {
+			_, err := os.Stat(d)
+			return e.in.putCount("jz") >= 1 && os.IsNotExist(err)
+		})
+		stop()
+	}
+}
+
 func TestRecoveryAfterAcceptedUploadPollsDisposition(t *testing.T) {
 	e := fresh(t)
 	e.cfg.Claim = false

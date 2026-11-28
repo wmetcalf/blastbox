@@ -997,3 +997,27 @@ func TestJobIDRefusesDotComponents(t *testing.T) {
 		}
 	}
 }
+
+// A refused handshake during a call about a held claim is retryable and never reads as an
+// answer about the job (lost claim, refused, no such job).
+func TestHeldCallSessionRefusalIsNotAJobAnswer(t *testing.T) {
+	for _, code := range []int{403, 404, 422} {
+		f, c := setup(t)
+		f.handler = func(w http.ResponseWriter, r *http.Request) bool {
+			if r.URL.Path == "/v1/nodes/session" {
+				w.WriteHeader(code)
+				return true
+			}
+			return false
+		}
+		cl := &Claim{JobID: "j1", ClaimID: "c1", Receipt: "r1"}
+		err := c.Fail(context.Background(), cl, "x", time.Now())
+		_, perr := c.PutResult(context.Background(), cl, "/nonexistent", ResultMeta{})
+		for _, e := range []error{err, perr} {
+			if !errors.Is(e, ErrSession) || !errors.Is(e, ErrServer) || errors.Is(e, ErrRefused) ||
+				errors.Is(e, ErrNotFound) || errors.Is(e, ErrRejected) || errors.Is(e, ErrClaimLost) {
+				t.Errorf("session %d: %v", code, e)
+			}
+		}
+	}
+}

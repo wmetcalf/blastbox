@@ -297,6 +297,25 @@ type reqSpec struct {
 	body    func() (io.ReadCloser, int64, error) // fresh body per attempt
 	ctype   string
 	timeout time.Duration
+	held    bool // a call about a held claim: a failed handshake is not an answer about the job
+}
+
+// ErrSession marks a failed session handshake during a call about a held claim. It is
+// retryable (it also matches ErrServer) and never matches ErrRefused, ErrNotFound or
+// ErrRejected: a /challenge or /session refusal (a load balancer with an unshared claim key, a
+// route being rolled out, a revoked cert) says nothing about the job, so its result is kept.
+var ErrSession = errors.New("wire: session handshake failed")
+
+type sessionError struct{ err error }
+
+func (e *sessionError) Error() string   { return "wire: session handshake failed: " + e.err.Error() }
+func (e *sessionError) Unwrap() []error { return []error{ErrSession, ErrServer} }
+
+func heldSessionErr(err error) error {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return &sessionError{err}
 }
 
 type resp struct {
@@ -405,6 +424,9 @@ func scrub(err error) error {
 func (c *Client) authed(ctx context.Context, s reqSpec) (*resp, error) {
 	tok, err := c.ensure(ctx)
 	if err != nil {
+		if s.held {
+			return nil, heldSessionErr(err)
+		}
 		return nil, err
 	}
 	r, err := c.send(ctx, s, tok)
@@ -416,6 +438,9 @@ func (c *Client) authed(ctx context.Context, s reqSpec) (*resp, error) {
 	}
 	r.Close()
 	if tok, err = c.handshake(ctx, tok); err != nil {
+		if s.held {
+			return nil, heldSessionErr(err)
+		}
 		return nil, err
 	}
 	r, err = c.send(ctx, s, tok)
@@ -697,7 +722,7 @@ func (c *Client) FetchInput(ctx context.Context, cl *Claim, dst string) (sum str
 	if err != nil {
 		return "", err
 	}
-	r, err := c.authed(ctx, reqSpec{method: "GET", path: p, headers: claimHeaders(cl), timeout: streamTimeout})
+	r, err := c.authed(ctx, reqSpec{method: "GET", path: p, headers: claimHeaders(cl), timeout: streamTimeout, held: true})
 	if err != nil {
 		return "", err
 	}
@@ -768,7 +793,7 @@ func (c *Client) PutResult(ctx context.Context, cl *Claim, tarPath string, meta 
 		return Outcome{}, err
 	}
 	if err := c.Session(ctx); err != nil { // learn the server clock before translating times
-		return Outcome{}, err
+		return Outcome{}, heldSessionErr(err)
 	}
 	h := claimHeaders(cl)
 	if meta.WorkerRuntime != "" {
@@ -793,7 +818,7 @@ func (c *Client) PutResult(ctx context.Context, cl *Claim, tarPath string, meta 
 		return f, st.Size(), nil
 	}
 	r, err := c.authed(ctx, reqSpec{method: "PUT", path: p, headers: h, body: open,
-		ctype: "application/x-tar", timeout: streamTimeout})
+		ctype: "application/x-tar", timeout: streamTimeout, held: true})
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -829,7 +854,7 @@ func (c *Client) update(ctx context.Context, cl *Claim, fields map[string]any) e
 	if err != nil {
 		return err
 	}
-	r, err := c.authed(ctx, reqSpec{method: "POST", path: p, ctype: "application/json", body: body})
+	r, err := c.authed(ctx, reqSpec{method: "POST", path: p, ctype: "application/json", body: body, held: true})
 	if err != nil {
 		return err
 	}
@@ -845,7 +870,7 @@ func (c *Client) update(ctx context.Context, cl *Claim, fields map[string]any) e
 // time (the run's started_at as the server knows it). The error is omitted when empty.
 func (c *Client) Fail(ctx context.Context, cl *Claim, reason string, finishedAt time.Time) error {
 	if err := c.Session(ctx); err != nil { // learn the server clock before translating times
-		return err
+		return heldSessionErr(err)
 	}
 	if finishedAt.IsZero() {
 		finishedAt = c.now()
@@ -970,7 +995,7 @@ func (c *Client) Disposition(ctx context.Context, jobID string) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	r, err := c.authed(ctx, reqSpec{method: "GET", path: p})
+	r, err := c.authed(ctx, reqSpec{method: "GET", path: p, held: true})
 	if err != nil {
 		return "", err
 	}

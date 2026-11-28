@@ -96,6 +96,7 @@ type ingress struct {
 	ca  *pki
 
 	mu          sync.Mutex
+	sessionCode int // non-zero: /v1/nodes/session answers this status
 	claims      int
 	hbs         []wire.Heartbeat
 	sessions    []string
@@ -150,6 +151,11 @@ func (in *ingress) serve(w http.ResponseWriter, r *http.Request) {
 		var m map[string]string
 		json.Unmarshal(body, &m)
 		in.mu.Lock()
+		if code := in.sessionCode; code != 0 {
+			in.mu.Unlock()
+			js(code, map[string]any{"detail": "session refused"})
+			return
+		}
 		in.sessions = append(in.sessions, m["cert_pem"])
 		n := len(in.sessions)
 		in.mu.Unlock()
