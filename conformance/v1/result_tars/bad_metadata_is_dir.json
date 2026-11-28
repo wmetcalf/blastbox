@@ -1,0 +1,6 @@
+{
+  "http_status": 422,
+  "reason": "metadata.json is a directory",
+  "server_verdict": "rejected",
+  "tar_sha256": "636b6648252cf01e1434a97d88cf045242e6b48ee3972f075aa2a03d326b41fd"
+}

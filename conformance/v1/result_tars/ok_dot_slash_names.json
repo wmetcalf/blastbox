@@ -1,0 +1,6 @@
+{
+  "http_status": 202,
+  "reason": "a leading ./ is normalised away",
+  "server_verdict": "accepted",
+  "tar_sha256": "72086a92d862eceb732a886263ac76d83ce943dce1afb80f08d842362a3cc3cf"
+}

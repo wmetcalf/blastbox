@@ -1,0 +1,6 @@
+{
+  "http_status": 422,
+  "reason": "absolute member path",
+  "server_verdict": "rejected",
+  "tar_sha256": "a9e3dfed4f9a043c108f63e06c4ce7164a3c357d0f363f6fef11c0734fcc23ac"
+}

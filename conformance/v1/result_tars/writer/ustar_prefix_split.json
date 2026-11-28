@@ -1,0 +1,8 @@
+{
+  "tar_bytes": 3072,
+  "tar_sha256": "133307e0baa2ea3d56977b5ab3b79d247b322c6426441eb6e0812d3d9dbf0836",
+  "tree": {
+    "a-nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm": "73706c697420696e746f20757374617220707265666978",
+    "metadata.json": "{\"a\":1}"
+  }
+}

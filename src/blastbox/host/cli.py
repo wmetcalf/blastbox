@@ -3,6 +3,7 @@
 Subcommands:
 - ``serve``    — start the FastAPI ingress server via uvicorn.
 - ``dispatch`` — run the Dispatcher loop (claim + launch worker containers).
+- ``node-finalizer`` — seal results uploaded by credential-less pull nodes (holds the attest key).
 - ``bench``    — run a performance benchmark scenario (or ``--list`` them).
 - ``egress``   — set up this node's egress tier (bridges, local/global exit, wg overlay).
 - ``worker-link`` — WireGuard control link so the dispatcher can reach workers behind NAT.
@@ -829,6 +830,71 @@ def _require_shared_blob_store() -> bool:
             raw,
         )
     return False
+
+
+def _node_finalizer_cmd(args: argparse.Namespace) -> int:
+    """Seal quarantined node results where the attest key lives. Never claims work."""
+    import threading
+
+    from blastbox.host import attest as _attest
+    from blastbox.host.blobs.factory import build_blob_store_from_env
+    from blastbox.host.jobs.factory import build_job_store_from_env
+    from blastbox.host.node_finalizer import NodeFinalizer
+
+    log = logging.getLogger("blastbox.node_finalizer")
+    key = None if args.no_receipts else _attest.load_attest_key()
+    if key is None and not args.no_receipts:
+        print("error: no attest key (set BLASTBOX_ATTEST_KEY to a readable key file); the "
+              "finalizer signs the receipt on every node result. Pass --no-receipts to run "
+              "WITHOUT receipts.", file=sys.stderr)
+        return 1
+    if args.no_receipts:
+        log.warning("node-finalizer running with --no-receipts: results from nodes will be "
+                    "marked DONE with NO signed receipt")
+    from blastbox.host.ingress.node_claim import (
+        resolve_pki_dir,
+        terminal_writes_mode,
+        terminal_writes_open_message,
+    )
+    from blastbox.host.ingress.node_reclaim import RECLAIM_AFTER_ENV
+
+    if not (os.environ.get(RECLAIM_AFTER_ENV) or "").strip():
+        log.error("%s is unset: a claim whose node never uploads is never reclaimed", RECLAIM_AFTER_ENV)
+    if resolve_pki_dir(None) is not None:
+        _open = terminal_writes_open_message(terminal_writes_mode())
+        if _open:
+            log.error("%s", _open)
+    job_root = Path(os.environ.get("BLASTBOX_JOB_ROOT", "/var/lib/blastbox/jobs"))
+    job_store = build_job_store_from_env()
+    blob_store = build_blob_store_from_env({**os.environ, "BLASTBOX_JOB_ROOT": str(job_root)})
+    # BEFORE the first result is sealed: this process uploads and marks DONE, so it must write
+    # the blob target the ingress serves from. The same queue-backed checks the dispatcher runs,
+    # round-trip first (under the canary toggle) because the agreement check PERSISTS.
+    from blastbox.host import canary as _canary
+
+    try:
+        if _canary_settings()[0]:
+            _canary.blob_roundtrip(blob_store, key_hint="node-finalizer")
+        _canary.check_blob_target_agreement(job_store, blob_store, role="node-finalizer")
+    except _canary.CanaryFailure as exc:
+        print(f"error: node-finalizer startup check failed: {exc}", file=sys.stderr)
+        return 1
+    fin = NodeFinalizer(
+        job_store=job_store,
+        blob_store=blob_store,
+        limits=Limits.from_env(), job_root=job_root, attest_key=key,
+        # float, exactly as the ingress parses it ("3600.0" is a valid ingress value)
+        job_retention_seconds=int(float(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0")),
+    )
+    if args.once:
+        fin.run_once()
+        return 0
+    stop = threading.Event()
+    try:
+        fin.run_forever(stop, args.interval)
+    except KeyboardInterrupt:
+        stop.set()
+    return 0
 
 
 def _dispatch_cmd(args: argparse.Namespace) -> int:
@@ -2180,6 +2246,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="comma-separated NAME=image:tag engine specs",
     )
     pd.set_defaults(func=_dispatch_cmd)
+
+    # node-finalizer
+    pnf = sub.add_parser(
+        "node-finalizer",
+        help="seal results uploaded by pull nodes (holds the attest key; never claims)",
+    )
+    pnf.add_argument("--once", action="store_true", help="one sweep, then exit")
+    pnf.add_argument("--interval", type=float, default=1.0, help="seconds between sweeps")
+    pnf.add_argument("--no-receipts", action="store_true",
+                     help="run without an attest key: results are marked DONE UNSIGNED")
+    pnf.set_defaults(func=_node_finalizer_cmd)
 
     # bench
     pb = sub.add_parser("bench", help="run a performance benchmark scenario")

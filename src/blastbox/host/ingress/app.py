@@ -515,8 +515,17 @@ def build_app(
                             _log.warning("ingress: scratch reclaim failed", exc_info=True)
                     if reclaim_after:
                         try:
+                            from blastbox.host import node_results as _node_results
+
+                            # an accepted upload awaiting the finalizer is not a gone node; an
+                            # unusable results root must not cost the fleet its reclaim sweep
+                            try:
+                                _res_root = _node_results.results_root(_job_root)
+                            except OSError:
+                                _res_root = None
                             reclaim_stale_claims(_job_store, after_s=reclaim_after,
-                                             retention_s=_retention_s)
+                                                 retention_s=_retention_s,
+                                                 results_root=_res_root)
                         except Exception:  # noqa: BLE001 -- same contract as above
                             _log.warning("ingress: stale-claim sweep failed", exc_info=True)
                     if queued_age:
@@ -592,7 +601,16 @@ def build_app(
     )
 
     # Requirement 1: 413 before spool (Content-Length fast path + streaming).
-    app.add_middleware(BodySizeLimitMiddleware, max_bytes=_limits.max_input_bytes)
+    from blastbox.host.node_results import stream_cap as _result_stream_cap
+
+    # A node's result tar is not an input: it carries up to max_total_artifacts + metadata.
+    # Only that one route gets the larger ceiling (the route enforces the same cap itself).
+    app.add_middleware(
+        BodySizeLimitMiddleware, max_bytes=_limits.max_input_bytes,
+        route_ceilings=(("PUT", r"/v1/nodes/jobs/[^/]+/result", _result_stream_cap(
+            max_artifact_total=_limits.max_total_artifact_bytes,
+            max_metadata=_limits.max_metadata_bytes,
+            max_artifacts=_limits.max_artifacts)),))
 
     if _api_key:
         app.add_middleware(
@@ -1459,7 +1477,8 @@ def build_app(
 
     # The API key doubles as the pepper for the store-held node signing key: every ingress
     # host already has it and a queue reader does not. See node_auth.resolve_claim_secret.
-    register_node_claim_routes(app, job_store=_job_store,
+    register_node_claim_routes(app, job_store=_job_store, job_root=_job_root,
+                               blob_store=_blob_store, limits=_limits,
                                pepper=_api_key.encode() if _api_key else None)
 
     return app

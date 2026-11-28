@@ -334,6 +334,10 @@ class RunObservation:
     # The APPLIED posture differs from the personality's declaration:
     net_downgraded: bool = False    # the network args failed the run closed to --network=none
     net_inspect: bool = False       # the run was routed through the TLS-MITM inspect gateway
+    # A credential-less pull node's identity (the node-finalizer, which seals what the node
+    # uploaded, stamps these). None everywhere else, so an ordinary receipt carries neither key.
+    node_id: str | None = None
+    node_cert_sha256: str | None = None
 
 
 def sha256_file(path: Path) -> str:
@@ -374,6 +378,10 @@ def build_receipt(obs: RunObservation, *, key_id: str, metadata_sha256: str,
         "finished_at_ms": int(obs.finished_at_ms),
         "issued_at_ms": now_ms() if issued_at_ms is None else int(issued_at_ms),
     }
+    if obs.node_id is not None:
+        doc["node_id"] = obs.node_id
+    if obs.node_cert_sha256 is not None:
+        doc["node_cert_sha256"] = obs.node_cert_sha256
     if obs.net_policy_effective is not None:
         doc["net_policy_effective"] = obs.net_policy_effective
         doc["net_exit"] = obs.net_exit

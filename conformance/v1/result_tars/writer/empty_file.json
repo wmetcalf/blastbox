@@ -1,0 +1,8 @@
+{
+  "tar_bytes": 2560,
+  "tar_sha256": "35c8ad7bea556b6983c79cd9f575ac0554424f740f9fae7a36de76676b0162ed",
+  "tree": {
+    "artifacts/empty": "",
+    "metadata.json": "{}"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "body": {
+    "detail": "not authorised to claim this work"
+  },
+  "decision": "refused",
+  "description": "403: node beta is not granted clamav; do NOT re-handshake, back off",
+  "status": 403
+}

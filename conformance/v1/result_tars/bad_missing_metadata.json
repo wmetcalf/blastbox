@@ -1,0 +1,6 @@
+{
+  "http_status": 422,
+  "reason": "no root metadata.json",
+  "server_verdict": "rejected",
+  "tar_sha256": "ca553150ff688376ad7ba31c0131c9720b628d558bcef9681a4c2690f6aa651c"
+}

@@ -1,0 +1,6 @@
+{
+  "http_status": 422,
+  "reason": "FIFO member",
+  "server_verdict": "rejected",
+  "tar_sha256": "12865ef7bf7609b07bf0b994f05ff8e72c6d800a3c27f7f1f6e6a34c33b0b86f"
+}

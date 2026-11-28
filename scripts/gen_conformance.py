@@ -23,9 +23,14 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime
+import gzip
 import hashlib
+import io
 import json
 import sys
+import tarfile
+import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -416,6 +421,16 @@ def generate() -> dict[str, bytes]:
         files[f"sandbox/seatbelt/{name}.json"] = _dumps(doc)
     for name, doc in gen_nsjail().items():
         files[f"sandbox/nsjail/{name}.json"] = _dumps(doc)
+    for name, doc in gen_claim_responses().items():
+        files[f"claim_responses/{name}.json"] = _dumps(doc)
+    for name, doc in gen_input_stream().items():
+        files[f"input_stream/{name}.json"] = _dumps(doc)
+    for name, doc in gen_writer().items():
+        files[f"result_tars/writer/{name}.json"] = _dumps(doc)
+    for name, doc in gen_envelope_seal().items():
+        files[f"envelope_seal/{name}.json"] = _dumps(doc)
+    for name, steps in gen_transcripts().items():
+        files[f"transcripts/{name}.json"] = _dumps(steps)
     return files
 
 
@@ -801,6 +816,593 @@ def add_ecdsa_negative(cross: Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Data plane (PR B): claim responses, input stream, result tars, envelope seal, transcripts
+# ---------------------------------------------------------------------------
+DP_SAMPLE = b"sample-bytes"
+DP_SAMPLE_SHA = hashlib.sha256(DP_SAMPLE).hexdigest()
+DP_WG = "A" * 42 + "B="
+SESSION_HDR = "x-blastbox-node-session"
+
+
+def tree_to_json(tree: dict[str, bytes]) -> dict[str, str]:
+    """``metadata.json`` as UTF-8 text, every other file as hex."""
+    return {k: (v.decode() if k == "metadata.json" else v.hex()) for k, v in tree.items()}
+
+
+def tree_from_json(doc: dict[str, str]) -> dict[str, bytes]:
+    return {k: (v.encode() if k == "metadata.json" else bytes.fromhex(v)) for k, v in doc.items()}
+
+
+def go_writer_tar(tree: dict[str, bytes]) -> bytes:
+    """Byte-for-byte the output of agent/internal/runner/tarw.go (Go ``archive/tar``).
+
+    USTAR, regular files only, paths sorted bytewise, mode 0644, uid/gid 0, empty uname/gname,
+    mtime 0, no directory entries, 512-byte blocks and the two-block end marker with NO padding
+    to a 10240-byte record (Go's writer does not pad; Python's ``tarfile`` does by default).
+    Go writes devmajor/devminor as ``0000000\\0``; Python leaves them NUL, so they are pinned
+    and the checksum is recomputed (same trick as that branch's testdata/tarcheck.py).
+    """
+    out = bytearray()
+    for name in sorted(tree, key=lambda s: s.encode()):
+        data = tree[name]
+        ti = tarfile.TarInfo(name)
+        ti.size, ti.mode, ti.uid, ti.gid = len(data), 0o644, 0, 0
+        ti.uname, ti.gname, ti.mtime = "", "", 0
+        ti.type = tarfile.REGTYPE
+        h = bytearray(ti.tobuf(tarfile.USTAR_FORMAT, "utf-8", "surrogateescape"))
+        h[329:337] = b"0000000\0"
+        h[337:345] = b"0000000\0"
+        h[148:156] = b"        "
+        h[148:156] = b"%06o\0 " % sum(h)
+        out += h
+        out += data + b"\0" * (-len(data) % 512)
+    out += b"\0" * 1024
+    return bytes(out)
+
+
+def _meta(**over: Any) -> bytes:
+    doc = {"engine": "clamav", "status": "ok", "input_sha256": DP_SAMPLE_SHA,
+           "detected": {"label": "bin", "mime": "application/octet-stream",
+                        "confidence": 0.9, "source": "magika"},
+           "artifacts": [], "warnings": [],
+           "payload": {"_type": "extracted_text", "text": "hi", "char_count": 2}}
+    doc.update(over)
+    return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
+
+
+WRITER_TREES: dict[str, dict[str, bytes]] = {
+    "minimal": {"metadata.json": b'{"a":1}'},
+    "empty_file": {"metadata.json": b"{}", "artifacts/empty": b""},
+    "sorted_bytewise": {"metadata.json": b"{}", "B.txt": b"", "art/z.bin": b"zz",
+                        "art/a.txt": b"hello\n", "a.txt": b"lower"},
+    "block_boundaries": {"metadata.json": b"{}", "artifacts/b511": b"x" * 511,
+                         "artifacts/b512": b"y" * 512, "artifacts/b513": b"z" * 513},
+    "binary_bytes": {"metadata.json": b"{}", "artifacts/all.bin": bytes(range(256))},
+    "ustar_prefix_split": {"metadata.json": b'{"a":1}',
+                           "a-" + "n" * 90 + "/" + "m" * 90: b"split into ustar prefix"},
+    "deep_path": {"metadata.json": b"{}", "deep/er/path/f": b"x" * 1000},
+}
+
+
+def gen_writer() -> dict[str, dict[str, Any]]:
+    out = {}
+    for name, tree in WRITER_TREES.items():
+        tar = go_writer_tar(tree)
+        out[name] = {"tree": tree_to_json(tree), "tar_bytes": len(tar),
+                     "tar_sha256": hashlib.sha256(tar).hexdigest()}
+    return out
+
+
+# ---- result_tars: adversarial, committed once ------------------------------------------
+def _tar(members: list[Any], *, metadata: bool = True, fmt: int = tarfile.PAX_FORMAT) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=fmt) as tf:
+        if metadata:
+            members = [("metadata.json", b"{}")] + list(members)
+        for member in members:
+            if isinstance(member, tarfile.TarInfo):
+                tf.addfile(member)
+                continue
+            name, content = member
+            if isinstance(content, tarfile.TarInfo):
+                tf.addfile(content)
+                continue
+            ti = tarfile.TarInfo(name)
+            ti.size = len(content)
+            tf.addfile(ti, io.BytesIO(content))
+    return buf.getvalue()
+
+
+def _special(name: str, typ: bytes, link: str = "") -> tarfile.TarInfo:
+    ti = tarfile.TarInfo(name)
+    ti.type = typ
+    ti.linkname = link
+    return ti
+
+
+def _dir(name: str) -> tarfile.TarInfo:
+    return _special(name, tarfile.DIRTYPE)
+
+
+def _gzip(b: bytes) -> bytes:
+    return gzip.compress(b, mtime=0)
+
+
+#: (case, server_verdict, reason, builder). Verdicts are re-derived from the REAL
+#: ``node_results.vet_tar`` + ``_safe_extract_tar`` by ``--check`` -- this table only seeds
+#: the first commit, it is not trusted afterwards.
+RESULT_TAR_CASES: list[tuple[str, str, str, Any]] = [
+    ("ok_minimal", "accepted", "metadata.json only",
+     lambda: go_writer_tar({"metadata.json": b"{}"})),
+    ("ok_artifacts", "accepted", "metadata plus nested artifacts, as the Go writer emits",
+     lambda: go_writer_tar(WRITER_TREES["sorted_bytewise"])),
+    ("ok_directory_entries", "accepted", "directory members are tolerated",
+     lambda: _tar([_dir("artifacts"), ("artifacts/a.bin", b"\x00\x01")])),
+    ("ok_dot_slash_names", "accepted", "a leading ./ is normalised away",
+     lambda: _tar([("./artifacts/a.bin", b"x")])),
+    ("bad_dotdot", "rejected", "parent reference in a member path",
+     lambda: _tar([("../evil", b"x")])),
+    ("bad_nested_dotdot", "rejected", "parent reference inside a path",
+     lambda: _tar([("a/../../evil", b"x")])),
+    ("bad_absolute", "rejected", "absolute member path",
+     lambda: _tar([("/etc/evil", b"x")])),
+    ("bad_symlink", "rejected", "symlink member",
+     lambda: _tar([("l", _special("l", tarfile.SYMTYPE, "/etc/passwd"))])),
+    ("bad_hardlink", "rejected", "hardlink member",
+     lambda: _tar([("h", _special("h", tarfile.LNKTYPE, "metadata.json"))])),
+    ("bad_chardev", "rejected", "character device member",
+     lambda: _tar([("d", _special("d", tarfile.CHRTYPE))])),
+    ("bad_fifo", "rejected", "FIFO member",
+     lambda: _tar([("f", _special("f", tarfile.FIFOTYPE))])),
+    ("bad_duplicate", "rejected", "the same path twice",
+     lambda: _tar([("x", b"1"), ("x", b"2")])),
+    ("bad_duplicate_via_dot", "rejected", "the same path twice, one spelled with ./",
+     lambda: _tar([("x", b"1"), ("./x", b"2")])),
+    ("bad_missing_metadata", "rejected", "no root metadata.json",
+     lambda: _tar([("a", b"x")], metadata=False)),
+    ("bad_metadata_in_subdir", "rejected", "metadata.json not at the root",
+     lambda: _tar([("sub/metadata.json", b"{}")], metadata=False)),
+    ("bad_metadata_is_dir", "rejected", "metadata.json is a directory",
+     lambda: _tar([("m", _dir("metadata.json"))], metadata=False)),
+    ("bad_backslash", "rejected", "backslash in a member path",
+     lambda: _tar([("a\\b", b"x")])),
+    ("bad_garbage", "rejected", "not a tar at all", lambda: b"not a tar at all" * 100),
+    ("bad_empty_body", "rejected", "empty body", lambda: b""),
+    ("bad_gzip", "rejected", "compressed tar (the stream must be a plain tar)",
+     lambda: _gzip(_tar([]))),
+    ("bad_truncated", "rejected", "tar cut mid-member",
+     lambda: _tar([("big", b"x" * 4096)])[:1024 + 700]),
+]
+
+
+def _result_limits() -> Any:
+    from blastbox.limits import Limits
+
+    return Limits()
+
+
+def server_verdict_for_tar(data: bytes) -> str:
+    """accepted / rejected, by the SAME two steps the PUT route runs (quarantine extraction)."""
+    from blastbox.host import node_results as nr
+    from blastbox.host.runtime.remote_http import _safe_extract_tar
+
+    lim = _result_limits()
+    max_members = lim.max_artifacts + 64
+    try:
+        fh = io.BytesIO(data)
+        nr.vet_tar(fh, max_members=max_members, max_total_bytes=lim.max_total_artifact_bytes,
+                   max_metadata_bytes=lim.max_metadata_bytes)
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "out"
+            out.mkdir()
+            _safe_extract_tar(fh, out, max_total_bytes=lim.max_total_artifact_bytes,
+                              max_members=max_members,
+                              max_metadata_bytes=lim.max_metadata_bytes)
+    except Exception:  # noqa: BLE001 - any fault is "refused", exactly as the route treats it
+        return "rejected"
+    return "accepted"
+
+
+def write_result_tars(out: Path) -> None:
+    """Committed once: written only when absent, with the verdict the reference returns now."""
+    d = out / "result_tars"
+    for case, _seed, reason, build in RESULT_TAR_CASES:
+        tar_path = d / f"{case}.tar"
+        if tar_path.exists():
+            continue
+        data = build()
+        verdict = server_verdict_for_tar(data)
+        _write(out, f"result_tars/{case}.tar", data)
+        _write(out, f"result_tars/{case}.json", _dumps({
+            "server_verdict": verdict, "reason": reason,
+            "http_status": 202 if verdict == "accepted" else 422,
+            "tar_sha256": hashlib.sha256(data).hexdigest()}))
+
+
+def verify_result_tars(out: Path = OUT) -> list[str]:
+    problems: list[str] = []
+    d = out / "result_tars"
+    for case, seed, _reason, _build in RESULT_TAR_CASES:
+        try:
+            data = (d / f"{case}.tar").read_bytes()
+            doc = json.loads((d / f"{case}.json").read_text())
+        except (OSError, ValueError) as exc:
+            problems.append(f"result_tars/{case}: unreadable ({exc})")
+            continue
+        if doc.get("tar_sha256") != hashlib.sha256(data).hexdigest():
+            problems.append(f"result_tars/{case}: tar_sha256 does not match the .tar")
+        got = server_verdict_for_tar(data)
+        if got != doc.get("server_verdict"):
+            problems.append(f"result_tars/{case}: vet+extract says {got}, vector says "
+                            f"{doc.get('server_verdict')}")
+        if doc.get("server_verdict") != seed:
+            problems.append(f"result_tars/{case}: verdict {doc.get('server_verdict')} differs "
+                            f"from the case's designed verdict {seed}")
+    return problems
+
+
+# ---- the real app, driven with the TestClient ------------------------------------------
+class _Rig:
+    """A real ``register_node_claim_routes`` app with a throwaway PKI, store and job root."""
+
+    def __init__(self, root: Path) -> None:
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from blastbox.host.ingress.node_claim import register_node_claim_routes
+        from blastbox.host.jobs.memory import InMemoryJobStore
+
+        self.root = root
+        self.pki = root / "pki"
+        ca = pki.ensure_ca(self.pki)
+        ca.issue_node("alpha", wg_pubkey=DP_WG, grants=pki.NodeGrants(
+            engines=("clamav",), tiers=("socks", "inetsim"), credentials=True)
+        ).write(self.pki, "node-alpha")
+        ca.issue_node("beta", wg_pubkey=DP_WG, grants=pki.NodeGrants(
+            engines=("boxjs",))).write(self.pki, "node-beta")
+        self.store = InMemoryJobStore()
+        self.jobs = root / "jobs"
+        app = FastAPI()
+        assert register_node_claim_routes(app, job_store=self.store, pki_dir=self.pki,
+                                          job_root=self.jobs) is True
+        self.client = TestClient(app)
+
+    def submit(self, *, job_id: str = "job-1", spool: bytes | None = DP_SAMPLE,
+               params: dict[str, Any] | None = None) -> None:
+        from blastbox.host.jobs.base import Job, JobStatus
+
+        self.store.create(Job(job_id=job_id, engine="clamav", filename="sample.bin",
+                              status=JobStatus.QUEUED, created_at=1.0,
+                              input_sha256=DP_SAMPLE_SHA, params=params or {}))
+        if spool is not None:
+            (self.jobs / job_id / "input").mkdir(parents=True)
+            (self.jobs / job_id / "input" / "sample.bin").write_bytes(spool)
+
+    def challenge(self) -> Any:
+        return self.client.get("/v1/nodes/challenge")
+
+    def session(self, who: str, challenge: str) -> Any:
+        key = (self.pki / f"node-{who}.key").read_bytes()
+        sig = _b64(node_auth.sign_claim(key, challenge, node_auth.SCOPE_CLAIM_NEXT, who))
+        return self.client.post("/v1/nodes/session", json={
+            "cert_pem": (self.pki / f"node-{who}.crt").read_text(),
+            "challenge": challenge, "signature": sig})
+
+    def token(self, who: str) -> str:
+        return self.session(who, self.challenge().json()["challenge"]).json()["token"]
+
+
+@contextmanager
+def _dp_rig(env: dict[str, str] | None = None) -> Iterator[_Rig]:
+    import os
+
+    with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ):
+        for k in [k for k in os.environ if k.startswith("BLASTBOX_")]:
+            del os.environ[k]
+        os.environ["BLASTBOX_NODE_RESULTS_DIR"] = str(Path(td) / "results")
+        os.environ.update(env or {})
+        yield _Rig(Path(td))
+
+
+def _normalise_claim(body: Any) -> Any:
+    if not isinstance(body, dict) or "job" not in body:
+        return body
+    body = json.loads(json.dumps(body))
+    body["job"]["claim_id"] = "<CLAIM_ID>"
+    body["job"]["started_at"] = "<STARTED_AT>"
+    body["receipt"] = "<RECEIPT>"
+    return body
+
+
+def _claim_vec(r: Any, decision: str, description: str, **extra: Any) -> dict[str, Any]:
+    body = _normalise_claim(r.json() if r.content else None)
+    return {"description": description, "status": r.status_code, "body": body,
+            "decision": decision, **extra}
+
+
+def gen_claim_responses() -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+
+    def claim(rig: _Rig, who: str = "alpha", token: str | None = None) -> Any:
+        return rig.client.post("/v1/nodes/claim", json={"engine": "clamav"},
+                               headers={SESSION_HDR: token or rig.token(who)})
+
+    with _dp_rig() as rig:
+        rig.submit()
+        out["run_basic"] = _claim_vec(claim(rig), "run",
+                                      "network none, input spooled on the ingress host")
+    with _dp_rig() as rig:
+        rig.submit(params={"SCAN": "fast", "DEPTH": 3, "lower": "x", "LD_PRELOAD": "/x.so",
+                           "BLASTBOX_SECRET": "x"})
+        out["run_params_filtered"] = _claim_vec(
+            claim(rig), "run", "run.params passes the engine param gate (UPPERCASE shape, no "
+                               "BLASTBOX_*/LD_*/PATH/PYTHON*, engine allowlist + defaults); "
+                               "job.params keeps the raw values")
+    with _dp_rig() as rig:
+        rig.submit(spool=None)
+        out["run_input_bytes_unknown"] = _claim_vec(
+            claim(rig), "run", "input not spooled here: run.input.bytes is null, size is "
+                               "taken from the stream's headers")
+    for label, driver in (("socks", "socks"), ("inetsim", "inetsim")):
+        exit_spec = "exit=socks,host=127.0.0.1,port=1080" if driver == "socks" else "exit=inetsim"
+        with _dp_rig({"BLASTBOX_NETPOLICY_EGRESS": exit_spec,
+                      "BLASTBOX_ENGINE_CLAMAV_NETPOLICY": "egress"}) as rig:
+            rig.submit()
+            out[f"release_network_{label}"] = _claim_vec(
+                claim(rig), "release_unstarted",
+                f"run.network is {driver!r}: this agent cannot enforce it, so it must release "
+                "the job unstarted (never run it with open egress)")
+    # The reference has no driver literally named "sinkhole"; the Go agent treats ANY
+    # run.network other than "none" as unenforceable, so pin the spelling the brief names.
+    with _dp_rig({"BLASTBOX_NETPOLICY_EGRESS": "exit=inetsim",
+                  "BLASTBOX_ENGINE_CLAMAV_NETPOLICY": "egress"}) as rig:
+        rig.submit()
+        vec = _claim_vec(claim(rig), "release_unstarted",
+                         "SYNTHETIC: the real run body from release_network_inetsim with "
+                         "network rewritten to 'sinkhole'", synthetic=True)
+        vec["body"]["run"]["network"] = "sinkhole"
+        out["release_network_sinkhole"] = vec
+    with _dp_rig() as rig:
+        out["idle_no_work"] = _claim_vec(claim(rig), "idle", "204: entitled, nothing to run")
+    with _dp_rig() as rig:
+        rig.submit()
+        tok = node_auth.issue_session(
+            "alpha", secret=node_auth.resolve_claim_secret(rig.store, rig.pki, pepper=None),
+            now=time.time() - node_auth.SESSION_TTL_S - 5)
+        out["rehandshake_expired_session"] = _claim_vec(
+            claim(rig, token=tok), "rehandshake", "expired session: 401, open a new session")
+    with _dp_rig() as rig:
+        out["rehandshake_no_session"] = _claim_vec(
+            rig.client.post("/v1/nodes/claim", json={"engine": "clamav"}), "rehandshake",
+            "no session header: 401")
+    with _dp_rig() as rig:
+        rig.submit()
+        out["refused_engine_not_granted"] = _claim_vec(
+            claim(rig, "beta"), "refused",
+            "403: node beta is not granted clamav; do NOT re-handshake, back off")
+    return out
+
+
+# ---- input_stream ----------------------------------------------------------------------
+def judge_input(vec: dict[str, Any]) -> str:
+    """The reference verdict for an input stream: what the Go agent MUST decide."""
+    if 300 <= vec["status"] < 400:
+        return "abort_redirect"
+    if vec["status"] != 200:
+        return "abort_status"
+    body = bytes.fromhex(vec["body_hex"])
+    exp = vec["expected"]
+    headers = {k.lower(): v for k, v in vec["headers"].items()}
+    declared = int(headers["content-length"]) if "content-length" in headers else None
+    want = exp["bytes"] if exp["bytes"] is not None else declared
+    if want is not None and want > vec["max_input"]:
+        return "abort_long"
+    if len(body) > (want if want is not None else vec["max_input"]):
+        return "abort_long"
+    if want is not None and len(body) < want:
+        return "abort_short"
+    if headers.get("x-blastbox-input-sha256") != exp["sha256"]:
+        return "abort_hash"
+    if hashlib.sha256(body).hexdigest() != exp["sha256"]:
+        return "abort_hash"
+    return "accept"
+
+
+def gen_input_stream() -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    with _dp_rig() as rig:
+        rig.submit()
+        tok = rig.token("alpha")
+        got = rig.client.post("/v1/nodes/claim", json={"engine": "clamav"},
+                              headers={SESSION_HDR: tok}).json()
+        hdr = {SESSION_HDR: tok, "x-blastbox-claim-id": got["job"]["claim_id"],
+               "x-blastbox-receipt": got["receipt"]}
+        r = rig.client.get("/v1/nodes/jobs/job-1/input", headers=hdr)
+        assert r.status_code == 200
+        real = {k: r.headers[k] for k in ("content-length", "content-type",
+                                          "x-blastbox-input-sha256")}
+        body = r.content
+        run_limit = got["run"]["limits"]["max_input"]
+    exp = {"sha256": DP_SAMPLE_SHA, "bytes": len(DP_SAMPLE)}
+
+    def vec(desc: str, verdict: str, *, status: int = 200, headers: dict[str, str] | None = None,
+            body_bytes: bytes = body, expected: dict[str, Any] | None = None,
+            max_input: int = run_limit) -> dict[str, Any]:
+        return {"description": desc, "status": status, "headers": headers or dict(real),
+                "body_hex": body_bytes.hex(), "expected": expected or dict(exp),
+                "max_input": max_input, "verdict": verdict}
+
+    out["accept"] = vec("headers and body exactly as the real route sent them", "accept")
+    out["accept_bytes_unknown"] = vec(
+        "run.input.bytes is null: length comes from the stream", "accept",
+        expected={"sha256": DP_SAMPLE_SHA, "bytes": None})
+    out["abort_short"] = vec("connection ended before expected.bytes", "abort_short",
+                             body_bytes=body[:-1])
+    out["abort_long"] = vec("more bytes than expected.bytes", "abort_long",
+                            body_bytes=body + b"X",
+                            headers={**real, "content-length": str(len(body) + 1)})
+    out["abort_long_over_max_input"] = vec(
+        "expected.bytes already exceeds run.limits.max_input: abort before reading", "abort_long",
+        max_input=len(body) - 1)
+    out["abort_hash_body"] = vec("same length, flipped byte: hash mismatch", "abort_hash",
+                                 body_bytes=bytes([body[0] ^ 1]) + body[1:])
+    out["abort_hash_header"] = vec(
+        "x-blastbox-input-sha256 disagrees with run.input.sha256", "abort_hash",
+        headers={**real, "x-blastbox-input-sha256": "0" * 64})
+    out["abort_redirect"] = vec(
+        "3xx: never follow a redirect with the session headers", "abort_redirect", status=307,
+        headers={"location": "http://169.254.169.254/latest/meta-data", "content-length": "0"},
+        body_bytes=b"")
+    for name, v in out.items():
+        assert judge_input(v) == v["verdict"], name
+    return out
+
+
+# ---- envelope_seal ---------------------------------------------------------------------
+def gen_envelope_seal() -> dict[str, dict[str, Any]]:
+    from blastbox.host.trust import OutputTrustError, validate_worker_output
+
+    def _a(id_: str, path: str, kind: str = "binary", **over: Any) -> dict[str, Any]:
+        # the schema REQUIRES sha256/bytes from the worker; the host discards them
+        return {"id": id_, "path": path, "kind": kind, "sha256": "00" * 32, "bytes": 0, **over}
+
+    art = _a("a1", "artifacts/a.bin")
+    cases: list[tuple[str, str, dict[str, bytes], dict[str, Any]]] = [
+        ("no_artifacts", "metadata only", {"metadata.json": _meta()}, {}),
+        ("reseal_overwrites_worker_claims",
+         "worker-reported sha256/bytes are discarded; the host recomputes them from the files",
+         {"metadata.json": _meta(artifacts=[{**art, "sha256": "ff" * 32, "bytes": 999}]),
+          "artifacts/a.bin": b"\x00\x01hello"}, {}),
+        ("two_artifacts_nested", "ordering follows the declaration, not the tar",
+         {"metadata.json": _meta(artifacts=[
+             _a("z", "artifacts/z.bin"), _a("a", "deep/er/a.txt", "text")]),
+          "artifacts/z.bin": b"zz", "deep/er/a.txt": b"hello\n"}, {}),
+        ("empty_artifact", "zero-byte artifact seals to the empty-string sha256",
+         {"metadata.json": _meta(artifacts=[art]), "artifacts/a.bin": b""}, {}),
+        ("missing_artifact", "declared but not in the tree",
+         {"metadata.json": _meta(artifacts=[art])}, {}),
+        ("input_sha_mismatch", "worker processed a different document",
+         {"metadata.json": _meta(input_sha256="ab" * 32)}, {}),
+        ("engine_mismatch", "worker reports another engine",
+         {"metadata.json": _meta(engine="boxjs")}, {}),
+        ("path_escape", "declared artifact path leaves the output dir",
+         {"metadata.json": _meta(artifacts=[{**art, "path": "../escape"}])}, {}),
+        ("reserved_attestation_path", "attestation.json is the host's, never an artifact",
+         {"metadata.json": _meta(artifacts=[{**art, "path": "attestation.json"}]),
+          "attestation.json": b"{}"}, {}),
+        ("metadata_not_json", "metadata.json is not an envelope",
+         {"metadata.json": b"not json"}, {}),
+    ]
+    out: dict[str, dict[str, Any]] = {}
+    for name, desc, tree, _ in cases:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for rel, data in tree.items():
+                p = root / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(data)
+            try:
+                env = validate_worker_output(output_dir=root, input_sha256=DP_SAMPLE_SHA,
+                                             engine="clamav", limits=_result_limits())
+                verdict: str = "sealed"
+                arts: Any = [{"id": a.id, "path": a.path, "kind": a.kind,
+                              "sha256": a.sha256, "bytes": a.bytes} for a in env.artifacts]
+            except OutputTrustError:
+                verdict, arts = "refused", None
+        out[name] = {"description": desc, "engine": "clamav", "input_sha256": DP_SAMPLE_SHA,
+                     "tree": tree_to_json(tree), "verdict": verdict, "artifacts": arts}
+    return out
+
+
+# ---- transcripts -----------------------------------------------------------------------
+class _Tape:
+    def __init__(self, rig: _Rig) -> None:
+        self.rig = rig
+        self.steps: list[dict[str, Any]] = []
+
+    def call(self, method: str, template: str, path: str | None = None, *,
+             headers: dict[str, str] | None = None, **kw: Any) -> Any:
+        r = self.rig.client.request(method, path or template, headers=headers, **kw)
+        self.steps.append({"req": {"method": method, "path": template,
+                                   "headers_present": sorted(h.lower() for h in (headers or {}))},
+                           "resp": {"status": r.status_code}})
+        return r
+
+
+def gen_transcripts() -> dict[str, list[dict[str, Any]]]:
+    out: dict[str, list[dict[str, Any]]] = {}
+    tar_ok = go_writer_tar({"metadata.json": _meta()})
+    res_path = "/v1/nodes/jobs/{job_id}/result"
+    inp_path = "/v1/nodes/jobs/{job_id}/input"
+    job_path = "/v1/nodes/jobs/{job_id}"
+
+    def handshake(t: _Tape, who: str) -> str:
+        ch = t.call("GET", "/v1/nodes/challenge").json()["challenge"]
+        key = (t.rig.pki / f"node-{who}.key").read_bytes()
+        sig = _b64(node_auth.sign_claim(key, ch, node_auth.SCOPE_CLAIM_NEXT, who))
+        r = t.call("POST", "/v1/nodes/session", json={
+            "cert_pem": (t.rig.pki / f"node-{who}.crt").read_text(),
+            "challenge": ch, "signature": sig})
+        return r.json()["token"] if r.status_code == 200 else ""
+
+    def claim(t: _Tape, tok: str, headers_extra: bool = False) -> Any:
+        return t.call("POST", "/v1/nodes/claim", json={"engine": "clamav"},
+                      headers={SESSION_HDR: tok})
+
+    def owned(tok: str, got: dict[str, Any]) -> dict[str, str]:
+        return {SESSION_HDR: tok, "x-blastbox-claim-id": got["job"]["claim_id"],
+                "x-blastbox-receipt": got["receipt"]}
+
+    with _dp_rig() as rig:
+        rig.submit()
+        t = _Tape(rig)
+        tok = handshake(t, "alpha")
+        got = claim(t, tok).json()
+        h = owned(tok, got)
+        t.call("GET", inp_path, "/v1/nodes/jobs/job-1/input", headers=h)
+        t.call("PUT", res_path, "/v1/nodes/jobs/job-1/result", content=tar_ok, headers={
+            **h, "x-blastbox-worker-runtime": "nsjail", "x-blastbox-started-at-ms": "1",
+            "x-blastbox-finished-at-ms": "2"})
+        out["happy"] = t.steps
+    with _dp_rig() as rig:
+        rig.submit()
+        t = _Tape(rig)
+        tok = handshake(t, "beta")
+        claim(t, tok)
+        out["refused"] = t.steps
+    with _dp_rig() as rig:
+        rig.submit()
+        t = _Tape(rig)
+        tok = handshake(t, "alpha")
+        got = claim(t, tok).json()
+        h = owned(tok, got)
+        # the claim moves to someone else; the CAS on (status, claim_id) is lost -> 409
+        t.call("POST", job_path, "/v1/nodes/jobs/job-1", headers={SESSION_HDR: tok}, json={
+            "claim_id": got["job"]["claim_id"], "receipt": got["receipt"],
+            "expect_status": "queued", "fields": {"worker_runtime": "nsjail"}})
+        out["lost_claim_409"] = t.steps
+    with _dp_rig() as rig:
+        rig.submit()
+        t = _Tape(rig)
+        tok = handshake(t, "alpha")
+        got = claim(t, tok).json()
+        h = owned(tok, got)
+        t.call("GET", inp_path, "/v1/nodes/jobs/job-1/input", headers=h)
+        stale = node_auth.issue_session(
+            "alpha", secret=node_auth.resolve_claim_secret(rig.store, rig.pki, pepper=None),
+            now=time.time() - node_auth.SESSION_TTL_S - 5)
+        meta = {"x-blastbox-worker-runtime": "nsjail", "x-blastbox-started-at-ms": "1",
+                "x-blastbox-finished-at-ms": "2"}
+        t.call("PUT", res_path, "/v1/nodes/jobs/job-1/result", content=tar_ok,
+               headers={**h, SESSION_HDR: stale, **meta})              # 401
+        tok2 = handshake(t, "alpha")                                    # challenge + session
+        t.call("PUT", res_path, "/v1/nodes/jobs/job-1/result", content=tar_ok,
+               headers={**h, SESSION_HDR: tok2, **meta})                # 202, same claim
+        out["session_expiry_mid_upload"] = t.steps
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Verification of committed-once artifacts + sha256sums
 # ---------------------------------------------------------------------------
 def verify_committed_once(out: Path = OUT) -> list[str]:
@@ -880,7 +1482,7 @@ def verify_committed_once(out: Path = OUT) -> list[str]:
                     f"ecdsa_cross.json: a {listname} signature verdict is "
                     f"{'valid' if verified else 'invalid'}, entry says {expect_valid}")
     problems += verify_renew_proof_doc(out)
-    return problems
+    return problems + verify_result_tars(out)
 
 
 def sha256sums(out: Path = OUT) -> bytes:
@@ -922,6 +1524,7 @@ def write_all(out: Path = OUT, *, regen_certs: bool = False, regen_signed: bool 
             _write(out, "renew_proof.json", _dumps(doc))
     add_node_cert_negatives(certs)
     add_ecdsa_negative(cross)
+    write_result_tars(out)
     problems = verify_committed_once(out)
     if problems:
         raise SystemExit("committed-once artifacts do not verify:\n  " + "\n  ".join(problems))
@@ -965,6 +1568,12 @@ edit of `v1/`.**
 | `node_certs/` | TEST CA, v1 (WireGuard key) and v2 (no key) node certs, and negatives; `cases.json` gives each verdict at the frozen `now` | `pki.node_identity`, `node_auth.admit_identity` |
 | `sandbox/seatbelt/*.json` | `request` -> exact SBPL `profile` + `-D` `params` | `seatbelt.build_profile` |
 | `sandbox/nsjail/*.json` | `request` -> exact `argv`, with `host_pins` for the host probes that were fixed | `NsjailSandbox._build_argv` |
+| `claim_responses/*.json` | status + normalised body of the REAL `POST /v1/nodes/claim`, and the agent's `decision` (`run`, `idle`, `rehandshake`, `refused`, `release_unstarted`) | `register_node_claim_routes` (`claim`, `_run_block`) |
+| `input_stream/*.json` | `GET .../input` as `{status, headers, body_hex, expected, max_input, verdict}`; verdicts `accept`, `abort_short`, `abort_long`, `abort_hash`, `abort_redirect` | the route, plus `judge_input` in the generator |
+| `result_tars/<case>.tar` + `.json` | adversarial result tars (committed once, bytes pinned by SHA256SUMS) and the server's verdict `accepted`/`rejected` (202 / 422) | `node_results.vet_tar` + `_safe_extract_tar` (the `PUT .../result` route) |
+| `result_tars/writer/*.json` | `{tree, tar_sha256}`: the exact tar the Go writer must produce for a file tree | `agent/internal/runner/tarw.go` semantics, built by `go_writer_tar` |
+| `envelope_seal/*.json` | tree -> sealed artifacts (`sha256`/`bytes` recomputed from disk) or `refused` | `trust.validate_worker_output` |
+| `transcripts/*.json` | ordered `[{req: {method, path, headers_present}, resp: {status}}]` for `happy`, `refused`, `lost_claim_409`, `session_expiry_mid_upload` | the real routes |
 | `SHA256SUMS` | hash of every other file | |
 
 Notes for consumers:
@@ -981,6 +1590,13 @@ Notes for consumers:
 * `v2_with_wg` is accepted (v2 MAY carry a key, and it is validated); `v2_bad_wg` and `v1_without_wg` are refused.
 * `session_token.json` entries all verify under the single `secret_hex`; a `forged` entry was minted under another secret.
 * `rsa_key` verifies as an identity but its `admit` verdict is `refused` (EC keys only).
+
+* Data-plane vectors (all produced by driving the real app, throwaway PKI, DEFAULT `Limits`, no `BLASTBOX_*` env):
+  * `claim_responses`: random values are replaced by placeholders `<CLAIM_ID>` (`job.claim_id`), `<STARTED_AT>` (`job.started_at`) and `<RECEIPT>`; match on shape, never on those. `run.network` is the exit driver name (`none` unless the engine has a governed egress personality). The reference has no driver called `sinkhole`, so `release_network_sinkhole` is `"synthetic": true` (real body, `network` rewritten); the real non-`none` cases are `release_network_socks` and `release_network_inetsim`. The agent releases the job UNSTARTED whenever `run.network != "none"`. `idle` is 204 with `body: null`.
+  * `input_stream`: `expected` is `run.input` (`bytes` may be null, then the stream's `content-length` is the length). Header names are lowercase. `abort_redirect` has a 307 and must never be followed.
+  * `result_tars/*.tar` are committed once (a rebuild would change nothing today, but the bytes are the contract); `--check` replays every one through `vet_tar` + extraction and compares to its `.json`. Caps (member count, byte totals, 413 stream ceiling) depend on `Limits` and are not vectors.
+  * `result_tars/writer`: USTAR, regular files only, paths sorted bytewise, mode 0644, uid/gid 0, empty uname/gname, mtime 0, no directory entries, 512-byte blocks plus the two-block end marker, and NO padding to a 10240-byte record (the Go writer does not pad; Python's tarfile does unless told otherwise). Go writes devmajor/devminor as `0000000\0`. The Go writer emits no PAX headers, so it REFUSES (fails the job) any tree with a non-ASCII path: a non-ASCII path is not representable in USTAR without PAX, and there is no writer vector for one. Server-side, `vet_tar` may still accept such names from other writers. In `tree`, `metadata.json` is UTF-8 text and every other value is hex.
+  * `transcripts`: `lost_claim_409` is the status write (`POST /jobs/{id}` with `expect_status`) losing its compare-and-swap; a node that has lost its claim sees 403 on input/result. `session_expiry_mid_upload`: PUT 401, then challenge + session, then the same PUT 202.
 
 Regenerate / check:
 

@@ -1,0 +1,6 @@
+{
+  "http_status": 202,
+  "reason": "metadata plus nested artifacts, as the Go writer emits",
+  "server_verdict": "accepted",
+  "tar_sha256": "a1d373122651982592f1c3bf2c3a0bce951bc618df321c64e471a3641ff47b4f"
+}

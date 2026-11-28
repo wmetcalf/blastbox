@@ -1,0 +1,102 @@
+[
+  {
+    "req": {
+      "headers_present": [],
+      "method": "GET",
+      "path": "/v1/nodes/challenge"
+    },
+    "resp": {
+      "status": 200
+    }
+  },
+  {
+    "req": {
+      "headers_present": [],
+      "method": "POST",
+      "path": "/v1/nodes/session"
+    },
+    "resp": {
+      "status": 200
+    }
+  },
+  {
+    "req": {
+      "headers_present": [
+        "x-blastbox-node-session"
+      ],
+      "method": "POST",
+      "path": "/v1/nodes/claim"
+    },
+    "resp": {
+      "status": 200
+    }
+  },
+  {
+    "req": {
+      "headers_present": [
+        "x-blastbox-claim-id",
+        "x-blastbox-node-session",
+        "x-blastbox-receipt"
+      ],
+      "method": "GET",
+      "path": "/v1/nodes/jobs/{job_id}/input"
+    },
+    "resp": {
+      "status": 200
+    }
+  },
+  {
+    "req": {
+      "headers_present": [
+        "x-blastbox-claim-id",
+        "x-blastbox-finished-at-ms",
+        "x-blastbox-node-session",
+        "x-blastbox-receipt",
+        "x-blastbox-started-at-ms",
+        "x-blastbox-worker-runtime"
+      ],
+      "method": "PUT",
+      "path": "/v1/nodes/jobs/{job_id}/result"
+    },
+    "resp": {
+      "status": 401
+    }
+  },
+  {
+    "req": {
+      "headers_present": [],
+      "method": "GET",
+      "path": "/v1/nodes/challenge"
+    },
+    "resp": {
+      "status": 200
+    }
+  },
+  {
+    "req": {
+      "headers_present": [],
+      "method": "POST",
+      "path": "/v1/nodes/session"
+    },
+    "resp": {
+      "status": 200
+    }
+  },
+  {
+    "req": {
+      "headers_present": [
+        "x-blastbox-claim-id",
+        "x-blastbox-finished-at-ms",
+        "x-blastbox-node-session",
+        "x-blastbox-receipt",
+        "x-blastbox-started-at-ms",
+        "x-blastbox-worker-runtime"
+      ],
+      "method": "PUT",
+      "path": "/v1/nodes/jobs/{job_id}/result"
+    },
+    "resp": {
+      "status": 202
+    }
+  }
+]

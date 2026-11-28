@@ -57,16 +57,18 @@ exposes no peer certificate to an ASGI app in any case.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import logging
 import math
 import os
+import stat
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
-from fastapi import APIRouter, Header, HTTPException, Query, Response
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field, StrictInt, StringConstraints
 
 from blastbox.host import node_auth, node_renew
@@ -397,6 +399,45 @@ _REFUSED = "not authorised to claim this work"
 _LINKS_REFUSED = ("this ingress's PKI dir contains cert entries that are not regular files; "
                   "links are refused -- an operator must replace them with regular files")
 
+#: Who may make a node's job DONE. ``direct`` (the default, today's behaviour): the node
+#: itself, through POST /v1/nodes/jobs/{id} -- right for Python credential-less dispatcher
+#: nodes that run the trust gate themselves. ``finalizer-only``: a node may write ``status``
+#: only as ``queued`` (release) or ``failed``; DONE comes only from ``blastbox
+#: node-finalizer``, which trust-gates and signs the uploaded result. Pull-agent deployments
+#: MUST set ``finalizer-only``: with ``direct`` an untrusted node can mark its job DONE with
+#: no result, no trust gate and no receipt. An unrecognised value fails CLOSED.
+TERMINAL_WRITES_ENV = "BLASTBOX_NODE_TERMINAL_WRITES"
+TERMINAL_WRITES_FINALIZER_ONLY = "finalizer-only"
+TERMINAL_WRITES_DIRECT = "direct"
+#: Under finalizer-only, the union of the two write shapes a node may send (spec 6.5):
+#: release {status: queued, claim_id: null}; fail {status: failed, error?, finished_at}.
+#: The fail write's expires_at is the control plane's (BLASTBOX_JOB_RETENTION_SECONDS).
+_RELEASE_FIELDS = frozenset({"status", "claim_id"})
+_FAIL_FIELDS = frozenset({"status", "error", "finished_at"})   # expires_at: server-set
+_FINALIZER_ONLY_FIELDS = _RELEASE_FIELDS | _FAIL_FIELDS
+
+
+def terminal_writes_mode(env: "dict[str, str] | None" = None) -> str:
+    raw = ((env if env is not None else os.environ).get(TERMINAL_WRITES_ENV) or "").strip()
+    if not raw:
+        return TERMINAL_WRITES_DIRECT
+    v = raw.lower()
+    if v in (TERMINAL_WRITES_DIRECT, TERMINAL_WRITES_FINALIZER_ONLY):
+        return v
+    _log.error("%s=%r is not one of %s|%s; treating it as %s", TERMINAL_WRITES_ENV, raw,
+               TERMINAL_WRITES_FINALIZER_ONLY, TERMINAL_WRITES_DIRECT,
+               TERMINAL_WRITES_FINALIZER_ONLY)
+    return TERMINAL_WRITES_FINALIZER_ONLY
+
+
+def terminal_writes_open_message(mode: str) -> "str | None":
+    """The startup complaint when a PKI is present and nodes may still write DONE."""
+    if mode == TERMINAL_WRITES_FINALIZER_ONLY:
+        return None
+    return (f"{TERMINAL_WRITES_ENV}={mode}: a node may mark its own job DONE through POST "
+            f"/v1/nodes/jobs/{{id}}, with no trust gate and no signed receipt. Pull-agent "
+            f"deployments must set {TERMINAL_WRITES_ENV}={TERMINAL_WRITES_FINALIZER_ONLY}.")
+
 
 class RenewRequest(BaseModel):
     """A fresh CSR, and proof that the holder of the node's current cert's key asked.
@@ -597,7 +638,8 @@ def _job_requirements(job) -> "tuple[str | None, bool, bool]":
 
 def register_node_claim_routes(
     app: "FastAPI", *, job_store: "JobStore", pki_dir: "Path | str | None" = None,
-    pepper: bytes | None = None,
+    pepper: bytes | None = None, job_root: "Path | str | None" = None,
+    blob_store: "Any | None" = None, limits: "Any | None" = None,
 ) -> bool:
     """Mount the claim routes if this deployment has a PKI. Returns whether it did."""
     resolved = resolve_pki_dir(pki_dir)
@@ -608,9 +650,85 @@ def register_node_claim_routes(
                   else os.environ.get(PKI_ENV, DEFAULT_PKI_DIR))
         return False
 
+    terminal_mode = terminal_writes_mode()
+    try:
+        # float, as the ingress retention sweeper parses it (app.py), so '3600.0' agrees
+        node_fail_retention_s = max(0.0, float(
+            os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0"))
+        if node_fail_retention_s != node_fail_retention_s:          # NaN
+            raise ValueError("nan")
+    except ValueError:
+        _log.error("BLASTBOX_JOB_RETENTION_SECONDS is not a number; node fail writes keep "
+                   "their rows (expires_at unset)")
+        node_fail_retention_s = 0.0
+    _open = terminal_writes_open_message(terminal_mode)
+    if _open:
+        _log.warning("node_claim: %s", _open)
+
     from blastbox.host.pki import load_trust_anchor
 
     router = APIRouter(prefix="/v1/nodes", tags=["nodes"])
+    _jobs_dir = Path(job_root or os.environ.get("BLASTBOX_JOB_ROOT", "/var/lib/blastbox/jobs"))
+
+    def _input_bytes(job) -> "int | None":
+        """Size of the spooled input, or None when it is not on this host."""
+        try:
+            name = Path(job.filename).name
+            if not name or name != job.filename:
+                return None
+            p = _jobs_dir / job.job_id / "input" / name
+            return p.stat().st_size if p.is_file() else None
+        except (OSError, ValueError):
+            return None
+
+    def _run_params(job) -> "dict[str, str]":
+        """job.params through the SAME gate the cold path applies before worker env (shape,
+        reserved floor incl. BLASTBOX_*/LD_*/PATH/PYTHON*, the engine's reserved keys and its
+        allowlist), read from the same per-engine env the dispatcher's EngineSpec is built
+        from, so the INGRESS must carry BLASTBOX_ENGINE_<NAME>_PARAM_KEYS/_RESERVED_KEYS for
+        every engine it serves to nodes. Operator DEFAULT_PARAMS are deliberately NOT merged:
+        they are operator material and the node is untrusted."""
+        from blastbox.host.dispatch import Dispatcher
+
+        eng = job.engine.upper().replace("-", "_")
+        keys_raw = os.environ.get(f"BLASTBOX_ENGINE_{eng}_PARAM_KEYS")
+        allowed = (None if keys_raw is None else
+                   frozenset(k.strip().upper() for k in keys_raw.split(",") if k.strip()))
+        reserved = frozenset(
+            k.strip().upper()
+            for k in (os.environ.get(f"BLASTBOX_ENGINE_{eng}_RESERVED_KEYS") or "").split(",")
+            if k.strip())
+        return Dispatcher._sanitize_params(job.params or {}, allowed, reserved, None)
+
+    def _run_block(job) -> "dict[str, Any]":
+        """The server-authored run description a credential-less agent reads and nothing else."""
+        from blastbox.limits import Limits
+
+        eng = job.engine.upper().replace("-", "_")
+        raw = (os.environ.get(f"BLASTBOX_NODE_RUN_DEADLINE_S_{eng}")
+               or os.environ.get("BLASTBOX_NODE_RUN_DEADLINE_S") or "300")
+        try:
+            deadline = int(raw)
+        except ValueError:
+            deadline = 300
+        deadline = max(10, min(3600, deadline))
+        # The limits this control plane ENFORCES on the result PUT, not a fresh env read.
+        lim = limits if limits is not None else Limits.from_env()
+        tier, _creds, _tell = _job_requirements(job)
+        return {
+            "deadline_s": deadline,
+            "limits": {
+                "max_input": lim.max_input_bytes,
+                "max_metadata": lim.max_metadata_bytes,
+                "max_artifact": lim.max_artifact_bytes,
+                "max_total_artifacts": lim.max_total_artifact_bytes,
+                "max_artifacts": lim.max_artifacts,
+            },
+            "network": tier or "none",
+            "params": _run_params(job),
+            "input": {"sha256": job.input_sha256, "bytes": _input_bytes(job),
+                      "filename": job.filename},
+        }
 
     def _anchor():
         """Loaded PER REQUEST, not once at startup.
@@ -936,7 +1054,8 @@ def register_node_claim_routes(
         _log.info("node_claim: handed job=%s engine=%s to node=%s",
                   job.job_id, job.engine, node_id)
         return {
-            "job": job.to_dict(),
+            "job": job.to_node_dict(),
+            "run": _run_block(job),
             "node_id": node_id,
             # The receipt, not just the claim id: see node_auth.claim_receipt for why
             # knowing a claim id must not be sufficient to write to a job.
@@ -1370,7 +1489,7 @@ def register_node_claim_routes(
         if not x_blastbox_claim_id or not x_blastbox_receipt:
             raise HTTPException(status_code=403, detail=_REFUSED)
         return {"job": _owned_job(job_id, node_id, x_blastbox_claim_id,
-                                  x_blastbox_receipt).to_dict()}
+                                  x_blastbox_receipt).to_node_dict()}
 
     @router.get("/jobs/{job_id}/disposition", response_model=None)
     def disposition(job_id: str,
@@ -1420,6 +1539,77 @@ def register_node_claim_routes(
         node_id = _node_from_token(x_blastbox_node_session)
         current = _owned_job(job_id, node_id, req.claim_id, req.receipt)
         fields = _vetted_fields(req.fields)
+        if terminal_mode == TERMINAL_WRITES_FINALIZER_ONLY:
+            # DONE comes only from the node-finalizer, which trust-gates and signs the
+            # uploaded result; a node may only release (queued) or fail its RUNNING claim.
+            # DONE keeps the claim id, so the receipt still authenticates after finalisation:
+            # without the RUNNING check a node could release a finished job to be detonated
+            # again, or flip it to FAILED. result_summary is the finalizer's (it is derived
+            # from the sealed envelope), never the node's.
+            # Exactly the agent's two write shapes (spec 6.5): release and fail. Nothing else:
+            # input_sha256 is what the finalizer gates on and signs, and worker_tier/runtime,
+            # started_at and security_warnings would narrate a run onto the row.
+            if "expires_at" in req.fields:
+                # retention is the operator's policy, not the node's: it is set below
+                raise HTTPException(status_code=400,
+                                    detail="expires_at is set by the control plane")
+            why = None
+            # what the NODE sent (_vetted_fields adds server-derived keys to a release)
+            extra = sorted(set(req.fields) - _FINALIZER_ONLY_FIELDS)
+            if current.status != JobStatus.RUNNING:
+                why = f"job is {current.status.value}"
+            elif "status" not in fields:
+                why = "no status"
+            elif fields["status"] not in (JobStatus.QUEUED, JobStatus.FAILED):
+                why = f"status={getattr(fields['status'], 'value', fields['status'])}"
+            elif extra:
+                why = f"fields {', '.join(extra)}"
+            elif fields["status"] == JobStatus.QUEUED and set(req.fields) - _RELEASE_FIELDS:
+                why = f"release with {', '.join(sorted(set(req.fields) - _RELEASE_FIELDS))}"
+            elif fields["status"] == JobStatus.FAILED and set(req.fields) != _FAIL_FIELDS \
+                    and set(req.fields) != _FAIL_FIELDS - {"error"}:
+                why = f"fail write with {', '.join(sorted(req.fields))}"
+            elif fields["status"] == JobStatus.FAILED and fields.get("finished_at") is None:
+                why = "fail write with a null finished_at"
+            elif req.expect_status is not None and req.expect_status != JobStatus.RUNNING.value:
+                why = f"expect_status={req.expect_status}"
+            else:
+                from blastbox.host import node_results as _nr
+
+                # After a 202 the sample has run and its result waits for the finalizer: a
+                # release would discard it and hand the sample to another node (spec 6.5:
+                # a sample handed to a sandbox is never released); a fail would throw away a
+                # good result. The finalizer decides from here.
+                if _nr.spool_dir(_nr.results_root(_jobs_dir), job_id, req.claim_id).is_dir():
+                    why = "a result for this claim is already quarantined"
+            if why is not None:
+                _log.warning("node_claim: refused node=%s job=%s write (%s) under %s=%s",
+                             node_id, job_id, why, TERMINAL_WRITES_ENV, terminal_mode)
+                raise HTTPException(status_code=403, detail=_REFUSED)
+        if terminal_mode == TERMINAL_WRITES_FINALIZER_ONLY:
+            if fields.get("status") == JobStatus.FAILED:
+                from blastbox.errors import sanitize_public_error
+
+                # the same scrub the dispatcher's own _fail_job applies before storage
+                if fields.get("error") is not None:
+                    fields["error"] = sanitize_public_error(str(fields["error"]))
+                started = current.started_at
+                if fields.get("finished_at") is not None and started is not None \
+                        and fields["finished_at"] < started:
+                    fields["finished_at"] = started
+                # the expiry the dispatcher's _fail_job stamps: now + retention, or None
+                # (keep) when BLASTBOX_JOB_RETENTION_SECONDS is 0/unset
+                fields["expires_at"] = (time.time() + node_fail_retention_s
+                                        if node_fail_retention_s > 0 else None)
+            # The RUNNING check above read a snapshot; the finalizer may make the job DONE
+            # before this write lands. The CAS is on RUNNING, whatever the caller expected.
+            if not job_store.update_if_status(job_id, JobStatus.RUNNING,
+                                              expect_claim_id=req.claim_id, **fields):
+                raise HTTPException(status_code=409, detail="status changed")
+            fresh = job_store.get(job_id)
+            if fresh is None:
+                raise HTTPException(status_code=409, detail="status changed")
+            return {"job": fresh.to_node_dict()}
         if req.expect_status is not None:
             try:
                 expect = JobStatus(req.expect_status)
@@ -1439,7 +1629,7 @@ def register_node_claim_routes(
             fresh = job_store.get(job_id)
             if fresh is None:
                 raise HTTPException(status_code=409, detail="status changed")
-            return {"job": fresh.to_dict()}
+            return {"job": fresh.to_node_dict()}
         # FENCED even without expect_status. `_owned_job` read the claim a moment ago, and an
         # unconditional write here would apply after a timeout sweep had already reclaimed the
         # job -- a stale owner's report landing on somebody else's run. The CAS on
@@ -1451,7 +1641,348 @@ def register_node_claim_routes(
         fresh = job_store.get(job_id)
         if fresh is None:
             raise HTTPException(status_code=409, detail="status changed")
-        return {"job": fresh.to_dict()}
+        return {"job": fresh.to_node_dict()}
+
+    # ---- data plane: input to the node, result tar back into the quarantine spool ----------
+    # The ingress only QUARANTINES. It holds no attest key and runs no trust gate; the
+    # node-finalizer (a separate process) does both. See blastbox.host.node_results.
+    _runtimes_ok = frozenset({"seatbelt", "nsjail"})
+
+    def _owned_any(job_id: str, node_id: str, claim_id: str | None, receipt: str | None):
+        if not claim_id or not receipt:
+            raise HTTPException(status_code=403, detail=_REFUSED)
+        return _owned_job(job_id, node_id, claim_id, receipt)
+
+    def _running_owned(job_id: str, node_id: str, claim_id: str | None, receipt: str | None):
+        from blastbox.host.jobs.base import JobStatus
+
+        job = _owned_any(job_id, node_id, claim_id, receipt)
+        if job.status != JobStatus.RUNNING:
+            raise HTTPException(status_code=403, detail=_REFUSED)
+        return job
+
+    def _reap_input_tmp(tmp_root: Path) -> None:
+        """Remove blob-store input copies left by a stream whose ingress died mid-way (the
+        generator's cleanup never ran). Unlinking one a live stream still reads is harmless:
+        the open fd keeps the data until the stream closes it."""
+        import shutil
+
+        cutoff = time.time() - 3600
+        try:
+            entries = list(tmp_root.iterdir())
+        except OSError:
+            return
+        for e in entries:
+            try:
+                # a fetch still writing keeps its FILE's mtime fresh inside an old dir
+                times = [e.lstat().st_mtime]
+                if e.is_dir() and not e.is_symlink():
+                    times += [f.lstat().st_mtime for f in e.iterdir()]
+                if max(times) < cutoff:
+                    shutil.rmtree(e, ignore_errors=True)
+            except OSError:
+                continue
+
+    def _local_input(job) -> "Path | None":
+        name = Path(job.filename or "").name
+        if not name or name != job.filename:
+            return None
+        p = _jobs_dir / job.job_id / "input" / name
+        try:
+            return p if stat.S_ISREG(p.lstat().st_mode) else None
+        except OSError:
+            return None
+
+    @router.get("/jobs/{job_id}/input", response_model=None)
+    def get_input(job_id: str,
+                  x_blastbox_node_session: str | None = Header(None),
+                  x_blastbox_claim_id: str | None = Header(None),
+                  x_blastbox_receipt: str | None = Header(None)):
+        import hashlib
+        import shutil
+        import tempfile
+
+        from fastapi.responses import StreamingResponse
+        from starlette.background import BackgroundTask
+
+        node_id = _node_from_token(x_blastbox_node_session)
+        job = _running_owned(job_id, node_id, x_blastbox_claim_id, x_blastbox_receipt)
+        local = _local_input(job)
+        cleanup: "Path | None" = None
+        if local is None:
+            if blob_store is None or not job.input_sha256:
+                raise HTTPException(status_code=503, detail="input unavailable")
+            tmp_root = _jobs_dir / ".node-input-tmp"
+            tmp_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            _reap_input_tmp(tmp_root)
+            cleanup = Path(tempfile.mkdtemp(dir=tmp_root))
+            local = cleanup / "input"
+            try:
+                blob_store.get_sample(job.input_sha256, local)
+                if not local.is_file():
+                    raise FileNotFoundError(str(local))
+            except Exception:                   # noqa: BLE001 - agent releases on 503
+                shutil.rmtree(cleanup, ignore_errors=True)
+                raise HTTPException(status_code=503, detail="input unavailable") from None
+        try:
+            fd = os.open(local, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            if cleanup:
+                shutil.rmtree(cleanup, ignore_errors=True)
+            raise HTTPException(status_code=503, detail="input unavailable") from None
+        size = os.fstat(fd).st_size
+        sha = job.input_sha256
+        if not sha:
+            h = hashlib.sha256()
+            with os.fdopen(os.dup(fd), "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            os.lseek(fd, 0, os.SEEK_SET)
+            sha = h.hexdigest()
+
+        fh = os.fdopen(fd, "rb")
+
+        def _body():
+            try:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    yield chunk
+            finally:
+                _done()          # a disconnect closes the generator without the BackgroundTask
+
+        def _done() -> None:
+            # idempotent: runs from the generator's finally AND the BackgroundTask
+            fh.close()
+            if cleanup:
+                shutil.rmtree(cleanup, ignore_errors=True)
+
+        return StreamingResponse(_body(), media_type="application/octet-stream",
+                                 headers={"Content-Length": str(size),
+                                          "x-blastbox-input-sha256": sha},
+                                 background=BackgroundTask(_done))
+
+    def _ms_header(name: str, raw: "str | None") -> "int | None":
+        if raw is None or raw == "":
+            return None
+        try:
+            v = int(raw)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"{name}: must be an integer") from None
+        if v < 0:
+            raise HTTPException(status_code=400, detail=f"{name}: must be non-negative")
+        return min(v, int((time.time() + MAX_FUTURE_SKEW_S) * 1000))
+
+    @router.put("/jobs/{job_id}/result", response_model=None)
+    async def put_result(job_id: str, request: Request,
+                         x_blastbox_node_session: str | None = Header(None),
+                         x_blastbox_claim_id: str | None = Header(None),
+                         x_blastbox_receipt: str | None = Header(None),
+                         x_blastbox_worker_runtime: str | None = Header(None),
+                         x_blastbox_started_at_ms: str | None = Header(None),
+                         x_blastbox_finished_at_ms: str | None = Header(None)):
+        import shutil
+        import tempfile
+
+        from fastapi.responses import JSONResponse
+        from starlette.concurrency import run_in_threadpool
+
+        from blastbox.errors import HOST_RESOURCE_ERRNOS
+        from blastbox.host import node_results as nr
+        from blastbox.host.runtime import remote_http as _remote_http
+        from blastbox.limits import Limits
+
+        node_id = _node_from_token(x_blastbox_node_session)
+        from blastbox.host.jobs.base import JobStatus
+
+        # Ownership (session + claim id + receipt + grant) is proved for EVERY call; RUNNING is
+        # required only to start a NEW extraction. A replay returns the stored outcome in any
+        # job state (spec 6.4), including after the finalizer has made the job DONE.
+        job = await run_in_threadpool(_owned_any, job_id, node_id,
+                                      x_blastbox_claim_id, x_blastbox_receipt)
+        claim_id = x_blastbox_claim_id or ""
+        runtime = x_blastbox_worker_runtime
+        if runtime is not None and runtime not in _runtimes_ok:
+            raise HTTPException(status_code=400, detail="worker runtime not allowed")
+        started = _ms_header("x-blastbox-started-at-ms", x_blastbox_started_at_ms)
+        finished = _ms_header("x-blastbox-finished-at-ms", x_blastbox_finished_at_ms)
+
+        root = nr.results_root(_jobs_dir)
+        final = nr.spool_dir(root, job_id, claim_id)
+
+        async def _existing() -> "JSONResponse | None":
+            if not final.is_dir():
+                return None
+            out = nr.read_outcome(final)
+            if out is None:
+                return JSONResponse({"status": "accepted"}, status_code=202)
+            if out.get("status") == "done":
+                return JSONResponse({"status": "done"}, status_code=200)
+            if out.get("reason") == nr.RETAINED_REASON:
+                # retained is not final: the pending-upload sweep may since have repaired the
+                # row to DONE (claim unchanged; _owned_any proved it is this node's claim)
+                cur = await run_in_threadpool(job_store.get, job_id)
+                if cur is not None and cur.status == JobStatus.DONE \
+                        and cur.claim_id == claim_id:
+                    return JSONResponse({"status": "done"}, status_code=200)
+            return JSONResponse({"status": "failed", "reason": out.get("reason")},
+                                status_code=422)
+
+        # Idempotent on (job, claim): never re-read or re-extract. The body is discarded.
+        prior = await _existing()
+        if prior is not None:
+            return prior
+
+        if job.status != JobStatus.RUNNING:
+            raise HTTPException(status_code=403, detail=_REFUSED)
+
+        lim = limits if limits is not None else Limits.from_env()
+        cap = nr.stream_cap(max_artifact_total=lim.max_total_artifact_bytes,
+                            max_metadata=lim.max_metadata_bytes,
+                            max_artifacts=lim.max_artifacts)
+        cert = await run_in_threadpool(nr.node_cert_sha256, resolved, node_id)
+        if cert is None:
+            raise HTTPException(status_code=403, detail=_REFUSED)
+        jobdir = root / job_id
+        jobdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        async def _receive_and_extract():
+            partial: "Path | None" = None
+            with tempfile.NamedTemporaryFile(dir=root, prefix=".upload-", suffix=".tar") as spool:
+                os.chmod(spool.name, 0o600)
+                declared = request.headers.get("content-length")
+                if declared and declared.isdigit() and int(declared) > cap:
+                    raise HTTPException(status_code=413, detail="result too large")
+                got = 0
+                async for chunk in request.stream():
+                    got += len(chunk)
+                    if got > cap:
+                        raise HTTPException(status_code=413, detail="result too large")
+                    await run_in_threadpool(spool.write, chunk)
+                spool.flush()
+                spool.seek(0)
+
+                def _extract() -> Path:
+                    nonlocal partial
+                    partial = Path(tempfile.mkdtemp(dir=jobdir, prefix=final.name + ".partial-"))
+                    os.chmod(partial, 0o700)
+                    max_members = lim.max_artifacts + 64
+                    nr.vet_tar(spool, max_members=max_members,
+                               max_total_bytes=lim.max_total_artifact_bytes,
+                               max_metadata_bytes=lim.max_metadata_bytes)
+                    out = partial / nr.OUT
+                    out.mkdir(mode=0o700)
+                    _remote_http._safe_extract_tar(
+                        spool, out, max_total_bytes=lim.max_total_artifact_bytes,
+                        max_members=max_members, max_metadata_bytes=lim.max_metadata_bytes)
+                    nr.fsync_tree(out)          # 202 promises durability, not only the marker
+                    return partial
+
+                try:
+                    await run_in_threadpool(_extract)
+                    # Ownership re-check: the reclaim sweep may have taken the job while we read.
+                    try:
+                        await run_in_threadpool(_running_owned, job_id, node_id,
+                                                x_blastbox_claim_id, x_blastbox_receipt)
+                    except HTTPException:
+                        raise
+                    assert partial is not None
+                    nr.write_marker(partial, nr.UploadMarker(
+                        job_id=job_id, claim_id=claim_id, node_id=node_id,
+                        node_cert_sha256=cert, worker_runtime=runtime,
+                        received_at=time.time(), started_at_ms=started,
+                        finished_at_ms=finished))
+                    # the marker and out/ are entries OF partial: persist them before the
+                    # rename publishes the dir, or a crash can leave a quarantine with no marker
+                    try:
+                        await run_in_threadpool(nr.fsync_dir, partial)
+                    except OSError as exc:
+                        # OUR disk failed, not the node's result: nothing published, retry
+                        _log.error("node_claim: could not fsync %s: %s", partial, exc)
+                        return JSONResponse({"status": "retry"}, status_code=503,
+                                            headers={"Retry-After": "30"})
+                    try:
+                        os.rename(partial, final)
+                    except OSError as exc:
+                        if not final.is_dir():
+                            # nothing was stored, and the tree was already vetted and
+                            # extracted: the host failed, not the node. Retry, never 202/422.
+                            _log.error("node_claim: could not move job=%s result into place: %s",
+                                       job_id, exc)
+                            return JSONResponse({"status": "retry"}, status_code=503,
+                                                headers={"Retry-After": "30"})
+                        # lost a race with an identical upload: it is already quarantined
+                        shutil.rmtree(partial, ignore_errors=True)
+                        partial = None
+                        return (await _existing()
+                                or JSONResponse({"status": "accepted"}, status_code=202))
+                    partial = None
+                    try:
+                        nr.fsync_dir(jobdir)
+                        nr.fsync_dir(root)      # jobdir itself may be a new entry of root
+                    except OSError as exc:
+                        # the tree IS in place (a retry would replay this same 202); say so
+                        _log.error("node_claim: could not fsync %s after rename: %s", jobdir, exc)
+                except HTTPException:
+                    raise
+                except Exception as exc:            # noqa: BLE001 - any extraction fault: refuse, no marker
+                    if isinstance(exc, OSError) and exc.errno in HOST_RESOURCE_ERRNOS:
+                        # OUR disk/fds/inodes ran out: not the node's result. Nothing was
+                        # stored, so the honest answer is "retry", never a terminal 422.
+                        _log.error("node_claim: host resource exhausted extracting job=%s: %s",
+                                   job_id, exc)
+                        return JSONResponse({"status": "retry"}, status_code=503,
+                                            headers={"Retry-After": "30"})
+                    if not isinstance(exc, (nr.TarRejected, OSError, RuntimeError, ValueError)):
+                        _log.exception("node_claim: result extraction failed job=%s", job_id)
+                    else:
+                        _log.warning("node_claim: result refused job=%s: %s", job_id, exc)
+                    return JSONResponse({"status": "failed", "reason": "result rejected"},
+                                        status_code=422)
+                finally:
+                    if partial is not None:
+                        shutil.rmtree(partial, ignore_errors=True)
+            return JSONResponse({"status": "accepted"}, status_code=202)
+
+        # Exactly one extraction per (job, claim): the first PUT holds this lock dir; a
+        # concurrent identical PUT waits briefly for the winner's result, else answers 202.
+        # A lock older than the longest plausible upload is stale (crash) and is broken.
+        lock = final.with_name(final.name + nr.UPLOAD_LOCK_SUFFIX)
+        upload_lock = nr.UploadLock(lock)
+        for _attempt in range(2):
+            if upload_lock.try_acquire():
+                break
+            else:
+                # held by a live upload (an flock dies with a crashed holder, so it is live)
+                for _ in range(50):
+                    await asyncio.sleep(0.1)
+                    prior = await _existing()
+                    if prior is not None:
+                        return prior
+                    if not upload_lock.held_elsewhere():
+                        break
+                # the winner failed (lock gone, nothing stored) or is still busy: nothing has
+                # been accepted, so say "retry" rather than a 202 that would be a lie (503, never 409: 409 means claim lost)
+                return (await _existing()) or JSONResponse({"status": "retry"}, status_code=503,
+                                             headers={"Retry-After": "2"})
+        else:
+            return JSONResponse({"status": "retry"}, status_code=503,
+                                             headers={"Retry-After": "2"})
+        try:
+            # a peer may have published between the first look and taking the lock: replay its
+            # stored outcome, body unread, exactly as the first check would have
+            prior = await _existing()
+            if prior is not None:
+                return prior
+            try:
+                return await _receive_and_extract()
+            except OSError as exc:
+                # spooling the body itself (temp file create/write) ran the host out of space
+                if exc.errno not in HOST_RESOURCE_ERRNOS:
+                    raise
+                _log.error("node_claim: host resource exhausted spooling job=%s: %s",
+                           job_id, exc)
+                return JSONResponse({"status": "retry"}, status_code=503,
+                                    headers={"Retry-After": "30"})
+        finally:
+            upload_lock.release()           # only ever OUR lock, never a successor's
 
     app.include_router(router)
     _log.info("node_claim: enforcing node grants at the hand-over (pki=%s)", resolved)

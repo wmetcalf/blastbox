@@ -1,0 +1,8 @@
+{
+  "body": {
+    "detail": "node session required"
+  },
+  "decision": "rehandshake",
+  "description": "expired session: 401, open a new session",
+  "status": 401
+}

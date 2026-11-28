@@ -215,3 +215,144 @@ def test_check_catches_a_doctored_renew_proof(tmp_path, mutate):
     (out / "renew_proof.json").write_text(json.dumps(doc))
     (out / "SHA256SUMS").write_bytes(gen.sha256sums(out))
     assert any("renew_proof" in p for p in gen.check(out))
+
+
+# ---------------------------------------------------------------- data plane (PR B)
+
+import io  # noqa: E402
+import tarfile  # noqa: E402
+
+
+def _each(sub: str):
+    return sorted((VECTORS / sub).glob("*.json"))
+
+
+def test_result_tars_verdicts_replay_through_the_reference():
+    assert gen.verify_result_tars() == []
+    docs = [json.loads(p.read_text()) for p in _each("result_tars")]
+    assert {d["server_verdict"] for d in docs} == {"accepted", "rejected"}
+    assert len(docs) >= 20
+
+
+def _owned_headers(rig, who="alpha"):
+    tok = rig.token(who)
+    got = rig.client.post("/v1/nodes/claim", json={"engine": "clamav"},
+                          headers={gen.SESSION_HDR: tok}).json()
+    return {gen.SESSION_HDR: tok, "x-blastbox-claim-id": got["job"]["claim_id"],
+            "x-blastbox-receipt": got["receipt"]}
+
+
+@pytest.mark.parametrize("case", [p.stem for p in _each("result_tars")
+                                  if json.loads(p.read_text())["server_verdict"] == "accepted"])
+def test_accepted_result_tar_gets_202_from_the_real_route(case):
+    vec = json.loads((VECTORS / "result_tars" / f"{case}.json").read_text())
+    with gen._dp_rig() as rig:
+        rig.submit()
+        h = _owned_headers(rig)
+        r = rig.client.put("/v1/nodes/jobs/job-1/result", headers=h,
+                           content=(VECTORS / "result_tars" / f"{case}.tar").read_bytes())
+        assert r.status_code == vec["http_status"] == 202, r.text
+        assert r.json() == {"status": "accepted"}
+
+
+def test_every_rejected_result_tar_gets_422_from_the_real_route():
+    rejected = [p.stem for p in _each("result_tars")
+                if json.loads(p.read_text())["server_verdict"] == "rejected"]
+    assert len(rejected) >= 15
+    with gen._dp_rig() as rig:
+        rig.submit()
+        h = _owned_headers(rig)
+        for case in rejected:
+            r = rig.client.put("/v1/nodes/jobs/job-1/result", headers=h,
+                               content=(VECTORS / "result_tars" / f"{case}.tar").read_bytes())
+            assert r.status_code == 422, (case, r.status_code, r.text)
+        # a rejection leaves nothing behind that a replay could mistake for an upload
+        assert list((rig.root / "results" / "job-1").glob("*")) == []
+
+
+@pytest.mark.parametrize("path", _each("result_tars/writer"), ids=lambda p: p.stem)
+def test_writer_goldens(path):
+    doc = json.loads(path.read_text())
+    tree = gen.tree_from_json(doc["tree"])
+    tar = gen.go_writer_tar(tree)
+    assert hashlib.sha256(tar).hexdigest() == doc["tar_sha256"]
+    assert len(tar) == doc["tar_bytes"] and len(tar) % 512 == 0
+    assert tar.endswith(b"\0" * 1024) and tar[257:265] == b"ustar\x0000"   # USTAR magic+version
+    # no record padding: the end marker is the last two blocks, and the last member's data
+    # (padded to 512) sits directly before it
+    with tarfile.open(fileobj=io.BytesIO(tar), mode="r:") as tf:
+        members = tf.getmembers()
+        assert [m.name for m in members] == sorted(tree, key=lambda s: s.encode())
+        for m in members:
+            assert m.isreg() and m.mode == 0o644 and m.uid == m.gid == 0 and m.mtime == 0
+            assert m.uname == "" and m.gname == ""
+            f = tf.extractfile(m)
+            assert f is not None and f.read() == tree[m.name]
+    # and the server accepts what the writer writes
+    assert gen.server_verdict_for_tar(tar) == "accepted"
+
+
+def test_writer_has_a_golden_for_every_tree():
+    assert {p.stem for p in _each("result_tars/writer")} == set(gen.WRITER_TREES)
+
+
+def test_claim_response_decisions_follow_the_run_block():
+    seen = set()
+    for p in _each("claim_responses"):
+        v = json.loads(p.read_text())
+        seen.add(v["decision"])
+        if v["decision"] in ("run", "release_unstarted"):
+            assert v["status"] == 200 and "run" in v["body"]
+            assert (v["decision"] == "run") == (v["body"]["run"]["network"] == "none"), p.name
+            assert v["body"]["receipt"] == "<RECEIPT>"
+            assert v["body"]["job"]["claim_id"] == "<CLAIM_ID>"
+        elif v["decision"] == "idle":
+            assert v["status"] == 204 and v["body"] is None
+        elif v["decision"] == "rehandshake":
+            assert v["status"] == 401
+        elif v["decision"] == "refused":
+            assert v["status"] == 403
+    assert seen == {"run", "idle", "rehandshake", "refused", "release_unstarted"}
+    sink = json.loads((VECTORS / "claim_responses" / "release_network_sinkhole.json").read_text())
+    assert sink["body"]["run"]["network"] == "sinkhole" and sink["synthetic"] is True
+
+
+def test_input_stream_verdicts_and_accept_matches_the_real_route():
+    seen = set()
+    for p in _each("input_stream"):
+        v = json.loads(p.read_text())
+        seen.add(v["verdict"])
+        assert gen.judge_input(v) == v["verdict"], p.name
+    assert seen == {"accept", "abort_short", "abort_long", "abort_hash", "abort_redirect"}
+    acc = json.loads((VECTORS / "input_stream" / "accept.json").read_text())
+    with gen._dp_rig() as rig:
+        rig.submit()
+        r = rig.client.get("/v1/nodes/jobs/job-1/input", headers=_owned_headers(rig))
+        assert r.status_code == 200 and r.content.hex() == acc["body_hex"]
+        assert r.headers["x-blastbox-input-sha256"] == acc["headers"]["x-blastbox-input-sha256"]
+        assert r.headers["content-length"] == acc["headers"]["content-length"]
+
+
+def test_envelope_seal_matches_files_on_disk():
+    seen = set()
+    for p in _each("envelope_seal"):
+        v = json.loads(p.read_text())
+        seen.add(v["verdict"])
+        if v["verdict"] != "sealed":
+            assert v["artifacts"] is None
+            continue
+        tree = gen.tree_from_json(v["tree"])
+        for a in v["artifacts"]:
+            data = tree[a["path"]]
+            assert a["sha256"] == hashlib.sha256(data).hexdigest() and a["bytes"] == len(data)
+    assert seen == {"sealed", "refused"}
+
+
+def test_transcripts_shape():
+    for p in _each("transcripts"):
+        steps = json.loads(p.read_text())
+        assert steps and all(set(s) == {"req", "resp"} for s in steps)
+        assert all(set(s["req"]) == {"method", "path", "headers_present"} for s in steps)
+    exp = [(s["req"]["method"], s["resp"]["status"]) for s in json.loads(
+        (VECTORS / "transcripts" / "session_expiry_mid_upload.json").read_text())]
+    assert exp[-4:] == [("PUT", 401), ("GET", 200), ("POST", 200), ("PUT", 202)]

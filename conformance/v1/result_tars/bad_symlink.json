@@ -1,0 +1,6 @@
+{
+  "http_status": 422,
+  "reason": "symlink member",
+  "server_verdict": "rejected",
+  "tar_sha256": "bfc20c1e22025cbbb0e1ca4e6823fbf730212c6371aab378ae2e0980af5a7e0d"
+}

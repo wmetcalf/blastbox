@@ -1,0 +1,16 @@
+{
+  "body_hex": "73616d706c652d6279746573",
+  "description": "headers and body exactly as the real route sent them",
+  "expected": {
+    "bytes": 12,
+    "sha256": "2acaaedc811f129ef98fad1e21ac5519b15cbe7f1f5930fedfcabfb1c2b55e27"
+  },
+  "headers": {
+    "content-length": "12",
+    "content-type": "application/octet-stream",
+    "x-blastbox-input-sha256": "2acaaedc811f129ef98fad1e21ac5519b15cbe7f1f5930fedfcabfb1c2b55e27"
+  },
+  "max_input": 104857600,
+  "status": 200,
+  "verdict": "accept"
+}

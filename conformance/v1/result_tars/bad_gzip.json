@@ -1,0 +1,6 @@
+{
+  "http_status": 422,
+  "reason": "compressed tar (the stream must be a plain tar)",
+  "server_verdict": "rejected",
+  "tar_sha256": "032a184e511dba72ba3b238d823256535d5c4fc5d2dd9d49a77ea002b9bbfc2e"
+}

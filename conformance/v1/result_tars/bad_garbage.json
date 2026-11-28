@@ -1,0 +1,6 @@
+{
+  "http_status": 422,
+  "reason": "not a tar at all",
+  "server_verdict": "rejected",
+  "tar_sha256": "9295e8f6cea59e99ca4219bb443e31a71f38dcaffb2c4f75b8714ac0a089fb41"
+}

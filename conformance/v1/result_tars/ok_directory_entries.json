@@ -1,0 +1,6 @@
+{
+  "http_status": 202,
+  "reason": "directory members are tolerated",
+  "server_verdict": "accepted",
+  "tar_sha256": "d1d7a91c748da5659a8c4aeedb42fa906f826ce076d5d0dc7a2db170c1b6d00e"
+}

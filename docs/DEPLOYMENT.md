@@ -889,6 +889,80 @@ Three things an operator must know:
 * **A refusal never says why.** Wrong CA, unheld key, ungranted engine and expired challenge
   all return the same message, so a caller cannot map the fleet's grants by probing. The
   reason is in the ingress log (`node_claim: refused …`); look there, not at the response.
+* **Pull-agent deployments MUST set `BLASTBOX_NODE_TERMINAL_WRITES=finalizer-only` on every
+  ingress.** It decides who may make a node's job DONE. `direct` (the default, kept for
+  existing deployments) lets a node write `status: done` itself through
+  `POST /v1/nodes/jobs/{id}` — right only for Python credential-less dispatcher nodes that run
+  the trust gate themselves; for an untrusted pull agent it means DONE with no result, no trust
+  gate and no receipt. `finalizer-only` accepts exactly the agent's two writes, release
+  `{status: queued, claim_id: null}` and fail `{status: failed, error, finished_at}`
+  (`error` optional, `finished_at` required and non-null and never earlier than the run's
+  start; the error is scrubbed like a dispatcher's). Retention is the operator's: the fail
+  write's `expires_at` is set by the ingress from `BLASTBOX_JOB_RETENTION_SECONDS` (now +
+  retention, or unset when 0, exactly as a dispatcher's own fail), so set it on the ingress
+  too; a node that sends `expires_at` gets a 400. Once the node's result upload has been accepted
+  (202), neither write is allowed: the result waits for the finalizer, and a release would
+  hand an already-run sample to another node. Each shape is checked on its own and only while the job is
+  RUNNING (the write's CAS is always on RUNNING); any other
+  field (`input_sha256`, `result_summary`, `worker_tier`, …) or status is the usual 403
+  refusal, logged at WARNING, and DONE comes only from `blastbox node-finalizer`. An unrecognised value is treated as `finalizer-only`. While
+  a PKI is present and the setting is not `finalizer-only`, the ingress logs a WARNING and the
+  node-finalizer an ERROR at startup.
+* **Set the engine param gate on the ingress too.** The claim's `run.params` is what a node
+  passes its engine, and the ingress computes it with the dispatcher's own gate from
+  `BLASTBOX_ENGINE_<NAME>_PARAM_KEYS` and `BLASTBOX_ENGINE_<NAME>_RESERVED_KEYS`, read from the
+  *ingress* environment. Without them it falls back to the shape + reserved-floor denylist, as
+  a dispatcher would. `BLASTBOX_ENGINE_<NAME>_DEFAULT_PARAMS` are never sent to a node.
+
+#### node-finalizer (seals what pull nodes upload)
+
+A credential-less node uploads its result tar to the ingress, which only *quarantines* it: the
+tar is safely extracted into a spool and a marker is written. It is never trust-gated, signed or
+marked DONE there. A separate service does that, with the exact cold-path code (size cap, trust
+gate, host re-seal, signed receipt, blob upload, claim-fenced CAS to DONE):
+
+```sh
+blastbox node-finalizer [--once] [--interval 1.0] [--no-receipts]
+```
+
+* **It holds the DB, the blob store and the attest key, and never claims work.** Run one or
+  more replicas; a per-job `flock` (`$BLASTBOX_NODE_RESULTS_DIR/<job>/.finalize.lock`) stops two
+  replicas finalising the same job, including two different claims of it.
+* **Shared results volume.** The ingress and the finalizer must see the same spool: mount one
+  volume at the same path in both and set `BLASTBOX_NODE_RESULTS_DIR` to it in both (default
+  `$BLASTBOX_JOB_ROOT/.node-results`). The ingress writes it; the finalizer reads, finalises,
+  and writes `outcome.json`, which the node's replayed `PUT /jobs/{id}/result` reads back.
+* **The attest key (`BLASTBOX_ATTEST_KEY`) is mounted ONLY into the finalizer. The ingress
+  never gets it.** A bug in tar handling on the ingress must not be able to reach the signing
+  key. The finalizer refuses to start without a key unless `--no-receipts` is given, which logs
+  a loud warning and marks node results DONE with no signed receipt.
+* **Env.** `BLASTBOX_DB` / job store and blob-store settings exactly as for `blastbox dispatch`
+  (same `BLASTBOX_JOB_ROOT` and `BLASTBOX_JOB_RETENTION_SECONDS`, which stamps `expires_at` on
+  node results as it does on dispatched ones), `BLASTBOX_ATTEST_KEY`, and `BLASTBOX_NODE_RESULTS_RETAIN_S`
+  (default `3600`): a whole (job, claim) directory is removed once its outcome is older than
+  that (a directory with no outcome at all is removed after 24 h, with a warning).
+* **A failed upload is not lost.** Before sealing, the finalizer renames the quarantined tree
+  into `$BLASTBOX_JOB_ROOT/<job>/output` (the cold dispatcher's own layout), so `job_root` and
+  the results volume must be on the same filesystem. If the blob upload then fails, the job is
+  failed with the retained marker exactly as on a dispatcher, the tree stays under `job_root`,
+  and the finalizer runs the dispatcher's pending-upload retry sweep every loop (no dispatcher
+  need run); a later successful upload repairs the row to DONE. `BLASTBOX_PENDING_UPLOAD_RETRY=0`
+  is not honoured by the finalizer.
+* **Poison trees.** A tree whose finalisation raises an unexpected error is retried with backoff
+  (60 s doubling, capped at 15 min, so a store blip of seconds never counts five times); after 5
+  spaced attempts the job is failed (`finalisation failed repeatedly`), its staged tree removed,
+  and the outcome recorded.
+* **Set `BLASTBOX_NODE_CLAIM_RECLAIM_AFTER_S`** on the ingress. Without it a claim whose node
+  never uploads is never reclaimed; the finalizer logs an ERROR at startup when it is unset.
+* Receipts it signs carry `worker_tier: node-agent`, plus `node_id` and `node_cert_sha256` of
+  the uploading node, and no `net_*` fields. **Known limit during certificate rotation:** a
+  node session names only the node id, not the certificate it was opened with, so
+  `node_cert_sha256` is the node's verifying certificate with the latest `not_after` at upload
+  time. While an old and a renewed certificate are both valid, a result uploaded on a session
+  opened with the old one is attributed to the new one. `node_id` is always right.
+* **A rejected result tar leaves the job RUNNING** (the 422 stores no outcome). The pull agent
+  sends its fail write (`status: failed`) after a first-time 422, so the job is terminalised
+  at once; a node that does not is reclaimed by `BLASTBOX_NODE_CLAIM_RECLAIM_AFTER_S`.
 
 **Step 3 RECURS.** `pki issue-node` defaults to a 7-day lifetime — that short lifetime is
 what makes "revocation is stop renewing" work without a CRL or any online check — and the

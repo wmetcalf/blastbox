@@ -1,0 +1,365 @@
+"""``blastbox node-finalizer``: seal what pull nodes uploaded, where the attest key lives.
+
+The ingress only extracts a node's result tar into a quarantine spool (``node_results``); it
+never holds the attest key and never trust-gates. This control-plane service holds the DB, the
+blob store and the attest key, and NEVER claims work. For each quarantined tree it runs the
+exact cold-path code (``Dispatcher.finalise_output``: size cap, trust gate, host re-seal,
+signed receipt, upload, claim-fenced CAS to DONE), then records the verdict in ``outcome.json``
+for the node's (idempotent) PUT replay to read.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import threading
+import time
+from pathlib import Path
+
+from blastbox.limits import Limits
+from blastbox.host import attest as _attest
+from blastbox.host import node_results as nr
+from blastbox.host.dispatch import Dispatcher
+from blastbox.host.ingress.node_claim import MAX_FUTURE_SKEW_S
+from blastbox.host.jobs.base import Job, JobStatus
+from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL, retry_pending_uploads
+
+_log = logging.getLogger(__name__)
+
+# One lock PER JOB: every claim of a job stages into the same job_root/<job>/output, so two
+# replicas finalising different claims of one job (a stale one and its successor) must
+# exclude each other, not merely two replicas on the same claim. It lives in the results
+# spool's <job>/ dir, which this service's own sweep removes, so it never resurrects a purged
+# job_root/<job> nor outlives the job's spool.
+LOCK_NAME = ".finalize.lock"
+RETAIN_ENV = "BLASTBOX_NODE_RESULTS_RETAIN_S"
+DEFAULT_RETAIN_S = 3600.0
+NODE_TIER = "node-agent"
+POISON_REASON = "finalisation failed repeatedly"
+RETAINED_REASON = nr.RETAINED_REASON
+ATTEMPTS_NAME = ".attempts"
+MAX_ATTEMPTS = 5
+# Failed attempts are SPACED: retry n waits min(BACKOFF_MAX_S, BACKOFF_BASE_S * 2**(n-1)).
+# The sweep runs every second, so without this five failures of a DB or blob-store blip
+# (seconds) would poison and destroy a perfectly good quarantined result. With it the
+# poison verdict needs failures across ~15 minutes.
+BACKOFF_BASE_S = 60.0
+BACKOFF_MAX_S = 900.0
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _all_older_than(top: Path, cutoff: float) -> bool:
+    """True when nothing in the tree was written since ``cutoff``. Stops at the first fresh
+    entry, so a live extraction costs a single stat per sweep, not a walk of its tree."""
+    if top.stat().st_mtime >= cutoff:
+        return False
+    for dirpath, dirs, files in os.walk(top, followlinks=False):
+        for name in (*dirs, *files):
+            try:
+                if os.lstat(os.path.join(dirpath, name)).st_mtime >= cutoff:
+                    return False
+            except OSError:
+                continue
+    return True
+STALE_NO_OUTCOME_S = 24 * 3600.0
+# A .partial-* extraction dir or a root .upload-*.tar older than this belongs to a dead ingress.
+STALE_PARTIAL_S = 3600.0
+
+
+def retain_seconds(env: "dict[str, str] | None" = None) -> float:
+    raw = ((env if env is not None else os.environ).get(RETAIN_ENV, "") or "").strip()
+    if not raw:
+        return DEFAULT_RETAIN_S
+    try:
+        v = float(raw)
+    except ValueError:
+        _log.error("%s=%r is not a number; using %ss", RETAIN_ENV, raw, DEFAULT_RETAIN_S)
+        return DEFAULT_RETAIN_S
+    if v != v or v < 0:
+        _log.error("%s=%r is not a non-negative number; using %ss", RETAIN_ENV, raw,
+                   DEFAULT_RETAIN_S)
+        return DEFAULT_RETAIN_S
+    return v
+
+
+class NodeFinalizer:
+    def __init__(self, *, job_store, blob_store, limits: Limits, job_root: Path,
+                 attest_key: object = _attest.FROM_ENV, results_dir: Path | None = None,
+                 retain_s: float | None = None, job_retention_seconds: int = 0) -> None:
+        self._store = job_store
+        self._job_root = Path(job_root)
+        self._blobs = blob_store
+        self._root = Path(results_dir) if results_dir is not None else nr.results_root(job_root)
+        self._retain_s = retain_seconds() if retain_s is None else retain_s
+        self._dispatcher = Dispatcher(
+            job_store=job_store, engines={}, limits=limits, job_root=Path(job_root),
+            blob_store=blob_store, attest_key=attest_key,
+            job_retention_seconds=job_retention_seconds,
+        )
+        # The same result lifecycle a dispatcher stamps (expires_at on DONE/FAILED, and on a
+        # pending-upload repair): BLASTBOX_JOB_RETENTION_SECONDS, 0 = keep forever.
+        self._job_retention_s = max(0, int(job_retention_seconds))
+        self._attest_key = self._dispatcher._attest_key
+
+    # ------------------------------------------------------------------ public
+
+    def run_once(self) -> int:
+        """Finalise every pending spool dir; return how many were finalised by THIS call."""
+        n = 0
+        for d in list(nr.pending(self._root)):
+            try:
+                if self._finalise_dir(d):
+                    n += 1
+            except Exception:  # noqa: BLE001 - one bad tree must not wedge the sweep
+                _log.exception("node-finalizer: unexpected error on %s; will retry", d)
+        # No dispatcher runs in the cut-over topology, so the finalizer owns the pending-upload
+        # sweep: a retained result lives under job_root/<job>/output and this drains it.
+        try:
+            retry_pending_uploads(self._job_root, self._blobs, self._store, _log,
+                                  on_repaired=self._dispatcher._index_repaired_result,
+                                  retention_seconds=self._job_retention_s,
+                                  attest_key=self._attest_key)
+        except Exception:  # noqa: BLE001
+            _log.exception("node-finalizer: pending-upload sweep failed")
+        self._sweep_old()
+        return n
+
+    def run_forever(self, stop: threading.Event, interval: float = 1.0) -> None:
+        while not stop.is_set():
+            try:
+                self.run_once()
+            except Exception:  # noqa: BLE001
+                _log.exception("node-finalizer: sweep failed")
+            stop.wait(interval)
+
+    # ------------------------------------------------------------------ internals
+
+    def _lock_path(self, job_id: str) -> Path:
+        return self._root / job_id / LOCK_NAME
+
+    def _finalise_dir(self, d: Path) -> bool:
+        # spool layout: <root>/<job_id>/<claim>. UploadLock: flock + unlink-on-release +
+        # inode re-check, so the lock file never lingers and a stale inode never wins.
+        lock = nr.UploadLock(self._lock_path(d.parent.name))
+        try:
+            if not lock.try_acquire():
+                return False                    # another replica holds it
+        except OSError:
+            return False
+        try:
+            if nr.read_outcome(d) is not None:  # finished while we waited
+                return False
+            marker = nr.read_marker(d)
+            if marker is None or marker.job_id != d.parent.name:
+                return False
+            if self._backing_off(d):
+                return False
+            try:
+                status, reason = self._decide(d, marker)
+            except Exception:  # noqa: BLE001
+                n = self._bump_attempts(d)
+                if n < MAX_ATTEMPTS:
+                    _log.exception("node-finalizer: attempt %d/%d failed for job %s; will retry",
+                                   n, MAX_ATTEMPTS, marker.job_id)
+                    return False
+                _log.exception("node-finalizer: job %s failed %d times; giving up",
+                               marker.job_id, n)
+                status, reason = "failed", POISON_REASON
+                job = self._store.get(marker.job_id)
+                if job is not None and job.claim_id == marker.claim_id:
+                    self._dispatcher._fail_job(job, POISON_REASON)
+                    # an earlier attempt may already have staged the tree under job_root
+                    staged = self._output_dir(marker.job_id)
+                    if staged.is_dir():
+                        self._discard_staged(job, staged)
+                shutil.rmtree(d / nr.OUT, ignore_errors=True)
+            nr.write_outcome(d, status, reason)
+            _log.info("node-finalizer: job %s claim %s -> %s%s", marker.job_id,
+                      nr.claim_digest(marker.claim_id), status, f" ({reason})" if reason else "")
+            return True
+        finally:
+            lock.release()
+
+    @staticmethod
+    def _read_attempts(d: Path) -> tuple[int, float]:
+        """(failed attempts so far, wall time of the last one); a bare count reads as 0.0."""
+        try:
+            parts = (d / ATTEMPTS_NAME).read_text().split()
+            n = int(parts[0]) if parts else 0
+            last = float(parts[1]) if len(parts) > 1 else 0.0
+        except (OSError, ValueError):
+            return 0, 0.0
+        return max(0, n), last
+
+    def _backing_off(self, d: Path) -> bool:
+        n, last = self._read_attempts(d)
+        if n <= 0:
+            return False
+        wait = min(BACKOFF_MAX_S, BACKOFF_BASE_S * (2 ** (n - 1)))
+        return 0.0 <= _now() - last < wait
+
+    def _bump_attempts(self, d: Path) -> int:
+        n = self._read_attempts(d)[0] + 1
+        try:
+            (d / ATTEMPTS_NAME).write_text(f"{n} {_now()}")
+        except OSError:
+            _log.warning("node-finalizer: cannot persist the attempt counter in %s", d)
+        return n
+
+    def _retained_for(self, job_id: str, claim_id: str) -> bool:
+        """True when a pending-upload sentinel written under THIS claim names the job."""
+        try:
+            got = (self._job_root / job_id / PENDING_UPLOAD_SENTINEL).read_text().strip()
+        except OSError:
+            return False
+        return bool(claim_id) and got == claim_id
+
+    def _output_dir(self, job_id: str) -> Path:
+        return self._job_root / job_id / "output"
+
+    def _stage(self, d: Path, job: Job) -> Path | None:
+        """Move the quarantined tree into the cold dispatcher's output layout, so a retained
+        result is owned by the existing pending-upload machinery. None when nothing to run."""
+        out = d / nr.OUT
+        dest = self._output_dir(job.job_id)
+        if not out.is_dir():
+            return dest if dest.is_dir() else None     # moved by an earlier, crashed attempt
+        jd = dest.parent
+        jd.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            if (jd / PENDING_UPLOAD_SENTINEL).exists():
+                raise RuntimeError(f"{dest} already holds a retained result")
+            shutil.rmtree(dest)
+        os.rename(out, dest)                           # same volume (job_root/results share it)
+        return dest
+
+    def _decide(self, d: Path, marker: nr.UploadMarker) -> tuple[str, str | None]:
+        job = self._store.get(marker.job_id)
+        if job is None or job.claim_id != marker.claim_id:
+            return "failed", "claim lost"
+        if job.status == JobStatus.DONE:        # crashed between the CAS and the outcome write
+            return "done", None
+        if job.status == JobStatus.FAILED:
+            if self._retained_for(job.job_id, marker.claim_id):
+                # crashed between finalise_output's "retained" and the outcome write: keep the
+                # canonical reason so a later sweep repair to DONE replays as done
+                return "failed", RETAINED_REASON
+            return "failed", job.error or "job failed"
+        if job.status != JobStatus.RUNNING:
+            return "failed", "claim lost"
+        if not job.input_sha256:
+            self._dispatcher._fail_job(job, "input hash missing; refusing to seal")
+            return "failed", "input hash missing; refusing to seal"
+        out = self._stage(d, job)
+        if out is None:
+            self._dispatcher._fail_job(job, "result tree missing")
+            return "failed", "result tree missing"
+        res = self._dispatcher.finalise_output(job, out, self._observation(job, marker))
+        if res == "retained":
+            return "failed", RETAINED_REASON    # the tree stays under job_root for the sweep
+        if res == "lost":
+            # finalise_output fails CLOSED: a store read error in its ownership check also says
+            # "lost". Only a CONFIRMED loss is terminal; a row still RUNNING under this claim
+            # (or an unreadable store, which raises here) keeps the staged tree and retries.
+            cur = self._store.get(job.job_id)
+            if cur is not None and cur.status == JobStatus.RUNNING \
+                    and cur.claim_id == job.claim_id:
+                raise RuntimeError("claim ownership unconfirmed; keeping the staged tree")
+        self._discard_staged(job, out)
+        if res == "done":
+            return "done", None
+        if res == "lost":
+            return "failed", "claim lost"
+        # "failed: <raw>" says what went wrong, not that OUR _fail_job CAS won, and the raw
+        # text can carry host paths. The node is told the row's (sanitised) error when the row
+        # is FAILED under its claim, and "claim lost" otherwise.
+        cur = self._store.get(job.job_id)
+        if cur is not None and cur.status == JobStatus.FAILED and cur.claim_id == job.claim_id:
+            return "failed", cur.error or "job failed"
+        return "failed", "claim lost"
+
+    def _discard_staged(self, job: Job, out: Path) -> None:
+        """The staged tree is spent (sealed + uploaded, or failed). Never remove it while a row
+        could still be RUNNING under someone else's claim, or while a sentinel names it."""
+        jd = out.parent
+        if (jd / PENDING_UPLOAD_SENTINEL).exists():
+            return
+        try:
+            cur = self._store.get(job.job_id)
+        except Exception:  # noqa: BLE001
+            return
+        if cur is not None and cur.status == JobStatus.RUNNING and cur.claim_id != job.claim_id:
+            return
+        shutil.rmtree(out, ignore_errors=True)
+
+    @staticmethod
+    def _observation(job: Job, marker: nr.UploadMarker) -> _attest.RunObservation:
+        now = _attest.now_ms()
+        cap = now + int(MAX_FUTURE_SKEW_S * 1000)
+        started = min(int(marker.started_at_ms if marker.started_at_ms is not None else now), cap)
+        finished = min(max(int(marker.finished_at_ms if marker.finished_at_ms is not None
+                               else now), started), cap)
+        return _attest.RunObservation(
+            job_id=job.job_id, engine=job.engine, input_sha256=job.input_sha256 or "",
+            worker_runtime=marker.worker_runtime, worker_tier=NODE_TIER,
+            started_at_ms=started, finished_at_ms=finished,
+            node_id=marker.node_id, node_cert_sha256=marker.node_cert_sha256,
+        )
+
+    def _sweep_old(self) -> None:
+        cutoff = time.time() - self._retain_s
+        orphan_cutoff = time.time() - STALE_PARTIAL_S
+        try:
+            jobs = list(self._root.iterdir())
+        except OSError:
+            return
+        for jd in jobs:
+            if jd.name.startswith(".upload-") and jd.is_file():
+                # an ingress killed mid-upload leaves its body spool behind (a live upload
+                # keeps writing it, so its mtime stays fresh)
+                try:
+                    if jd.stat().st_mtime < orphan_cutoff:
+                        jd.unlink()
+                except OSError:
+                    pass
+                continue
+            if not jd.is_dir():
+                continue
+            try:
+                claims = list(jd.iterdir())
+            except OSError:
+                continue
+            for cd in claims:
+                try:
+                    if ".partial" in cd.name:
+                        # an extraction killed mid-way (never renamed into place). The dir's
+                        # own mtime does not move while a file deep inside grows, so judge it
+                        # by the newest write anywhere in the tree.
+                        if cd.is_dir() and _all_older_than(cd, orphan_cutoff):
+                            shutil.rmtree(cd, ignore_errors=True)
+                        continue
+                    if (cd.name.endswith(nr.UPLOAD_LOCK_SUFFIX) or cd.name == LOCK_NAME) \
+                            and cd.is_file():
+                        # an upload lock its (crashed) holder never unlinked; a held one stays
+                        if cd.stat().st_mtime < orphan_cutoff:
+                            lk = nr.UploadLock(cd)
+                            if lk.try_acquire():
+                                lk.release()
+                        continue
+                    if (cd / nr.OUTCOME).is_file():
+                        if (cd / nr.OUTCOME).stat().st_mtime < cutoff:
+                            shutil.rmtree(cd, ignore_errors=True)
+                    elif ".partial" not in cd.name and cd.is_dir() \
+                            and cd.stat().st_mtime < time.time() - STALE_NO_OUTCOME_S:
+                        _log.warning("node-finalizer: removing %s: no outcome after %.0fh",
+                                     cd, STALE_NO_OUTCOME_S / 3600)
+                        shutil.rmtree(cd, ignore_errors=True)
+                except OSError:
+                    continue
+            try:
+                jd.rmdir()                      # only succeeds when empty
+            except OSError:
+                pass
