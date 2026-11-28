@@ -278,7 +278,9 @@ def vet_tar(fileobj: Any, *, max_members: int, max_total_bytes: int,
     seen: set[str] = set()
     # every filesystem entry extraction will create: explicit members AND the missing parents
     # _safe_extract_tar makes for them, so deep paths cannot multiply inodes past the cap
-    entries: set[str] = set()
+    # Interned as (parent entry id, component) -> id, never as joined prefix strings: joining
+    # every prefix of one deep name is quadratic in its length, before any cap could fire.
+    entries: dict[tuple[int, str], int] = {}
     meta_regular = False
     count = 0
     total = 0
@@ -306,12 +308,16 @@ def vet_tar(fileobj: Any, *, max_members: int, max_total_bytes: int,
                 if norm in seen:
                     raise TarRejected(f"duplicate member: {norm!r}")
                 seen.add(norm)
-                npart = norm.split("/")
-                for i in range(1, len(npart) + 1):
-                    entries.add("/".join(npart[:i]))
-                if len(entries) > max_members:
-                    raise TarRejected(f"more than {max_members} members, counting the "
-                                      "directories extraction creates")
+                parent = 0                      # 0 = the extraction root
+                for comp in norm.split("/"):
+                    key = (parent, comp)
+                    nid = entries.get(key)
+                    if nid is None:
+                        if len(entries) >= max_members:     # checked per NEW entry
+                            raise TarRejected(f"more than {max_members} members, counting "
+                                              "the directories extraction creates")
+                        nid = entries[key] = len(entries) + 1
+                    parent = nid
                 if norm == "metadata.json" and m.isfile():
                     meta_regular = True
                     if max_metadata_bytes is not None and m.size > max_metadata_bytes:

@@ -903,3 +903,19 @@ def test_a_result_published_before_the_lock_is_replayed_not_reprocessed(tmp_path
     monkeypatch.setattr(node_results, "node_cert_sha256", cert_then_publish)
     r = put(c, hdr, b"placeholder, not a tar")
     assert r.status_code == 200 and r.json() == {"status": "done"}, r.text
+
+
+def test_one_very_deep_name_is_refused_without_quadratic_memory():
+    """Joining every prefix of an 8,000-component name allocates ~64 MB before a cap fires."""
+    import tracemalloc
+
+    deep = "/".join(["a"] * 8000) + "/f"
+    body = make_tar([(deep, b"")])              # GNU/PAX long name, ~16 KB
+    tracemalloc.start()
+    try:
+        with pytest.raises(node_results.TarRejected, match="members"):
+            node_results.vet_tar(io.BytesIO(body), max_members=65, max_total_bytes=1 << 20)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 4 << 20, peak
