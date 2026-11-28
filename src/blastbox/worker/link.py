@@ -2265,6 +2265,33 @@ def _dispatch(args: argparse.Namespace) -> int:
         # A step that could not be verified (still up / enabled / loaded) is not a clean
         # leave: say so in the exit status too, so automation does not read it as done.
         return 1 if any(n.startswith("WARNING") for n in notes) else 0
+    if action == "status" and getattr(args, "check", False):
+        # Alarm mode: only WireGuard handshake freshness, exit 0/2/1. Same reader on both
+        # roles; the host module is the one that owns it.
+        iface = args.iface
+        role = _role(args)
+        if not iface and role == "host":
+            # The host's link interface is configurable; read it the way every other host
+            # action does rather than assuming the default name.
+            iface = _host_cfg(args, base_required=False).wg_iface
+        iface = iface or DEFAULT_IFACE
+        # Resolved as `status` does (PATH plus the Homebrew/local prefixes): under sudo or a
+        # timer the ambient PATH may not reach it, and the dump must run the same binary.
+        wg = _which("wg")
+        if role == "worker" and _supported_platform() == "darwin":
+            # macOS wg-quick runs the link on a utunN, not on the logical name: check the
+            # utun verified by key to run THIS link, exactly as `status` does.
+            real = _our_real_iface_darwin(wg, _link_iface(iface))
+            if real is None:
+                print(f"error: {iface}: no running utun verified to carry this link "
+                      "(link down, or `wg` / our key unreadable)", file=sys.stderr)
+                return 1
+            iface = real
+        code, lines = _host_mod().check_handshakes(iface, args.max_handshake_age,
+                                                   wg=wg or "wg")
+        for ln in lines:
+            print(ln, file=sys.stderr if code == 1 else sys.stdout)
+        return code
     if action == "status" and _role(args) == "worker":
         ok, rows = status(args.iface or DEFAULT_IFACE)
         for r in rows:
@@ -2396,6 +2423,11 @@ def add_parser(sub: argparse._SubParsersAction) -> None:
     iface(ps)
     ps.add_argument("--role", choices=("host", "worker"), default=None,
                     help="default: host if /etc/blastbox/worker-link.env exists, else worker")
+    ps.add_argument("--check", action="store_true",
+                    help="alarm mode: exit 2 if any peer's latest handshake is older than "
+                         "--max-handshake-age (or never happened), 1 on a read error")
+    ps.add_argument("--max-handshake-age", type=float, default=180.0, metavar="SECONDS",
+                    help="with --check: the oldest acceptable handshake (default 180)")
     ps.set_defaults(func=_cmd)
 
     # worker

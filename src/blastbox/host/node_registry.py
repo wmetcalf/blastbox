@@ -1,11 +1,17 @@
 """Federated node registry: who is out there, what they have, and what they may run.
 
-NOT YET WIRED. `build_node_registry` is never called and `SqlNodeRegistry` creates a `nodes`
-table nothing writes to, so the MEMBERSHIP half — a fleet view something publishes into and
-reads — is still step 5's work, and everything below is written in the present tense because
-it describes what the module does when called, not what runs today. (A test asserts this
-banner stays until something really does build a fleet view; it caught an attempt to soften it
-to "partly".)
+NOT YET WIRED, except liveness. `build_node_registry` is never called and `SqlNodeRegistry`
+creates a `nodes` table nothing writes to, so the MEMBERSHIP half -- a fleet view something
+publishes into and reads -- is still step 5's work, and everything below is written in the
+present tense because it describes what the module does when called, not what runs today.
+(A test asserts this banner stays until something really does build a fleet view; it caught
+an attempt to soften it to "partly".)
+
+What IS wired, and is NOT this registry: per-node LIVENESS. `POST /v1/nodes/heartbeat` and
+every authenticated `/claim` write `blastbox.host.node_liveness` (its own `node_liveness`
+table: last heartbeat, last claim, the node's self-reported body) so an operator can alert on
+a node that has gone quiet. That is observation only; it feeds no placement or sizing
+decision, and it is not a fleet view.
 
 What IS in place: the grants half is enforced twice over. A dispatcher checks its own
 certificate before running work (:class:`blastbox.host.placement.SelfGrants`), and

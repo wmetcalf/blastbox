@@ -210,6 +210,13 @@ def test_the_modules_say_accurately_which_half_is_wired():
             "nothing builds a fleet view, so node_registry's present-tense guarantees "
             "still describe a system that does not exist yet; say so"
         )
+        # Liveness IS wired (heartbeat + claim recording) and the banner must say exactly
+        # that, no more: it is observation only, not the fleet view.
+        doc = node_registry.__doc__ or ""
+        assert "LIVENESS" in doc and "/v1/nodes/heartbeat" in doc
+        assert "observation only" in doc
+        from blastbox.host.ingress import node_claim
+        assert "node_liveness" in open(node_claim.__file__).read()
 
 
 def test_the_self_check_and_the_fleet_filter_are_one_predicate():

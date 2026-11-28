@@ -1179,6 +1179,57 @@ def status(cfg: WorkerLinkConfig, *, now: float | None = None) -> tuple[bool, li
     return ok, rows
 
 
+def check_handshakes(iface: str, max_age: float = 180.0, *, now: float | None = None,
+                     run=None, wg: str = "wg") -> tuple[int, list[str]]:
+    """Alarm-friendly handshake check: ``(exit_code, lines)``.
+
+    0 = every peer's latest handshake is within ``max_age`` seconds; 2 = at least one peer
+    is stale or never handshook (each offender is listed by its public key truncated to 8
+    characters and its age); 1 = the dump could not be read, or the interface has no peers.
+    ``wg`` is the executable to run (a resolved path: under sudo or a timer the ambient
+    ``PATH`` may not reach it). Only the public key is ever printed: the dump's interface line (private key) is
+    discarded by ``parse_wg_dump`` and the per-peer preshared key is never read.
+    """
+    import time
+
+    from blastbox.host.exit_attest import parse_wg_dump
+
+    import math
+
+    if not (math.isfinite(max_age) and max_age > 0):    # NaN compares False to everything
+        return 1, ["error: --max-handshake-age must be a positive number"]
+    runner = run or ea._run
+    at = time.time() if now is None else now
+    try:
+        dump = runner([wg, "show", iface, "dump"], check=False)
+    except OSError as exc:
+        return 1, [f"error: cannot read `wg show {iface} dump`: {exc.__class__.__name__}"]
+    if dump.returncode != 0:
+        return 1, [f"error: cannot read `wg show {iface} dump` (needs root, interface up)"]
+    peers = parse_wg_dump(dump.stdout or "", observed_at=at)
+    # parse_wg_dump skips lines it cannot read; for an ALARM an unread peer is not a healthy
+    # one. Count the peer lines (everything after the interface line) and refuse on a gap.
+    # The unread line itself is never echoed: it carries the peer's preshared key.
+    n_lines = sum(1 for ln in (dump.stdout or "").splitlines()[1:] if ln.strip())
+    if n_lines != len(peers):
+        return 1, [f"error: {n_lines - len(peers)} peer line(s) in `wg show {iface} dump` "
+                   "could not be parsed"]
+    if not peers:
+        return 1, [f"error: no peers on {iface}"]
+    bad: list[str] = []
+    for p in peers:
+        if not p.ever_connected:
+            bad.append(f"  {p.public_key[:8]}: never handshaked")
+        elif abs(at - p.latest_handshake) > max_age:
+            # abs(): after a backward clock step a dead peer's last handshake sits in the
+            # future, and a negative age would pass any limit until the clock caught up.
+            bad.append(f"  {p.public_key[:8]}: last handshake {at - p.latest_handshake:.0f}s ago "
+                       f"(limit {max_age:.0f}s)")
+    if bad:
+        return 2, [f"STALE: {len(bad)} of {len(peers)} peer(s) on {iface}", *bad]
+    return 0, [f"ok: {len(peers)} peer(s) on {iface} handshook within {max_age:.0f}s"]
+
+
 @_installation_locked
 def teardown(cfg: WorkerLinkConfig) -> list[str]:
     """Remove only what ``init`` created: the interface, its unit, the firewall table, its
