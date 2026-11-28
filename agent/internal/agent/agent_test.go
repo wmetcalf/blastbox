@@ -248,6 +248,55 @@ func TestRecoveryReplaysASlowUploadToCompletion(t *testing.T) {
 	}
 }
 
+// A replay that takes longer than the report bound and is then refused (422) is still followed
+// by its fail: the fail gets a fresh report bound, not what the slow upload left of one.
+func TestRecoverySlowRefusedReplayStillFails(t *testing.T) {
+	e := fresh(t)
+	e.cfg.Claim = false
+	d := jobDir(e, "jr", true, true)
+	os.WriteFile(filepath.Join(d, runner.ResultTarName), make([]byte, 1024), 0o600)
+	os.WriteFile(filepath.Join(d, runner.ResultMetaName), []byte(`{"worker_runtime":"seatbelt","started_at_ms":1,"finished_at_ms":2}`), 0o600)
+	e.in.putStatus["jr"] = 422
+	e.in.putDelay = 300 * time.Millisecond
+	h := newHarness(e)
+	h.a.ReportWait = 100 * time.Millisecond
+	h.start(t)
+	eventually(t, "fail sent and dir wiped", func() bool {
+		_, err := os.Stat(d)
+		u := e.in.update("jr")
+		return os.IsNotExist(err) && u != nil
+	})
+}
+
+// The startup recovery pass runs before the heartbeat starts: it must not hold the node silent
+// for a long result upload (up to the 35 min upload bound per job). It keeps the report bound;
+// the background recovery loop, which runs beside the heartbeat, finishes the upload.
+func TestStartupRecoveryDoesNotSilenceTheNode(t *testing.T) {
+	e := fresh(t)
+	e.cfg.Claim = false
+	d := jobDir(e, "jh", true, true)
+	os.WriteFile(filepath.Join(d, runner.ResultTarName), make([]byte, 1024), 0o600)
+	os.WriteFile(filepath.Join(d, runner.ResultMetaName), []byte(`{"worker_runtime":"seatbelt","started_at_ms":1,"finished_at_ms":2}`), 0o600)
+	os.WriteFile(filepath.Join(d, runner.UploadedName), nil, 0o600)
+	e.in.putDelay = 1500 * time.Millisecond
+	h := newHarness(e)
+	h.a.ReportWait = 100 * time.Millisecond
+	start := time.Now()
+	h.start(t)
+	eventually(t, "first heartbeat", func() bool {
+		e.in.mu.Lock()
+		defer e.in.mu.Unlock()
+		return len(e.in.hbs) > 0
+	})
+	if waited := time.Since(start); waited > time.Second {
+		t.Fatalf("first heartbeat only after %v: the startup recovery pass held it", waited)
+	}
+	eventually(t, "the loop finishes the upload", func() bool {
+		_, err := os.Stat(d)
+		return os.IsNotExist(err)
+	})
+}
+
 func TestRecoveryAfterAcceptedUploadPollsDisposition(t *testing.T) {
 	e := fresh(t)
 	e.cfg.Claim = false

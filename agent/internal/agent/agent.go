@@ -67,8 +67,9 @@ type Agent struct {
 	ReportWait   time.Duration // recovery's bound on one fail/release report (2 min)
 	UploadWait   time.Duration // recovery's bound on one result upload (runner.DefaultUploadWait)
 
-	startedAt time.Time
-	binSHA    string
+	startedAt   time.Time
+	startupPass bool // the synchronous recovery pass before the heartbeat starts
+	binSHA      string
 
 	mu        sync.Mutex
 	cl        *wire.Client
@@ -368,7 +369,9 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.Log.Warn("initial session failed; will retry", "err", err.Error())
 	}
 	a.snapshotRecovery()
+	a.startupPass = true
 	a.recoverJobs(ctx)
+	a.startupPass = false
 	for _, es := range a.engines {
 		a.probeEngine(ctx, es, true)
 	}

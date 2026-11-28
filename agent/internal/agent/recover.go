@@ -185,12 +185,23 @@ func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool)
 			cl.ClaimedAt = fi.ModTime()
 		}
 	}
-	rctx, cancel := context.WithTimeout(ctx, orDur(a.ReportWait, 2*time.Minute))
-	defer cancel()
+	reportWait := orDur(a.ReportWait, 2*time.Minute)
 	// A result upload streams up to max_total_artifacts and waits for the control plane to
-	// extract it: it gets the upload bound, not the short report bound.
-	uctx, ucancel := context.WithTimeout(ctx, orDur(a.UploadWait, runner.DefaultUploadWait))
+	// extract it: it gets the upload bound, not the short report bound -- except in the startup
+	// pass, which runs before the heartbeat and must not hold the node silent; the background
+	// loop retries what it leaves.
+	uploadWait := orDur(a.UploadWait, runner.DefaultUploadWait)
+	if a.startupPass {
+		uploadWait = reportWait
+	}
+	uctx, ucancel := context.WithTimeout(ctx, uploadWait)
 	defer ucancel()
+	// Each fail/release gets its own report bound, started when it is sent (after any replay).
+	report := func(f func(context.Context) error) error {
+		rctx, cancel := context.WithTimeout(ctx, reportWait)
+		defer cancel()
+		return f(rctx)
+	}
 	if uploaded {
 		return a.recoverUploaded(uctx, dir, name, cl)
 	}
@@ -214,10 +225,10 @@ func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool)
 			}
 		}
 		if action == "fail" {
-			cerr = a.client().Fail(rctx, cl, reason, a.Now())
+			cerr = report(func(rctx context.Context) error { return a.client().Fail(rctx, cl, reason, a.Now()) })
 		}
 	} else {
-		cerr = a.client().Release(rctx, cl)
+		cerr = report(func(rctx context.Context) error { return a.client().Release(rctx, cl) })
 	}
 	switch {
 	case cerr == nil:
