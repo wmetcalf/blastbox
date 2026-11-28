@@ -25,7 +25,7 @@ var nodeIDRE = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
 
 const resubmitAfter = time.Hour
 
-func syncDir(dir string) {
+var syncDir = func(dir string) {
 	if d, err := os.Open(dir); err == nil {
 		d.Sync()
 		d.Close()
@@ -94,6 +94,8 @@ func RecoverPair(cfg *config.Config, now time.Time) (bool, error) {
 			return false, err
 		}
 		os.Remove(nextKey + ".csr")
+		// The key rename must be durable before cert.next is renamed away (see tryInstall).
+		syncDir(filepath.Dir(cfg.KeyFile))
 	case keyMatches(cfg.KeyFile, pub):
 	default:
 		return false, nil
@@ -421,6 +423,10 @@ func (r *Renewer) tryInstall(ctx context.Context) (bool, error) {
 	if err := os.Rename(nextKey, r.Cfg.KeyFile); err != nil {
 		return false, err
 	}
+	// The key rename must be durable before cert.next is renamed away: key_file and cert_file
+	// may be in different directories, and a power loss that kept the new cert but restored the
+	// old key (with cert.next gone) would leave a pair RecoverPair cannot repair.
+	syncDir(filepath.Dir(r.Cfg.KeyFile))
 	if err := os.Rename(nextCert, r.Cfg.CertFile); err != nil {
 		return false, err // RecoverPair finishes this at the next start
 	}

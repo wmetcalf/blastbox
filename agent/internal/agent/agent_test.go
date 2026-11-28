@@ -1642,3 +1642,80 @@ func TestDuplicateClaimFailIsRetriedUntilDelivered(t *testing.T) {
 		return e.in.updCount["jd2"] >= 3 && u["claim_id"] == "cid-jd2-b" && f["status"] == "failed"
 	})
 }
+
+// syncTrace records, at each directory sync, whether key.next and cert.next were still present.
+type syncEvent struct {
+	dir               string
+	keyNext, certNext bool
+}
+
+func traceSyncs(t *testing.T, keyFile, certFile string) *[]syncEvent {
+	var mu sync.Mutex
+	ev := &[]syncEvent{}
+	prev := syncDir
+	syncDir = func(dir string) {
+		_, ke := os.Lstat(keyFile + ".next")
+		_, ce := os.Lstat(certFile + ".next")
+		mu.Lock()
+		*ev = append(*ev, syncEvent{dir, ke == nil, ce == nil})
+		mu.Unlock()
+		prev(dir)
+	}
+	t.Cleanup(func() { syncDir = prev })
+	return ev
+}
+
+// keyRenameSynced: the key's directory was synced after key.next was renamed and before
+// cert.next was, so a power loss can never keep the new cert with the old key.
+func keyRenameSynced(ev []syncEvent, keyDir string) bool {
+	for _, e := range ev {
+		if e.dir == keyDir && !e.keyNext && e.certNext {
+			return true
+		}
+	}
+	return false
+}
+
+// moveKeyToOwnDir puts the node key in a directory of its own (key_file and cert_file apart).
+func moveKeyToOwnDir(t *testing.T, e *env) string {
+	kd := t.TempDir()
+	nk := filepath.Join(kd, "node.key")
+	if err := os.Rename(e.cfg.KeyFile, nk); err != nil {
+		t.Fatal(err)
+	}
+	e.cfg.KeyFile = nk
+	return kd
+}
+
+func TestRecoverPairSyncsTheKeyDirBeforeTheCertRename(t *testing.T) {
+	e := fresh(t)
+	kd := moveKeyToOwnDir(t, e)
+	nk := mustKey(t)
+	c := e.ca.issueNode(t, "node-a", &nk.PublicKey, time.Now().Add(-time.Minute), time.Now().Add(7*24*time.Hour))
+	writeKey(t, e.cfg.KeyFile+".next", nk)
+	os.WriteFile(e.cfg.CertFile+".next", c, 0o644)
+	ev := traceSyncs(t, e.cfg.KeyFile, e.cfg.CertFile)
+	if ok, err := RecoverPair(e.cfg, time.Now()); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	if !keyRenameSynced(*ev, kd) {
+		t.Fatalf("key dir not synced between the key and cert renames: %+v", *ev)
+	}
+}
+
+func TestRenewalSyncsTheKeyDirBeforeTheCertRename(t *testing.T) {
+	e := newEnv(t, time.Now().Add(-29*24*time.Hour), time.Now().Add(24*time.Hour))
+	kd := moveKeyToOwnDir(t, e)
+	oldCert := string(e.cert)
+	ev := traceSyncs(t, e.cfg.KeyFile, e.cfg.CertFile)
+	h := newHarness(e)
+	stop := h.start(t)
+	eventually(t, "swap", func() bool {
+		b, _ := os.ReadFile(e.cfg.CertFile)
+		return string(b) != oldCert
+	})
+	stop()
+	if !keyRenameSynced(*ev, kd) {
+		t.Fatalf("key dir not synced between the key and cert renames: %+v", *ev)
+	}
+}
