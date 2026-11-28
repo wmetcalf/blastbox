@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -99,7 +101,7 @@ func TestTarRefusesNonRegular(t *testing.T) {
 		{"symlink", func(r string) error { return os.Symlink("/etc/passwd", filepath.Join(r, "l")) }},
 		{"hardlink", func(r string) error { return os.Link(filepath.Join(r, "f"), filepath.Join(r, "h")) }},
 		{"fifo", func(r string) error { return mkfifo(filepath.Join(r, "p")) }},
-		{"non-ascii", func(r string) error { return os.WriteFile(filepath.Join(r, "café"), []byte("x"), 0o600) }},
+		{"not utf-8", func(r string) error { return os.WriteFile(filepath.Join(r, "caf\xe9"), []byte("x"), 0o600) }},
 		{"too long", func(r string) error {
 			return os.WriteFile(filepath.Join(r, strings.Repeat("n", 101)), []byte("x"), 0o600)
 		}},
@@ -116,5 +118,43 @@ func TestTarRefusesNonRegular(t *testing.T) {
 		if _, err := os.Stat(dst); err == nil {
 			t.Errorf("%s: partial tar left behind", c.name)
 		}
+	}
+}
+
+// The writer is byte-for-byte Python's tarfile USTAR (the conformance generator), including
+// raw UTF-8 names and tarfile's shortest-prefix split of long paths.
+func TestTarMatchesPythonTarfile(t *testing.T) {
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not installed")
+	}
+	tree := map[string]string{
+		"metadata.json": "7b7d",
+		strings.Repeat("x", 50) + "/" + strings.Repeat("y", 50) + "/" + strings.Repeat("z", 40): "01",
+		"art/" + strings.Repeat("é", 60) + "/f.txt":                                             "02",
+		strings.Repeat("n", 100):       "",
+		"a/" + strings.Repeat("b", 99): "0303",
+	}
+	root := t.TempDir()
+	for rel, hx := range tree {
+		body, _ := hex.DecodeString(hx)
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	js, _ := json.Marshal(tree)
+	cmd := exec.Command(py, filepath.Join("testdata", "tartree.py"))
+	cmd.Stdin = bytes.NewReader(js)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(writeTar(t, root))
+	if got, want := hex.EncodeToString(sum[:]), strings.TrimSpace(string(out)); got != want {
+		t.Fatalf("Go tar %s, Python tarfile %s", got, want)
 	}
 }

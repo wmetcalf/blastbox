@@ -27,13 +27,6 @@ func TestWriterVectors(t *testing.T) {
 		n++
 		name := strings.TrimSuffix(e.Name(), ".json")
 		t.Run(name, func(t *testing.T) {
-			if name == "unicode_name" {
-				// The vector expects raw UTF-8 bytes in a USTAR name field. Go's archive/tar
-				// refuses any non-ASCII name under FormatUSTAR, and Write deliberately emits no
-				// PAX, so the agent refuses such a tree. The vector's claim about the Go writer
-				// is wrong (or the writer must change by decision): unresolved, see the branch notes.
-				t.Skip("unicode_name: Go archive/tar cannot write a non-ASCII USTAR name; vector disputed")
-			}
 			var v struct {
 				Tree      map[string]string `json:"tree"`
 				TarSHA256 string            `json:"tar_sha256"`
