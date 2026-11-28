@@ -92,3 +92,24 @@ func TestNsjailCommandRunsASymlinkedEngine(t *testing.T) {
 		t.Fatalf("a symlinked engine did not run in the jail: %v: %s", err, out)
 	}
 }
+
+// argv[0] is exec'd as given: a multi-call binary or a venv launcher behind a symlink depends
+// on the name it was invoked by. A symlinked argv[0] the jail cannot see gets the resolved
+// file mounted AT that path rather than argv[0] rewritten to the target.
+func TestNsjailCommandKeepsTheInvokedName(t *testing.T) {
+	h := nsjailHost(t)
+	real, link := t.TempDir(), t.TempDir()
+	script := filepath.Join(real, "engine.sh")
+	name := filepath.Join(link, "applet")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ntest \"$0\" = '"+name+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(script, name); err != nil {
+		t.Fatal(err)
+	}
+	resolved, _ := filepath.EvalSymlinks(script)
+	out, err := runNsjail(t, h, resolved, []string{name}, Limits{TimeoutS: 10})
+	if err != nil {
+		t.Fatalf("the engine did not see the name it was invoked by: %v: %s", err, out)
+	}
+}

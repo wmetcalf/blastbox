@@ -152,7 +152,7 @@ func Command(ctx context.Context, sb Kind, req Request, argv []string, lim Limit
 			pins = *req.Pins
 		}
 		nreq := NsjailRequest{
-			Argv: shimArgv(req.Nonce, marker, jailArgv(argv, req.ExecPaths)),
+			Argv: shimArgv(req.Nonce, marker, argv),
 			Env:  env,
 			// Never egress: Command cannot produce --disable_clone_newnet.
 			Limits:         NsjailLimits{TimeoutS: lim.TimeoutS},
@@ -170,6 +170,9 @@ func Command(ctx context.Context, sb Kind, req Request, argv []string, lim Limit
 				seen[p] = true
 				nreq.ROMounts = append(nreq.ROMounts, Mount{p, p})
 			}
+		}
+		if m, ok := jailAlias(argv[0], req.ExecPaths, req.ROPaths, rw); ok {
+			nreq.ROMounts = append(nreq.ROMounts, m)
 		}
 		for _, p := range rw {
 			nreq.RWMounts = append(nreq.RWMounts, Mount{p, p})
@@ -222,29 +225,25 @@ func capNsjailFSize(argv []string, fsize uint64) {
 	}
 }
 
-// jailArgv makes argv[0] exist inside the jail. The jail sees /usr and /etc, plus the resolved
-// ExecPaths mounted at their own paths: an argv[0] elsewhere that is a symlink (or a bare name
-// found on the agent's PATH) is not there, so it is replaced by the resolved path it names.
-func jailArgv(argv, execPaths []string) []string {
-	abs := argv[0]
-	if !filepath.IsAbs(abs) {
-		lp, err := exec.LookPath(abs)
-		if err != nil {
-			return argv
+// jailAlias makes argv[0] exist inside the jail under the name it is invoked by. The jail
+// sees /usr, /etc, the ro/rw paths and the resolved ExecPaths at their own paths; an absolute
+// argv[0] elsewhere that is a symlink to an ExecPath gets that file mounted at its own path
+// (argv[0] is never rewritten: a multi-call binary or a venv launcher depends on the name).
+func jailAlias(argv0 string, execPaths, roPaths, rwPaths []string) (Mount, bool) {
+	if !filepath.IsAbs(argv0) || isRelativeTo(argv0, "/usr") || isRelativeTo(argv0, "/etc") ||
+		contains(execPaths, argv0) {
+		return Mount{}, false
+	}
+	for _, p := range append(append([]string(nil), roPaths...), rwPaths...) {
+		if isRelativeTo(argv0, p) {
+			return Mount{}, false
 		}
-		if abs, err = filepath.Abs(lp); err != nil {
-			return argv
-		}
 	}
-	if isRelativeTo(abs, "/usr") || isRelativeTo(abs, "/etc") {
-		return argv
+	resolved, err := filepath.EvalSymlinks(argv0)
+	if err != nil || resolved == argv0 || !contains(execPaths, resolved) {
+		return Mount{}, false
 	}
-	resolved, err := filepath.EvalSymlinks(abs)
-	if err != nil || resolved == argv[0] || !contains(execPaths, resolved) {
-		return argv
-	}
-	out := append([]string{resolved}, argv[1:]...)
-	return out
+	return Mount{resolved, argv0}, true
 }
 
 func contains(ss []string, s string) bool {
