@@ -996,3 +996,17 @@ func TestUndeliveredEarlyReportIsHandedBack(t *testing.T) {
 		t.Fatalf("%+v: an undelivered early release was not handed back", res)
 	}
 }
+
+// The new claim of a job whose dir holds a started marker is failed before anything is
+// recorded for it: an unanswered fail is handed back with its reason.
+func TestRefusedClaimHandsBackItsUndeliveredFail(t *testing.T) {
+	f := setup(t, happyEngine)
+	f.in.updStatus = 503
+	d := filepath.Join(f.state, "jobs", testJob)
+	os.MkdirAll(d, 0o700)
+	os.WriteFile(filepath.Join(d, "started"), nil, 0o600)
+	res := f.run()
+	if res.Outcome != "refused" || !res.Unrecorded || res.PendingFail == "" {
+		t.Fatalf("%+v: the refused claim's undelivered fail was not handed back", res)
+	}
+}

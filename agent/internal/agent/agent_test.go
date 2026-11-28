@@ -1598,3 +1598,47 @@ func TestUnrecordedReportIsRetriedUntilDelivered(t *testing.T) {
 		stop()
 	}
 }
+
+// A re-issued claim for a job still running here is failed; if that fail goes unanswered it
+// is retried (nothing on disk records the new claim), not dropped.
+func TestDuplicateClaimFailIsRetriedUntilDelivered(t *testing.T) {
+	e := fresh(t)
+	two := 2
+	e.cfg.Engines[0].Slots = &two // a second slot claims while the first run is live
+	var n int
+	var mu sync.Mutex
+	e.in.onClaim = func(int) (int, string) {
+		mu.Lock()
+		defer mu.Unlock()
+		n++
+		switch n {
+		case 1:
+			return 200, claimBody("jd2")
+		case 2:
+			return 200, strings.Replace(claimBody("jd2"), `"cid-jd2"`, `"cid-jd2-b"`, 1)
+		}
+		return 204, ""
+	}
+	e.in.onUpdate = func(id string, k int) int {
+		if k < 3 {
+			return 503
+		}
+		return 200
+	}
+	release := make(chan struct{})
+	h := newHarness(e)
+	h.a.Runner = fakeRunner{fn: func(context.Context, *wire.Claim) runner.Result {
+		<-release
+		return runner.Result{Outcome: "done"}
+	}}
+	stop := h.start(t)
+	defer stop()
+	defer close(release)
+	eventually(t, "the duplicate claim's fail delivered", func() bool {
+		e.in.mu.Lock()
+		defer e.in.mu.Unlock()
+		u := e.in.updates["jd2"]
+		f, _ := u["fields"].(map[string]any)
+		return e.in.updCount["jd2"] >= 3 && u["claim_id"] == "cid-jd2-b" && f["status"] == "failed"
+	})
+}
