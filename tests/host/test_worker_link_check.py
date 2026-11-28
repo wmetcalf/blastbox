@@ -114,3 +114,47 @@ def test_cli_check_on_a_host_reads_the_configured_interface(monkeypatch):
                         lambda iface, age, **_: seen.append(iface) or (0, ["ok"]))
     assert args.func(args) == 0
     assert seen == ["customwg0"]
+
+
+def _worker_check_args(*extra: str):
+    import argparse
+    p = argparse.ArgumentParser()
+    link.add_parser(p.add_subparsers())
+    return p.parse_args(["worker-link", "status", "--check", "--role", "worker", *extra])
+
+
+def test_cli_check_on_a_macos_worker_reads_the_real_utun(monkeypatch):
+    """macOS wg-quick runs the link on a utunN; `wg show wtwg0` would fail on a healthy link."""
+    monkeypatch.setattr(link, "_platform", lambda: "darwin")
+    monkeypatch.setattr(link, "_which", lambda name: f"/opt/homebrew/bin/{name}")
+    resolved = []
+    monkeypatch.setattr(link, "_our_real_iface_darwin",
+                        lambda wg, iface: resolved.append((wg, iface)) or "utun7")
+    seen = []
+    monkeypatch.setattr(wla, "check_handshakes",
+                        lambda iface, age, **_: seen.append(iface) or (0, ["ok"]))
+    args = _worker_check_args()
+    assert args.func(args) == 0
+    assert seen == ["utun7"]
+    assert resolved == [("/opt/homebrew/bin/wg", link.DEFAULT_IFACE)]
+
+
+def test_cli_check_on_a_macos_worker_with_no_verified_utun_is_an_error(monkeypatch, capsys):
+    monkeypatch.setattr(link, "_platform", lambda: "darwin")
+    monkeypatch.setattr(link, "_which", lambda name: f"/opt/homebrew/bin/{name}")
+    monkeypatch.setattr(link, "_our_real_iface_darwin", lambda wg, iface: None)
+    monkeypatch.setattr(wla, "check_handshakes",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("not reached")))
+    args = _worker_check_args("--iface", "wtwg0")
+    assert args.func(args) == 1
+    assert "wtwg0" in capsys.readouterr().err
+
+
+def test_cli_check_on_a_linux_worker_keeps_the_logical_name(monkeypatch):
+    monkeypatch.setattr(link, "_platform", lambda: "linux")
+    seen = []
+    monkeypatch.setattr(wla, "check_handshakes",
+                        lambda iface, age, **_: seen.append(iface) or (0, ["ok"]))
+    args = _worker_check_args("--iface", "wtwg0")
+    assert args.func(args) == 0
+    assert seen == ["wtwg0"]

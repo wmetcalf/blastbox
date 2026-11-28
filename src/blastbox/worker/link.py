@@ -2269,12 +2269,22 @@ def _dispatch(args: argparse.Namespace) -> int:
         # Alarm mode: only WireGuard handshake freshness, exit 0/2/1. Same reader on both
         # roles; the host module is the one that owns it.
         iface = args.iface
-        if not iface and _role(args) == "host":
+        role = _role(args)
+        if not iface and role == "host":
             # The host's link interface is configurable; read it the way every other host
             # action does rather than assuming the default name.
             iface = _host_cfg(args, base_required=False).wg_iface
-        code, lines = _host_mod().check_handshakes(
-            iface or DEFAULT_IFACE, args.max_handshake_age)
+        iface = iface or DEFAULT_IFACE
+        if role == "worker" and _supported_platform() == "darwin":
+            # macOS wg-quick runs the link on a utunN, not on the logical name: check the
+            # utun verified by key to run THIS link, exactly as `status` does.
+            real = _our_real_iface_darwin(_which("wg"), _link_iface(iface))
+            if real is None:
+                print(f"error: {iface}: no running utun verified to carry this link "
+                      "(link down, or `wg` / our key unreadable)", file=sys.stderr)
+                return 1
+            iface = real
+        code, lines = _host_mod().check_handshakes(iface, args.max_handshake_age)
         for ln in lines:
             print(ln, file=sys.stderr if code == 1 else sys.stdout)
         return code
