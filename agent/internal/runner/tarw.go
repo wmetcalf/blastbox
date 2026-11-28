@@ -1,0 +1,225 @@
+package runner
+
+import (
+	"bufio"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"syscall"
+	"unicode/utf8"
+)
+
+// Write writes a deterministic USTAR archive of the regular files under root to dst (created
+// exclusively, mode 0600). Paths are sorted bytewise; every header has mode 0644, uid/gid 0,
+// empty uname/gname and mtime 0; directories are not emitted. Anything that is not a regular
+// file (symlinks, devices, FIFOs, sockets) and any hardlinked file (nlink > 1) is refused, as is
+// any path that is not UTF-8 or holds a backslash. A path USTAR cannot hold gets a PAX path
+// record, as Python's tarfile writes it. Names are raw
+// UTF-8 bytes, split into prefix/name as Python's tarfile does (conformance result_tars/writer).
+// The same bytes come out on every host.
+func Write(root, dst string) (err error) {
+	var names []string
+	werr := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, rerr := filepath.Rel(root, p)
+		if rerr != nil {
+			return rerr
+		}
+		if rel == "." {
+			return nil
+		}
+		fi, err := os.Lstat(p)
+		if err != nil {
+			return err
+		}
+		switch {
+		case fi.IsDir():
+			return nil
+		case !fi.Mode().IsRegular():
+			return fmt.Errorf("%s: not a regular file (%s)", rel, fi.Mode().Type())
+		}
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok && uint64(st.Nlink) > 1 {
+			return fmt.Errorf("%s: hardlinked file (nlink %d)", rel, st.Nlink)
+		}
+		names = append(names, filepath.ToSlash(rel))
+		return nil
+	})
+	if werr != nil {
+		return werr
+	}
+	sort.Strings(names) // bytewise
+
+	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			os.Remove(dst)
+		}
+	}()
+	tw := bufio.NewWriterSize(f, 64<<10)
+	for _, name := range names {
+		if err := addFile(tw, root, name); err != nil {
+			return err
+		}
+	}
+	if _, err := tw.Write(make([]byte, 2*blockSize)); err != nil { // end-of-archive marker
+		return err
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+const (
+	blockSize  = 512
+	nameSize   = 100
+	prefixSize = 155
+	maxSize    = 1<<33 - 1 // 11 octal digits
+)
+
+// splitName splits name into a USTAR prefix and name exactly as Python's tarfile does: the
+// SHORTEST "/"-boundary prefix whose remainder fits. ok is false when no split fits (the
+// name then gets a PAX path record).
+func splitName(name string) (prefix, base string, ok bool) {
+	if len(name) <= nameSize {
+		return "", name, true
+	}
+	parts := strings.Split(name, "/")
+	for i := 1; i < len(parts); i++ {
+		p, b := strings.Join(parts[:i], "/"), strings.Join(parts[i:], "/")
+		if len(p) <= prefixSize && len(b) <= nameSize {
+			return p, b, true
+		}
+	}
+	return "", "", false
+}
+
+// ustarHeader is the 512-byte header Go's archive/tar wrote for an ASCII name (and Python's
+// tarfile writes for any UTF-8 name): mode 0644, uid/gid 0, mtime 0, empty uname/gname,
+// devmajor/devminor "0000000\0".
+func ustarHeader(name string, size int64) ([]byte, error) {
+	if !utf8.ValidString(name) || strings.ContainsRune(name, 0) {
+		return nil, errors.New("name is not UTF-8")
+	}
+	if strings.ContainsRune(name, '\\') { // the control plane's vet_tar refuses the whole tar
+		return nil, errors.New("name holds a backslash")
+	}
+	if size < 0 || size > maxSize {
+		return nil, fmt.Errorf("size %d does not fit a USTAR header", size)
+	}
+	prefix, base, ok := splitName(name)
+	if !ok {
+		return paxHeader(name, size), nil
+	}
+	return ustarBlock(base, prefix, size, '0', 0o644), nil
+}
+
+// paxHeader is what Python's tarfile PAX format writes for a path USTAR cannot hold (a
+// component over 100 bytes, or over 255 in all): an "x" header named ././@PaxHeader whose
+// payload is the "path" record, then the USTAR header with the name ASCII-replaced and cut to
+// 100 bytes (readers take the path record). The control plane's tar reader accepts it.
+func paxHeader(name string, size int64) []byte {
+	kv := "path=" + name + "\n"
+	l := len(kv) + 1 // + the space after the length
+	n, p := 0, 0
+	for {
+		n = l + len(strconv.Itoa(p))
+		if n == p {
+			break
+		}
+		p = n
+	}
+	rec := strconv.Itoa(p) + " " + kv
+	out := ustarBlock("././@PaxHeader", "", int64(len(rec)), 'x', 0)
+	payload := make([]byte, (len(rec)+blockSize-1)/blockSize*blockSize)
+	copy(payload, rec)
+	out = append(out, payload...)
+	short := make([]byte, 0, len(name))
+	for _, r := range name {
+		if r < 0x80 {
+			short = append(short, byte(r))
+		} else {
+			short = append(short, '?')
+		}
+	}
+	if len(short) > nameSize {
+		short = short[:nameSize]
+	}
+	return append(out, ustarBlock(string(short), "", size, '0', 0o644)...)
+}
+
+func ustarBlock(base, prefix string, size int64, typ byte, mode int) []byte {
+	h := make([]byte, blockSize)
+	copy(h[0:100], base)
+	copy(h[100:108], fmt.Sprintf("%07o\x00", mode))
+	copy(h[108:116], "0000000\x00")
+	copy(h[116:124], "0000000\x00")
+	copy(h[124:136], fmt.Sprintf("%011o\x00", size))
+	copy(h[136:148], "00000000000\x00")
+	copy(h[148:156], "        ")
+	h[156] = typ
+	copy(h[257:265], "ustar\x0000")
+	copy(h[329:337], "0000000\x00")
+	copy(h[337:345], "0000000\x00")
+	copy(h[345:500], prefix)
+	sum := 0
+	for _, c := range h {
+		sum += int(c)
+	}
+	copy(h[148:156], fmt.Sprintf("%06o\x00 ", sum))
+	return h
+}
+
+func addFile(tw io.Writer, root, name string) error {
+	p := filepath.Join(root, filepath.FromSlash(name))
+	in, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	// Re-check on the open descriptor: the file must still be what the walk saw.
+	fi, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("%s: changed while archiving", name)
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && uint64(st.Nlink) > 1 {
+		return fmt.Errorf("%s: hardlinked file", name)
+	}
+	hdr, err := ustarHeader(name, fi.Size())
+	if err != nil {
+		return fmt.Errorf("%+q: %w", name, err)
+	}
+	if _, err := tw.Write(hdr); err != nil {
+		return err
+	}
+	n, err := io.Copy(tw, io.LimitReader(in, fi.Size()))
+	if err != nil {
+		return err
+	}
+	if n != fi.Size() {
+		return errors.New(name + ": short read")
+	}
+	if pad := -n & (blockSize - 1); pad > 0 {
+		if _, err := tw.Write(make([]byte, pad)); err != nil {
+			return err
+		}
+	}
+	return nil
+}

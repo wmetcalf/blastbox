@@ -482,6 +482,12 @@ peers:
 * **Pull removes one failure mode, not all of them.** It removes the inbound direction and the
   tunnel. It does not stop a path that is keyed on the node's address from breaking when that
   address changes. §10 is what turns that into an alert instead of 11 silent hours.
+* **Route finding (measured on the Mac, 2026-11-27): no route pin is needed for plain outbound
+  HTTPS to the ingress.** A STATIC host route to the ingress, left over from an old DHCP
+  address, made every connect fail with `EADDRNOTAVAIL` while the default route would have
+  worked. The agent therefore never manages routes (and never sudoes). It detects the condition
+  and logs it loudly (`agent/README.md`, "Ingress unreachable"). The fix is to delete the stale
+  host route. This supersedes the `pin_private_service_routes` bullet below for the agent itself.
 * **`wtwg0` after cutover.**
   * Remove peer 10.78.0.2 on toolz2 with `worker-link` peer removal. Other peers (10.78.0.3/.4)
     stay.

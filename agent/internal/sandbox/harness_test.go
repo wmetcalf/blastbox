@@ -1,0 +1,220 @@
+package sandbox
+
+import (
+	"context"
+	"os/exec"
+	"strings"
+	"testing"
+
+	"github.com/wmetcalf/blastbox/agent/internal/config"
+)
+
+// fakeBuild is a sandbox stand-in: it runs the handshake shim (or, with skipShim, argv alone)
+// UNSANDBOXED, so the probe's own bookkeeping branches can be exercised on any host.
+func fakeBuild(skipShim bool) func(context.Context, Kind, Request, []string, Limits) (*exec.Cmd, error) {
+	return func(ctx context.Context, _ Kind, req Request, argv []string, _ Limits) (*exec.Cmd, error) {
+		var full []string
+		if skipShim {
+			full = argv
+		} else {
+			full = shimArgv(req.Nonce, req.Scratch+"/"+HandshakeName, argv)
+		}
+		cmd := exec.CommandContext(ctx, full[0], full[1:]...)
+		cmd.Dir = req.Scratch
+		return cmd, nil
+	}
+}
+
+func fakeHost(skipShim bool) Host {
+	return Host{AgentBin: testAgentBin, build: fakeBuild(skipShim)}
+}
+
+func verdictEngine(argv ...string) config.Engine {
+	return config.Engine{Name: "e", Sandbox: "seatbelt", ProbeArgv: argv}
+}
+
+func TestCustomProbeMustPrintAllDeniedVerdict(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name   string
+		argv   []string
+		wantOK bool
+		reason string
+	}{
+		{"true proves nothing", []string{"/usr/bin/true"}, false, "no verdict"},
+		{"garbage output", []string{"/bin/sh", "-c", "echo hello"}, false, "not JSON"},
+		{"one allowed", []string{"/bin/sh", "-c", `echo '{"read":"denied","connect":"ALLOWED","write":"denied"}'`}, false, "connect"},
+		{"missing key", []string{"/bin/sh", "-c", `echo '{"read":"denied","connect":"denied"}'`}, false, "write"},
+		{"all denied", []string{"/bin/sh", "-c", `echo '{"read":"denied","connect":"denied","write":"denied"}'`}, true, ""},
+	}
+	for _, c := range cases {
+		r := fakeHost(false).Probe(ctx, verdictEngine(c.argv...))
+		if r.OK != c.wantOK || (c.reason != "" && !strings.Contains(r.Reason, c.reason)) {
+			t.Errorf("%s: OK=%v reason=%q", c.name, r.OK, r.Reason)
+		}
+	}
+}
+
+func TestProbeNeedsHandshake(t *testing.T) {
+	r := fakeHost(true).Probe(context.Background(), verdictEngine("/bin/sh", "-c",
+		`echo '{"read":"denied","connect":"denied","write":"denied"}'`))
+	if r.OK || !strings.Contains(r.Reason, "handshake") {
+		t.Fatalf("a run with no handshake must fail: %+v", r)
+	}
+}
+
+func TestProbeFailsWhenListenerGotAConnection(t *testing.T) {
+	// Unsandboxed built-in probe connects to the listener (and reads/writes freely).
+	r := fakeHost(false).Probe(context.Background(), verdictEngine(testAgentBin, "__probe",
+		"--read", "{canary}", "--connect", "{connect}", "--write", "{outside}"))
+	if r.OK || !strings.Contains(r.Reason, "listener") {
+		t.Fatalf("expected a listener-connection failure: %+v", r)
+	}
+}
+
+func TestNsjailHostWithoutLayersIsInsecure(t *testing.T) {
+	h := Host{NsjailPath: "/usr/local/bin/nsjail", AgentBin: testAgentBin}
+	got := strings.Join(h.InsecurityReasons(), ",")
+	if got != "seccomp_policy_missing,apparmor_missing" {
+		t.Errorf("reasons = %q", got)
+	}
+	eng := config.Engine{Name: "e", Sandbox: "nsjail", SelftestArgv: []string{"/usr/bin/true"}}
+	if r := h.Probe(context.Background(), eng); r.OK || !strings.Contains(r.Reason, "insecure nsjail host") {
+		t.Errorf("probe must refuse an insecure host: %+v", r)
+	}
+	if r := h.SelfTest(context.Background(), eng); r.OK || !strings.Contains(r.Reason, "apparmor_missing") {
+		t.Errorf("selftest must refuse an insecure host: %+v", r)
+	}
+	h.SeccompPolicy = "/etc/passwd"
+	h.AllowMissingAppArmor = true
+	if r := h.InsecurityReasons(); len(r) != 0 {
+		t.Errorf("explicit opt-out should clear apparmor: %v", r)
+	}
+}
+
+func TestCommandNeverAllowsEgress(t *testing.T) {
+	pins := HostPins{AppArmorProfile: "p", Exists: map[string]bool{"/usr": true}, Symlinks: map[string]bool{}}
+	cmd, err := Command(context.Background(), Nsjail, Request{
+		ExecPaths: []string{"/usr/bin/true"}, Scratch: "/tmp/s", Nonce: "n", AgentBin: "/x/agent",
+		NsjailPath: "/usr/local/bin/nsjail", Pins: &pins,
+		SeccompPolicy: "/x/seccomp.kafel", AttachAppArmor: true,
+	}, []string{"/usr/bin/true"}, Limits{TimeoutS: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range cmd.Args {
+		if a == "--disable_clone_newnet" {
+			t.Fatal("Command produced an egress-capable argv")
+		}
+	}
+	if !contains(cmd.Args, "--iface_no_lo") {
+		t.Error("expected the sealed net namespace flag")
+	}
+	if cmd.SysProcAttr == nil || cmd.SysProcAttr.Setpgid != true {
+		t.Error("Setpgid not set")
+	}
+}
+
+func TestCommandRefusesInsecureNsjailHost(t *testing.T) {
+	pins := HostPins{AppArmorProfile: "p", Exists: map[string]bool{"/usr": true}, Symlinks: map[string]bool{}}
+	base := Request{
+		ExecPaths: []string{"/usr/bin/true"}, Scratch: "/tmp/s", Nonce: "n", AgentBin: "/x/agent",
+		NsjailPath: "/usr/local/bin/nsjail", Pins: &pins, SeccompPolicy: "/x/seccomp.kafel", AttachAppArmor: true,
+	}
+	build := func(r Request) error {
+		_, err := Command(context.Background(), Nsjail, r, []string{"/usr/bin/true"}, Limits{TimeoutS: 5})
+		return err
+	}
+	if err := build(base); err != nil {
+		t.Fatalf("secure request refused: %v", err)
+	}
+	noSeccomp := base
+	noSeccomp.SeccompPolicy = ""
+	if err := build(noSeccomp); err == nil || !strings.Contains(err.Error(), "seccomp") {
+		t.Errorf("empty seccomp policy must be refused: %v", err)
+	}
+	noAA := base
+	noAA.AttachAppArmor = false
+	if err := build(noAA); err == nil || !strings.Contains(err.Error(), "AppArmor") {
+		t.Errorf("unattached AppArmor must be refused: %v", err)
+	}
+	noAA.AllowMissingAppArmor = true
+	if err := build(noAA); err != nil {
+		t.Errorf("explicit opt-out must be accepted: %v", err)
+	}
+	// seatbelt is unaffected by the nsjail layer checks.
+	if _, err := Command(context.Background(), Seatbelt, Request{Scratch: "/tmp/s", Nonce: "n", AgentBin: "/x/agent"},
+		[]string{"/usr/bin/true"}, Limits{}); err != nil {
+		t.Errorf("seatbelt: %v", err)
+	}
+}
+
+// A probe or self-test that floods its output must not grow the agent's memory without bound:
+// only the tail is kept (the verdict is the LAST line, so it survives).
+func TestProbeOutputIsBounded(t *testing.T) {
+	flood := `head -c 33554432 /dev/zero | tr '\0' x; echo; echo '{"read":"denied","connect":"denied","write":"denied"}'; head -c 33554432 /dev/zero >&2`
+	h := fakeHost(false)
+	rr, err := h.runUnder(context.Background(), verdictEngine(), t.TempDir(), []string{"/bin/sh", "-c", flood})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rr.stdout) > probeOutputCap || len(rr.stderr) > probeOutputCap {
+		t.Fatalf("kept %d stdout / %d stderr bytes, cap %d", len(rr.stdout), len(rr.stderr), probeOutputCap)
+	}
+	if err := parseVerdict(rr.stdout); err != nil {
+		t.Fatalf("the verdict line was lost: %v", err)
+	}
+}
+
+// Under nsjail the file-size cap is nsjail's own --rlimit_fsize (the launcher must not pin a
+// hard limit nsjail would then fail to raise), and it is never above the requested cap.
+func TestNsjailFileSizeCapIsNsjails(t *testing.T) {
+	pins := HostPins{AppArmorProfile: "p", Exists: map[string]bool{"/usr": true}, Symlinks: map[string]bool{}}
+	req := Request{ExecPaths: []string{"/usr/bin/true"}, Scratch: "/tmp/s", Nonce: "n", AgentBin: "/x/agent",
+		NsjailPath: "/usr/local/bin/nsjail", Pins: &pins, SeccompPolicy: "/x/seccomp.kafel", AttachAppArmor: true}
+	for _, c := range []struct {
+		fsize uint64
+		want  string
+	}{{50 << 20, "50"}, {(50 << 20) + 1, "51"}, {4 << 30, "1024"}, {0, "1024"}} {
+		cmd, err := Command(context.Background(), Nsjail, req, []string{"/usr/bin/true"}, Limits{TimeoutS: 5, FSizeBytes: c.fsize})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if contains(cmd.Args, "--rlimit-fsize") {
+			t.Errorf("fsize %d: launcher pins RLIMIT_FSIZE: %v", c.fsize, cmd.Args)
+		}
+		got := ""
+		for i, a := range cmd.Args {
+			if a == "--rlimit_fsize" && i+1 < len(cmd.Args) {
+				got = cmd.Args[i+1]
+			}
+		}
+		if got != c.want {
+			t.Errorf("fsize %d: nsjail --rlimit_fsize %q, want %q", c.fsize, got, c.want)
+		}
+	}
+}
+
+// A read-only path that lies inside another read-only path is not mounted on its own: the
+// ancestor's bind already exposes it, and nsjail cannot remount a file the later directory
+// mount shadows (every job failed before the handshake).
+func TestNsjailNestedROPathsMountOnce(t *testing.T) {
+	pins := HostPins{AppArmorProfile: "p", Exists: map[string]bool{"/usr": true}, Symlinks: map[string]bool{}}
+	req := Request{ExecPaths: []string{"/opt/eng/bin/engine.sh"}, ROPaths: []string{"/opt/eng", "/opt/eng/data", "/opt/other"},
+		Scratch: "/tmp/s", Nonce: "n", AgentBin: "/x/agent",
+		NsjailPath: "/usr/local/bin/nsjail", Pins: &pins, SeccompPolicy: "/x/seccomp.kafel", AttachAppArmor: true}
+	cmd, err := Command(context.Background(), Nsjail, req, []string{"/opt/eng/bin/engine.sh"}, Limits{TimeoutS: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ro []string
+	for i, a := range cmd.Args {
+		if a == "--bindmount_ro" && i+1 < len(cmd.Args) && strings.HasPrefix(cmd.Args[i+1], "/opt/") {
+			ro = append(ro, cmd.Args[i+1])
+		}
+	}
+	want := []string{"/opt/eng:/opt/eng", "/opt/other:/opt/other"}
+	if strings.Join(ro, " ") != strings.Join(want, " ") {
+		t.Fatalf("ro mounts %v, want %v", ro, want)
+	}
+}
