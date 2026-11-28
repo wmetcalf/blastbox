@@ -464,7 +464,7 @@ jobs:
 
   agent-e2e-macos:
     # Same driver, seatbelt sandbox, on Apple silicon.
-    runs-on: macos-14
+    runs-on: macos-15
     permissions:
       contents: read
     steps:
