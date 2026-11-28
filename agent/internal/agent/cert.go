@@ -100,6 +100,17 @@ func RecoverPair(cfg *config.Config, now time.Time) (bool, error) {
 	return true, nil
 }
 
+// recoverPairLocked is RecoverPair under the certificate lock (a renewal step of another
+// process may be mid-swap).
+func recoverPairLocked(cfg *config.Config, now time.Time) (bool, error) {
+	unlock, err := lockCert(cfg)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	return RecoverPair(cfg, now)
+}
+
 // RenewState is what one renewal step did.
 type RenewState int
 
@@ -149,6 +160,15 @@ func (r *Renewer) Due() (bool, time.Time, error) {
 // only if the certificate is still due and none was sent in the last hour (or force). The old
 // key and cert stay current until /cert serves a cert for key.next.
 func (r *Renewer) Step(ctx context.Context, force bool) (RenewState, error) {
+	unlock, err := lockCert(r.Cfg)
+	if err != nil {
+		return RenewPending, err
+	}
+	defer unlock()
+	return r.step(ctx, force)
+}
+
+func (r *Renewer) step(ctx context.Context, force bool) (RenewState, error) {
 	// A swap interrupted between its two renames (a failed rename, or a crash) is finished
 	// here too, not only at the next start: until then the key and cert do not match.
 	if promoted, err := RecoverPair(r.Cfg, r.now()); err != nil {
@@ -449,7 +469,7 @@ func Enrol(nodeID, dir string, w io.Writer) error {
 // RenewNow is `blastbox-agent renew`: force one renewal attempt (the wire client handshakes
 // lazily on its first authenticated call), then check once whether the cert is already issued.
 func RenewNow(ctx context.Context, cfg *config.Config, now func() time.Time, w io.Writer) error {
-	if _, err := RecoverPair(cfg, now()); err != nil {
+	if _, err := recoverPairLocked(cfg, now()); err != nil {
 		return err
 	}
 	cl, err := wire.New(cfg, "blastbox-agent/"+Version)

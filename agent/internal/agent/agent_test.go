@@ -1307,3 +1307,30 @@ func TestRenewStepFinishesAnInterruptedSwap(t *testing.T) {
 		t.Fatal("key and cert still do not match")
 	}
 }
+
+// `blastbox-agent renew` and a running agent's renewal loop act on the same key and cert
+// files: a step waits for the other's to finish (the swap is two renames and a cert write).
+func TestRenewStepsAreSerialisedAcrossProcesses(t *testing.T) {
+	e := newEnv(t, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	e.in.holdIssue = true
+	unlock, err := lockCert(e.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		renewer(t, e).Step(context.Background(), true)
+	}()
+	select {
+	case <-done:
+		t.Fatal("a renewal step ran while another held the certificate lock")
+	case <-time.After(300 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the step never ran after the lock was released")
+	}
+}

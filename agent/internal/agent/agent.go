@@ -291,7 +291,7 @@ func (a *Agent) startup(ctx context.Context) error {
 			a.binSHA = s
 		}
 	}
-	if promoted, err := RecoverPair(a.Cfg, a.Now()); err != nil {
+	if promoted, err := recoverPairLocked(a.Cfg, a.Now()); err != nil {
 		return fmt.Errorf("finishing an interrupted certificate swap: %w", err)
 	} else if promoted {
 		a.Log.Warn("completed an interrupted key+cert swap at startup")
