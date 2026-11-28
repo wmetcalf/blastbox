@@ -822,3 +822,18 @@ def test_input_tmp_still_being_fetched_is_not_reaped(tmp_path, pki_dir):  # noqa
     os.utime(live, (old, old))
     assert c.get("/v1/nodes/jobs/job-1/input", headers=hdr).status_code == 200
     assert (live / "input").exists()
+
+
+def test_implicit_parent_directories_count_against_the_member_cap():
+    """Extraction creates every missing parent: a deep path per file must spend the budget."""
+    deep = "/".join(f"d{i}" for i in range(20))
+    body = make_tar([(f"t{n}/{deep}/f", b"") for n in range(5)])   # 5 files, 105 dirs
+    with pytest.raises(node_results.TarRejected, match="members"):
+        node_results.vet_tar(io.BytesIO(body), max_members=50, max_total_bytes=1 << 20)
+
+
+def test_explicit_and_implicit_directories_are_counted_once():
+    body = make_tar([("a", special("a", tarfile.DIRTYPE)), ("a/b", b"x"), ("a/c", b"y")])
+    # metadata.json + a + a/b + a/c = 4 entries
+    node_results.vet_tar(io.BytesIO(body), max_members=4, max_total_bytes=1 << 20)
+

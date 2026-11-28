@@ -263,6 +263,9 @@ def vet_tar(fileobj: Any, *, max_members: int, max_total_bytes: int,
     total, exactly as ``_safe_extract_tar`` and the cold trust gate count it.
     """
     seen: set[str] = set()
+    # every filesystem entry extraction will create: explicit members AND the missing parents
+    # _safe_extract_tar makes for them, so deep paths cannot multiply inodes past the cap
+    entries: set[str] = set()
     meta_regular = False
     count = 0
     total = 0
@@ -290,6 +293,12 @@ def vet_tar(fileobj: Any, *, max_members: int, max_total_bytes: int,
                 if norm in seen:
                     raise TarRejected(f"duplicate member: {norm!r}")
                 seen.add(norm)
+                npart = norm.split("/")
+                for i in range(1, len(npart) + 1):
+                    entries.add("/".join(npart[:i]))
+                if len(entries) > max_members:
+                    raise TarRejected(f"more than {max_members} members, counting the "
+                                      "directories extraction creates")
                 if norm == "metadata.json" and m.isfile():
                     meta_regular = True
                     if max_metadata_bytes is not None and m.size > max_metadata_bytes:
