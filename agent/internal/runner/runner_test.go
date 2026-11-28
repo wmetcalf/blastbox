@@ -658,13 +658,16 @@ func TestOversizeOutputFails(t *testing.T) {
 	f.wantFail(t, f.run(), "over max_artifact")
 }
 
-// The control plane's vet_tar counts metadata.json toward max_total_artifacts too: an output
-// whose artifacts fit but whose total with the (final) envelope does not is refused locally.
-func TestTotalCountsTheEnvelope(t *testing.T) {
+// metadata.json has its own cap (max_metadata) and does NOT count toward max_total_artifacts:
+// the control plane's vet_tar, its extractor and the cold trust gate all exclude it. An output
+// whose artifacts fit is delivered however large its envelope (within max_metadata).
+func TestTotalExcludesTheEnvelope(t *testing.T) {
 	f := setup(t, `mkdir -p "$1/art"; head -c 990 /dev/zero > "$1/art/a"; printf '{"pad":"%060d"}' 0 > "$1/metadata.json"`)
 	f.claim.Run.Limits.MaxTotalArtifacts = 1000
 	f.claim.Run.Limits.MaxArtifact = 1000
-	f.wantFail(t, f.run(), "max_total_artifacts")
+	if res := f.run(); res.Outcome != "done" {
+		t.Fatalf("%+v: an output within the artifact total was refused for its envelope", res)
+	}
 }
 
 func TestTooManyArtifactsAndTotalFail(t *testing.T) {

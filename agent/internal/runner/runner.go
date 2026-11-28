@@ -321,15 +321,16 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	if err != nil || fi.Size() > orDef(c.Run.Limits.MaxMetadata, defMaxMetadata) {
 		return j.fail(ctx, "metadata.json over max_metadata")
 	}
-	// The control plane's vet_tar counts every member, the final envelope included.
+	// metadata.json has its own cap above and does not count toward max_total_artifacts: the
+	// control plane's vet_tar, its extractor and the cold trust gate all exclude it.
 	var total int64
 	for rel, n := range files {
 		if rel != metadataName {
 			total += n
 		}
 	}
-	if maxTotal := orDef(c.Run.Limits.MaxTotalArtifacts, defMaxTotalArtifacts); total+fi.Size() > maxTotal {
-		return j.fail(ctx, fmt.Sprintf("output total with metadata.json is over max_total_artifacts (%d)", maxTotal))
+	if maxTotal := orDef(c.Run.Limits.MaxTotalArtifacts, defMaxTotalArtifacts); total > maxTotal {
+		return j.fail(ctx, fmt.Sprintf("artifacts total %d is over max_total_artifacts (%d)", total, maxTotal))
 	}
 	tarPath := filepath.Join(j.dir, ResultTarName)
 	if err := Write(j.out, tarPath); err != nil {
