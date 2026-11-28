@@ -377,8 +377,13 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.Log.Warn("initial session failed; will retry", "err", err.Error())
 	}
 	a.snapshotRecovery()
+	// The startup pass runs before the heartbeat: bound it AS A WHOLE (each report inside it
+	// has its own bound too), so many kept jobs against a slow ingress cannot hold the node
+	// silent for the sum of their bounds. What it does not settle, the background loop does.
 	a.startupPass = true
-	a.recoverJobs(ctx)
+	sctx, scancel := context.WithTimeout(ctx, orDur(a.ReportWait, 2*time.Minute))
+	a.recoverJobs(sctx)
+	scancel()
 	a.startupPass = false
 	for _, es := range a.engines {
 		a.probeEngine(ctx, es, true)

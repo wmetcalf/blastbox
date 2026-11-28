@@ -1745,3 +1745,31 @@ func TestRenewalSyncsTheKeyDirBeforeTheCertRename(t *testing.T) {
 		t.Fatalf("key dir not synced between the key and cert renames: %+v", *ev)
 	}
 }
+
+// The startup pass as a whole is bounded, not each job in it: many kept uploads against a slow
+// ingress must not hold the first heartbeat for the sum of their bounds.
+func TestStartupRecoveryOfManyJobsDoesNotSilenceTheNode(t *testing.T) {
+	e := fresh(t)
+	e.cfg.Claim = false
+	var dirs []string
+	for i := 0; i < 16; i++ {
+		d := jobDir(e, fmt.Sprintf("jm%02d", i), true, true)
+		os.WriteFile(filepath.Join(d, runner.ResultTarName), make([]byte, 1024), 0o600)
+		os.WriteFile(filepath.Join(d, runner.ResultMetaName), []byte(`{"worker_runtime":"seatbelt","started_at_ms":1,"finished_at_ms":2}`), 0o600)
+		os.WriteFile(filepath.Join(d, runner.UploadedName), nil, 0o600)
+		dirs = append(dirs, d)
+	}
+	e.in.putDelay = 1500 * time.Millisecond
+	h := newHarness(e)
+	h.a.ReportWait = 300 * time.Millisecond
+	start := time.Now()
+	h.start(t)
+	eventually(t, "first heartbeat", func() bool {
+		e.in.mu.Lock()
+		defer e.in.mu.Unlock()
+		return len(e.in.hbs) > 0
+	})
+	if waited := time.Since(start); waited > 2*time.Second {
+		t.Fatalf("first heartbeat only after %v: the startup recovery pass held it", waited)
+	}
+}
