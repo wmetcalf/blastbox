@@ -140,6 +140,9 @@ func TestClassifyDialError(t *testing.T) {
 		{"ctxdeadline", fmt.Errorf("x: %w", context.DeadlineExceeded), []string{"timed out"}},
 		{"tls", fmt.Errorf("%w: boom", wire.ErrTLS), []string{"TLS"}},
 		{"tls-x509", x509.UnknownAuthorityError{}, []string{"TLS"}},
+		// The ingress refused the NODE's certificate: point at renew/enrol, not at ca_file.
+		{"client-cert-refused", fmt.Errorf("%w: %w: remote error", wire.ErrTLS, wire.ErrClientCertRefused),
+			[]string{"refused this node's certificate", "blastbox-agent renew", "enrol"}},
 		{"dns", &net.OpError{Op: "dial", Err: &net.DNSError{Err: "no such host", Name: "ingress.example"}}, []string{"DNS"}},
 		{"other", errors.New("weird"), []string{"unclassified"}},
 	}

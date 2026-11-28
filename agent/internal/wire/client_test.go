@@ -978,7 +978,7 @@ func TestClientCertRejectedByIngressIsTLS(t *testing.T) {
 		ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool}
 	f.srv.StartTLS()
 	err := newClient(t, f, ca).Session(context.Background())
-	if !errors.Is(err, ErrTLS) || errors.Is(err, ErrServer) {
+	if !errors.Is(err, ErrTLS) || !errors.Is(err, ErrClientCertRefused) || errors.Is(err, ErrServer) {
 		t.Fatalf("client cert refused by the ingress: %v", err)
 	}
 }

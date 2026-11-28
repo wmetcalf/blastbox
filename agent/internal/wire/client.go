@@ -38,6 +38,9 @@ var (
 	// ErrTLS is a certificate or verification failure (wrong CA, SAN mismatch): permanent until
 	// an operator intervenes, so callers back off long.
 	ErrTLS = errors.New("wire: TLS verification failed")
+	// ErrClientCertRefused (always with ErrTLS) is the ingress refusing the node's own client
+	// certificate (expired, revoked, another CA): renew or re-enrol, not a CA-file problem.
+	ErrClientCertRefused = errors.New("wire: the ingress refused the node certificate")
 )
 
 // DispositionAbsent is what Disposition returns when the control plane has no such job.
@@ -358,8 +361,11 @@ func (c *Client) send(ctx context.Context, s reqSpec, token string) (*resp, erro
 		var ua x509.UnknownAuthorityError
 		var he x509.HostnameError
 		var ci x509.CertificateInvalidError
-		if errors.As(err, &cve) || errors.As(err, &ua) || errors.As(err, &he) || errors.As(err, &ci) ||
-			remoteCertAlert(err) {
+		if remoteCertAlert(err) {
+			c.contact(fmt.Errorf("%w: %w: %w", ErrTLS, ErrClientCertRefused, scrub(err)))
+			return nil, fmt.Errorf("%w: %w: %v", ErrTLS, ErrClientCertRefused, scrub(err))
+		}
+		if errors.As(err, &cve) || errors.As(err, &ua) || errors.As(err, &he) || errors.As(err, &ci) {
 			c.contact(fmt.Errorf("%w: %w", ErrTLS, scrub(err)))
 			return nil, fmt.Errorf("%w: %v", ErrTLS, scrub(err))
 		}
@@ -447,7 +453,6 @@ func detail(r *resp) string {
 	return ""
 }
 
-// statusErr maps a non-success status. claimed means the caller held the claim, so 403 = lost.
 // certAlerts are the TLS alerts an ingress sends when it refuses the node's client certificate
 // (Go's spelling of each alert). Like a client-side verification failure they need an operator
 // (renew or re-enrol), so they are ErrTLS rather than a retryable network error.
@@ -486,6 +491,7 @@ func retryAfter(v string) time.Duration {
 	return min(time.Duration(n)*time.Second, maxRetryAfter)
 }
 
+// statusErr maps a non-success status. claimed means the caller held the claim, so 403 = lost.
 func statusErr(r *resp, claimed bool) error {
 	code := r.StatusCode
 	switch {

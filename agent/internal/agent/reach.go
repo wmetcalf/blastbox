@@ -77,6 +77,8 @@ func classifyReach(err error, hostPort string) string {
 	var dns *net.DNSError
 	var ne net.Error
 	switch {
+	case errors.Is(err, wire.ErrClientCertRefused):
+		return fmt.Sprintf("the ingress %s refused this node's certificate (expired, revoked or not issued by its CA): run `blastbox-agent renew` while it is valid, else `blastbox-agent enrol`", hostPort)
 	case errors.Is(err, wire.ErrTLS) || errors.As(err, &ua) || errors.As(err, &he) || errors.As(err, &ci):
 		return fmt.Sprintf("TLS verification failed for %s (check ca_file and the ingress certificate)", hostPort)
 	case errors.Is(err, syscall.EADDRNOTAVAIL):
