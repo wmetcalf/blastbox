@@ -1499,3 +1499,31 @@ func TestRunningAgentAdoptsAPairInstalledUnderIt(t *testing.T) {
 		return e.in.sessions[len(e.in.sessions)-1] == string(newCert)
 	})
 }
+
+// Whichever path re-handshakes with a new pair (the renewal loop, or a 401's resession), the
+// heartbeat's cert_not_after follows the cert the client actually uses.
+func TestResessionWithANewPairUpdatesTheReportedExpiry(t *testing.T) {
+	e := newEnv(t, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	a := newHarness(e).a
+	ctx := context.Background()
+	if err := a.startup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	nk, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	na := time.Now().Add(7 * 24 * time.Hour).Truncate(time.Second)
+	newCert := e.ca.issueNode(t, "node-a", &nk.PublicKey, time.Now().Add(-time.Minute), na)
+	os.Remove(e.cfg.KeyFile)
+	if err := writeKeyExcl(e.cfg.KeyFile, nk); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(e.cfg.CertFile, newCert, 0o644)
+	if err := a.resession(ctx); err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	got := a.notAfter
+	a.mu.Unlock()
+	if !got.Equal(na) {
+		t.Fatalf("reported expiry %v after adopting a cert that expires %v", got, na)
+	}
+}

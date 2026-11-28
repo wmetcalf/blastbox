@@ -354,7 +354,9 @@ func (a *Agent) resession(ctx context.Context) error {
 	}
 	a.mu.Lock()
 	a.cl = cl
-	a.certInUse = certPEM
+	if _, c, err := certPub(certPEM); err == nil {
+		a.certInUse, a.notAfter = certPEM, c.NotAfter
+	}
 	a.mu.Unlock()
 	return nil
 }
@@ -606,15 +608,10 @@ func (a *Agent) pairReplaced() bool {
 }
 
 func (a *Agent) afterInstall(ctx context.Context) {
+	// resession records the new cert's expiry only once the client really uses it; a failed
+	// re-handshake leaves the old one (and pairReplaced retries next pass).
 	if err := a.resession(ctx); err != nil {
 		a.Log.Error("re-handshake with the new certificate failed", "err", err.Error())
-	}
-	if raw, err := os.ReadFile(a.Cfg.CertFile); err == nil {
-		if _, c, err := certPub(raw); err == nil {
-			a.mu.Lock()
-			a.notAfter = c.NotAfter
-			a.mu.Unlock()
-		}
 	}
 }
 
