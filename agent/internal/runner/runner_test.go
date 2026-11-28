@@ -49,10 +49,13 @@ type ingress struct {
 	putStatus    int    // 0 = 200
 	putBody      string
 	putDelay     time.Duration // how long the PUT takes to answer
-	dispStatus   string        // disposition answer; "" = done
-	updStatus    int           // status for POST /v1/nodes/jobs/<id>; 0 = 200
-	state        string        // the fixture's state dir (for markers seen mid-run)
-	reportedSeen bool          // the "reported" marker existed when disposition was polled
+	putSeq       []int         // statuses for the first PUTs, before putStatus applies
+	retryAfter   string        // Retry-After on a 503
+	putTimes     []time.Time
+	dispStatus   string // disposition answer; "" = done
+	updStatus    int    // status for POST /v1/nodes/jobs/<id>; 0 = 200
+	state        string // the fixture's state dir (for markers seen mid-run)
+	reportedSeen bool   // the "reported" marker existed when disposition was polled
 
 	inputGets int
 	puts      int
@@ -127,9 +130,17 @@ func (in *ingress) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "PUT" && r.URL.Path == jp+"/result":
 		in.puts++
 		in.putTar = body
+		in.putTimes = append(in.putTimes, time.Now())
 		time.Sleep(in.putDelay)
-		switch in.putStatus {
+		status := in.putStatus
+		if len(in.putSeq) > 0 {
+			status, in.putSeq = in.putSeq[0], in.putSeq[1:]
+		}
+		switch status {
 		case 503:
+			if in.retryAfter != "" {
+				w.Header().Set("Retry-After", in.retryAfter)
+			}
 			w.WriteHeader(503)
 		case 409:
 			w.WriteHeader(409)
@@ -375,6 +386,24 @@ func TestUndeliveredUploadIsKeptForRecovery(t *testing.T) {
 		if _, err := os.Lstat(filepath.Join(d, n)); err != nil {
 			t.Fatalf("%s gone: %v", n, err)
 		}
+	}
+}
+
+// A 503 {"status":"retry"} with Retry-After (the control plane is out of disk or another upload
+// holds the job) is honoured: re-sending the whole tar after 2 s would land the retry storm
+// exactly when the host is out of resources.
+func TestUploadRetryHonoursRetryAfter(t *testing.T) {
+	f := setup(t, happyEngine)
+	f.in.putSeq = []int{503}
+	f.in.retryAfter = "1"
+	if res := f.run(); res.Outcome != "done" {
+		t.Fatalf("%+v", res)
+	}
+	if len(f.in.putTimes) != 2 {
+		t.Fatalf("%d PUTs", len(f.in.putTimes))
+	}
+	if gap := f.in.putTimes[1].Sub(f.in.putTimes[0]); gap < 900*time.Millisecond {
+		t.Fatalf("re-sent after %v despite Retry-After: 1", gap)
 	}
 }
 

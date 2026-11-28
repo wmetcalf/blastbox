@@ -462,6 +462,30 @@ func remoteCertAlert(err error) bool {
 	return errors.As(err, &oe) && oe.Op == "remote error" && oe.Err != nil && certAlerts[oe.Err.Error()]
 }
 
+// maxRetryAfter caps a server's Retry-After: it paces a retry, never parks one.
+const maxRetryAfter = 5 * time.Minute
+
+// RetryAfterError is a retryable answer (it wraps ErrServer) that named how long to wait.
+type RetryAfterError struct {
+	Err   error
+	After time.Duration
+}
+
+func (e *RetryAfterError) Error() string {
+	return fmt.Sprintf("%v (retry after %v)", e.Err, e.After)
+}
+
+func (e *RetryAfterError) Unwrap() error { return e.Err }
+
+// retryAfter parses a delay-seconds Retry-After (the only form the control plane sends).
+func retryAfter(v string) time.Duration {
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return min(time.Duration(n)*time.Second, maxRetryAfter)
+}
+
 func statusErr(r *resp, claimed bool) error {
 	code := r.StatusCode
 	switch {
@@ -472,7 +496,11 @@ func statusErr(r *resp, claimed bool) error {
 	case code == http.StatusNotFound:
 		return ErrNotFound
 	case code >= 500, code == http.StatusRequestTimeout, code == http.StatusTooManyRequests:
-		return fmt.Errorf("%w: HTTP %d", ErrServer, code)
+		err := fmt.Errorf("%w: HTTP %d", ErrServer, code)
+		if d := retryAfter(r.Header.Get("Retry-After")); d > 0 {
+			return &RetryAfterError{Err: err, After: d}
+		}
+		return err
 	default:
 		return fmt.Errorf("%w: HTTP %d: %s", ErrRejected, code, detail(r))
 	}

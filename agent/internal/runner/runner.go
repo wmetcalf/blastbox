@@ -911,8 +911,13 @@ func (r *Runner) retry(ctx context.Context, f func() error) error {
 			return err
 		}
 		if i < tries-1 {
+			wait := delay
+			var ra *wire.RetryAfterError
+			if errors.As(err, &ra) && ra.After > wait {
+				wait = ra.After // the control plane said how long it needs
+			}
 			select {
-			case <-time.After(delay):
+			case <-time.After(wait):
 				delay *= 2
 			case <-ctx.Done():
 				return err
