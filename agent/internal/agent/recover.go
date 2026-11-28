@@ -7,15 +7,12 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"regexp"
 	"time"
 
 	"github.com/wmetcalf/blastbox/agent/internal/runner"
 	"github.com/wmetcalf/blastbox/agent/internal/sandbox"
 	"github.com/wmetcalf/blastbox/agent/internal/wire"
 )
-
-var recJobIDRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
 
 // wipeDir removes a job dir whatever modes the engine left behind.
 func wipeDir(dir string) {
@@ -168,7 +165,7 @@ func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool)
 		Receipt string `json:"receipt"`
 		Claimed int64  `json:"claimed_at_ms"`
 	}
-	if err != nil || json.Unmarshal(raw, &cj) != nil || cj.JobID != name || !recJobIDRE.MatchString(cj.JobID) ||
+	if err != nil || json.Unmarshal(raw, &cj) != nil || cj.JobID != name || !wire.ValidJobID(cj.JobID) ||
 		cj.ClaimID == "" || cj.Receipt == "" {
 		a.Log.Warn("recovery: job dir without a usable claim record; wiping", "job", name, "started", started)
 		wipeDir(dir)

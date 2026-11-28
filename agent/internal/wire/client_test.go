@@ -982,3 +982,18 @@ func TestClientCertRejectedByIngressIsTLS(t *testing.T) {
 		t.Fatalf("client cert refused by the ingress: %v", err)
 	}
 }
+
+// "." and ".." match the id character set but are path components: /v1/nodes/jobs/.. is
+// /v1/nodes/, and the job dir jobs/.. is the state dir itself (which a refused claim wipes).
+func TestJobIDRefusesDotComponents(t *testing.T) {
+	for _, id := range []string{".", "..", "...", "a..b", "j-1.2"} {
+		_, err := jobPath(id, "/result")
+		want := id == "." || id == ".."
+		if (err != nil) != want {
+			t.Errorf("jobPath(%q): err=%v, want refused=%v", id, err, want)
+		}
+		if ValidJobID(id) == want {
+			t.Errorf("ValidJobID(%q) = %v", id, !want)
+		}
+	}
+}

@@ -63,6 +63,10 @@ const (
 
 var jobIDRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
 
+// ValidJobID reports whether id is safe as a URL path segment and a job dir name: the id
+// character set, and never the "." or ".." path components.
+func ValidJobID(id string) bool { return jobIDRE.MatchString(id) && id != "." && id != ".." }
+
 // Limits mirrors the claim's run.limits.
 type Limits struct {
 	MaxInput          int64 `json:"max_input"`
@@ -622,7 +626,7 @@ func jsonBody(v any) (func() (io.ReadCloser, int64, error), error) {
 }
 
 func jobPath(id, suffix string) (string, error) {
-	if !jobIDRE.MatchString(id) {
+	if !ValidJobID(id) {
 		return "", errors.New("wire: invalid job id")
 	}
 	return "/v1/nodes/jobs/" + id + suffix, nil
@@ -672,7 +676,7 @@ func (c *Client) Claim(ctx context.Context, engine string, exclude []string) (*C
 		JobID   string `json:"job_id"`
 		ClaimID string `json:"claim_id"`
 	}
-	if err := json.Unmarshal(out.Job, &j); err != nil || !jobIDRE.MatchString(j.JobID) ||
+	if err := json.Unmarshal(out.Job, &j); err != nil || !ValidJobID(j.JobID) ||
 		j.ClaimID == "" || out.Receipt == "" {
 		return nil, fmt.Errorf("%w: incomplete claim", ErrServer)
 	}
