@@ -878,7 +878,8 @@ Three things an operator must know:
   scp /var/lib/blastbox/pki/node-toolz3.crt ingress-2:/var/lib/blastbox/pki/   # every replica
   ```
 
-  The public certificate only — never the key. Renewals must be copied the same way.
+  The public certificate only — never the key. A manual re-issue must be copied the same way;
+  an online renewal is published to every ingress by `renew-pending --node-dir` (below).
 * **`BLASTBOX_API_KEY` does not apply to these routes, by design.** They authenticate with a
   CA-issued certificate and a session bound to it — stronger than the key, and orthogonal to
   it. Requiring the key too would put the *submitter's* credential on every node, letting
@@ -907,6 +908,83 @@ takes the identity and key from the payload, so registering a peer is a signatur
 rather than trust in a string an operator retyped. Grants default to **nothing**, so a cert
 issued without them produces an idle node rather than an unrestricted one, and revocation is
 "stop renewing" — which is why the default lifetime is a week.
+
+**Node certificate renewal.** A node holding a valid session renews online: it POSTs a fresh
+CSR to `/v1/nodes/renew` (202), then polls `GET /v1/nodes/cert` for the new certificate. The
+session is a bearer token, so it is not what authorises a new key: the request also carries the
+node's **current** certificate and a proof of possession of its key, `{csr_pem, cert_pem,
+issued_at, signature}`, where `signature` is base64 DER ECDSA-P256-SHA256 by that certificate's
+key over `blastbox/node-renew/v1 \0 <node_id> \0 sha256hex(csr_pem) \0 <issued_at>`
+(`conformance/v1/renew_proof.json`). The ingress requires the certificate to verify, to name the
+session's node, to carry the key of one of the node's CURRENT certificates (revocation is
+deletion, so an older certificate stays CA-valid until it expires; after a revoke and re-enrol the
+old key must not renew), the signature to verify, and `issued_at` within 300 s of its clock (403 for an
+identity failure, 400 otherwise). The CA host checks all of it **again against its own CA**, with
+`issued_at` within 24 h, before signing: the queue sits in the ingress's dir, and a copy of a
+node's certificate is not its key. A queue entry from before this change (a bare CSR) is refused.
+
+What a client must do (the Go agent follows this): `issued_at` is integer **unix seconds** from a
+clock within 300 s of the ingress's (an NTP-synced node; a 400 naming `issued_at` means the clock
+is off). Keep the **old key and the pending key** until `GET /v1/nodes/cert` serves a certificate
+whose public key is the pending one, then swap atomically. A retry resends the **same** CSR (the
+queue is newest-wins) and always polls `/cert` first: once the timer has published the renewal,
+the old certificate's key is no longer current, so a renewal proven with it is a 403. A 403 after
+a renewal was queued therefore means "fetch `/cert` and adopt it if it matches the pending key",
+not "not granted". The
+ingress has no CA key, so it only validates and queues the CSR under `<pki>/renew/` (one JSON file
+per node: CSR up to 8 KiB, the whole entry up to 64 KiB). On the CA host, `blastbox-pki-renew.timer` (every 5 min) runs
+`blastbox pki renew-pending`, which signs each queued CSR with the grants of the node's
+**current** certificate and replaces that certificate file in place. A node whose certificate
+was removed or has expired is never renewed: that is still the revocation path. Install with
+`cp deploy/systemd/blastbox-pki-renew.* /etc/systemd/system/ && systemctl enable --now
+blastbox-pki-renew.timer` on the CA host only. The unit passes `--dir /var/lib/blastbox/pki`;
+edit it if your PKI dir differs.
+
+When the ingress is **not** the CA host, the queue and the certificates the ingress authorises
+with live in the ingress's PKI dir, so the CA host must reach it. Make each ingress host's PKI
+dir reachable on the CA host (an sshfs or NFS mount, CA host as the client, so the ingress never
+sees `ca.key`) and add one `--node-dir <mount>` per ingress to the unit's `ExecStart`.
+`renew-pending` then drains every queue (`--dir`'s own included) and treats the node's
+certificates in ALL of those dirs as its current state: the renewed certificate carries the
+**intersection** of their grants and the WireGuard key (or none) of the most recently issued of
+them, and replaces the node's certificates in every dir where it still verifies, so an
+ingress that narrowed a node is never widened by a renewal queued through another. A dir where
+it was revoked is left alone. The proof's key must be current in EVERY dir where the node
+verifies, not just the one that queued it: one ingress's copy of a certificate (say, an old one
+restored after a revoke and re-enrol) is not evidence for the others. A renewal whose key is
+current where it was queued but not in another dir is deferred, naming that dir. While a renewal
+is published to some dirs but not yet all, the CA host links its old and new key in its own
+`--dir` (`.renew-publishing/<node>.json`, at most 24 h; removed once published everywhere and by
+`revoke-node`) so the retry can finish. Every certificate is verified against the CA host's own CA, never
+a node dir's `ca.crt`, and reads from a node dir are bounded and never block on a FIFO: the dir is
+the ingress's to write.
+
+**PKI and node dirs must contain regular files; links are refused.** Renewal never follows a
+link. A dir with any `*.crt` entry that is not a regular file (a symlink, FIFO, directory...) is
+reported by name, no cert entry in it is followed and no cert is written there: the renewal of
+every node it holds in a regular file (or that it queued) is deferred, and the run exits 2, until
+an operator replaces the links with regular files. (Its queue is still drained the usual way, so a
+stale or invalid entry there is refused as anywhere else.) The ingress likewise answers `/v1/nodes/renew` and
+`/v1/nodes/cert` with 503 while its PKI dir holds one, and `revoke-node` revokes the node's
+regular certificates there without following the links and reports the dir (exit 1). A queue that cannot be read mid-run is reported and
+skipped; the rest still run. A symlinked queued CSR is refused. A run that cannot lock every dir within two minutes, or finds a node dir without `ca.crt`
+(an unmounted mountpoint), renews nothing and exits 1; a write that fails mid-way keeps the CSR, and the next run redoes it. Without
+`--node-dir` a split deployment's renewals are never seen: the node gets 202 and its old
+certificate until it expires.
+
+**Revoke with `blastbox pki revoke-node --node-id <id> [--node-dir …]`.** It deletes the node's
+certificates and any queued renewal from every dir under the same lock `renew-pending` holds, so a
+renewal in flight cannot write a certificate back. A held lock does not block it: such a dir is
+revoked at once anyway and then again once the lock comes (a renewal that held it may have just
+written the certificate back). A dir it cannot reach, a lock that never comes, a file too large to
+check are NOT revoked but reported. In a dir holding any non-regular `*.crt` entry (links are
+refused, `ca.crt` included) the node's regular certificates and queued renewal ARE removed, the
+links are not followed or touched, and the dir is reported: check the links by hand, since one may
+still hold the node.
+It exits 1 unless every dir was fully revoked.
+`renew-pending` exits 2 when any renewal was deferred, so a fault that repeats every run (a
+read-only mount) turns the timer unit red instead of letting the node's certificate run out. Deleting the file by hand still revokes, but
+can race a renewal that is signing at that moment.
 
 `--name`/`--public-key` still work for nodes not yet enrolled, and say plainly that the key
 is unauthenticated. The certificate's node-info extension uses a **placeholder OID arc that

@@ -1,0 +1,14 @@
+# blastbox-pki-renew.timer — sign queued node-cert renewals every five minutes.
+# A node renews well before expiry, so five minutes of queue latency is harmless.
+
+[Unit]
+Description=periodically sign queued blastbox node-certificate renewals
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=10s
+Unit=blastbox-pki-renew.service
+
+[Install]
+WantedBy=timers.target

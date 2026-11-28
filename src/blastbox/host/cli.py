@@ -1510,6 +1510,55 @@ def _pki_cmd(args: argparse.Namespace) -> int:
             f"  ca.key  (issuing key -- keep on issuing hosts only, 0600)      : {pki_dir / 'ca.key'}"
         )
         return 0
+    if args.pki_action == "revoke-node":
+        from blastbox.host.node_renew import revoke
+        from blastbox.host.node_renew import PartialRevoke
+        try:
+            removed = revoke(pki_dir, args.node_id,
+                             node_dirs=[Path(p) for p in args.node_dir] or None)
+        except PartialRevoke as exc:         # the rest WAS revoked; say what was not
+            for path in exc.removed:
+                print(f"removed {path}")
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except (OSError, ValueError) as exc:   # bad id, unreadable CA
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        for path in removed:
+            print(f"removed {path}")
+        if not removed:
+            print(f"error: no certificate for {args.node_id} found; nothing revoked",
+                  file=sys.stderr)
+            return 1
+        return 0
+    if args.pki_action == "renew-pending":
+        from blastbox.host.node_renew import sign_pending
+        from blastbox.host.pki import load_ca
+        try:
+            ca = load_ca(pki_dir)
+        except Exception as exc:  # noqa: BLE001 - no CA key here is an operator error
+            print(f"error: cannot load the CA (this needs the CA key): {exc}", file=sys.stderr)
+            return 1
+        try:
+            outcomes = sign_pending(ca, pki_dir, days=args.days,
+                                    node_dirs=[Path(p) for p in args.node_dir] or None)
+        except (ValueError, OSError) as exc:   # bad --days / unreachable node dir: nothing touched
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        for node_id, outcome in outcomes:
+            print(f"{node_id}: {outcome}")
+        # A deferral repeats every run until someone fixes its cause; exit 2 so the timer
+        # unit shows it, instead of staying green while the node's cert runs out.
+        return 2 if any(o.startswith("deferred") for _, o in outcomes) else 0
+    if args.pki_action == "sign-node-csr":
+        # LOAD, never generate: a mistyped --dir must not mint a rogue CA and sign with it.
+        from blastbox.host.pki import load_ca
+        try:
+            load_ca(pki_dir)
+        except Exception as exc:  # noqa: BLE001 - no CA here is an operator error
+            print(f"error: cannot load the CA from {pki_dir} (this needs the CA key): {exc}",
+                  file=sys.stderr)
+            return 1
     ca = ensure_ca(pki_dir)  # generate-or-load the CA
     if args.pki_action == "init":
         crt, key = ca.issue_client("dispatcher", days=args.days).write(
@@ -1544,8 +1593,12 @@ def _pki_cmd(args: argparse.Namespace) -> int:
         from blastbox.host.pki import NodeGrants
         grants = NodeGrants(engines=tuple(args.engine), tiers=tuple(args.tier),
                             credentials=bool(args.credentials))
-        issued = ca.issue_node(args.node_id, wg_pubkey=args.wg_pubkey,
-                               grants=grants, days=args.days)
+        try:
+            issued = ca.issue_node(args.node_id, wg_pubkey=args.wg_pubkey,
+                                   grants=grants, days=args.days)
+        except ValueError as exc:     # bad id, bad wg key, lifetime outside 1..30 days
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
         if args.out:
             # `write` appends the suffixes, so an --out the operator spelled with one
             # produced toolz3.crt.crt and toolz3.crt.key — findable only by looking.
@@ -1557,13 +1610,53 @@ def _pki_cmd(args: argparse.Namespace) -> int:
             crt, key = issued.write(pki_dir, f"node-{args.node_id}")
         print(f"node cert for {args.node_id} ({args.days}d) -> {crt} / {key}")
         print(f"  {key} is a PRIVATE KEY (0600). Renewal is this same command with the "
-              f"same --node-id and --wg-pubkey, then `egress peer-add --cert {crt}`; at "
+              f"same --node-id (and the same --wg-pubkey, if it has one); a node on the "
+              f"overlay then needs `egress peer-add --cert {crt}`; at "
               f"{args.days}d it is a recurring step, not a one-off enrolment.")
         if not grants.engines and not grants.tiers:
             # Fail-closed defaults are correct but silently useless; say so once here
             # rather than let an operator debug an idle node.
             print("  NOTE: no --engine/--tier granted, so this node is authorised for "
                   "nothing. Reissue with grants when you want it to take work.")
+        print(f"  grants: engines={list(grants.engines)} tiers={list(grants.tiers)} "
+              f"credentials={grants.credentials}")
+        return 0
+    if args.pki_action == "sign-node-csr":
+        from cryptography import x509 as _x509
+
+        from blastbox.host.pki import NodeGrants
+        grants = NodeGrants(engines=tuple(args.engine), tiers=tuple(args.tier),
+                            credentials=bool(args.credentials))
+        try:
+            cert_pem = ca.sign_node_csr(Path(args.csr).read_bytes(), node_id=args.node_id,
+                                        grants=grants, days=args.days)
+            out = Path(args.out) if args.out else pki_dir / f"node-{args.node_id}.crt"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            existed = out.exists()
+            tmp = out.with_name(out.name + f".{os.getpid()}.tmp")
+            try:
+                for attempt in (0, 1):
+                    try:
+                        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                        break
+                    except FileExistsError:
+                        if attempt:
+                            raise
+                        tmp.unlink(missing_ok=True)   # stale, from a pid collision
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(cert_pem)
+                os.chmod(tmp, 0o644)
+                os.replace(tmp, out)
+            finally:
+                tmp.unlink(missing_ok=True)
+        except (OSError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        if existed:
+            print(f"replaced existing {out}", file=sys.stderr)
+        not_after = _x509.load_pem_x509_certificate(cert_pem).not_valid_after_utc
+        print(f"node cert for {args.node_id} -> {out}")
+        print(f"  not_after: {not_after.isoformat()}")
         print(f"  grants: engines={list(grants.engines)} tiers={list(grants.tiers)} "
               f"credentials={grants.credentials}")
         return 0
@@ -1576,6 +1669,7 @@ def _pki_cmd(args: argparse.Namespace) -> int:
             return 1
         print(json.dumps({
             "node_id": ident.node_id, "wg_pubkey": ident.wg_pubkey,
+            "info_version": ident.info_version,
             "engines": list(ident.grants.engines), "tiers": list(ident.grants.tiers),
             "credentials": ident.grants.credentials,
             "not_after": ident.not_after.isoformat(), "expired": ident.expired,
@@ -1804,6 +1898,27 @@ def _egress_cmd(args: argparse.Namespace) -> int:
         return 1
 
 
+def _wg_key_to_node(ca, pki_dir: Path) -> dict[str, str]:
+    """WireGuard key -> node id from the valid node certs in ``pki_dir``.
+
+    Every cert in the directory, not just `node-*.crt`. `pki issue-node --out` lets an
+    operator name the file anything; globbing a prefix silently ignored those, and their
+    node then read as an UNAUTHORISED peer — a false accusation produced by a filename
+    convention. node_identity() is the filter: a transport cert simply fails it. A v2
+    cert with no WireGuard key has nothing to map and is skipped.
+    """
+    from blastbox.host.pki import node_identity
+    out: dict[str, str] = {}
+    for crt in sorted(pki_dir.glob("*.crt")):
+        try:
+            ident = node_identity(ca, crt.read_bytes())
+        except ValueError:
+            continue          # expired or invalid: it authorises nothing
+        if ident.wg_pubkey is not None:
+            out[ident.wg_pubkey] = ident.node_id
+    return out
+
+
 def _egress_cmd_inner(args: argparse.Namespace) -> int:
     """Node egress setup: bridges, exit mode, overlay transport.
 
@@ -1913,6 +2028,11 @@ def _egress_cmd_inner(args: argparse.Namespace) -> int:
             # decision, which is the habit this whole change exists to break.
             overlay_tiers = tuple(t for t in ("openvpn", "wireguard")
                                   if ident.grants.allows_tier(t))
+            if ident.wg_pubkey is None:
+                print(f"error: {ident.node_id}'s certificate carries no WireGuard public "
+                      f"key (node-info v2), so it cannot be added as an overlay peer.",
+                      file=sys.stderr)
+                return 1
             if not overlay_tiers and not args.force:
                 print(f"error: {ident.node_id} is not granted an overlay tier "
                       f"(has: {list(ident.grants.tiers) or 'none'}). Reissue with "
@@ -1952,24 +2072,13 @@ def _egress_cmd_inner(args: argparse.Namespace) -> int:
         # The public half only: attestation VERIFIES, and this runs on the exit host,
         # which is the last machine that should hold the key that mints node identities.
         from blastbox.host.pki import load_trust_anchor, node_identity
-        key_to_node: dict[str, str] = {}
         pki_dir = Path(args.pki_dir)
         try:
             ca = load_trust_anchor(pki_dir)
         except Exception as exc:
             print(f"error: cannot load the CA from {pki_dir}: {exc}", file=sys.stderr)
             return 1
-        # Every cert in the directory, not just `node-*.crt`. `pki issue-node --out`
-        # lets an operator name the file anything; globbing a prefix silently ignored
-        # those, and their node then read as an UNAUTHORISED peer — a false accusation
-        # produced by a filename convention. node_identity() is the filter: a transport
-        # cert simply fails it.
-        for crt in sorted(pki_dir.glob("*.crt")):
-            try:
-                ident = node_identity(ca, crt.read_bytes())
-            except ValueError:
-                continue          # expired or invalid: it authorises nothing
-            key_to_node[ident.wg_pubkey] = ident.node_id
+        key_to_node = _wg_key_to_node(ca, pki_dir)
         working = {n: True for n in args.working}
         if not working:
             # FAIL-OPEN, and say so. With no working set, nothing can be contradicted:
@@ -2119,11 +2228,12 @@ def build_parser() -> argparse.ArgumentParser:
     pk_csr.add_argument("--days", type=int, default=30)
     pk_node = pks.add_parser(
         "issue-node",
-        help="mint a NODE cert: identity + its WireGuard key + its grants")
+        help="mint a NODE cert: identity + its grants (+ its WireGuard key, optional)")
     pk_node.add_argument("--node-id", required=True,
                          help="the machine's identity (lowercase, 1-63 chars)")
-    pk_node.add_argument("--wg-pubkey", required=True,
-                         help="the node's WireGuard PUBLIC key (printed by `egress peer`)")
+    pk_node.add_argument("--wg-pubkey", default=None,
+                         help="the node's WireGuard PUBLIC key (printed by `egress peer`); "
+                              "omit for a node that never joins the overlay (v2 cert)")
     pk_node.add_argument("--engine", action="append", default=[],
                          help="engine this node may be assigned (repeatable; default none)")
     pk_node.add_argument("--tier", action="append", default=[],
@@ -2139,6 +2249,38 @@ def build_parser() -> argparse.ArgumentParser:
              "stripped, so --out /tmp/toolz3.crt writes /tmp/toolz3.crt and .key rather "
              "than toolz3.crt.crt. Default: <pki-dir>/node-<node-id>.{crt,key} — this "
              "command ALWAYS writes a private key to disk, it never prints to stdout")
+    pk_sc = pks.add_parser(
+        "sign-node-csr",
+        help="sign a node-generated CSR into a node cert (the key never leaves the node)")
+    pk_sc.add_argument("--csr", required=True, help="path to the node's CSR PEM")
+    pk_sc.add_argument("--node-id", required=True,
+                       help="must equal the CSR common name")
+    pk_sc.add_argument("--engine", action="append", default=[],
+                       help="engine this node may be assigned (repeatable)")
+    pk_sc.add_argument("--tier", action="append", default=[],
+                       help="netpolicy tier this node may be assigned (repeatable)")
+    pk_sc.add_argument("--credentials", action="store_true",
+                       help="this node may hold provider credentials")
+    pk_sc.add_argument("--days", type=int, default=7)
+    pk_sc.add_argument("--out", default=None,
+                       help="cert path to write (default: <pki-dir>/node-<node-id>.crt)")
+    pk_rp = pks.add_parser(
+        "renew-pending",
+        help="sign the CSRs nodes queued through POST /v1/nodes/renew, with the grants of "
+             "each node's CURRENT cert (CA host only; run from a timer)")
+    pk_rp.add_argument("--days", type=int, default=7)
+    pk_rp.add_argument(
+        "--node-dir", action="append", default=[],
+        help="an ingress host's PKI dir, reachable here (repeatable): drain its renew/ "
+             "queue and write renewed certs to every node dir where the node still "
+             "verifies. --dir is always included")
+    pk_rv = pks.add_parser(
+        "revoke-node",
+        help="revoke a node: delete its certs and queued renewal CSRs from --dir and every "
+             "--node-dir, under the renewal lock so an in-flight renewal cannot undo it")
+    pk_rv.add_argument("--node-id", required=True)
+    pk_rv.add_argument("--node-dir", action="append", default=[],
+                       help="an ingress host's PKI dir, reachable here (repeatable)")
     pk_ns = pks.add_parser(
         "node-status",
         help="what THIS node's environment resolves to: is the grants gate armed, does "

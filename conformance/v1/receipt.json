@@ -1,0 +1,81 @@
+{
+  "check": [
+    {
+      "claim_id": "claim-a",
+      "job_id": "job-1",
+      "node_id": "mac-mini-1",
+      "receipt": "7c31be33f0a36c9879b8a8b5d2494165e5e96e8adbdfff07200ebeea647996bb",
+      "verdict": "ok"
+    },
+    {
+      "claim_id": "claim-a",
+      "job_id": "job-2",
+      "node_id": "mac-mini-1",
+      "receipt": "7c31be33f0a36c9879b8a8b5d2494165e5e96e8adbdfff07200ebeea647996bb",
+      "verdict": "refused"
+    },
+    {
+      "claim_id": "claim-b",
+      "job_id": "job-1",
+      "node_id": "mac-mini-1",
+      "receipt": "7c31be33f0a36c9879b8a8b5d2494165e5e96e8adbdfff07200ebeea647996bb",
+      "verdict": "refused"
+    },
+    {
+      "claim_id": "claim-a",
+      "job_id": "job-1",
+      "node_id": "other-node",
+      "receipt": "7c31be33f0a36c9879b8a8b5d2494165e5e96e8adbdfff07200ebeea647996bb",
+      "verdict": "refused"
+    },
+    {
+      "claim_id": "claim-a",
+      "job_id": "job-1",
+      "node_id": "mac-mini-1",
+      "receipt": "7C31BE33F0A36C9879B8A8B5D2494165E5E96E8ADBDFFF07200EBEEA647996BB",
+      "verdict": "refused"
+    },
+    {
+      "claim_id": "claim-a",
+      "job_id": "job-1",
+      "node_id": "mac-mini-1",
+      "receipt": "",
+      "verdict": "refused"
+    },
+    {
+      "claim_id": "claim-a",
+      "job_id": "job-1",
+      "node_id": "mac-mini-1",
+      "receipt": "\u00e9",
+      "verdict": "refused"
+    },
+    {
+      "claim_id": "claim-a",
+      "job_id": "job-1",
+      "node_id": "mac-mini-1",
+      "receipt": "9c677a7d482c409e6aaa927829a7de93506c508426fee502717ce92ab55fc1b4",
+      "verdict": "refused"
+    }
+  ],
+  "issue": [
+    {
+      "claim_id": "claim-a",
+      "job_id": "job-1",
+      "node_id": "mac-mini-1",
+      "receipt": "7c31be33f0a36c9879b8a8b5d2494165e5e96e8adbdfff07200ebeea647996bb"
+    },
+    {
+      "claim_id": "c\u00e9",
+      "job_id": "j\u00f6b-\ud83d\ude00",
+      "node_id": "worker.a_b-2",
+      "receipt": "3a0284f03d1247653f50dbc45783bee632a08e137cc52488fba41752459bc668"
+    },
+    {
+      "claim_id": "",
+      "job_id": "",
+      "node_id": "n",
+      "receipt": "94ca1e7fd4225c96835124d28d942f798cfcbfcd91d13b70373dd3bbf6060c62"
+    }
+  ],
+  "secret_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+}

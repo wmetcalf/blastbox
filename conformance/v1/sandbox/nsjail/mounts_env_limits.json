@@ -1,0 +1,132 @@
+{
+  "argv": [
+    "/usr/local/bin/nsjail",
+    "--mode",
+    "o",
+    "--quiet",
+    "--really_quiet",
+    "--time_limit",
+    "30",
+    "--rlimit_as",
+    "512",
+    "--rlimit_fsize",
+    "64",
+    "--rlimit_nofile",
+    "4096",
+    "--rlimit_nproc",
+    "256",
+    "--rlimit_core",
+    "0",
+    "--user",
+    "65534",
+    "--group",
+    "65534",
+    "--hostname",
+    "blastbox",
+    "--iface_no_lo",
+    "--bindmount_ro",
+    "/usr:/usr",
+    "--bindmount_ro",
+    "/etc:/etc",
+    "--symlink",
+    "usr/bin:/bin",
+    "--symlink",
+    "usr/sbin:/sbin",
+    "--symlink",
+    "usr/lib:/lib",
+    "--symlink",
+    "usr/lib64:/lib64",
+    "--tmpfsmount",
+    "/tmp",
+    "--bindmount_ro",
+    "/dev/null:/dev/null",
+    "--bindmount_ro",
+    "/dev/zero:/dev/zero",
+    "--bindmount_ro",
+    "/dev/random:/dev/random",
+    "--bindmount_ro",
+    "/dev/urandom:/dev/urandom",
+    "--bindmount_ro",
+    "/srv/in:/in",
+    "--bindmount_ro",
+    "/opt/engine:/opt/engine",
+    "--bindmount",
+    "/var/run/bb/out:/out",
+    "--env",
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "--env",
+    "HOME=/out",
+    "--env",
+    "LANG=C",
+    "--seccomp_policy",
+    "/etc/blastbox/seccomp.policy",
+    "--",
+    "/opt/engine/bin/scan"
+  ],
+  "host_pins": {
+    "aa_exec": "/usr/bin/aa-exec",
+    "apparmor_profile": "blastbox-child",
+    "limit_defaults": {
+      "memory_bytes": 8589934592,
+      "net_egress": false,
+      "timeout_s": 120,
+      "tmpfs_bytes": 1073741824
+    },
+    "minimal_env": {
+      "HOME": "/tmp",
+      "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    },
+    "nsjail": "/usr/local/bin/nsjail",
+    "paths_that_are_symlinks": [
+      "/bin",
+      "/lib",
+      "/lib64",
+      "/sbin"
+    ],
+    "paths_that_exist": [
+      "/bin",
+      "/dev/null",
+      "/dev/random",
+      "/dev/urandom",
+      "/dev/zero",
+      "/etc",
+      "/lib",
+      "/lib64",
+      "/sbin",
+      "/usr"
+    ],
+    "seccomp_policy": "/etc/blastbox/seccomp.policy"
+  },
+  "request": {
+    "aa_exec": false,
+    "argv": [
+      "/opt/engine/bin/scan"
+    ],
+    "attach_apparmor": false,
+    "env": {
+      "HOME": "/out",
+      "LANG": "C"
+    },
+    "limits": {
+      "memory_bytes": 536870912,
+      "timeout_s": 30,
+      "tmpfs_bytes": 67108864
+    },
+    "ro_mounts": [
+      {
+        "source": "/srv/in",
+        "target": "/in"
+      },
+      {
+        "source": "/opt/engine",
+        "target": "/opt/engine"
+      }
+    ],
+    "rw_mounts": [
+      {
+        "source": "/var/run/bb/out",
+        "target": "/out"
+      }
+    ]
+  }
+}

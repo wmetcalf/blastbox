@@ -67,9 +67,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
 from fastapi import APIRouter, Header, HTTPException, Query, Response
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, Field, StrictInt, StringConstraints
 
-from blastbox.host import node_auth
+from blastbox.host import node_auth, node_renew
 from blastbox.host.jobs.base import NODE_CLAIM_PREFIX as _NODE_CLAIM_PREFIX
 
 if TYPE_CHECKING:                       # pragma: no cover - typing only
@@ -393,6 +393,23 @@ class _RefusalMemo:
 #: over the wire would let a caller map the fleet's grants by probing; the real reason is
 #: logged server-side, where it is diagnosis rather than a disclosure.
 _REFUSED = "not authorised to claim this work"
+#: Said when this ingress's PKI dir holds a non-regular *.crt entry (renewal refuses links).
+_LINKS_REFUSED = ("this ingress's PKI dir contains cert entries that are not regular files; "
+                  "links are refused -- an operator must replace them with regular files")
+
+
+class RenewRequest(BaseModel):
+    """A fresh CSR, and proof that the holder of the node's current cert's key asked.
+
+    ``signature`` is base64 (std) DER ECDSA-P256-SHA256 by ``cert_pem``'s key over
+    ``node_renew.renew_payload(node_id, csr_pem, issued_at)``. The session alone is a
+    bearer token, so it cannot be what authorises a new key.
+    """
+
+    csr_pem: str = Field(..., max_length=16384, description="the node's new CSR, PEM")
+    cert_pem: str = Field(..., max_length=16384, description="the node's CURRENT cert, PEM")
+    issued_at: StrictInt = Field(..., description="unix seconds; within 300 s of the ingress clock")
+    signature: str = Field(..., max_length=512, description="base64 DER ECDSA-P256-SHA256")
 
 
 class SessionRequest(BaseModel):
@@ -664,6 +681,58 @@ def register_node_claim_routes(
             _grants_cache["sig"] = sig
             _grants_cache["until"] = now + _GRANTS_CACHE_TTL_S
         return _grants_cache["map"].get(node_id)
+
+    def _refuse_irregular_pki_dir() -> None:
+        """503 up front: links and other non-regular cert entries are refused for renewal.
+        (The grants lookup itself never blocks on a FIFO: fleet_grants reads non-blocking.)"""
+        bad = node_renew._non_regular(resolved)      # lstat failures count as bad
+        if bad:
+            _log.warning("node_claim: %s %s", resolved, node_renew.LINKS_REFUSED)
+            raise HTTPException(status_code=503, detail=_LINKS_REFUSED)
+
+    @router.post("/renew", status_code=202)
+    def renew(req: RenewRequest,
+              x_blastbox_node_session: str | None = Header(None)) -> dict[str, Any]:
+        """Queue a fresh CSR for the CA host's timer to sign. No CA key lives here."""
+        node_id = _node_from_token(x_blastbox_node_session)
+        _refuse_irregular_pki_dir()
+        if _grants_now(node_id) is None:
+            raise HTTPException(status_code=403, detail=_REFUSED)
+        try:
+            node_renew.queue_csr(resolved, node_id, req.csr_pem.encode(),
+                                 cert_pem=req.cert_pem.encode(), issued_at=req.issued_at,
+                                 signature=req.signature)
+        except node_renew.NonRegularEntries as exc:
+            _log.warning("node_claim: %s", exc)
+            raise HTTPException(status_code=503, detail=_LINKS_REFUSED) from None
+        except node_renew.RenewRefused as exc:
+            if exc.identity:            # who is asking failed: the uniform refusal
+                _log.warning("node_claim: renew refused for %s: %s", node_id, exc)
+                raise HTTPException(status_code=403, detail=_REFUSED) from None
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        except OSError as exc:
+            _log.warning("node_claim: renew queue write failed: %s", exc)
+            raise HTTPException(status_code=503, detail="renewal queue unavailable") from None
+        return {"queued": True}
+
+    @router.get("/cert")
+    def current_node_cert(x_blastbox_node_session: str | None = Header(None)) -> dict[str, Any]:
+        """The session node's own current certificate, never another node's."""
+        node_id = _node_from_token(x_blastbox_node_session)
+        _refuse_irregular_pki_dir()
+        if _grants_now(node_id) is None:
+            raise HTTPException(status_code=403, detail=_REFUSED)
+        try:
+            found = node_renew.current_cert_info(resolved, node_id)
+        except node_renew.NonRegularEntries as exc:
+            _log.warning("node_claim: %s", exc)
+            raise HTTPException(status_code=503, detail=_LINKS_REFUSED) from None
+        except OSError as exc:
+            _log.warning("node_claim: cert store read failed: %s", exc)
+            raise HTTPException(status_code=503, detail="certificate store unavailable") from None
+        if found is None:
+            raise HTTPException(status_code=404, detail="no current certificate")
+        return {"cert_pem": found[0].decode(), "not_after": found[1]}
 
     @router.post("/session", response_model=None)
     def session(req: SessionRequest) -> dict[str, Any]:
