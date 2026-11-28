@@ -858,6 +858,13 @@ func (j *job) fillArtifacts(files map[string]int64) error {
 		return nil
 	}
 	arts, _ := env["artifacts"].([]any)
+	// Bound the declarations before hashing anything (the control plane's trust gate refuses
+	// more than max_artifacts anyway), and hash each file once however often it is declared:
+	// otherwise a small envelope could make the agent re-read one large file without end.
+	if maxN := orDef(j.c.Run.Limits.MaxArtifacts, defMaxArtifacts); int64(len(arts)) > maxN {
+		return fmt.Errorf("metadata.json declares %d artifacts, over max_artifacts (%d)", len(arts), maxN)
+	}
+	sums := map[string]string{}
 	changed := false
 	for _, a := range arts {
 		m, ok := a.(map[string]any)
@@ -873,9 +880,12 @@ func (j *job) fillArtifacts(files map[string]int64) error {
 		if !ok {
 			continue
 		}
-		sum, err := fileSHA(filepath.Join(j.out, filepath.FromSlash(clean)))
-		if err != nil {
-			return fmt.Errorf("artifact %+q: %v", clean, err)
+		sum, ok := sums[clean]
+		if !ok {
+			if sum, err = fileSHA(filepath.Join(j.out, filepath.FromSlash(clean))); err != nil {
+				return fmt.Errorf("artifact %+q: %v", clean, err)
+			}
+			sums[clean] = sum
 		}
 		m["sha256"], m["bytes"] = sum, json.Number(strconv.FormatInt(size, 10))
 		changed = true
@@ -890,7 +900,7 @@ func (j *job) fillArtifacts(files map[string]int64) error {
 	return os.WriteFile(p, out, 0o600)
 }
 
-func fileSHA(p string) (string, error) {
+var fileSHA = func(p string) (string, error) {
 	f, err := os.Open(p)
 	if err != nil {
 		return "", err
