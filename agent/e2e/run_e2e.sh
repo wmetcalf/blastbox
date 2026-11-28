@@ -7,6 +7,12 @@
 #   PYTHON      python used for JSON parsing and free-port discovery (default: python3)
 #   NSJAIL      nsjail binary for the linux sandbox (default: command -v nsjail)
 #   AA_PROFILE  AppArmor profile the agent attaches to nsjail (default: blastbox-sandbox)
+#   BB_PYTHON   python that can import blastbox, to verify the receipt signature
+#               (default: the python next to BLASTBOX, else PYTHON)
+#   E2E_PORT    ingress port (default: a free one)
+#   E2E_RENEW   1 (default) runs the renewal round trip; 0 skips it
+#   E2E_RENEW_LIVE_WAIT  seconds to let the RUNNING agent adopt the renewed cert on its own
+#               (its cert loop runs every 5 min) before restarting it to adopt it at start (default 0)
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd -P)
@@ -14,6 +20,8 @@ REPO=$(cd "$HERE/../.." && pwd -P)
 AGENT_BIN=${AGENT_BIN:?set AGENT_BIN to the blastbox-agent binary}
 BLASTBOX=${BLASTBOX:-blastbox}
 PYTHON=${PYTHON:-python3}
+BB_DIR=$(cd "$(dirname "$(command -v "$BLASTBOX")")" && pwd -P)
+BB_PYTHON=${BB_PYTHON:-$( [ -x "$BB_DIR/python" ] && echo "$BB_DIR/python" || echo "$PYTHON")}
 NODE=e2e-node
 KEY=e2e-throwaway-key-$$
 TIMEOUT=${E2E_TIMEOUT:-90}
@@ -53,7 +61,8 @@ sha256_of() {
 }
 json() { "$PYTHON" -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
 
-PORT=$("$PYTHON" -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1])")
+PORT=${E2E_PORT:-}
+[ -n "$PORT" ] || PORT=$("$PYTHON" -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1])")
 BASE="https://127.0.0.1:$PORT"
 CA="$T/pki/ca.crt"
 api() { curl -sS --fail-with-body --cacert "$CA" -H "Authorization: Bearer $KEY" "$@"; }
@@ -72,6 +81,8 @@ export BLASTBOX_NODE_CLAIM_RECLAIM_AFTER_S=900
 export BLASTBOX_NODE_HEARTBEAT_S=5
 export BLASTBOX_ATTEST_KEY="$T/attest.key"
 export BLASTBOX_HOST_ID=e2e-host
+# Pull-agent deployments must keep DONE with the finalizer (no node-written terminal status).
+export BLASTBOX_NODE_TERMINAL_WRITES=finalizer-only
 
 # 2. serve, 3. finalizer (same job root, DB and blob settings; it holds the attest key).
 "$BLASTBOX" serve --host 127.0.0.1 --port "$PORT" >"$T/serve.log" 2>&1 &
@@ -162,9 +173,14 @@ log "job $JOB submitted; waiting for DONE (<= ${TIMEOUT}s)"
 st=$(wait_status "$JOB" done) || fail "job $JOB ended as $st"
 log "job $JOB done"
 api "$BASE/v1/jobs/$JOB/attestation" >"$T/receipt.json" || fail "no receipt for $JOB"
-"$PYTHON" - "$T/receipt.json" "$NODE" "$T/node/node.crt" "$SAMPLE_SHA" <<'PY'
+api "$BASE/v1/attestation/key" >"$T/attest-pub.json" \
+  || fail "no attestation key"
+check_receipt() { # receipt.json node.crt
+  "$BB_PYTHON" - "$1" "$NODE" "$2" "$SAMPLE_SHA" "$SANDBOX" "$T/attest-pub.json" <<'PY'
 import hashlib, json, ssl, sys
-rcpt, node, crt, sample = sys.argv[1:]
+from pathlib import Path
+from blastbox.host import attest
+rcpt, node, crt, sample, runtime, pub = sys.argv[1:]
 doc = json.load(open(rcpt))
 assert doc.get("signature"), "receipt is unsigned"
 d = doc["attestation"]
@@ -175,8 +191,13 @@ assert d.get("node_id") == node, f"node_id {d.get('node_id')!r}"
 assert d.get("node_cert_sha256") == want, f"node_cert_sha256 {d.get('node_cert_sha256')!r} != {want}"
 assert d.get("worker_tier") == "node-agent", f"worker_tier {d.get('worker_tier')!r}"
 assert d.get("input_sha256") == sample, "input_sha256 mismatch"
-print("[e2e] receipt ok:", {k: d[k] for k in ("node_id", "worker_tier", "worker_runtime") if k in d})
+assert d.get("worker_runtime") == runtime, f"worker_runtime {d.get('worker_runtime')!r} != {runtime}"
+assert attest.verify_body(attest.load_verify_key(Path(pub)), doc), "receipt signature does not verify"
+print("[e2e] receipt ok (signature valid):",
+      {k: d[k] for k in ("node_id", "node_cert_sha256", "worker_tier", "worker_runtime") if k in d})
 PY
+}
+check_receipt "$T/receipt.json" "$T/node/node.crt" || fail "receipt check failed"
 
 # 9. Liveness while the agent runs: node present, heartbeating, no node_silent alert.
 api "$BASE/v1/fleet/liveness" >"$T/live.json"
@@ -186,10 +207,9 @@ d = json.load(open(sys.argv[1])); node = sys.argv[2]
 rows = [n for n in d["nodes"] if n["node_id"] == node]
 assert rows, f"{node} missing from liveness: {d['nodes']}"
 assert rows[0]["last_heartbeat_at"], f"{node} never heartbeated"
-silent = [a for a in d["alerts"] if a.get("kind") == "node_silent" and a.get("subject") == node]
-assert not silent, f"node_silent alert while running: {silent}"
+assert not d["alerts"], f"liveness alerts while running: {d['alerts']}"
 print("[e2e] liveness node:", json.dumps(rows[0], sort_keys=True), "alerts:", d["alerts"])
-print("[e2e] liveness ok: heartbeating, no node_silent")
+print("[e2e] liveness ok: heartbeating, no alerts")
 PY
 
 # 8. kill -9 mid-run: the restarted agent fails the job, and nothing re-runs it.
@@ -204,8 +224,44 @@ start_agent
 st=$(wait_status "$SLOW" failed) || fail "slow job $SLOW ended as $st, wanted failed"
 err=$(api "$BASE/v1/jobs/$SLOW" | json "d.get('error') or ''")
 case "$err" in *"agent restarted mid-run"*) ;; *) fail "slow job error is $err" ;; esac
+snap() { api "$BASE/v1/jobs/$1" | json "(d['status'], d.get('started_at'), d.get('finished_at'), d.get('worker_runtime'))"; }
+before=$(snap "$SLOW")
 sleep 8   # long enough for a (wrong) re-claim to show up
-[ "$(status_of "$SLOW")" = failed ] || fail "slow job left the failed state"
-log "slow job failed with: $err"
+after=$(snap "$SLOW")
+[ "$before" = "$after" ] || fail "slow job changed after failing: $before -> $after"
+log "slow job failed with: $err (record unchanged after 8s: $after)"
+
+# 10. Renewal round trip with proof of possession: the agent queues a CSR signed by its CURRENT
+# key, the CA host signs it (`pki renew-pending`), and the agent adopts the new cert.
+if [ "${E2E_RENEW:-1}" = 1 ]; then
+  old_sha=$(sha256_of "$T/node/node.crt")
+  "$AGENT_BIN" renew --config "$T/agent.toml" >"$T/renew.out" 2>&1 || { cat "$T/renew.out" >&2; fail "renew request refused"; }
+  log "renew: $(tr '\n' ' ' <"$T/renew.out")"
+  [ -f "$T/node/node.key.next.csr" ] || fail "no persisted renewal CSR"
+  "$BLASTBOX" pki --dir "$T/pki" renew-pending >"$T/renew-pending.out" 2>&1 \
+    || { cat "$T/renew-pending.out" >&2; fail "renew-pending failed"; }
+  log "renew-pending: $(tr '\n' ' ' <"$T/renew-pending.out")"
+  grep -q renewed "$T/renew-pending.out" || fail "renew-pending renewed nothing"
+  adopted() { [ "$(sha256_of "$T/node/node.crt")" != "$old_sha" ] && [ ! -e "$T/node/node.key.next" ]; }
+  deadline=$((SECONDS + ${E2E_RENEW_LIVE_WAIT:-0}))
+  while [ $SECONDS -lt $deadline ] && ! adopted; do sleep 2; done
+  how="by the running agent"
+  if ! adopted; then
+    log "restarting the agent so it adopts the renewed cert at start"
+    kill -TERM "$AGENT_PID"; wait "$AGENT_PID" 2>/dev/null || true
+    start_agent
+    how="by the restarted agent"
+    deadline=$((SECONDS + 30))
+    while [ $SECONDS -lt $deadline ] && ! adopted; do sleep 1; done
+  fi
+  adopted || fail "agent did not adopt the renewed cert"
+  grep -q "renewed certificate installed" "$T/agent.log" || fail "agent log does not show the install"
+  log "renewed cert adopted $how: $old_sha -> $(sha256_of "$T/node/node.crt")"
+  JOB2=$(submit)
+  st=$(wait_status "$JOB2" done) || fail "post-renewal job $JOB2 ended as $st"
+  api "$BASE/v1/jobs/$JOB2/attestation" >"$T/receipt2.json" || fail "no receipt for $JOB2"
+  check_receipt "$T/receipt2.json" "$T/node/node.crt" || fail "post-renewal receipt check failed"
+  log "post-renewal job $JOB2 done under the renewed cert"
+fi
 
 log "PASS"
