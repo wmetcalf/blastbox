@@ -621,3 +621,28 @@ def test_sweep_removes_a_finalize_lock_left_by_a_killed_finalizer(tmp_path):
     os.utime(left, (old, old))
     fin.run_once()
     assert not jd.exists()
+
+
+def test_crash_after_retained_fail_keeps_the_retained_outcome(tmp_path):
+    """finalise_output marked the row FAILED and the tree retained, then the finalizer died
+    before outcome.json: recovery must record RETAINED_REASON (so a later sweep repair to
+    DONE reads as done on replay), not the row's error."""
+    store, job, fin, _ = build(tmp_path)
+    d = spool(tmp_path, job)
+    (tmp_path / "jobs" / "job-1").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "jobs" / "job-1" / ".pending-upload").write_text(job.claim_id)
+    store.update_if_status("job-1", JobStatus.RUNNING, expect_claim_id=job.claim_id,
+                           status=JobStatus.FAILED, error="result upload failed")
+    assert fin.run_once() == 1
+    assert nr.read_outcome(d) == {"status": "failed", "reason": nr.RETAINED_REASON}
+
+
+def test_crash_after_failed_cas_ignores_another_claims_sentinel(tmp_path):
+    store, job, fin, _ = build(tmp_path)
+    d = spool(tmp_path, job)
+    (tmp_path / "jobs" / "job-1").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "jobs" / "job-1" / ".pending-upload").write_text("someone-else")
+    store.update_if_status("job-1", JobStatus.RUNNING, expect_claim_id=job.claim_id,
+                           status=JobStatus.FAILED, error="boom")
+    assert fin.run_once() == 1
+    assert nr.read_outcome(d) == {"status": "failed", "reason": "boom"}

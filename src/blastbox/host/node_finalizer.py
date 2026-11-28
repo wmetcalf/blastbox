@@ -209,6 +209,14 @@ class NodeFinalizer:
             _log.warning("node-finalizer: cannot persist the attempt counter in %s", d)
         return n
 
+    def _retained_for(self, job_id: str, claim_id: str) -> bool:
+        """True when a pending-upload sentinel written under THIS claim names the job."""
+        try:
+            got = (self._job_root / job_id / PENDING_UPLOAD_SENTINEL).read_text().strip()
+        except OSError:
+            return False
+        return bool(claim_id) and got == claim_id
+
     def _output_dir(self, job_id: str) -> Path:
         return self._job_root / job_id / "output"
 
@@ -235,6 +243,10 @@ class NodeFinalizer:
         if job.status == JobStatus.DONE:        # crashed between the CAS and the outcome write
             return "done", None
         if job.status == JobStatus.FAILED:
+            if self._retained_for(job.job_id, marker.claim_id):
+                # crashed between finalise_output's "retained" and the outcome write: keep the
+                # canonical reason so a later sweep repair to DONE replays as done
+                return "failed", RETAINED_REASON
             return "failed", job.error or "job failed"
         if job.status != JobStatus.RUNNING:
             return "failed", "claim lost"
