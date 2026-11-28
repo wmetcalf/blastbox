@@ -75,6 +75,7 @@ const (
 	defMaxArtifact       = 50 << 20
 	defMaxTotalArtifacts = 500 << 20
 	defMaxArtifacts      = 1000
+	tarMemberSlack       = 64 // node_claim.put_result: max_members = max_artifacts + 64
 	maxDirs              = 4096
 	maxParamValue        = 4096 // characters, as dispatch._MAX_ENV_VALUE_LEN
 	metadataName         = "metadata.json"
@@ -812,8 +813,10 @@ func (j *job) checkOutput() (map[string]int64, error) {
 			}
 			return nil
 		}
-		if n++; n > maxN {
-			return fmt.Errorf("more than max_artifacts (%d) files in output", maxN)
+		// The control plane's tar check allows max_artifacts + 64 members, metadata.json
+		// included; max_artifacts itself bounds the DECLARED artifacts (in its trust gate).
+		if n++; n+1 > maxN+tarMemberSlack {
+			return fmt.Errorf("more than max_artifacts (%d) + %d tar members in output", maxN, tarMemberSlack)
 		}
 		if fi.Size() > maxArt {
 			return fmt.Errorf("artifact %+q is over max_artifact (%d)", rel, maxArt)

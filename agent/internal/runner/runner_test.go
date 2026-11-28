@@ -673,8 +673,16 @@ func TestTotalExcludesTheEnvelope(t *testing.T) {
 	}
 }
 
+// The control plane's tar check allows max_artifacts + 64 members, metadata.json included
+// (max_artifacts itself bounds the DECLARED artifacts, in the trust gate): undeclared files up
+// to that member count are delivered, one more is refused locally.
 func TestTooManyArtifactsAndTotalFail(t *testing.T) {
-	f := setup(t, `for i in 1 2 3 4; do echo x > "$1/f$i"; done; echo '{}' > "$1/metadata.json"`)
+	f := setup(t, `i=0; while [ $i -lt 66 ]; do echo x > "$1/f$i"; i=$((i+1)); done; echo '{}' > "$1/metadata.json"`)
+	f.claim.Run.Limits.MaxArtifacts = 3
+	if res := f.run(); res.Outcome != "done" {
+		t.Fatalf("%+v: 66 files + metadata.json (= max_artifacts + 64 members) refused", res)
+	}
+	f = setup(t, `i=0; while [ $i -lt 67 ]; do echo x > "$1/f$i"; i=$((i+1)); done; echo '{}' > "$1/metadata.json"`)
 	f.claim.Run.Limits.MaxArtifacts = 3
 	f.wantFail(t, f.run(), "max_artifacts")
 	f = setup(t, `head -c 300 /dev/zero > "$1/a"; head -c 300 /dev/zero > "$1/b"; echo '{}' > "$1/metadata.json"`)
