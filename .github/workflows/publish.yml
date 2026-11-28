@@ -12,6 +12,9 @@ on:
 
 jobs:
   pypi:
+    # `agent-v*` releases belong to agent-release.yml (the Go blastbox-agent
+    # binary). They must NEVER publish the Python package to PyPI.
+    if: ${{ !startsWith(github.event.release.tag_name, 'agent-v') }}
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
