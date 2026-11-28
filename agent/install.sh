@@ -163,8 +163,9 @@ record_previous() {
   rp=${rp%/}
   [ "$rp" != "$2" ] || return 0
   if [ -e "$prefix/.previous" ] || [ -L "$prefix/.previous" ]; then
-    [ -f "$prefix/.previous" ] && [ ! -L "$prefix/.previous" ] \
-      || die "$prefix/.previous is not a regular file"
+    if [ ! -f "$prefix/.previous" ] || [ -L "$prefix/.previous" ]; then
+      die "$prefix/.previous is not a regular file"
+    fi
     saved_prev="v:$(cat "$prefix/.previous")"
   else
     saved_prev=none
