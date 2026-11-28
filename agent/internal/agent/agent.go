@@ -80,6 +80,7 @@ type Agent struct {
 	hbReady chan struct{}
 	hbOnce  sync.Once
 	renewer *Renewer
+	reach   *reachMon
 	lock    *os.File // flock on <state_dir>/agent.lock, held for the life of Run
 }
 
@@ -305,7 +306,7 @@ func (a *Agent) startup(ctx context.Context) error {
 	if err := a.checkNsjailPin(); err != nil {
 		return err
 	}
-	cl, err := wire.New(a.Cfg, "blastbox-agent/"+a.Version)
+	cl, err := a.newWire()
 	if err != nil {
 		return err
 	}
@@ -314,9 +315,25 @@ func (a *Agent) startup(ctx context.Context) error {
 	return nil
 }
 
+// newWire builds a client wired to the ingress-reachability monitor.
+func (a *Agent) newWire() (*wire.Client, error) {
+	cl, err := wire.New(a.Cfg, "blastbox-agent/"+a.Version)
+	if err != nil {
+		return nil, err
+	}
+	a.mu.Lock()
+	if a.reach == nil {
+		a.reach = newReachMon(a.Now, a.Log, a.Cfg.UnreachableAfter(), ingressHostPort(a.Cfg.Ingress))
+	}
+	rm := a.reach
+	a.mu.Unlock()
+	cl.OnContact = rm.Contact
+	return cl, nil
+}
+
 // resession replaces the client (dropping its token) and handshakes anew.
 func (a *Agent) resession(ctx context.Context) error {
-	cl, err := wire.New(a.Cfg, "blastbox-agent/"+a.Version)
+	cl, err := a.newWire()
 	if err != nil {
 		return err
 	}

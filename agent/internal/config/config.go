@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -25,7 +26,27 @@ type Config struct {
 	Claim    bool     `toml:"claim"` // false = shadow: handshake, heartbeat, probes only
 	Engines  []Engine `toml:"engine"`
 	Nsjail   *Nsjail  `toml:"nsjail"`
+	// IngressUnreachableAfterS: seconds without a successful ingress round trip before the agent
+	// logs an ERROR naming the likely cause (default 90, min 15).
+	IngressUnreachableAfterS *int  `toml:"ingress_unreachable_after_s"`
+	Sound                    Sound `toml:"sound"`
 }
+
+// Sound is the optional connect sound. Off by default.
+type Sound struct {
+	OnConnect string `toml:"on_connect"` // "" (off) or "modem"
+}
+
+// UnreachableAfter is the effective ingress-unreachable threshold.
+func (c *Config) UnreachableAfter() time.Duration {
+	if c.IngressUnreachableAfterS == nil {
+		return 90 * time.Second
+	}
+	return time.Duration(*c.IngressUnreachableAfterS) * time.Second
+}
+
+// ModemEnabled reports whether the modem connect sound is on.
+func (c *Config) ModemEnabled() bool { return c.Sound.OnConnect == "modem" }
 
 // Engine is one engine this node can run.
 type Engine struct {
@@ -142,6 +163,12 @@ func (c *Config) validate(goos string) error {
 	if u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery ||
 		u.Fragment != "" || strings.Contains(c.Ingress, "#") {
 		return fmt.Errorf("ingress must be a bare https://host[:port] (no userinfo, path, query or fragment), got %q", c.Ingress)
+	}
+	if c.IngressUnreachableAfterS != nil && *c.IngressUnreachableAfterS < 15 {
+		return fmt.Errorf("ingress_unreachable_after_s must be >= 15, got %d", *c.IngressUnreachableAfterS)
+	}
+	if c.Sound.OnConnect != "" && c.Sound.OnConnect != "modem" {
+		return fmt.Errorf(`[sound] on_connect must be "modem" or empty, got %q`, c.Sound.OnConnect)
 	}
 	for name, f := range map[string]string{"ca_file": c.CAFile, "cert_file": c.CertFile} {
 		st, err := os.Stat(f)

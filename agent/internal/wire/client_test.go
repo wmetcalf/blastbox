@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -24,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -900,5 +902,64 @@ func TestFailFinishedAtClampedToClaimTime(t *testing.T) {
 	startedSrv := float64(c.toServer(claimed).UnixNano()) / 1e9
 	if fin < startedSrv-1e-6 {
 		t.Fatalf("finished_at %v before the claim time %v", fin, startedSrv)
+	}
+}
+
+type rtFunc func(*http.Request) (*http.Response, error)
+
+func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestOnContactReportsDialErrorsAndAnyHTTPResponse(t *testing.T) {
+	ca := newCA(t, "test ingress CA")
+	f := newFake(t, ca)
+	c := newClient(t, f, ca)
+	var got []error
+	c.OnContact = func(err error) { got = append(got, err) }
+	dial := &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.EADDRNOTAVAIL)}
+	c.hc.Transport = rtFunc(func(*http.Request) (*http.Response, error) { return nil, dial })
+	if err := c.Session(context.Background()); err == nil {
+		t.Fatal("want an error")
+	}
+	if len(got) != 1 || !errors.Is(got[0], syscall.EADDRNOTAVAIL) {
+		t.Fatalf("want the dial error with its errno: %v", got)
+	}
+	if strings.Contains(fmt.Sprint(got[0]), "/v1/nodes") {
+		t.Fatalf("hook error carries the URL: %v", got[0])
+	}
+	for _, code := range []int{200, 302, 404, 503} {
+		got = nil
+		code := code
+		c.hc.Transport = rtFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: code, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("{}"))}, nil
+		})
+		c.Session(context.Background())
+		if len(got) == 0 || got[0] != nil {
+			t.Fatalf("status %d must count as reachable: %v", code, got)
+		}
+	}
+}
+
+func TestOnSessionReportsHandshakeResult(t *testing.T) {
+	ca := newCA(t, "test ingress CA")
+	f := newFake(t, ca)
+	c := newClient(t, f, ca)
+	var got []error
+	c.OnSession = func(err error) { got = append(got, err) }
+	if err := c.Session(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Session(context.Background()); err != nil { // cached token: no new handshake
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != nil {
+		t.Fatalf("want one nil report for one handshake, got %v", got)
+	}
+	c2 := newClient(t, f, ca)
+	var got2 []error
+	c2.OnSession = func(err error) { got2 = append(got2, err) }
+	c2.hc.Transport = rtFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("down") })
+	c2.Session(context.Background())
+	if len(got2) != 1 || got2[0] == nil {
+		t.Fatalf("want one failure report, got %v", got2)
 	}
 }

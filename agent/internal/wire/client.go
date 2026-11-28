@@ -164,6 +164,13 @@ type Client struct {
 	skew   atomic.Int64 // server clock minus local clock, ns
 	hbSkew atomic.Bool  // skew came from a heartbeat server_time; Date (1 s resolution) no longer overrides it
 
+	// OnContact, if set, is told after every request whether the ingress answered: nil for any
+	// HTTP response (2xx/3xx/4xx/5xx all prove a round trip), else the transport error (URL
+	// scrubbed; TLS failures wrap ErrTLS). OnSession, if set, is told the result of every
+	// handshake actually performed. Both must be quick and must not call back into the client.
+	OnContact func(err error)
+	OnSession func(err error)
+
 	mu         sync.Mutex
 	token      string
 	tokenUntil time.Time
@@ -341,6 +348,7 @@ func (c *Client) send(ctx context.Context, s reqSpec, token string) (*resp, erro
 	if err != nil {
 		cancel()
 		if errors.Is(err, ErrRedirect) {
+			c.contact(nil) // a redirect is still an answer
 			return nil, ErrRedirect
 		}
 		if ctx.Err() != nil {
@@ -351,10 +359,13 @@ func (c *Client) send(ctx context.Context, s reqSpec, token string) (*resp, erro
 		var he x509.HostnameError
 		var ci x509.CertificateInvalidError
 		if errors.As(err, &cve) || errors.As(err, &ua) || errors.As(err, &he) || errors.As(err, &ci) {
+			c.contact(fmt.Errorf("%w: %w", ErrTLS, scrub(err)))
 			return nil, fmt.Errorf("%w: %v", ErrTLS, scrub(err))
 		}
+		c.contact(scrub(err))
 		return nil, fmt.Errorf("%w: %v", ErrServer, scrub(err))
 	}
+	c.contact(nil)
 	c.noteDate(r.Header)
 	if r.StatusCode >= 300 && r.StatusCode < 400 {
 		r.Body.Close()
@@ -362,6 +373,12 @@ func (c *Client) send(ctx context.Context, s reqSpec, token string) (*resp, erro
 		return nil, ErrRedirect
 	}
 	return &resp{Response: r, cancel: cancel}, nil
+}
+
+func (c *Client) contact(err error) {
+	if c.OnContact != nil {
+		c.OnContact(err)
+	}
 }
 
 // scrub drops the URL from a url.Error so logs carry no request details.
@@ -468,12 +485,17 @@ func (c *Client) ensure(ctx context.Context) (string, error) {
 }
 
 // handshake opens a session unless another caller already replaced stale.
-func (c *Client) handshake(ctx context.Context, stale string) (string, error) {
+func (c *Client) handshake(ctx context.Context, stale string) (tok string, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.valid() && c.token != stale {
 		return c.token, nil
 	}
+	defer func() {
+		if c.OnSession != nil {
+			c.OnSession(err)
+		}
+	}()
 	c.token = ""
 	r, err := c.send(ctx, reqSpec{method: "GET", path: "/v1/nodes/challenge"}, "")
 	if err != nil {

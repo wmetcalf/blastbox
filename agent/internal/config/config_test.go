@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 type fixture struct{ dir, ca, crt, key string }
@@ -224,5 +225,36 @@ func TestKeyFileChecks(t *testing.T) {
 	fail := func(fs.FileInfo) (int, error) { return 0, errors.New("no owner info") }
 	if err := checkKeyFile(f.key, fail, me); err == nil {
 		t.Error("owner lookup failure accepted")
+	}
+}
+
+func TestUnreachableAfterAndSound(t *testing.T) {
+	f := newFixture(t)
+	body := f.toml(eng(`sandbox = "nsjail"`+"\n"), "")
+	nsj := "[nsjail]\npath = \"/usr/local/bin/nsjail\"\nsha256 = \"" + strings.Repeat("b", 64) + "\"\nseccomp_policy = \"/etc/passwd\"\nallow_missing_apparmor = true\n"
+	c, err := load(write(t, f, f.toml(eng(`sandbox = "nsjail"`+"\n"), nsj)), "linux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.UnreachableAfter() != 90*time.Second || c.Sound.OnConnect != "" || c.ModemEnabled() {
+		t.Fatalf("defaults: %v %+v", c.UnreachableAfter(), c.Sound)
+	}
+	_ = body
+	with := func(top, tail string) (*Config, error) {
+		b := strings.Replace(f.toml(eng(`sandbox = "nsjail"`+"\n"), nsj+tail), "claim = false\n", "claim = false\n"+top, 1)
+		return load(write(t, f, b), "linux")
+	}
+	c, err = with("ingress_unreachable_after_s = 15\n", "[sound]\non_connect = \"modem\"\n")
+	if err != nil || c.UnreachableAfter() != 15*time.Second || !c.ModemEnabled() {
+		t.Fatalf("explicit: %v %v", c, err)
+	}
+	if _, err = with("ingress_unreachable_after_s = 14\n", ""); err == nil || !strings.Contains(err.Error(), "ingress_unreachable_after_s") {
+		t.Fatalf("min 15 not enforced: %v", err)
+	}
+	if _, err = with("", "[sound]\non_connect = \"klaxon\"\n"); err == nil || !strings.Contains(err.Error(), "on_connect") {
+		t.Fatalf("bad sound accepted: %v", err)
+	}
+	if c, err = with("", "[sound]\non_connect = \"\"\n"); err != nil || c.ModemEnabled() {
+		t.Fatalf("empty sound: %v", err)
 	}
 }
