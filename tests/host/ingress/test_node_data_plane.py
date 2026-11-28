@@ -837,3 +837,21 @@ def test_explicit_and_implicit_directories_are_counted_once():
     # metadata.json + a + a/b + a/c = 4 entries
     node_results.vet_tar(io.BytesIO(body), max_members=4, max_total_bytes=1 << 20)
 
+
+def test_quarantine_dir_is_fsynced_with_its_marker_before_publish(tmp_path, pki_dir, monkeypatch):  # noqa: F811
+    """202 promises the upload survives a crash: the partial dir's entries (upload.json, out)
+    must be fsynced while the marker is in it, and the new job dir entry persisted in root."""
+    synced: list[tuple[str, bool]] = []
+    real = node_results.fsync_dir
+
+    def spy(d):
+        synced.append((str(d), (d / node_results.MARKER).is_file()))
+        real(d)
+
+    monkeypatch.setattr(node_results, "fsync_dir", spy)
+    _, c, hdr = _setup(tmp_path, pki_dir)
+    r = put(c, hdr, make_tar([]))
+    assert r.status_code == 202, r.text
+    assert any(".partial-" in p and has for p, has in synced), synced
+    root = node_results.results_root(tmp_path / "jobs")
+    assert str(root) in [p for p, _ in synced], synced
