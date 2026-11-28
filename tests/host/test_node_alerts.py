@@ -471,3 +471,28 @@ def test_node_health_counts_only_granted_engines():
     assert run(T0 + 10, e, {"n": extra}) == []
     only_ungranted = lv(T0, engines=(("clamav", True),))
     assert kinds(run(T0 + 10, e, {"n": only_ungranted})) == [("node_unhealthy", "n")]
+
+
+def test_enrolled_scan_never_blocks_on_a_fifo_named_crt(tmp_path):
+    """A FIFO (or a symlink to one) planted as *.crt must be skipped, not block the scan:
+    the scan runs under the monitor lock, so a hang would freeze /v1/fleet/liveness too."""
+    import os
+    import threading
+
+    d = tmp_path / "pki"
+    ca = pki.ensure_ca(d)
+    ca.issue_node("alpha", wg_pubkey=WG, grants=pki.NodeGrants(engines=("clamav",)),
+                  days=7).write(d, "node-alpha")
+    os.mkfifo(d / "a-fifo.crt")
+    (d / "b-link.crt").symlink_to(d / "a-fifo.crt")
+    got: list = []
+    t = threading.Thread(target=lambda: got.append(enrolled_nodes(d)), daemon=True)
+    t.start()
+    t.join(10)
+    if t.is_alive():
+        # unblock the stuck reader so the suite does not hang, then fail
+        fd = os.open(d / "a-fifo.crt", os.O_WRONLY | os.O_NONBLOCK)
+        os.close(fd)
+        t.join(5)
+        raise AssertionError("enrolled_nodes blocked on a FIFO named *.crt")
+    assert set(got[0]) == {"alpha"}

@@ -449,6 +449,7 @@ def enrolled_nodes(pki_dir: "Path | str", *, now: float | None = None) -> "dict[
     to the intersection of grants and the LATER expiry, so an overlap never false-alarms.
     Certs that expired within :data:`CERT_EXPIRED_GRACE_S` are kept (see :func:`evaluate`)."""
     from blastbox.host.pki import load_trust_anchor, node_identity
+    from blastbox.host.placement import _read_cert_file
 
     d = Path(pki_dir)
     now_ = time.time() if now is None else now
@@ -460,7 +461,8 @@ def enrolled_nodes(pki_dir: "Path | str", *, now: float | None = None) -> "dict[
         return out
     for crt in sorted(d.glob("*.crt")):
         try:
-            ident = node_identity(ca, crt.read_bytes(), allow_expired=True)
+            # never read_bytes(): a FIFO named *.crt would block under the monitor lock
+            ident = node_identity(ca, _read_cert_file(crt), allow_expired=True)
         except Exception:  # noqa: BLE001 - one bad file is not a fleet outage
             continue
         if ident.not_after.timestamp() <= cutoff:
