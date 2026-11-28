@@ -18,7 +18,7 @@ import (
 // exclusively, mode 0600). Paths are sorted bytewise; every header has mode 0644, uid/gid 0,
 // empty uname/gname and mtime 0; directories are not emitted. Anything that is not a regular
 // file (symlinks, devices, FIFOs, sockets) and any hardlinked file (nlink > 1) is refused, as is
-// any path that is not UTF-8 or that USTAR cannot hold without a PAX extension. Names are raw
+// any path that is not UTF-8, holds a backslash, or that USTAR cannot hold without a PAX extension. Names are raw
 // UTF-8 bytes, split into prefix/name as Python's tarfile does (conformance result_tars/writer).
 // The same bytes come out on every host.
 func Write(root, dst string) (err error) {
@@ -111,6 +111,9 @@ func splitName(name string) (prefix, base string, ok bool) {
 func ustarHeader(name string, size int64) ([]byte, error) {
 	if !utf8.ValidString(name) || strings.ContainsRune(name, 0) {
 		return nil, errors.New("name is not UTF-8")
+	}
+	if strings.ContainsRune(name, '\\') { // the control plane's vet_tar refuses the whole tar
+		return nil, errors.New("name holds a backslash")
 	}
 	if size < 0 || size > maxSize {
 		return nil, fmt.Errorf("size %d does not fit a USTAR header", size)

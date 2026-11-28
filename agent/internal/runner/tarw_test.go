@@ -103,6 +103,8 @@ func TestTarRefusesNonRegular(t *testing.T) {
 		{"symlink", func(r string) error { return os.Symlink("/etc/passwd", filepath.Join(r, "l")) }},
 		{"hardlink", func(r string) error { return os.Link(filepath.Join(r, "f"), filepath.Join(r, "h")) }},
 		{"fifo", func(r string) error { return mkfifo(filepath.Join(r, "p")) }},
+		// The control plane refuses the whole tar on a backslash: refuse it before uploading.
+		{"backslash", func(r string) error { return os.WriteFile(filepath.Join(r, `win\path.txt`), []byte("x"), 0o600) }},
 		{"not utf-8", func(r string) error { return os.WriteFile(filepath.Join(r, "caf\xe9"), []byte("x"), 0o600) }},
 		{"too long", func(r string) error {
 			return os.WriteFile(filepath.Join(r, strings.Repeat("n", 101)), []byte("x"), 0o600)
