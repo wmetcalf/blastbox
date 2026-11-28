@@ -165,3 +165,32 @@ func TestProbeOutputIsBounded(t *testing.T) {
 		t.Fatalf("the verdict line was lost: %v", err)
 	}
 }
+
+// Under nsjail the file-size cap is nsjail's own --rlimit_fsize (the launcher must not pin a
+// hard limit nsjail would then fail to raise), and it is never above the requested cap.
+func TestNsjailFileSizeCapIsNsjails(t *testing.T) {
+	pins := HostPins{AppArmorProfile: "p", Exists: map[string]bool{"/usr": true}, Symlinks: map[string]bool{}}
+	req := Request{ExecPaths: []string{"/usr/bin/true"}, Scratch: "/tmp/s", Nonce: "n", AgentBin: "/x/agent",
+		NsjailPath: "/usr/local/bin/nsjail", Pins: &pins, SeccompPolicy: "/x/seccomp.kafel", AttachAppArmor: true}
+	for _, c := range []struct {
+		fsize uint64
+		want  string
+	}{{50 << 20, "50"}, {(50 << 20) + 1, "51"}, {4 << 30, "1024"}, {0, "1024"}} {
+		cmd, err := Command(context.Background(), Nsjail, req, []string{"/usr/bin/true"}, Limits{TimeoutS: 5, FSizeBytes: c.fsize})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if contains(cmd.Args, "--rlimit-fsize") {
+			t.Errorf("fsize %d: launcher pins RLIMIT_FSIZE: %v", c.fsize, cmd.Args)
+		}
+		got := ""
+		for i, a := range cmd.Args {
+			if a == "--rlimit_fsize" && i+1 < len(cmd.Args) {
+				got = cmd.Args[i+1]
+			}
+		}
+		if got != c.want {
+			t.Errorf("fsize %d: nsjail --rlimit_fsize %q, want %q", c.fsize, got, c.want)
+		}
+	}
+}

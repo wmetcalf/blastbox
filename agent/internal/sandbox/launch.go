@@ -120,7 +120,11 @@ func Command(ctx context.Context, sb Kind, req Request, argv []string, lim Limit
 		}
 	}
 	add("--rlimit-cpu", lim.CPUSeconds)
-	add("--rlimit-fsize", lim.FSizeBytes)
+	if sb != Nsjail {
+		// nsjail sets its own --rlimit_fsize (soft = hard) in the child; a hard limit pinned
+		// here first could not be raised by an unprivileged nsjail and every run would fail.
+		add("--rlimit-fsize", lim.FSizeBytes)
+	}
 	add("--rlimit-nofile", lim.NoFile)
 	add("--rlimit-nproc", lim.NProc)
 	launch = append(launch, "--")
@@ -148,7 +152,7 @@ func Command(ctx context.Context, sb Kind, req Request, argv []string, lim Limit
 			pins = *req.Pins
 		}
 		nreq := NsjailRequest{
-			Argv: shimArgv(req.Nonce, marker, argv),
+			Argv: shimArgv(req.Nonce, marker, jailArgv(argv, req.ExecPaths)),
 			Env:  env,
 			// Never egress: Command cannot produce --disable_clone_newnet.
 			Limits:         NsjailLimits{TimeoutS: lim.TimeoutS},
@@ -184,6 +188,7 @@ func Command(ctx context.Context, sb Kind, req Request, argv []string, lim Limit
 		if err != nil {
 			return nil, err
 		}
+		capNsjailFSize(inner, lim.FSizeBytes)
 		cmdEnv = []string{"PATH=/usr/bin:/bin", "LANG=C"}
 	default:
 		return nil, fmt.Errorf("unknown sandbox %q", sb)
@@ -197,6 +202,49 @@ func Command(ctx context.Context, sb Kind, req Request, argv []string, lim Limit
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = 3 * time.Second
 	return cmd, nil
+}
+
+// capNsjailFSize lowers nsjail's --rlimit_fsize (MiB, the tmpfs size by default) to the
+// requested per-file cap, rounded up to a whole MiB. It never raises it.
+func capNsjailFSize(argv []string, fsize uint64) {
+	if fsize == 0 {
+		return
+	}
+	want := (fsize + (1<<20 - 1)) >> 20
+	for i := 0; i+1 < len(argv); i++ {
+		if argv[i] != "--rlimit_fsize" {
+			continue
+		}
+		if cur, err := strconv.ParseUint(argv[i+1], 10, 64); err == nil && want < cur {
+			argv[i+1] = strconv.FormatUint(want, 10)
+		}
+		return
+	}
+}
+
+// jailArgv makes argv[0] exist inside the jail. The jail sees /usr and /etc, plus the resolved
+// ExecPaths mounted at their own paths: an argv[0] elsewhere that is a symlink (or a bare name
+// found on the agent's PATH) is not there, so it is replaced by the resolved path it names.
+func jailArgv(argv, execPaths []string) []string {
+	abs := argv[0]
+	if !filepath.IsAbs(abs) {
+		lp, err := exec.LookPath(abs)
+		if err != nil {
+			return argv
+		}
+		if abs, err = filepath.Abs(lp); err != nil {
+			return argv
+		}
+	}
+	if isRelativeTo(abs, "/usr") || isRelativeTo(abs, "/etc") {
+		return argv
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil || resolved == argv[0] || !contains(execPaths, resolved) {
+		return argv
+	}
+	out := append([]string{resolved}, argv[1:]...)
+	return out
 }
 
 func contains(ss []string, s string) bool {
