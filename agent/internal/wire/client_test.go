@@ -963,3 +963,22 @@ func TestOnSessionReportsHandshakeResult(t *testing.T) {
 		t.Fatalf("want one failure report, got %v", got2)
 	}
 }
+
+// The ingress refusing the node's client certificate (expired, revoked, wrong CA) is a TLS
+// alert FROM the server; it needs an operator just like a client-side verification failure,
+// so it is ErrTLS (the long operator back-off), never a transient server error.
+func TestClientCertRejectedByIngressIsTLS(t *testing.T) {
+	ca, other := newCA(t, "real"), newCA(t, "other")
+	f := newFake(t, ca)
+	f.srv.Close()
+	f.srv = httptest.NewUnstartedServer(http.HandlerFunc(f.serve))
+	pool := x509.NewCertPool()
+	pool.AddCert(other.cert)
+	f.srv.TLS = &tls.Config{Certificates: []tls.Certificate{ca.serverCert(t)},
+		ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool}
+	f.srv.StartTLS()
+	err := newClient(t, f, ca).Session(context.Background())
+	if !errors.Is(err, ErrTLS) || errors.Is(err, ErrServer) {
+		t.Fatalf("client cert refused by the ingress: %v", err)
+	}
+}

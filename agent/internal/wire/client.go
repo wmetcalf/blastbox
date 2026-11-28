@@ -358,7 +358,8 @@ func (c *Client) send(ctx context.Context, s reqSpec, token string) (*resp, erro
 		var ua x509.UnknownAuthorityError
 		var he x509.HostnameError
 		var ci x509.CertificateInvalidError
-		if errors.As(err, &cve) || errors.As(err, &ua) || errors.As(err, &he) || errors.As(err, &ci) {
+		if errors.As(err, &cve) || errors.As(err, &ua) || errors.As(err, &he) || errors.As(err, &ci) ||
+			remoteCertAlert(err) {
 			c.contact(fmt.Errorf("%w: %w", ErrTLS, scrub(err)))
 			return nil, fmt.Errorf("%w: %v", ErrTLS, scrub(err))
 		}
@@ -447,6 +448,20 @@ func detail(r *resp) string {
 }
 
 // statusErr maps a non-success status. claimed means the caller held the claim, so 403 = lost.
+// certAlerts are the TLS alerts an ingress sends when it refuses the node's client certificate
+// (Go's spelling of each alert). Like a client-side verification failure they need an operator
+// (renew or re-enrol), so they are ErrTLS rather than a retryable network error.
+var certAlerts = map[string]bool{
+	"tls: bad certificate": true, "tls: unsupported certificate": true, "tls: revoked certificate": true,
+	"tls: expired certificate": true, "tls: unknown certificate": true,
+	"tls: unknown certificate authority": true, "tls: access denied": true, "tls: certificate required": true,
+}
+
+func remoteCertAlert(err error) bool {
+	var oe *net.OpError
+	return errors.As(err, &oe) && oe.Op == "remote error" && oe.Err != nil && certAlerts[oe.Err.Error()]
+}
+
 func statusErr(r *resp, claimed bool) error {
 	code := r.StatusCode
 	switch {
