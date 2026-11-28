@@ -6,6 +6,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -74,6 +75,7 @@ type Agent struct {
 	mu        sync.Mutex
 	cl        *wire.Client
 	notAfter  time.Time
+	certInUse []byte // the cert file the wire client was built from
 	inflight  map[string]wire.HeartbeatJob
 	recSet    map[string]bool // job ids left on disk by a previous run (and runner-refused ids)
 	idLocks   map[string]*idLock
@@ -292,7 +294,7 @@ func (a *Agent) startup(ctx context.Context) error {
 			a.binSHA = s
 		}
 	}
-	if promoted, err := recoverPairLocked(a.Cfg, a.Now()); err != nil {
+	if promoted, err := recoverPairLocked(ctx, a.Cfg, a.Now()); err != nil {
 		return fmt.Errorf("finishing an interrupted certificate swap: %w", err)
 	} else if promoted {
 		a.Log.Warn("completed an interrupted key+cert swap at startup")
@@ -318,6 +320,7 @@ func (a *Agent) startup(ctx context.Context) error {
 		return err
 	}
 	a.cl = cl
+	a.certInUse = certPEM
 	a.renewer = &Renewer{Cfg: a.Cfg, Now: a.Now}
 	return nil
 }
@@ -341,6 +344,7 @@ func (a *Agent) newWire() (*wire.Client, error) {
 
 // resession replaces the client (dropping its token) and handshakes anew.
 func (a *Agent) resession(ctx context.Context) error {
+	certPEM, _ := os.ReadFile(a.Cfg.CertFile) // what newWire is about to load
 	cl, err := a.newWire()
 	if err != nil {
 		return err
@@ -350,6 +354,7 @@ func (a *Agent) resession(ctx context.Context) error {
 	}
 	a.mu.Lock()
 	a.cl = cl
+	a.certInUse = certPEM
 	a.mu.Unlock()
 	return nil
 }
@@ -571,10 +576,33 @@ func (a *Agent) certLoop(ctx context.Context) {
 		case st == RenewSubmitted:
 			a.Log.Info("certificate renewal requested; waiting for the CA to sign it")
 		}
+		if st != RenewInstalled && ctx.Err() == nil && a.pairReplaced() {
+			// Installed under this agent (`blastbox-agent renew`), or an earlier re-handshake
+			// failed: the in-memory client still holds the old pair.
+			a.Log.Info("node key and certificate changed on disk; re-handshaking")
+			a.afterInstall(ctx)
+		}
 		if !a.Sleep(ctx, a.CertEvery) {
 			return
 		}
 	}
+}
+
+// pairReplaced reports whether the cert on disk is not the one the wire client was built from
+// and is a complete pair with the key on disk (a half-done swap is left to RecoverPair).
+func (a *Agent) pairReplaced() bool {
+	raw, err := os.ReadFile(a.Cfg.CertFile)
+	if err != nil {
+		return false
+	}
+	a.mu.Lock()
+	same := bytes.Equal(raw, a.certInUse)
+	a.mu.Unlock()
+	if same {
+		return false
+	}
+	pub, _, err := certPub(raw)
+	return err == nil && keyMatches(a.Cfg.KeyFile, pub)
 }
 
 func (a *Agent) afterInstall(ctx context.Context) {

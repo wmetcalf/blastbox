@@ -1370,7 +1370,7 @@ func TestRenewStepFinishesAnInterruptedSwap(t *testing.T) {
 func TestRenewStepsAreSerialisedAcrossProcesses(t *testing.T) {
 	e := newEnv(t, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
 	e.in.holdIssue = true
-	unlock, err := lockCert(e.cfg)
+	unlock, err := lockCert(context.Background(), e.cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1390,4 +1390,82 @@ func TestRenewStepsAreSerialisedAcrossProcesses(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the step never ran after the lock was released")
 	}
+}
+
+// The certificate lock lives in the state dir (always the agent's): a read-only key dir must
+// not stop the agent starting, and a lock held elsewhere never blocks past its context.
+func TestCertLockIsInTheStateDirAndCancellable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes a 0500 dir")
+	}
+	e := newEnv(t, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	kd := filepath.Dir(e.cfg.KeyFile)
+	if err := os.Chmod(kd, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(kd, 0o700)
+	unlock, err := lockCert(context.Background(), e.cfg)
+	if err != nil {
+		t.Fatalf("cert lock with a read-only key dir: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	t0 := time.Now()
+	if _, err := lockCert(ctx, e.cfg); err == nil {
+		t.Fatal("took a lock that is held")
+	}
+	if d := time.Since(t0); d > 2*time.Second {
+		t.Fatalf("a held lock blocked %v past its context", d)
+	}
+	unlock()
+}
+
+// A key.next that is not a regular file (a symlink, a directory) is a bad leftover, not a key
+// that merely cannot be read right now: it is replaced, never kept forever.
+func TestRenewReplacesANonRegularPendingKey(t *testing.T) {
+	e := newEnv(t, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	e.in.holdIssue = true
+	nk := e.cfg.KeyFile + ".next"
+	if err := os.Symlink(e.cfg.KeyFile, nk); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := renewer(t, e).Step(context.Background(), true); err != nil || st != RenewSubmitted {
+		t.Fatalf("%v %v: a symlinked key.next blocked renewal", st, err)
+	}
+	if fi, err := os.Lstat(nk); err != nil || !fi.Mode().IsRegular() {
+		t.Fatalf("key.next not replaced by a regular key: %v", err)
+	}
+}
+
+// A pair installed under a running agent (by `blastbox-agent renew`) is adopted by its renewal
+// loop: the agent re-handshakes with the new key and cert instead of holding the old ones
+// until the server stops accepting them.
+func TestRunningAgentAdoptsAPairInstalledUnderIt(t *testing.T) {
+	e := newEnv(t, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	h := newHarness(e)
+	h.start(t)
+	eventually(t, "first session", func() bool {
+		e.in.mu.Lock()
+		defer e.in.mu.Unlock()
+		return len(e.in.sessions) >= 1
+	})
+	nk, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	newCert := e.ca.issueNode(t, "node-a", &nk.PublicKey, time.Now().Add(-time.Minute), time.Now().Add(7*24*time.Hour))
+	unlock, err := lockCert(context.Background(), e.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(e.cfg.KeyFile)
+	if err := writeKeyExcl(e.cfg.KeyFile, nk); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(e.cfg.CertFile, newCert, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+	eventually(t, "re-handshake with the installed pair", func() bool {
+		e.in.mu.Lock()
+		defer e.in.mu.Unlock()
+		return e.in.sessions[len(e.in.sessions)-1] == string(newCert)
+	})
 }

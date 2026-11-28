@@ -50,9 +50,15 @@ func certPub(certPEM []byte) (*ecdsa.PublicKey, *x509.Certificate, error) {
 
 // unreadable reports whether a key load failed in the file system (open or read: permissions,
 // EIO, fd exhaustion), as opposed to on its content. Only bad content proves a corrupt file.
-func unreadable(err error) bool {
+// A path that is not a regular file (a symlink the O_NOFOLLOW open refuses, a directory) is
+// a bad leftover too, never a key.
+func unreadable(path string, err error) bool {
 	var pe *fs.PathError
-	return errors.As(err, &pe)
+	if !errors.As(err, &pe) {
+		return false
+	}
+	fi, lerr := os.Lstat(path)
+	return lerr != nil || fi.Mode().IsRegular()
 }
 
 func keyMatches(keyPath string, pub *ecdsa.PublicKey) bool {
@@ -102,8 +108,8 @@ func RecoverPair(cfg *config.Config, now time.Time) (bool, error) {
 
 // recoverPairLocked is RecoverPair under the certificate lock (a renewal step of another
 // process may be mid-swap).
-func recoverPairLocked(cfg *config.Config, now time.Time) (bool, error) {
-	unlock, err := lockCert(cfg)
+func recoverPairLocked(ctx context.Context, cfg *config.Config, now time.Time) (bool, error) {
+	unlock, err := lockCert(ctx, cfg)
 	if err != nil {
 		return false, err
 	}
@@ -160,7 +166,7 @@ func (r *Renewer) Due() (bool, time.Time, error) {
 // only if the certificate is still due and none was sent in the last hour (or force). The old
 // key and cert stay current until /cert serves a cert for key.next.
 func (r *Renewer) Step(ctx context.Context, force bool) (RenewState, error) {
-	unlock, err := lockCert(r.Cfg)
+	unlock, err := lockCert(ctx, r.Cfg)
 	if err != nil {
 		return RenewPending, err
 	}
@@ -186,7 +192,7 @@ func (r *Renewer) step(ctx context.Context, force bool) (RenewState, error) {
 	pendingKey := statErr == nil
 	if pendingKey {
 		if _, err := wire.LoadKey(nextKey); err != nil {
-			if unreadable(err) {
+			if unreadable(nextKey, err) {
 				// Not known to be corrupt: it may be the key a signed CSR names. Keep it.
 				return RenewPending, fmt.Errorf("pending key %s: %w", nextKey, err)
 			}
@@ -311,7 +317,7 @@ func ensureNextKey(path string) (*ecdsa.PrivateKey, error) {
 	if k, err := wire.LoadKey(path); err == nil {
 		return k, nil
 	} else if _, serr := os.Lstat(path); serr == nil {
-		if unreadable(err) {
+		if unreadable(path, err) {
 			return nil, fmt.Errorf("pending key %s: %w", path, err)
 		}
 		if rerr := os.Remove(path); rerr != nil { // corrupt leftover of a crash
@@ -469,7 +475,7 @@ func Enrol(nodeID, dir string, w io.Writer) error {
 // RenewNow is `blastbox-agent renew`: force one renewal attempt (the wire client handshakes
 // lazily on its first authenticated call), then check once whether the cert is already issued.
 func RenewNow(ctx context.Context, cfg *config.Config, now func() time.Time, w io.Writer) error {
-	if _, err := recoverPairLocked(cfg, now()); err != nil {
+	if _, err := recoverPairLocked(ctx, cfg, now()); err != nil {
 		return err
 	}
 	cl, err := wire.New(cfg, "blastbox-agent/"+Version)
@@ -489,7 +495,7 @@ func RenewNow(ctx context.Context, cfg *config.Config, now func() time.Time, w i
 		return err
 	}
 	if st == RenewInstalled {
-		fmt.Fprintln(w, "new certificate installed; restart the agent to use it")
+		fmt.Fprintln(w, "new certificate installed; a running agent adopts it at its next renewal check")
 	} else {
 		fmt.Fprintln(w, "renewal pending; a running agent installs the certificate once issued, or re-run renew later")
 	}
