@@ -60,13 +60,52 @@ func semverCmp(a, b string) int {
 			return 1
 		}
 	}
-	// Equal numbers: a prerelease is below its release (semver 2.0 §11); build metadata after
-	// "+" does not count. Two prereleases of one version compare equal here (fail-open only
-	// between prereleases, never past the release itself).
-	if pa, pb := prerelease(a), prerelease(b); pa != pb && (pa == "" || pb == "") {
-		if pa != "" {
-			return -1
+	// Equal numbers: a prerelease is below its release, and prereleases are ordered by their
+	// dot-separated identifiers (semver 2.0 §11); build metadata after "+" does not count.
+	ra, rb := prerelease(a), prerelease(b)
+	switch {
+	case ra == rb:
+		return 0
+	case ra == "":
+		return 1
+	case rb == "":
+		return -1
+	}
+	return prereleaseCmp(ra, rb)
+}
+
+// prereleaseCmp orders two non-empty prerelease strings (semver 2.0 §11.4): identifiers are
+// compared left to right, numeric ones numerically and below alphanumeric ones, others in
+// ASCII order; a shorter list that is a prefix of the longer one is lower.
+func prereleaseCmp(a, b string) int {
+	ia, ib := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(ia) && i < len(ib); i++ {
+		x, y := ia[i], ib[i]
+		if x == y {
+			continue
 		}
+		nx, ex := strconv.ParseUint(x, 10, 64)
+		ny, ey := strconv.ParseUint(y, 10, 64)
+		switch {
+		case ex == nil && ey == nil:
+			if nx < ny {
+				return -1
+			}
+			return 1
+		case ex == nil:
+			return -1
+		case ey == nil:
+			return 1
+		case x < y:
+			return -1
+		default:
+			return 1
+		}
+	}
+	switch {
+	case len(ia) < len(ib):
+		return -1
+	case len(ia) > len(ib):
 		return 1
 	}
 	return 0
