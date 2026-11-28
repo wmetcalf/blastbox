@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -1245,5 +1247,63 @@ func TestRenewIssuedAtUsesServerClock(t *testing.T) {
 	want := time.Now().Add(200 * time.Second).Unix()
 	if at != float64(int64(at)) || int64(at) < want-3 || int64(at) > want+3 {
 		t.Fatalf("issued_at %v, want ~%d", at, want)
+	}
+}
+
+// Only a key.next whose CONTENT is unusable is a corrupt leftover. One that merely cannot be
+// read right now (permissions, EIO, fd exhaustion) may be the key a signed CSR names: deleting
+// it would strand the node with a published cert nothing can use.
+func TestRenewKeepsAPendingKeyItCannotRead(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a 0000 file")
+	}
+	e := newEnv(t, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	e.in.holdIssue = true
+	ctx := context.Background()
+	r := renewer(t, e)
+	if st, err := r.Step(ctx, true); err != nil || st != RenewSubmitted {
+		t.Fatalf("%v %v", st, err)
+	}
+	nk := e.cfg.KeyFile + ".next"
+	want, _ := os.ReadFile(nk)
+	if err := os.Chmod(nk, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Step(ctx, true); err == nil {
+		t.Error("an unreadable pending key was not reported")
+	}
+	os.Chmod(nk, 0o600)
+	if got, err := os.ReadFile(nk); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("pending key replaced or deleted after a read error: %v", err)
+	}
+	if _, err := os.Stat(nk + ".csr"); err != nil {
+		t.Fatalf("pending CSR deleted after a read error: %v", err)
+	}
+}
+
+// An interrupted swap (key.next renamed over key, cert.next not yet over cert) is finished by
+// the running agent's next renewal step, not only at the next start: until then its key and
+// cert do not match and every re-handshake fails.
+func TestRenewStepFinishesAnInterruptedSwap(t *testing.T) {
+	e := newEnv(t, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	ctx := context.Background()
+	r := renewer(t, e)
+	nk, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	newCert := e.ca.issueNode(t, "node-a", &nk.PublicKey, time.Now().Add(-time.Minute), time.Now().Add(7*24*time.Hour))
+	os.Remove(e.cfg.KeyFile)
+	if err := writeKeyExcl(e.cfg.KeyFile, nk); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(e.cfg.CertFile+".next", newCert, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := r.Step(ctx, false)
+	if err != nil || st != RenewInstalled {
+		t.Fatalf("%v %v: the half-swapped pair was left in place", st, err)
+	}
+	raw, _ := os.ReadFile(e.cfg.CertFile)
+	pub, _, _ := certPub(raw)
+	if !keyMatches(e.cfg.KeyFile, pub) {
+		t.Fatal("key and cert still do not match")
 	}
 }

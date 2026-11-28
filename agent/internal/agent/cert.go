@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -45,6 +46,13 @@ func certPub(certPEM []byte) (*ecdsa.PublicKey, *x509.Certificate, error) {
 		return nil, nil, errors.New("certificate key is not ECDSA")
 	}
 	return pub, c, nil
+}
+
+// unreadable reports whether a key load failed in the file system (open or read: permissions,
+// EIO, fd exhaustion), as opposed to on its content. Only bad content proves a corrupt file.
+func unreadable(err error) bool {
+	var pe *fs.PathError
+	return errors.As(err, &pe)
 }
 
 func keyMatches(keyPath string, pub *ecdsa.PublicKey) bool {
@@ -141,6 +149,14 @@ func (r *Renewer) Due() (bool, time.Time, error) {
 // only if the certificate is still due and none was sent in the last hour (or force). The old
 // key and cert stay current until /cert serves a cert for key.next.
 func (r *Renewer) Step(ctx context.Context, force bool) (RenewState, error) {
+	// A swap interrupted between its two renames (a failed rename, or a crash) is finished
+	// here too, not only at the next start: until then the key and cert do not match.
+	if promoted, err := RecoverPair(r.Cfg, r.now()); err != nil {
+		return RenewPending, err
+	} else if promoted {
+		r.submitted = time.Time{}
+		return RenewInstalled, nil
+	}
 	due, _, err := r.Due()
 	if err != nil {
 		return RenewNotDue, err
@@ -150,6 +166,10 @@ func (r *Renewer) Step(ctx context.Context, force bool) (RenewState, error) {
 	pendingKey := statErr == nil
 	if pendingKey {
 		if _, err := wire.LoadKey(nextKey); err != nil {
+			if unreadable(err) {
+				// Not known to be corrupt: it may be the key a signed CSR names. Keep it.
+				return RenewPending, fmt.Errorf("pending key %s: %w", nextKey, err)
+			}
 			// A corrupt leftover can never match an issued certificate: drop it, so a fresh key
 			// and CSR replace it instead of every pass failing until the certificate expires.
 			if rerr := os.Remove(nextKey); rerr != nil {
@@ -271,6 +291,9 @@ func ensureNextKey(path string) (*ecdsa.PrivateKey, error) {
 	if k, err := wire.LoadKey(path); err == nil {
 		return k, nil
 	} else if _, serr := os.Lstat(path); serr == nil {
+		if unreadable(err) {
+			return nil, fmt.Errorf("pending key %s: %w", path, err)
+		}
 		if rerr := os.Remove(path); rerr != nil { // corrupt leftover of a crash
 			return nil, fmt.Errorf("unreadable %s (%v) and cannot be removed: %w", path, err, rerr)
 		}
@@ -366,6 +389,9 @@ func (r *Renewer) tryInstall(ctx context.Context) (bool, error) {
 	if err := f.Close(); err != nil {
 		return false, err
 	}
+	// cert.next's directory entry must be durable before key.next replaces the only key the
+	// current cert matches: a power loss must never leave the new key without its cert.
+	syncDir(filepath.Dir(nextCert))
 	if err := os.Rename(nextKey, r.Cfg.KeyFile); err != nil {
 		return false, err
 	}
