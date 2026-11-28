@@ -185,10 +185,14 @@ func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool)
 			cl.ClaimedAt = fi.ModTime()
 		}
 	}
-	rctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	rctx, cancel := context.WithTimeout(ctx, orDur(a.ReportWait, 2*time.Minute))
 	defer cancel()
+	// A result upload streams up to max_total_artifacts and waits for the control plane to
+	// extract it: it gets the upload bound, not the short report bound.
+	uctx, ucancel := context.WithTimeout(ctx, orDur(a.UploadWait, runner.DefaultUploadWait))
+	defer ucancel()
 	if uploaded {
-		return a.recoverUploaded(rctx, dir, name, cl)
+		return a.recoverUploaded(uctx, dir, name, cl)
 	}
 	var cerr error
 	action := "release"
@@ -197,7 +201,7 @@ func (a *Agent) recoverOne(ctx context.Context, dir, name string) (settled bool)
 		reason := "agent restarted mid-run"
 		if tar, meta, ok := resultRecord(dir); ok {
 			action = "replay upload"
-			out, err := a.client().PutResult(rctx, cl, tar, meta)
+			out, err := a.client().PutResult(uctx, cl, tar, meta)
 			switch {
 			case err != nil && runner.Permanent(err):
 				action, reason = "fail", "result upload refused: "+err.Error()
@@ -266,4 +270,11 @@ func (a *Agent) recoverUploaded(ctx context.Context, dir, name string, cl *wire.
 	}
 	a.Log.Warn("recovery: will retry", "job", name, "action", "poll accepted upload", "err", err.Error())
 	return false
+}
+
+func orDur(d, def time.Duration) time.Duration {
+	if d > 0 {
+		return d
+	}
+	return def
 }

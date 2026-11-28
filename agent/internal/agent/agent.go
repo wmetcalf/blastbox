@@ -64,6 +64,8 @@ type Agent struct {
 	DrainGrace   time.Duration // added to the longest in-flight deadline (30 s)
 	ReprobeEvery time.Duration // 10 min
 	CertEvery    time.Duration // 5 min
+	ReportWait   time.Duration // recovery's bound on one fail/release report (2 min)
+	UploadWait   time.Duration // recovery's bound on one result upload (runner.DefaultUploadWait)
 
 	startedAt time.Time
 	binSHA    string

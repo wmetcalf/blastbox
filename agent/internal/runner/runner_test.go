@@ -48,10 +48,11 @@ type ingress struct {
 	inputHeader  string // "" = the true sha256
 	putStatus    int    // 0 = 200
 	putBody      string
-	dispStatus   string // disposition answer; "" = done
-	updStatus    int    // status for POST /v1/nodes/jobs/<id>; 0 = 200
-	state        string // the fixture's state dir (for markers seen mid-run)
-	reportedSeen bool   // the "reported" marker existed when disposition was polled
+	putDelay     time.Duration // how long the PUT takes to answer
+	dispStatus   string        // disposition answer; "" = done
+	updStatus    int           // status for POST /v1/nodes/jobs/<id>; 0 = 200
+	state        string        // the fixture's state dir (for markers seen mid-run)
+	reportedSeen bool          // the "reported" marker existed when disposition was polled
 
 	inputGets int
 	puts      int
@@ -126,6 +127,7 @@ func (in *ingress) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "PUT" && r.URL.Path == jp+"/result":
 		in.puts++
 		in.putTar = body
+		time.Sleep(in.putDelay)
 		switch in.putStatus {
 		case 503:
 			w.WriteHeader(503)
@@ -373,6 +375,18 @@ func TestUndeliveredUploadIsKeptForRecovery(t *testing.T) {
 		if _, err := os.Lstat(filepath.Join(d, n)); err != nil {
 			t.Fatalf("%s gone: %v", n, err)
 		}
+	}
+}
+
+// The result upload is bounded by the stream timeout, not by the short fail/release report
+// bound: a large tar (up to max_total_artifacts) or a slow finalizer hand-over took longer than
+// 2 minutes, and recovery replayed it under the same bound, so it could never be delivered.
+func TestUploadOutlivesTheReportBound(t *testing.T) {
+	f := setup(t, happyEngine)
+	f.r.ReportWait = 100 * time.Millisecond
+	f.in.putDelay = 400 * time.Millisecond
+	if res := f.run(); res.Outcome != "done" || res.Keep {
+		t.Fatalf("%+v: an upload slower than the report bound was cut off", res)
 	}
 }
 

@@ -109,6 +109,7 @@ type ingress struct {
 	jobStatus   map[string]int             // job id -> status code override for updates
 	puts        map[string]int             // job id -> result PUTs
 	putStatus   map[string]int             // job id -> result PUT status (default 200 done)
+	putDelay    time.Duration              // how long every result PUT takes to answer
 	onUpdate    func(id string, n int) int // optional: status for the n-th update of id (may block)
 	updCount    map[string]int
 	dispStatus  map[string]string // job id -> disposition status (absent: no job)
@@ -262,7 +263,9 @@ func (in *ingress) serve(w http.ResponseWriter, r *http.Request) {
 		in.mu.Lock()
 		in.puts[id]++
 		code := in.putStatus[id]
+		delay := in.putDelay
 		in.mu.Unlock()
+		time.Sleep(delay)
 		switch code {
 		case 0, 200:
 			js(200, map[string]any{"status": "done"})

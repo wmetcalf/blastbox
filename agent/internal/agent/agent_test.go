@@ -220,6 +220,32 @@ func TestRecoveryAfterAcceptedUploadReplaysAndNeverFails(t *testing.T) {
 	}
 }
 
+// Recovery replays a result upload under the upload bound, not the 2 min report bound: a large
+// tar (or a slow finalizer hand-over) otherwise timed out on every pass and was never delivered.
+func TestRecoveryReplaysASlowUploadToCompletion(t *testing.T) {
+	for _, uploaded := range []bool{false, true} {
+		e := fresh(t)
+		e.cfg.Claim = false
+		d := jobDir(e, "js", true, true)
+		os.WriteFile(filepath.Join(d, runner.ResultTarName), make([]byte, 1024), 0o600)
+		os.WriteFile(filepath.Join(d, runner.ResultMetaName), []byte(`{"worker_runtime":"seatbelt","started_at_ms":1,"finished_at_ms":2}`), 0o600)
+		if uploaded {
+			os.WriteFile(filepath.Join(d, runner.UploadedName), nil, 0o600)
+		}
+		e.in.putDelay = 400 * time.Millisecond
+		h := newHarness(e)
+		h.a.ReportWait = 100 * time.Millisecond
+		h.start(t)
+		eventually(t, "slow replay settles", func() bool {
+			_, err := os.Stat(d)
+			return os.IsNotExist(err)
+		})
+		if u := e.in.update("js"); u != nil {
+			t.Fatalf("uploaded=%v: a fail or release followed a slow upload: %v", uploaded, u)
+		}
+	}
+}
+
 func TestRecoveryAfterAcceptedUploadPollsDisposition(t *testing.T) {
 	e := fresh(t)
 	e.cfg.Claim = false

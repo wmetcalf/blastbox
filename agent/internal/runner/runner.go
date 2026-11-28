@@ -96,6 +96,8 @@ type Runner struct {
 	DispPoll    time.Duration                 // Disposition poll period (2 s)
 	RetryBase   time.Duration                 // first retry delay for Fail/PutResult on a retryable error (2 s)
 	RetryTries  int                           // attempts for Fail/PutResult (3)
+	ReportWait  time.Duration                 // bound on one fail/release report, retries included (2 min)
+	UploadWait  time.Duration                 // bound on one result upload, retries included (DefaultUploadWait)
 	rss         func(pgid int) (int64, error) // test seam; nil = groupRSSKiB (plus the run's escapees)
 	build       func(context.Context, sandbox.Kind, sandbox.Request, []string, sandbox.Limits) (*exec.Cmd, error)
 	hostPins    *sandbox.HostPins
@@ -922,12 +924,22 @@ func (r *Runner) retry(ctx context.Context, f func() error) error {
 
 // reportCtx outlives a cancelled run context: a job interrupted by shutdown must still be told
 // to the control plane.
-func reportCtx(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+func (r *Runner) reportCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), def(r.ReportWait, 2*time.Minute))
+}
+
+// DefaultUploadWait bounds a result upload: the wire client's 30 min stream timeout for the
+// body plus its 5 min wait for the control plane's answer (it extracts and fsyncs the tree
+// before answering). The 2 min report bound would cut off any large tar on a slow uplink.
+const DefaultUploadWait = 35 * time.Minute
+
+// UploadContext is reportCtx for a result upload (and its disposition poll).
+func (r *Runner) UploadContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), def(r.UploadWait, DefaultUploadWait))
 }
 
 func (j *job) release(ctx context.Context, why string) Result {
-	rc, cancel := reportCtx(ctx)
+	rc, cancel := j.r.reportCtx(ctx)
 	defer cancel()
 	return j.releaseOrLost2(rc, why, j.cl.Release(rc, j.c))
 }
@@ -970,7 +982,7 @@ func serverReason(s string) string {
 
 func (j *job) fail(ctx context.Context, why string) Result {
 	why = serverReason(why)
-	rc, cancel := reportCtx(ctx)
+	rc, cancel := j.r.reportCtx(ctx)
 	defer cancel()
 	err := j.r.retry(rc, func() error { return j.cl.Fail(rc, j.c, why, time.Now()) })
 	switch {
@@ -985,7 +997,7 @@ func (j *job) fail(ctx context.Context, why string) Result {
 }
 
 func (j *job) upload(ctx context.Context, tarPath string, kind sandbox.Kind) Result {
-	rc, cancel := reportCtx(ctx)
+	rc, cancel := j.r.UploadContext(ctx)
 	defer cancel()
 	meta := wire.ResultMeta{WorkerRuntime: string(kind), StartedAt: j.start, FinishedAt: time.Now()}
 	// Recorded first: if the upload goes unanswered (or the agent dies), recovery replays the
