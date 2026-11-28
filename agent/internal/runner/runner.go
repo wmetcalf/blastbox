@@ -100,6 +100,7 @@ type Runner struct {
 
 	// Tunables (zero = production defaults); tests shorten them.
 	MemPoll     time.Duration                 // memory watchdog period (500 ms)
+	DiskPoll    time.Duration                 // disk watchdog period (1 s)
 	DispWait    time.Duration                 // how long to poll Disposition after an "accepted" (60 s)
 	DispPoll    time.Duration                 // Disposition poll period (2 s)
 	RetryBase   time.Duration                 // first retry delay for Fail/PutResult on a retryable error (2 s)
@@ -109,7 +110,8 @@ type Runner struct {
 	rss         func(pgid int) (int64, error) // test seam; nil = groupRSSKiB (plus the run's escapees)
 	build       func(context.Context, sandbox.Kind, sandbox.Request, []string, sandbox.Limits) (*exec.Cmd, error)
 	hostPins    *sandbox.HostPins
-	sweep       func(sandbox.RunIdentity) (int, error) // test seam; nil = sandbox.SweepRun
+	sweep       func(sandbox.RunIdentity) (int, error)          // test seam; nil = sandbox.SweepRun
+	held        func(pids []int, roots []string) (int64, error) // test seam; nil = heldUnlinkedBytes
 	skipAAProbe bool
 }
 
@@ -292,6 +294,11 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 	}
 	if killed != "" {
 		return j.fail(ctx, killed)
+	}
+	// One last measurement now that the run is over (its processes killed and swept): a burst
+	// written after the last sample must not slip through.
+	if over, _ := j.diskOver(0, false); over != "" {
+		return j.fail(ctx, over+" after the run")
 	}
 	if capw != nil && capw.overflowed() {
 		return j.fail(ctx, "envelope over max_metadata")
@@ -650,6 +657,9 @@ func (j *job) exec(ctx context.Context, cmd *exec.Cmd, capw *capWriter) (killed 
 	if rssFn == nil {
 		rssFn = func(pgid int) (int64, error) { return groupRSSKiB(pgid, j.ident.Match) }
 	}
+	diskTick := time.NewTicker(def(j.r.DiskPoll, time.Second))
+	defer diskTick.Stop()
+	diskFails := 0
 	for {
 		select {
 		case err := <-done:
@@ -673,6 +683,24 @@ func (j *job) exec(ctx context.Context, cmd *exec.Cmd, capw *capWriter) (killed 
 			kill("run interrupted: agent shutting down")
 			err := <-done
 			return killed, err
+		case <-diskTick.C:
+			over, err := j.diskOver(pid, true)
+			if err != nil {
+				diskFails++
+				j.r.logf("job %s: disk watchdog read failed (%d/3): %v", j.c.JobID, diskFails, err)
+				if diskFails >= 3 {
+					kill("disk watchdog unavailable")
+					err := <-done
+					return killed, err
+				}
+				continue
+			}
+			diskFails = 0
+			if over != "" {
+				kill(over)
+				err := <-done
+				return killed, err
+			}
 		case <-tick.C:
 			rss, err := rssFn(pid)
 			if err != nil {
@@ -695,6 +723,59 @@ func (j *job) exec(ctx context.Context, cmd *exec.Cmd, capw *capWriter) (killed 
 			}
 		}
 	}
+}
+
+// diskRoots are the run's writable dirs.
+func (j *job) diskRoots() []string {
+	roots := []string{j.scr}
+	if j.eng.Output == "dir" {
+		roots = append(roots, j.out)
+	}
+	return roots
+}
+
+// diskBudget is the most a run may hold in its writable dirs: the engine's max_disk_mib, but
+// never less than a full output (max_total_artifacts + max_metadata, plus block slack).
+func (j *job) diskBudget() int64 {
+	lim := j.c.Run.Limits
+	floor := orDef(lim.MaxTotalArtifacts, defMaxTotalArtifacts) + orDef(lim.MaxMetadata, defMaxMetadata) + 64<<20
+	return max(int64(j.eng.DiskLimitMiB())<<20, floor)
+}
+
+// diskOver measures the run's writable dirs (and, while it runs, the unlinked files its
+// processes still hold) and returns a kill reason when they are over budget or could not all
+// be read (fail closed: what cannot be measured cannot be shown under budget). err is a
+// failed held-file sample.
+func (j *job) diskOver(pid int, running bool) (string, error) {
+	roots := j.diskRoots()
+	used, entries, complete := dirUsage(roots, maxDiskEntries)
+	if !complete {
+		return "disk budget: part of the writable dirs could not be read", nil
+	}
+	if running {
+		procs, err := groupProcs(pid, j.ident.Match)
+		if err != nil {
+			return "", err
+		}
+		pids := make([]int, 0, len(procs))
+		for p := range procs {
+			pids = append(pids, p)
+		}
+		heldFn := j.r.held
+		if heldFn == nil {
+			heldFn = heldUnlinkedBytes
+		}
+		h, err := heldFn(pids, roots)
+		if err != nil {
+			return "", err
+		}
+		used += h
+	}
+	if budget := j.diskBudget(); used > budget || entries > maxDiskEntries {
+		return fmt.Sprintf("disk budget exceeded: writable dirs hold %d bytes / %d entries (limit %d bytes / %d entries)",
+			used, entries, budget, maxDiskEntries), nil
+	}
+	return "", nil
 }
 
 // killGroupOf SIGKILLs process group pid only while pid is still the leader that was started
