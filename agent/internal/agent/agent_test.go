@@ -1527,3 +1527,32 @@ func TestResessionWithANewPairUpdatesTheReportedExpiry(t *testing.T) {
 		t.Fatalf("reported expiry %v after adopting a cert that expires %v", got, na)
 	}
 }
+
+// A FIFO at key.next must not hang the renewal step (which holds the cert lock, and so the
+// renew subcommand, startup and shutdown) in open(2): it is a bad leftover, replaced.
+func TestRenewReplacesAFifoPendingKeyWithoutHanging(t *testing.T) {
+	e := newEnv(t, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	e.in.holdIssue = true
+	nk := e.cfg.KeyFile + ".next"
+	if err := syscall.Mkfifo(nk, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := renewer(t, e)
+	done := make(chan error, 1)
+	go func() { _, err := r.Step(context.Background(), true); done <- err }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("step: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		f, _ := os.OpenFile(nk, os.O_WRONLY|syscall.O_NONBLOCK, 0) // unblock the open
+		if f != nil {
+			f.Close()
+		}
+		t.Fatal("a FIFO key.next hung the renewal step")
+	}
+	if fi, err := os.Lstat(nk); err != nil || !fi.Mode().IsRegular() {
+		t.Fatalf("key.next not replaced by a regular key: %v", err)
+	}
+}
