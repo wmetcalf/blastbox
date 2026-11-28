@@ -883,3 +883,23 @@ def test_pax_sparse_headers_refused_before_the_map_is_parsed(monkeypatch, hdrs):
     with pytest.raises(node_results.TarRejected, match="sparse"):
         node_results.vet_tar(io.BytesIO(buf.getvalue()), max_members=100,
                              max_total_bytes=1 << 20)
+
+
+def test_a_result_published_before_the_lock_is_replayed_not_reprocessed(tmp_path, pki_dir, monkeypatch):  # noqa: F811
+    """A peer PUT publishes (and the finalizer finishes) after this request's first look but
+    before it takes the lock: the replay must answer from the stored outcome, body unread."""
+    _, c, hdr = _setup(tmp_path, pki_dir)
+    assert put(c, hdr, make_tar([])).status_code == 202
+    (d,) = spool_dirs(tmp_path)
+    node_results.write_outcome(d, "done", None)
+    hidden = d.with_name(d.name + ".hidden")
+    d.rename(hidden)                    # first _existing() sees nothing
+    real = node_results.node_cert_sha256
+
+    def cert_then_publish(*a, **k):
+        hidden.rename(d)                # the peer's result lands during the cert lookup
+        return real(*a, **k)
+
+    monkeypatch.setattr(node_results, "node_cert_sha256", cert_then_publish)
+    r = put(c, hdr, b"placeholder, not a tar")
+    assert r.status_code == 200 and r.json() == {"status": "done"}, r.text

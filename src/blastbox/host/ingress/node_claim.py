@@ -1966,6 +1966,11 @@ def register_node_claim_routes(
             return JSONResponse({"status": "retry"}, status_code=503,
                                              headers={"Retry-After": "2"})
         try:
+            # a peer may have published between the first look and taking the lock: replay its
+            # stored outcome, body unread, exactly as the first check would have
+            prior = await _existing()
+            if prior is not None:
+                return prior
             try:
                 return await _receive_and_extract()
             except OSError as exc:
