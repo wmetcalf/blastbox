@@ -1643,6 +1643,32 @@ func TestDuplicateClaimFailIsRetriedUntilDelivered(t *testing.T) {
 	})
 }
 
+// A settled job dir that could not be wiped stays in the recovery set and is wiped on a later
+// pass, never dropped with its data still on disk.
+func TestRecoveryRetriesAWipeThatFailed(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root removes anything")
+	}
+	e := fresh(t)
+	d := jobDir(e, "jw", true, true)
+	os.WriteFile(filepath.Join(d, runner.ReportedName), nil, 0o600)
+	jobs := filepath.Dir(d)
+	h := newHarness(e)
+	h.a.snapshotRecovery()
+	os.Chmod(jobs, 0o500)
+	defer os.Chmod(jobs, 0o700)
+	if left := h.a.recoverJobs(context.Background()); left != 1 {
+		t.Fatalf("an unwiped job dir left the recovery set (left=%d)", left)
+	}
+	os.Chmod(jobs, 0o700)
+	if left := h.a.recoverJobs(context.Background()); left != 0 {
+		t.Fatalf("left=%d after the wipe could proceed", left)
+	}
+	if _, err := os.Lstat(d); !os.IsNotExist(err) {
+		t.Fatalf("job dir survived: %v", err)
+	}
+}
+
 // syncTrace records, at each directory sync, whether key.next and cert.next were still present.
 type syncEvent struct {
 	dir               string

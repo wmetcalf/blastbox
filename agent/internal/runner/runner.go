@@ -51,6 +51,8 @@ type Result struct {
 	// a release, or a fail with PendingFail as its reason.
 	Unrecorded  bool
 	PendingFail string
+	// Unwiped: the job dir could not be removed after the run; recovery retries the wipe.
+	Unwiped bool
 }
 
 // Files a job dir may hold besides in/ out/ scratch/ (crash recovery reads them).
@@ -193,14 +195,20 @@ func (r *Runner) Run(ctx context.Context, cl *wire.Client, eng config.Engine, c 
 			Unrecorded: fr.Unrecorded, PendingFail: fr.PendingFail}
 	}
 	if _, err := os.Lstat(j.dir); err == nil { // leftover of an earlier, unstarted attempt
-		wipe(j.dir)
+		if err := Wipe(j.dir); err != nil {
+			r.logf("job %s: leftover job dir: %v", c.JobID, err)
+		}
 	}
 	if err := os.Mkdir(j.dir, 0o700); err != nil {
 		return j.release(ctx, "job dir: "+err.Error())
 	}
 	defer func() {
 		if !res.Keep {
-			wipe(j.dir)
+			if err := Wipe(j.dir); err != nil {
+				// Job data must not stay on disk: crash recovery retries the wipe.
+				r.logf("job %s: %v; left to recovery", c.JobID, err)
+				res.Unwiped = true
+			}
 		}
 	}()
 	j.in, j.out, j.scr = filepath.Join(j.dir, "in"), filepath.Join(j.dir, "out"), filepath.Join(j.dir, "scratch")
@@ -1082,17 +1090,6 @@ func (j *job) upload(ctx context.Context, tarPath string, kind sandbox.Kind) Res
 }
 
 // ---- wiping ----
-
-// wipe removes the job dir whatever the engine did to its modes.
-func wipe(dir string) {
-	filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-		if d != nil && d.IsDir() {
-			os.Chmod(p, 0o700)
-		}
-		return nil
-	})
-	os.RemoveAll(dir)
-}
 
 // ---- writers ----
 

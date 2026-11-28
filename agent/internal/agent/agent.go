@@ -803,6 +803,9 @@ func (a *Agent) runClaim(ctx, jobsCtx context.Context, es *engState, c *wire.Cla
 		// The terminal report went unanswered: recovery retries it from the kept dir.
 		a.Log.Warn("job report not delivered; left to recovery", "job", c.JobID)
 		a.addRecovery(c.JobID)
+	case res.Unwiped:
+		a.Log.Warn("job dir not wiped; left to recovery", "job", c.JobID)
+		a.addRecovery(c.JobID)
 	case res.Outcome == "refused":
 		// A job dir already held a started marker: it now belongs to crash recovery.
 		a.Log.Warn("runner refused a claim whose job dir holds a started marker; left to recovery", "job", c.JobID)
