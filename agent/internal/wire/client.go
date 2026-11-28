@@ -660,7 +660,7 @@ func (c *Client) FetchInput(ctx context.Context, cl *Claim, dst string) (sum str
 		return "", fmt.Errorf("wire: input larger than max_input (%d)", max)
 	}
 	if b := cl.Run.Input.Bytes; b != nil && r.ContentLength >= 0 && r.ContentLength != *b {
-		return "", errors.New("wire: input length differs from the claim")
+		return "", lengthErr(r.ContentLength, *b)
 	}
 	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
@@ -684,7 +684,7 @@ func (c *Client) FetchInput(ctx context.Context, cl *Claim, dst string) (sum str
 		return "", errors.New("wire: input body shorter than Content-Length")
 	}
 	if b := cl.Run.Input.Bytes; b != nil && n != *b {
-		return "", errors.New("wire: input length differs from the claim")
+		return "", lengthErr(n, *b)
 	}
 	got := hw.sum()
 	if h := strings.ToLower(r.Header.Get("x-blastbox-input-sha256")); h != got {
@@ -697,6 +697,13 @@ func (c *Client) FetchInput(ctx context.Context, cl *Claim, dst string) (sum str
 		return "", err
 	}
 	return got, nil
+}
+
+func lengthErr(got, want int64) error {
+	if got > want {
+		return fmt.Errorf("wire: input longer than the claim (%d > %d bytes)", got, want)
+	}
+	return fmt.Errorf("wire: input shorter than the claim (%d < %d bytes)", got, want)
 }
 
 // ---- result ----
