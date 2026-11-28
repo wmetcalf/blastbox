@@ -954,9 +954,19 @@ def test_a_directory_in_the_queue_is_refused_not_fatal(tmp_path):
     assert out["evil"].startswith("refused") and out["evil2"].startswith("refused")
 
 
-def test_a_deeply_nested_directory_in_the_queue_does_not_abort_the_run(tmp_path):
+def _rm_deep(root: Path) -> None:
+    """Remove a tree too deep for shutil.rmtree (which pytest's tmp cleanup uses)."""
+    for top, dirs, files in os.walk(root, topdown=False):     # iterative since 3.12
+        for f in files:
+            os.unlink(os.path.join(top, f))
+        for d in dirs:
+            os.rmdir(os.path.join(top, d))
+
+
+def test_a_deeply_nested_directory_in_the_queue_does_not_abort_the_run(tmp_path, request):
     """Cleanup must not traverse what the ingress planted: a recursive rmtree raises
     RecursionError on a deep enough tree, despite ignore_errors."""
+    request.addfinalizer(lambda: _rm_deep(tmp_path))
     ca, ca_dir, i1, _i2 = _split(tmp_path)
     (i1 / "renew").mkdir(exist_ok=True)
     deep = i1 / "renew" / "aaa.csr.signing"
