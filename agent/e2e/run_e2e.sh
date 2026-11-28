@@ -199,6 +199,18 @@ PY
 }
 check_receipt "$T/receipt.json" "$T/node/node.crt" || fail "receipt check failed"
 
+# 7b. A run long enough for the memory and disk watchdogs to sample it many times under the
+# real sandbox (and, on linux, the enforced AppArmor child profile) must still finish DONE,
+# without a failed sample.
+LONG=$(submit 6)
+log "long job $LONG submitted; waiting for DONE"
+st=$(wait_status "$LONG" done) || fail "long job $LONG ended as $st"
+if grep -q "watchdog read failed" "$T/agent.log"; then
+  grep "watchdog read failed" "$T/agent.log" >&2
+  fail "a watchdog could not sample the confined run"
+fi
+log "long job $LONG done; every watchdog sample read the confined run"
+
 # 9. Liveness while the agent runs: node present, heartbeating, no node_silent alert.
 api "$BASE/v1/fleet/liveness" >"$T/live.json"
 "$PYTHON" - "$T/live.json" "$NODE" <<'PY'
