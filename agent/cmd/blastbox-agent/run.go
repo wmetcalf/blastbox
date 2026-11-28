@@ -14,28 +14,41 @@ import (
 )
 
 func loadConfig(name string, args []string) (*config.Config, int) {
+	cfg, _, code := loadConfigFlags(name, args, false)
+	return cfg, code
+}
+
+// loadConfigFlags is loadConfig plus, for `run`, the --modem-sound flag (returned, not applied).
+func loadConfigFlags(name string, args []string, withSound bool) (*config.Config, bool, int) {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	path := fs.String("config", "", "path of the agent TOML config")
+	var modem *bool
+	if withSound {
+		modem = fs.Bool("modem-sound", false, "play the modem connect sound on the first successful session")
+	}
 	if err := fs.Parse(args); err != nil {
-		return nil, 2
+		return nil, false, 2
 	}
 	if *path == "" || fs.NArg() != 0 {
 		fmt.Fprintf(os.Stderr, "usage: blastbox-agent %s --config PATH\n", name)
-		return nil, 2
+		return nil, false, 2
 	}
 	cfg, err := config.Load(*path)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "blastbox-agent:", err)
-		return nil, 1
+		return nil, false, 1
 	}
-	return cfg, 0
+	return cfg, modem != nil && *modem, 0
 }
 
 func cmdRun(args []string) int {
-	cfg, code := loadConfig("run", args)
+	cfg, sound, code := loadConfigFlags("run", args, true)
 	if cfg == nil {
 		return code
+	}
+	if sound {
+		cfg.Sound.OnConnect = "modem"
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()

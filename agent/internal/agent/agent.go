@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/wmetcalf/blastbox/agent/internal/config"
+	"github.com/wmetcalf/blastbox/agent/internal/modem"
 	"github.com/wmetcalf/blastbox/agent/internal/runner"
 	"github.com/wmetcalf/blastbox/agent/internal/sandbox"
 	"github.com/wmetcalf/blastbox/agent/internal/wire"
@@ -49,6 +50,7 @@ type Agent struct {
 	Host    sandbox.Host
 	Runner  JobRunner
 	Log     *slog.Logger
+	Modem   *modem.Notifier // optional connect sound; nil/disabled = silent
 
 	KillRunFn  func(sandbox.RunRecord) error // recovery's kill of a left-behind run; default sandbox.KillRun
 	ProbeFn    func(context.Context, config.Engine) sandbox.ProbeResult
@@ -116,6 +118,8 @@ func New(cfg *config.Config) *Agent {
 	a.SelfTestFn = func(ctx context.Context, e config.Engine) sandbox.ProbeResult { return a.Host.SelfTest(ctx, e) }
 	a.InsecureFn = a.Host.InsecurityReasons
 	a.KillRunFn = sandbox.KillRun
+	a.Modem = &modem.Notifier{Enabled: cfg.ModemEnabled(), StateDir: cfg.StateDir,
+		Debug: func(msg string, err error) { a.Log.Debug(msg, "err", err.Error()) }}
 	a.Now = time.Now
 	a.Sleep = realSleep
 	a.Rand = rand.Float64
@@ -328,6 +332,7 @@ func (a *Agent) newWire() (*wire.Client, error) {
 	rm := a.reach
 	a.mu.Unlock()
 	cl.OnContact = rm.Contact
+	cl.OnSession = a.Modem.OnSession
 	return cl, nil
 }
 

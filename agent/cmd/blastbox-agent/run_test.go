@@ -18,3 +18,12 @@ func TestProbeReportExitCode(t *testing.T) {
 		t.Fatal(rc, b.String())
 	}
 }
+
+func TestModemSoundFlagOnlyOnRun(t *testing.T) {
+	if _, _, code := loadConfigFlags("run", []string{"--modem-sound", "--config", "/nonexistent"}, true); code != 1 {
+		t.Fatalf("run must accept --modem-sound (then fail on the config), got %d", code)
+	}
+	if _, _, code := loadConfigFlags("probe", []string{"--modem-sound", "--config", "/nonexistent"}, false); code != 2 {
+		t.Fatalf("probe must reject --modem-sound, got %d", code)
+	}
+}
